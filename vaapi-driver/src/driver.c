@@ -80,11 +80,14 @@ static void dmd_init_vtable(struct VADriverVTable *vtable)
 #include "vtable.inc"
 }
 
-/* 入口符号名必须是 __vaDriverInit_<major>_<minor>：libva 从当前版本向下
- * 逐个 dlsym（va/va.c 的 va_getDriverInitName + compatible_versions 循环），
- * 首个命中即用。libva 头文件没有提供生成该名字的宏，所以在这里自己拼 ——
- * 用 VA_MAJOR/MINOR_VERSION 拼接可随 libva 升级自动跟随，
- * 比硬编码 __vaDriverInit_1_22 更耐版本变化。
+/* 入口符号名必须是 __vaDriverInit_<major>_<minor>。libva 头文件没有提供生成
+ * 该名字的宏（已确认 va_backend.h 只有 typedef VADriverInit），所以自己拼。
+ *
+ * 版本选择：libva 从自身版本 1.N 起**降序**逐个 dlsym 到 1.0
+ * （va/va.c 的 va_getDriverInitName + compatible_versions 循环），首个命中即用。
+ * 因此导出 __vaDriverInit_1_0 的兼容窗口最宽 —— 任意 libva 1.x 都能接受；
+ * 只导出 1_22 则在 libva 低于 1.22 时不会被命中。
+ * 两者都导出，成本为零：编译期版本一个（跟随头文件），1_0 一个（保底）。
  *
  * -fvisibility=hidden 下必须显式标 default 可见性，否则符号不导出，
  * libva 会报 "has no function __vaDriverInit_1_0"。 */
@@ -92,11 +95,25 @@ static void dmd_init_vtable(struct VADriverVTable *vtable)
 #define DMD_INIT_NAME_(maj, min) DMD_CONCAT_(__vaDriverInit_, maj, min)
 #define DMD_DRIVER_INIT DMD_INIT_NAME_(VA_MAJOR_VERSION, VA_MINOR_VERSION)
 
-__attribute__((visibility("default"))) VAStatus
-DMD_DRIVER_INIT(VADriverContextP ctx);
+static VAStatus dmd_driver_init(VADriverContextP ctx);
 
 __attribute__((visibility("default"))) VAStatus
 DMD_DRIVER_INIT(VADriverContextP ctx)
+{
+    return dmd_driver_init(ctx);
+}
+
+/* 保底入口：让低于编译期版本的 libva 也能加载本驱动。
+ * 若头文件本身就是 1.0，上面的宏已展开成同名函数，此处不再重复定义。 */
+#if VA_MAJOR_VERSION != 1 || VA_MINOR_VERSION != 0
+__attribute__((visibility("default"))) VAStatus
+__vaDriverInit_1_0(VADriverContextP ctx)
+{
+    return dmd_driver_init(ctx);
+}
+#endif
+
+static VAStatus dmd_driver_init(VADriverContextP ctx)
 {
     if (!ctx || !ctx->vtable)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
