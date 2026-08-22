@@ -300,6 +300,51 @@ static struct dmd_session *session_open(int codec, unsigned int width,
     return s;
 }
 
+/* flush 过的会话已不能再送数据，透明换一条新的。
+ *
+ * 为什么可以这么做（已实测，probe_rebuild）：
+ * 新建会话 + 重送 SPS/PPS 后，**从非 IDR 帧续传也能立刻出帧**
+ * （实测续传 12 个 VCL 出 9 帧，首个续传单元 nal_unit_type=1）。
+ * 所以不必等下一个 IDR，不会有可见花屏。
+ *
+ * 调用方必须持锁；本函数内部会临时放锁做阻塞 IO（connect + 握手）。
+ * 返回 0 成功，-1 失败（失败时 c->session 置空，由调用方走失败路径）。
+ */
+static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
+                                  int idx)
+{
+    struct dmd_session *old = c->session;
+    int codec = c->codec;
+    unsigned int w = c->picture_width;
+    unsigned int h = c->picture_height;
+
+    /* 先摘下旧会话，避免放锁期间别的线程还往里写。 */
+    c->session = NULL;
+
+    drv->io_busy[idx] = 1;
+    pthread_mutex_unlock(&drv->lock);
+    if (old)
+        dmd_session_destroy(old);
+    struct dmd_session *ns = session_open(codec, w, h);
+    pthread_mutex_lock(&drv->lock);
+    drv->io_busy[idx] = 0;
+    pthread_cond_broadcast(&drv->io_done);
+
+    if (!ns) {
+        dmd_log("会话重建失败\n");
+        c->session_failed = 1;
+        return -1;
+    }
+
+    c->session = ns;
+    c->input_finished = 0;
+    /* 参数集属于旧会话的状态，新会话必须重送 —— 清掉"已送"标记，
+     * 下一次 EndPicture 的既有逻辑就会重新合成并发送 SPS/PPS。 */
+    c->param_sets_sent = 0;
+    dmd_log("会话已重建（codec=%d %ux%u），参数集将重送\n", codec, w, h);
+    return 0;
+}
+
 VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
                            int picture_width, int picture_height, int flag,
                            VASurfaceID *render_targets, int num_render_targets,
@@ -1183,6 +1228,37 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         return VA_STATUS_ERROR_UNIMPLEMENTED;
     }
 
+    /* 会话写端已关（flush 过），但上游又送料了 —— 透明换一条新会话。
+     *
+     * 这条路径覆盖的是 **seek**：daemon 没有连接内 reset，flush 又是不可逆的
+     * shutdown(SHUT_WR)，所以播放器跳转后要继续解码只能重建会话。
+     * 可行性已实测（probe_rebuild）：新会话重送 SPS/PPS 后，
+     * 从非 IDR 帧续传也能立刻出帧，不必等下一个 IDR，因此不会有可见花屏。
+     *
+     * 注意：Firefox 的正常播放**不会**走到这里 —— 实测它一旦在
+     * vaSyncSurface 上卡住就直接 DestroyContext，不再调 EndPicture。
+     * 那个死锁是靠 DMD_FLUSH_AFTER_MS + DMD_PIPELINE_DEPTH 从根上避免的，
+     * 本路径只是 seek/异常场景的兜底，尚未被真实 seek 端到端验证过。 */
+    if (c->session && c->input_finished) {
+        dmd_log("EndPicture: 会话写端已关闭但仍有新输入，重建会话\n");
+        if (session_rebuild_locked(drv, c, idx) < 0) {
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                pthread_mutex_unlock(&drv->lock);
+                free(scratch);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+        } else {
+            /* 重建期间放过锁，对象可能已被销毁，重新定位。 */
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                pthread_mutex_unlock(&drv->lock);
+                free(scratch);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+        }
+    }
+
     /* 会话惰性重试：CreateContext 时 daemon 可能还没起来。 */
     if (!c->session && !c->session_failed) {
         /* 不可能：session_failed 与 session 互补。保守处理。 */
@@ -1500,8 +1576,16 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
     /* 单次等待用较小的片，这样能周期性回到锁内检查状态。 */
     const int slice_ms = 100;
     /* 等这么久还没帧就认为解码器在攥尾部帧，主动 flush。
-     * 取总超时的一半：留足后半段时间让 flush 后的帧真正流出来。 */
-    const int flush_after_ms = timeout_ms / 2;
+     *
+     * ⚠️ 不能取 timeout_ms/2：调用方的超时不是"流是否结束"的证据。
+     * Firefox 用很短的超时轮询 vaSyncSurface（还会在解码前先 DeriveImage
+     * 探一次），timeout_ms/2 于是变得极小 —— 才送 3 帧就误判成流结束、
+     * 执行不可逆的 shutdown(SHUT_WR)，会话作废，浏览器永久回落软解。
+     * 命令行 ffmpeg 用大超时，所以从没暴露这个问题。
+     *
+     * flush 是"上游不再送料"才该做的事，与单次等待的耐心无关，
+     * 因此这里用固定阈值，且必须显著大于解码器填满流水线所需的时间。 */
+    const int flush_after_ms = DMD_FLUSH_AFTER_MS;
 
     for (;;) {
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
@@ -1530,8 +1614,14 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          *
          * ⚠️ finish_input 是不可逆的 shutdown(SHUT_WR)：一旦关闭，本会话
          * 再也不能送数据。所以只在"等了足够久、确实卡住"时才做，且只做一次。
-         * 代价是若 ffmpeg 之后还想解码，必须重建 context —— 但那时它已经
-         * 拿到了 TIMEDOUT 错误，本来也要重建。 */
+         *
+         * flush 之后本会话即成一次性资源，但**不等于 context 报废**：
+         * 见下方 session_rebuild_locked —— 下一次 EndPicture 会透明重建
+         * 会话并重送参数集，上层察觉不到。这对浏览器是必需的：
+         * 浏览器里 ffmpeg 稳态只保持 3 帧在飞，而 MediaCodec 有 B 帧时
+         * 滞后 4 帧（实测 probe_lag：有 B 帧 4，无 B 帧 1），双方差一帧
+         * 必然触发这里的 flush。若 flush 即报废，浏览器拿到 I/O error
+         * 后会永久回落软解（实测 Firefox 140 只硬解 1 帧就掉回软解）。 */
         if (!c->input_finished && spent >= flush_after_ms) {
             struct dmd_session *fs = c->session;
             c->input_finished = 1;
@@ -1707,9 +1797,86 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
-    VAStatus status = sync_surface_locked(drv, context, surface, timeout_ms);
+    struct dmd_context *sc = dmd_find_context_locked(drv, context);
+    int c_pending = sc ? sc->pending_count : 0;
+
+    /* 放行是有额度的：只在"在飞帧数还不足以喂饱解码器流水线"时才放行。
+     *
+     * 无条件放行会把死锁换成队列无界增长 —— 实测 pending 一路涨到
+     * DMD_MAX_SURFACES 溢出，ffmpeg 报 "Failed to end picture decode
+     * issue: 23"。因为消费者是"能送就送"的：不挡它，它就一直送，
+     * 而取像素（DeriveImage）要等到它自己攒够帧才做。
+     *
+     * 所以额度取实测的滞后深度 DMD_PIPELINE_DEPTH：
+     * 在飞帧数低于它时放行（让流水线填满，这是打破死锁的必要条件），
+     * 达到之后就老实阻塞等帧 —— 此刻解码器已经不欠料，等得到，
+     * 于是队列被排空，形成稳定的背压。 */
+    if (c_pending >= DMD_PIPELINE_DEPTH) {
+        VAStatus st = sync_surface_locked(drv, context, surface, timeout_ms);
+        pthread_mutex_unlock(&drv->lock);
+        return st;
+    }
+
+    /* ⚠️ 这里**不能**一直等到帧真的到手，否则与 MediaCodec 的流水线深度死锁。
+     *
+     * 实测的时序矛盾（probe_lag 直连 daemon 量得，与驱动无关）：
+     *   MediaCodec 有 B 帧时滞后 4 个输入单元才吐首帧（无 B 帧时滞后 1）
+     *   而浏览器里的 ffmpeg 稳态只保持 3 帧在飞（H.264 重排深度决定），
+     *   送完第 3 帧就阻塞在 vaSyncSurface 等第 1 帧。
+     * 双方差正好一帧：谁都不动 → 我们的兜底 flush 触发（不可逆
+     * shutdown(SHUT_WR)）→ 会话作废 → 浏览器拿到 I/O error 后永久回落软解。
+     * 实测 Firefox 140 因此只硬解出 1 帧，EndPicture 只被调用 3 次
+     * 就直接 DestroyContext。
+     *
+     * 已否决的两条路（都实测过）：
+     *  · daemon 开 low-latency：滞后仍是 4，无效（改动已保留，对交互有价值）
+     *  · 合成 SPS 里写 max_num_reorder_frames：真实码流的 SPS 本来就带 VUI，
+     *    滞后照旧 4 —— 说明这是高通解码器固有的流水线深度，signal 不掉。
+     *
+     * 所以阻塞点必须挪走：VA-API 允许像素在 map 时才真正就绪
+     * （消费者取像素走 DeriveImage + MapBuffer，实测 Firefox/ffmpeg 都如此）。
+     * 这里只做"短暂尝试"，没到就报成功放 ffmpeg 走 —— 它于是提交第 4 帧，
+     * 正好把 MediaCodec 的流水线推过阈值，帧随即流出。
+     * 真正的等待落在 MapBuffer/DeriveImage（见 image.c 的 dmd_surface_wait）。 */
+    const int probe_ms = 30;
+    VAStatus status = sync_surface_locked(drv, context, surface,
+                                         timeout_ms < probe_ms ? timeout_ms
+                                                               : probe_ms);
+    if (status == VA_STATUS_ERROR_TIMEDOUT) {
+        /* 帧还在解码器里排队，这不是错误。报成功让上游继续送料，
+         * 像素在 map 时保证就绪。 */
+        status = VA_STATUS_SUCCESS;
+    }
     pthread_mutex_unlock(&drv->lock);
 
+    return status;
+}
+
+/* 等到 surface 的像素真的就绪。供 image.c 在 map 前调用。
+ *
+ * 这是 SyncSurface 让路之后真正的阻塞点：此刻消费者已经把后续帧送进去了，
+ * MediaCodec 的流水线不再欠料，所以这里等得到。 */
+VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface)
+{
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (s->state != DMD_SURFACE_PENDING) {
+        VAStatus st = s->decode_status;
+        pthread_mutex_unlock(&drv->lock);
+        return st;
+    }
+    VAContextID context = surface_context_locked(drv, surface);
+    if (context == VA_INVALID_ID) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    VAStatus status = sync_surface_locked(drv, context, surface,
+                                         DMD_FRAME_TIMEOUT_MS);
+    pthread_mutex_unlock(&drv->lock);
     return status;
 }
 

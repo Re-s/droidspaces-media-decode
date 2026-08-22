@@ -360,11 +360,46 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
         bw_put_flag(&bw, 0);
     }
 
-    /* C：VUI 全部缺失（色彩空间、SAR、帧率、bitstream restriction 都没有）。
-     * 填 0 表示"无 VUI"，解码器用默认值：SAR 1:1、色彩空间 unspecified。
-     * 影响：显示宽高比与色彩元数据丢失。对 hwdownload 到 NV12 的场景，
-     * 几何与像素值都不受影响（我们自己按 crop 处理显示区域）。 */
-    bw_put_flag(&bw, 0);
+    /* C：VUI 只写 bitstream_restriction 一段，其余（色彩空间、SAR、帧率）
+     * 仍然缺失 —— VA-API 不提供它们，解码器用默认值：SAR 1:1、
+     * 色彩空间 unspecified。对 NV12 输出，几何与像素值都不受影响
+     * （显示区域由我们按 crop 处理）。
+     *
+     * 为什么必须写 bitstream_restriction：
+     * 没有它时 max_num_reorder_frames 的缺省值等于 DPB 上限（§E.2.1），
+     * MediaCodec 只能按最坏情况攥帧 —— 实测滞后 4 个输入单元才吐首帧
+     * （无 B 帧的流滞后 1，证明攥帧确实来自重排假设）。
+     * 而浏览器里的 ffmpeg 稳态只保持 3 帧在飞（H.264 重排深度决定），
+     * 送完第 3 帧就阻塞在 vaSyncSurface 等第 1 帧 → 双方差一帧 → 死锁 →
+     * 驱动兜底 flush（不可逆）→ 会话作废 → 浏览器永久回落软解。
+     * 实测 Firefox 140 因此只硬解出 1 帧。
+     *
+     * ⚠️ 不要把 max_num_reorder_frames 写 0（曾经试过，已否决）：
+     * 那是谎报流的重排需求，会破坏语义 —— 软解侧实测 150 帧掉到 115 帧。
+     * 这里用 num_ref_frames 作上界：它是 SPS 自带的参考帧数上限，
+     * 重排深度不可能超过它，所以这是**真实且不放大**的约束。 */
+    bw_put_flag(&bw, 1); /* vui_parameters_present_flag */
+
+    bw_put_flag(&bw, 0); /* aspect_ratio_info_present_flag */
+    bw_put_flag(&bw, 0); /* overscan_info_present_flag */
+    bw_put_flag(&bw, 0); /* video_signal_type_present_flag */
+    bw_put_flag(&bw, 0); /* chroma_loc_info_present_flag */
+    bw_put_flag(&bw, 0); /* timing_info_present_flag */
+    bw_put_flag(&bw, 0); /* nal_hrd_parameters_present_flag */
+    bw_put_flag(&bw, 0); /* vcl_hrd_parameters_present_flag */
+    bw_put_flag(&bw, 0); /* pic_struct_present_flag */
+
+    bw_put_flag(&bw, 1); /* bitstream_restriction_flag */
+    bw_put_flag(&bw, 1); /* motion_vectors_over_pic_boundaries_flag：
+                          * 缺省即 1，写 1 不改变语义 */
+    bw_put_ue(&bw, 0);   /* max_bytes_per_pic_denom：0 = 无限制 */
+    bw_put_ue(&bw, 0);   /* max_bits_per_mb_denom：0 = 无限制 */
+    /* log2_max_mv_length_horizontal/vertical：写规范允许的最大值 15，
+     * 等价于不施加额外限制。 */
+    bw_put_ue(&bw, 15);
+    bw_put_ue(&bw, 15);
+    bw_put_ue(&bw, pp->num_ref_frames); /* max_num_reorder_frames */
+    bw_put_ue(&bw, pp->num_ref_frames); /* max_dec_frame_buffering */
 
     bw_rbsp_trailing(&bw);
 

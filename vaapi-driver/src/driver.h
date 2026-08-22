@@ -49,6 +49,22 @@
 /* surface 上限：ffmpeg 的 hwframe pool 默认 20+ 个（initial_pool_size 加
  * 解码器的 DPB 需求），Firefox 会更多。64 对 8 个并发实例足够。 */
 #define DMD_MAX_SURFACES 64
+
+/* MediaCodec 的输出滞后深度（实测值，见 vaapi-driver/tools 里的 probe_lag）：
+ * 有 B 帧的 H.264 流要送进第 4 个输入单元才吐出第 1 帧，无 B 帧时是 1。
+ *
+ * SyncSurface 用它作为"放行额度"：在飞帧数低于此值时不阻塞消费者，
+ * 让它继续送料把流水线填满；达到之后才真正阻塞等帧。
+ * 取 6（滞后 4 再留 2 的余量）—— 太小会退回死锁，太大会让队列变长、
+ * 增加延迟且浪费 surface。 */
+#define DMD_PIPELINE_DEPTH 6
+
+/* 等这么久（毫秒）仍取不到帧，才认定上游不再送料、执行不可逆的 flush。
+ *
+ * 必须是固定值，不能按调用方的超时推算：调用方的耐心不是"流已结束"的证据。
+ * Firefox 用很短的超时轮询 vaSyncSurface，按比例推算会得到极小的阈值，
+ * 才送 3 帧就误判流结束 → flush → 会话作废 → 永久回落软解。 */
+#define DMD_FLUSH_AFTER_MS 2000
 /* context 上限对齐 media_codecs.xml 声明的并发解码实例数（16）。 */
 #define DMD_MAX_CONTEXTS 16
 /* buffer 上限：每帧 4 个左右（pic param / IQ matrix / slice param / slice data），
@@ -365,6 +381,13 @@ VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target);
 
 VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
                           uint64_t timeout_ns);
+
+/* 等到 surface 像素真的就绪（内部自行加锁，调用方不得持锁）。
+ *
+ * SyncSurface 为避免与 MediaCodec 的流水线深度死锁，会对"已提交但未就绪"
+ * 的 surface 直接报成功放行，真正的等待推迟到取像素时。所以 image.c 的
+ * DeriveImage / GetImage 在读 surface 几何或拷像素之前必须先调用本函数。 */
+VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface);
 
 VAStatus dmd_QuerySurfaceStatus(VADriverContextP ctx,
                                 VASurfaceID render_target,

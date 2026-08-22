@@ -160,6 +160,15 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
     if (!drv || !image)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
+    /* 真正的等帧点。SyncSurface 为了不与 MediaCodec 流水线深度死锁，
+     * 对"已提交未就绪"的 surface 直接报成功放行（详见 decode.c 里
+     * dmd_SyncSurface2 的注释）。所以像素必须在这里保证就绪 ——
+     * 下面要读 s->stride / s->slice_height，它们只有帧回来后才是真值。
+     * 必须在取锁之前调用：dmd_surface_wait 自己会加锁。 */
+    VAStatus wait = dmd_surface_wait(drv, surface);
+    if (wait != VA_STATUS_SUCCESS)
+        return wait;
+
     pthread_mutex_lock(&drv->lock);
     struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
     if (!s) {
@@ -267,6 +276,12 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     /* 色度平面按 2x2 采样，奇数起点会把 U/V 对拆开。 */
     if ((x & 1) || (y & 1))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* 与 DeriveImage 同理：SyncSurface 会放行未就绪的 surface，
+     * 拷像素之前必须在这里等到帧真的到手。 */
+    VAStatus wait = dmd_surface_wait(drv, surface);
+    if (wait != VA_STATUS_SUCCESS)
+        return wait;
 
     pthread_mutex_lock(&drv->lock);
 

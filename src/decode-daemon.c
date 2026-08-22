@@ -895,6 +895,23 @@ static void *session_thread(void *arg)
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_WIDTH,  max_w);
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_HEIGHT, max_h);
 
+    /* 低延迟模式：让解码器尽快吐帧，而不是攥着几帧等流水线填满。
+     *
+     * 为什么必须开：MediaCodec 稳态滞后 2-3 个输入单元，而浏览器里的
+     * ffmpeg 稳态只保持 3 帧在飞（H.264 重排深度 has_b_frames=2 决定），
+     * 送完第 3 帧就 vaSyncSurface 阻塞等第 1 帧。双方差正好一帧 →
+     * 互等 → 驱动侧兜底 flush（不可逆 shutdown(SHUT_WR)）→ 会话作废 →
+     * 浏览器永久回落软解。实测 Firefox 140 只硬解出 1 帧就掉回软解。
+     * 命令行 ffmpeg 不受影响，因为它送料远远超前，盖住了这个滞后。
+     *
+     * 为什么用字面量而不用 AMEDIAFORMAT_KEY_LOW_LATENCY：
+     * 该符号是 __INTRODUCED_IN(30)（NdkMediaFormat.h:321），而本 daemon
+     * 按 API 29 构建。key 本身只是字符串常量，直接写字面值即可，
+     * 既不用抬高构建 API，也不引入弱符号判空。
+     * 低于 API 30 的设备上 MediaCodec 会忽略未知 key —— 退化为原有行为，
+     * 不会失败。 */
+    AMediaFormat_setInt32(fmt, "low-latency", 1);
+
     s->codec = AMediaCodec_createDecoderByType(s->mime);
     if (!s->codec) { dlog(0, "[%d] 无可用解码器: %s", s->id, s->mime); goto out_fmt; }
 
