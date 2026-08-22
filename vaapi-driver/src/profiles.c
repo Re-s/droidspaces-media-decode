@@ -10,12 +10,21 @@
 
 #include "driver.h"
 
-/* 本驱动支持的 profile 集合。顺序即 vainfo 的输出顺序。 */
+/* 本驱动支持的 profile 集合。顺序即 vainfo 的输出顺序。
+ *
+ * ⚠️ 只列**解码路径真的通了**的 profile。声明了但解不出来比不声明更糟 ——
+ * 消费者会选中我们然后失败，而它本来可以直接走软解。
+ *
+ * HEVC（VAProfileHEVCMain）曾经列在这里，现已移除：码流转发未实现，
+ * `vaEndPicture` 返回 UNIMPLEMENTED。这个虚报是有实际后果的 ——
+ * Firefox 的 vaapitest 探针会把它读成 CODEC_HW_HEVC（GfxInfo.h:63 的 1<<8），
+ * 实测探针输出 368 = H264|VP8|VP9|HEVC，于是 Firefox 认为我们能解 HEVC。
+ * 等 HEVC 真正实现后再加回来。
+ */
 static const VAProfile dmd_profiles[] = {
     VAProfileH264ConstrainedBaseline,
     VAProfileH264Main,
     VAProfileH264High,
-    VAProfileHEVCMain,
     VAProfileVP9Profile0,
     VAProfileVP8Version0_3,
 };
@@ -32,7 +41,9 @@ int dmd_profile_supported(VAProfile profile)
 }
 
 /* profile → 协议 codec id。
- * 注意 HEVC/VP9/VP8 各只有一个 profile 被声明，高位深未验证故不映射。 */
+ * 高位深 profile 未验证故不映射。
+ * HEVCMain 保留映射但**不在 dmd_profiles 里声明**：映射本身无害，
+ * 等 HEVC 码流转发实现后只需把 profile 加回声明表即可。 */
 int dmd_profile_to_codec(VAProfile profile)
 {
     switch (profile) {
