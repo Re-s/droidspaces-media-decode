@@ -1,0 +1,43 @@
+# Build artifacts
+*.o
+*.d
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Compiled binaries
+decode-daemon
+decode-daemon-arm64
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Test files
+*.h264
+*.mp4
+*.mkv
+*.avi
