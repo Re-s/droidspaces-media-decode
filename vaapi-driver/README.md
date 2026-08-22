@@ -203,24 +203,98 @@ DMD_VA_LOG=1 firefox-hwdec   # 看驱动侧日志，确认硬解真的生效
 Xvfb 不行：它不提供 DRI3，GLX 走不到 freedreno，`MESA_ACCELERATED` 恒为 FALSE。
 必须是真实的 Wayland/X 会话。
 
-### 浏览器暴露的死锁（已修）
+实测结果（真实 kwin_wayland 会话，1080p H.264，`<video>` 播放）：
 
-浏览器里的 ffmpeg 稳态只保持 **3 帧在飞**（H.264 重排深度决定），而 MediaCodec
-有 B 帧时**滞后 4 个输入单元**才吐首帧（无 B 帧时滞后 1，实测见 `tools/probe_lag.c`）。
-差正好一帧 → 双方互等。
+| 指标 | 值 |
+|---|---|
+| VA-API 硬解帧 | 143（视频共 147 帧） |
+| 软解帧 | **0** |
+| `vaExportSurfaceHandle` | 148 次全部成功 |
+| 平均解码耗时 | 7.4 ms（帧间隔 33.3 ms） |
+| 驱动侧 / 浏览器侧错误 | 无 |
 
-旧代码的兜底 flush 阈值取 `timeout_ms / 2`，而 Firefox 用很短的超时轮询
-`vaSyncSurface`，阈值因此极小 —— 才送 3 帧就误判"流已结束"，执行不可逆的
-`shutdown(SHUT_WR)`，会话作废，浏览器拿到 I/O error 后**永久**回落软解。
-命令行 ffmpeg 用大超时，所以从未暴露这个问题。
+### 必须以桌面会话的所属用户运行
 
-两处修法（`DMD_FLUSH_AFTER_MS` / `DMD_PIPELINE_DEPTH`）：
-1. flush 阈值改固定值 —— 调用方的耐心不是"流已结束"的证据
-2. 在飞帧数低于流水线深度时 `vaSyncSurface` 放行，真正的等待推迟到取像素
-   （`DeriveImage`/`GetImage` 前置 `dmd_surface_wait`）
+Firefox 拒绝以 root 身份使用普通用户的会话，直接退出并只留一句
+`Running Firefox as root in a regular user's session is not supported.`
+容器里桌面常跑在 uid 1000 下，而人习惯用 root 操作，很容易撞上：
 
-无条件放行会把死锁换成队列无界增长（实测 pending 涨到溢出、ffmpeg 报
-`decode issue: 23`），所以放行必须有额度、达到后照常阻塞形成背压。
+```bash
+su master -s /bin/bash -c 'firefox-hwdec'
+```
+
+`firefox-hwdec` 会提前检查并给出准确提示，不让人对着空日志猜。
+
+### `vaExportSurfaceHandle` 是浏览器的硬性要求
+
+**这是"ffmpeg 全绿但浏览器不动"的根本原因**，值得单独记一笔。
+
+Firefox 取帧只走 dmabuf 导出：`CreateImageVAAPI` 拿到解码帧后立刻调
+`vaExportSurfaceHandle` 要 `DRM_PRIME_2` 描述符，失败就返回
+`NS_ERROR_DOM_MEDIA_DECODE_ERR`，播放器随即 `ProcessFlush()` 并重建成**软解**。
+全过程没有任何错误日志，**也没有回退到拷贝的路径**
+（`dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp:1632`）。
+症状就是"硬解出 1 帧然后永久软解"。
+
+而 ffmpeg 命令行**不需要**这个入口（`hwdownload` 走 `vaDeriveImage` + `vaMapBuffer`），
+所以命令行六条流全绿的同时浏览器一动不动。
+
+实现上有个反直觉的点：**不必零拷贝**。此前"零拷贝走不通"的三条依据
+（容器 ION 不可用、无 `/dev/dma_heap`、NDK 不给 MediaCodec 输出缓冲的 fd）
+说的都是同一件事 —— 拿不到 MediaCodec 那块内存的 fd。但 Firefox 要的只是
+**一个能被合成器导入的 dmabuf fd**，并不要求那块内存就是解码器的原始输出。
+于是 surface 改为分配在 msm_drm 的 dumb buffer 里
+（`DRM_IOCTL_MODE_CREATE_DUMB` + `MAP_DUMB`），帧直接落进这块可导出内存，
+拷贝次数与原来的 `calloc` 方案**相同**。
+
+描述符要点（`src/export.c`）：单 object；Firefox 传 `SEPARATE_LAYERS`，
+所以默认两层 —— Y 用 `DRM_FORMAT_R8`、UV 用 `DRM_FORMAT_GR88`，
+UV 的 offset 是 `stride × slice_height`（**缓冲高 1088**，不是显示高 1080，
+与 `VAImage.offsets[1]` 同一个坑）。fd 必须带 `CLOEXEC`：驱动跑在浏览器
+进程里，泄漏到子进程是安全问题。
+
+### 观测教训：不要让未实现入口静默失败
+
+上面这个根因之所以难找，是因为 25 个未实现桩**静默**返回
+`VA_STATUS_ERROR_UNIMPLEMENTED`。消费者踩到未实现入口的典型症状是
+"悄悄回落软解"而不是报错，静默桩让这种情况完全不可观测 —— 为此绕了两轮弯路
+（先后误判为流水线深度死锁、flush 阈值误判）。
+
+现在 `tools/gen_stubs.py` 给每个桩都生成一行日志，一跑就现形：
+
+```
+[dmd-va] 未实现入口被调用: vaExportSurfaceHandle
+```
+
+### 与解码器流水线深度的互等（已修）
+
+浏览器稳态只保持 **3 帧在飞**（H.264 重排深度决定），而 MediaCodec 有 B 帧时
+要收到**第 4 个输入单元**才吐首帧（无 B 帧时 1，实测见 `tools/probe_lag.c`）。
+差正好一帧：浏览器要先拿到帧才肯送下一个单元，解码器要再收一个单元才肯出帧。
+
+daemon 侧的 `low-latency` 降不下来 —— 那是解码器固有的流水线深度。
+所以**这个互等只能由我们主动 flush 打破**，问题只在于等多久。
+
+判据是"**再等下去也不可能有帧**"，不是"等够久了"：
+
+- 队列深度低于 `DMD_PIPELINE_DEPTH` 时，队列不会自己变化，等待徒劳 → 立刻 flush
+- 队列够深时按 `DMD_FLUSH_AFTER_MS` 等 —— 那时帧确实在路上，
+  提前 flush 会白白打断正常会话
+
+flush 的代价（会话作废）由 `EndPicture` 的**透明重建**消掉：重送 SPS/PPS 后
+可从非 IDR 帧续传，上层察觉不到（`tools/probe_rebuild.c` 验证）。
+
+两个反面教材，都是实测踩出来的：
+
+- 按耐心阈值等满 2000ms 再 flush → 每帧 2 秒，播放等于卡死（硬解 7 帧就停）
+- 只按队列深度判、浅队列一律不 flush → 流末尾的尾帧取不出来，
+  `test1080` 少收 2 帧并报 `TIMEDOUT 38`。尾帧同样是浅队列，
+  想用"上游是否还在送料"区分它和"填充中"也行不通 ——
+  浏览器停止送料与流结束在该指标上无法区分
+
+⚠️ 当前代价：浏览器场景下几乎每帧触发一次会话重建（147 帧 ≈ 147 次）。
+功能正确、速度也够（平均 7.4 ms/帧，帧间隔 33.3 ms），但这是"用重建换出帧"
+的权衡。根治需要 daemon 在浅队列下也能出帧。
 
 ## 无感发现机制（改名即失效）
 

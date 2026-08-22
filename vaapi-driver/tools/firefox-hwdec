@@ -90,6 +90,20 @@ fi
 export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-msm}"
 export MOZ_DISABLE_RDD_SANDBOX="${MOZ_DISABLE_RDD_SANDBOX:-1}"
 
+# Firefox 拒绝以 root 身份使用别人的会话，报
+# "Running Firefox as root in a regular user's session is not supported."
+# 然后直接退出。容器里桌面通常跑在普通用户下（XDG_RUNTIME_DIR=/run/user/1000），
+# 而人习惯用 root 操作，于是撞上这条 —— 提前说清楚，别让人对着空日志猜。
+if [ "$(id -u)" = "0" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    rt_owner=$(stat -c %u "$XDG_RUNTIME_DIR" 2>/dev/null || echo 0)
+    if [ "$rt_owner" != "0" ]; then
+        rt_user=$(stat -c %U "$XDG_RUNTIME_DIR" 2>/dev/null || echo "?")
+        log "✗ 你是 root，但 $XDG_RUNTIME_DIR 属于 $rt_user —— Firefox 会拒绝启动。"
+        log "  改用该用户运行： su $rt_user -s /bin/bash -c '$0 $*'"
+        exit 1
+    fi
+fi
+
 # Wayland 下 Firefox 才能拿到硬件 WebRender（VA-API 的第二重门要求
 # 合成器不是软件 WebRender）。有 WAYLAND_DISPLAY 就顺手打开开关。
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
