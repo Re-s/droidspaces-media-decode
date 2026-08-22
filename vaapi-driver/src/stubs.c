@@ -13,6 +13,7 @@ VAStatus dmd_QuerySurfaceError(VADriverContextP ctx, VASurfaceID render_target, 
     (void)render_target;
     (void)error_status;
     (void)error_info;
+    dmd_log("未实现入口被调用: vaQuerySurfaceError\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -32,6 +33,7 @@ VAStatus dmd_PutSurface(VADriverContextP ctx, VASurfaceID surface, void*draw, sh
     (void)cliprects;
     (void)number_cliprects;
     (void)flags;
+    dmd_log("未实现入口被调用: vaPutSurface\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -40,6 +42,7 @@ VAStatus dmd_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned cha
     (void)ctx;
     (void)image;
     (void)palette;
+    dmd_log("未实现入口被调用: vaSetImagePalette\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -56,6 +59,7 @@ VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image
     (void)dest_y;
     (void)dest_width;
     (void)dest_height;
+    dmd_log("未实现入口被调用: vaPutImage\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -64,6 +68,7 @@ VAStatus dmd_CreateSubpicture(VADriverContextP ctx, VAImageID image, VASubpictur
     (void)ctx;
     (void)image;
     (void)subpicture;
+    dmd_log("未实现入口被调用: vaCreateSubpicture\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -71,6 +76,7 @@ VAStatus dmd_DestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture)
 {
     (void)ctx;
     (void)subpicture;
+    dmd_log("未实现入口被调用: vaDestroySubpicture\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -79,6 +85,7 @@ VAStatus dmd_SetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture,
     (void)ctx;
     (void)subpicture;
     (void)image;
+    dmd_log("未实现入口被调用: vaSetSubpictureImage\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -89,6 +96,7 @@ VAStatus dmd_SetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpict
     (void)chromakey_min;
     (void)chromakey_max;
     (void)chromakey_mask;
+    dmd_log("未实现入口被调用: vaSetSubpictureChromakey\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -97,6 +105,7 @@ VAStatus dmd_SetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpi
     (void)ctx;
     (void)subpicture;
     (void)global_alpha;
+    dmd_log("未实现入口被调用: vaSetSubpictureGlobalAlpha\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -115,6 +124,7 @@ VAStatus dmd_AssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture
     (void)dest_width;
     (void)dest_height;
     (void)flags;
+    dmd_log("未实现入口被调用: vaAssociateSubpicture\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -124,6 +134,7 @@ VAStatus dmd_DeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpictu
     (void)subpicture;
     (void)target_surfaces;
     (void)num_surfaces;
+    dmd_log("未实现入口被调用: vaDeassociateSubpicture\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -140,6 +151,7 @@ VAStatus dmd_LockSurface(VADriverContextP ctx, VASurfaceID surface, unsigned int
     (void)chroma_v_offset;
     (void)buffer_name;
     (void)buffer;
+    dmd_log("未实现入口被调用: vaLockSurface\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -147,6 +159,7 @@ VAStatus dmd_UnlockSurface(VADriverContextP ctx, VASurfaceID surface)
 {
     (void)ctx;
     (void)surface;
+    dmd_log("未实现入口被调用: vaUnlockSurface\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -156,6 +169,7 @@ VAStatus dmd_GetSurfaceAttributes(VADriverContextP dpy, VAConfigID config, VASur
     (void)config;
     (void)attrib_list;
     (void)num_attribs;
+    dmd_log("未实现入口被调用: vaGetSurfaceAttributes\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -164,6 +178,7 @@ VAStatus dmd_AcquireBufferHandle(VADriverContextP ctx, VABufferID buf_id, VABuff
     (void)ctx;
     (void)buf_id;
     (void)buf_info;
+    dmd_log("未实现入口被调用: vaAcquireBufferHandle\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -171,6 +186,7 @@ VAStatus dmd_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id)
 {
     (void)ctx;
     (void)buf_id;
+    dmd_log("未实现入口被调用: vaReleaseBufferHandle\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -178,6 +194,7 @@ VAStatus dmd_CreateMFContext(VADriverContextP ctx, VAMFContextID *mfe_context)
 {
     (void)ctx;
     (void)mfe_context;
+    dmd_log("未实现入口被调用: vaCreateMFContext\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -186,6 +203,7 @@ VAStatus dmd_MFAddContext(VADriverContextP ctx, VAMFContextID mf_context, VACont
     (void)ctx;
     (void)mf_context;
     (void)context;
+    dmd_log("未实现入口被调用: vaMFAddContext\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -194,6 +212,7 @@ VAStatus dmd_MFReleaseContext(VADriverContextP ctx, VAMFContextID mf_context, VA
     (void)ctx;
     (void)mf_context;
     (void)context;
+    dmd_log("未实现入口被调用: vaMFReleaseContext\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -203,6 +222,7 @@ VAStatus dmd_MFSubmit(VADriverContextP ctx, VAMFContextID mf_context, VAContextI
     (void)mf_context;
     (void)contexts;
     (void)num_contexts;
+    dmd_log("未实现入口被调用: vaMFSubmit\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -216,6 +236,7 @@ VAStatus dmd_CreateBuffer2(VADriverContextP ctx, VAContextID context, VABufferTy
     (void)unit_size;
     (void)pitch;
     (void)buf_id;
+    dmd_log("未实现入口被调用: vaCreateBuffer2\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -225,6 +246,7 @@ VAStatus dmd_QueryProcessingRate(VADriverContextP ctx, VAConfigID config_id, VAP
     (void)config_id;
     (void)proc_buf;
     (void)processing_rate;
+    dmd_log("未实现入口被调用: vaQueryProcessingRate\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -235,6 +257,7 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, u
     (void)mem_type;
     (void)flags;
     (void)descriptor;
+    dmd_log("未实现入口被调用: vaExportSurfaceHandle\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -243,6 +266,7 @@ VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeou
     (void)ctx;
     (void)buf_id;
     (void)timeout_ns;
+    dmd_log("未实现入口被调用: vaSyncBuffer\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -252,5 +276,6 @@ VAStatus dmd_Copy(VADriverContextP ctx, VACopyObject *dst, VACopyObject *src, VA
     (void)dst;
     (void)src;
     (void)option;
+    dmd_log("未实现入口被调用: vaCopy\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
