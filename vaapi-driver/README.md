@@ -10,8 +10,10 @@
 **已实现：能力查询 + H.264 / VP9 / VP8 解码数据路径。** `vainfo` 能列出 profiles
 与配置属性；三者都已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
 
-**未实现：HEVC 的解码数据路径。** profile 仍然声明（能力查询正常），
-但 `vaEndPicture` 返回 `VA_STATUS_ERROR_UNIMPLEMENTED`。
+**未实现：HEVC 的解码数据路径。** 因此 **profile 也不再声明** ——
+声明了但解不出来比不声明更糟：消费者会选中我们然后失败，而它本来可以直接
+走软解。撤销前 Firefox 的探针会把 HEVC 读成"可硬解"（位图含 `1<<8`）。
+现在 HEVC 在能力协商阶段就干净失败并回退软解。
 
 各 codec 实际状态：
 
@@ -20,7 +22,7 @@
 | `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | **通过** | 1080p 150 帧 + 4K 90 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP9Profile0` | 2（VP9） | 正常 | **通过** | 720p 120 帧 + 1080p 60 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP8Version0_3` | 3（VP8） | 正常 | **通过** | 720p 120 帧，`cmp` 与软解逐字节一致 |
-| `VAProfileHEVCMain` | 1（HEVC） | 正常 | 未实现 | `vaEndPicture` 返回 UNIMPLEMENTED |
+| ~~`VAProfileHEVCMain`~~ | 1（HEVC） | **不声明** | 未实现 | 见上：不虚报未实现的能力 |
 
 各 codec 的难度差异只有一个来源 —— **VA-API 传给 driver 的码流完整度不同**：
 
@@ -128,6 +130,97 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 显示 1920x1080。`VAImage.width/height` 必须报显示尺寸（否则 ffmpeg 尺寸校验
 失败），但 `offsets[1] = stride * slice_height` 要用 **1088**。按 1080 算会让
 色度平面偏移 `stride*8` 字节，症状是绿边、花屏、色度错位。
+
+## 浏览器（Firefox）：能力没问题，门槛在环境
+
+`vainfo` / ffmpeg 能硬解**不代表** Firefox 也会硬解。Firefox 判定"能否硬解"要
+过三重门，卡住任意一重都只会静默回落软解，日志里只有一句
+`Codec h264 is not accelerated`，看不出原因。
+
+Firefox 自己的探针是认可本驱动的 —— 它启动时跑 `/usr/lib/firefox-esr/vaapitest`
+（`widget/gtk/GfxInfo.cpp`），`strace` 可见它 dlopen 了我们的 `.so`：
+
+```
+$ /usr/lib/firefox-esr/vaapitest --drm /dev/dri/renderD128
+VAAPI_SUPPORTED
+TRUE
+VAAPI_HWCODECS
+112          # = 0b1110000 = H264(1<<4) | VP8(1<<5) | VP9(1<<6)
+```
+
+### 三重门（`dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp`）
+
+| 门 | 条件 | 卡住时的日志 |
+|---|---|---|
+| 1 | `gfxVars::UseH264HwDecode()` | `Codec h264 is not accelerated` |
+| 2 | 硬件 WebRender（非软件合成） | `Hardware WebRender is off, VAAPI is disabled` |
+| 3 | 解码在 RDD 进程 | `VA-API works in RDD process only` |
+
+第 1 重的来源链最长，也最容易踩：
+
+```
+FEATURE_H264_HW_DECODE 要求 mVAAPISupportedCodecs & CODEC_HW_H264
+  ← 由 GetDataVAAPI() 跑 vaapitest 填充
+    ← 只在 probeHWDecode 为真时才跑：
+      probeHWDecode = mIsAccelerated && (status OK || force-enabled pref)
+                      ^^^^^^^^^^^^^^
+      mIsAccelerated = !mesaAccelerated.Equals("FALSE")   ← 来自 glxtest
+```
+
+**`media.hardware-video-decoding.force-enabled` 绕不过 `mIsAccelerated`** ——
+它只在括号内起作用。没有硬件 GL 就没有硬解，这是 Firefox 的设计。
+
+### 容器里的两个必要环境变量
+
+```bash
+MESA_LOADER_DRIVER_OVERRIDE=msm   # 否则 Mesa 走 zink → 挑不到 Vulkan 设备
+                                  # → 回落 llvmpipe → MESA_ACCELERATED FALSE
+MOZ_DISABLE_RDD_SANDBOX=1         # 否则 RDD 沙箱禁止本驱动连 daemon 的 TCP
+                                  # （驱动日志：创建 TCP socket 失败: Permission denied）
+```
+
+加覆盖后 glxtest 报 `RENDERER FD640`（真 Adreno 640 / freedreno）而非 llvmpipe。
+
+⚠️ **`MOZ_DISABLE_RDD_SANDBOX=1` 是安全权衡**：它降低 RDD 进程的隔离强度。
+更干净的长期做法是驱动改用 Unix socket，或由沙箱策略放行这一个连接。
+只在信任本机环境时使用。
+
+profile 里还需要两个 pref：
+
+```
+media.ffmpeg.vaapi.enabled = true
+media.hardware-video-decoding.force-enabled = true
+```
+
+`tools/firefox-hwdec` 把上述环境固化了，并带自检：
+
+```bash
+firefox-hwdec --dmd-check    # 只检查环境（DRM 设备 / daemon / 驱动 / 探针位图）
+firefox-hwdec                # 带正确环境启动 Firefox
+DMD_VA_LOG=1 firefox-hwdec   # 看驱动侧日志，确认硬解真的生效
+```
+
+Xvfb 不行：它不提供 DRI3，GLX 走不到 freedreno，`MESA_ACCELERATED` 恒为 FALSE。
+必须是真实的 Wayland/X 会话。
+
+### 浏览器暴露的死锁（已修）
+
+浏览器里的 ffmpeg 稳态只保持 **3 帧在飞**（H.264 重排深度决定），而 MediaCodec
+有 B 帧时**滞后 4 个输入单元**才吐首帧（无 B 帧时滞后 1，实测见 `tools/probe_lag.c`）。
+差正好一帧 → 双方互等。
+
+旧代码的兜底 flush 阈值取 `timeout_ms / 2`，而 Firefox 用很短的超时轮询
+`vaSyncSurface`，阈值因此极小 —— 才送 3 帧就误判"流已结束"，执行不可逆的
+`shutdown(SHUT_WR)`，会话作废，浏览器拿到 I/O error 后**永久**回落软解。
+命令行 ffmpeg 用大超时，所以从未暴露这个问题。
+
+两处修法（`DMD_FLUSH_AFTER_MS` / `DMD_PIPELINE_DEPTH`）：
+1. flush 阈值改固定值 —— 调用方的耐心不是"流已结束"的证据
+2. 在飞帧数低于流水线深度时 `vaSyncSurface` 放行，真正的等待推迟到取像素
+   （`DeriveImage`/`GetImage` 前置 `dmd_surface_wait`）
+
+无条件放行会把死锁换成队列无界增长（实测 pending 涨到溢出、ffmpeg 报
+`decode issue: 23`），所以放行必须有额度、达到后照常阻塞形成背压。
 
 ## 无感发现机制（改名即失效）
 
