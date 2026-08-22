@@ -1,124 +1,100 @@
-# MediaCodec Decode Daemon - Magisk Module
+# MediaCodec Decode Daemon — KSU/Magisk 模块
 
-## 概述
-这是一个Magisk模块，用于在Android设备上运行MediaCodec硬件解码daemon，为DroidSpaces容器提供视频解码服务。
+模块的唯一职责：**开机自动启动 `decode-daemon`**。
 
-## 功能特性
-- 开机自启decode-daemon服务
-- 自动配置SELinux策略
-- 支持H.264和HEVC硬件解码
-- 使用Unix socket与容器客户端通信
-- 零拷贝帧传递（通过文件描述符）
+> ⚠️ **开发和测试阶段不需要安装本模块。**
+> 直接推送二进制手动启动即可，见仓库根目录 [README 的测试方法](../README.md#测试方法)。
+> 模块只是最终发布形态，安装模块会引入 bootloop 风险，调试期间没必要承担。
 
-## 安装要求
-- 已安装Magisk 20.0+
-- Android 10.0+ (API 29+)
-- 支持MediaCodec硬件解码的设备
-- ARM64架构
+## 当前状态
 
-## 安装步骤
-1. 下载模块ZIP文件
-2. 打开Magisk Manager应用
-3. 点击"模块" → "从本地安装"
-4. 选择下载的ZIP文件
-5. 等待安装完成，重启设备
+模块脚手架可用，但**尚未在真机上完整验证过安装流程**。已知待完善处见文末。
 
-## 配置说明
-### Socket路径
-默认socket路径：`/tmp/anland/decode.sock`
-可通过修改`service.sh`中的`SOCKET_PATH`变量更改。
+## 组成
 
-### SELinux策略
-模块会自动配置SELinux策略，允许decode-daemon：
-- 创建和使用Unix socket
-- 访问硬件设备文件
-- 与surfaceflinger等系统服务交互
+| 文件 | 作用 |
+|------|------|
+| `module.prop` | 模块元信息 |
+| `customize.sh` | 安装时解包与设置权限 |
+| `service.sh` | `late_start service` 阶段启动 daemon |
+| `sepolicy.rule` | SELinux 策略规则（见下方说明，当前多数规则冗余） |
+| `META-INF/` | Magisk/KSU 安装器入口（`update-binary` 为标准空壳，由安装器接管） |
 
-### 日志文件
-daemon日志保存在：`/data/local/tmp/decode-daemon.log`
+## 打包
 
-## 使用方法
-### 容器客户端连接
-```c
-// C语言示例
-int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-struct sockaddr_un addr;
-addr.sun_family = AF_UNIX;
-strcpy(addr.sun_path, "/tmp/anland/decode.sock");
-connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+需要先构建出 daemon 二进制并放进模块目录：
 
-// 发送NALU数据
-uint32_t size = nalu_size;
-send(sock, &size, 4, 0);
-send(sock, nalu_data, size, 0);
-
-// 接收解码帧
-uint32_t width, height, stride;
-recv(sock, &width, 4, 0);
-recv(sock, &height, 4, 0);
-recv(sock, &stride, 4, 0);
-// 接收文件描述符用于零拷贝访问
+```bash
+./build.sh                                  # 在仓库根目录
+cp build/decode-daemon magisk-module/
+cd magisk-module
+zip -r ../decode-daemon-module.zip . -x '*.git*'
 ```
 
-### Python客户端示例
-```python
-import socket
-import struct
+安装：Magisk Manager / KernelSU Manager → 模块 → 从本地安装 → 选择 ZIP → 重启。
 
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect('/tmp/anland/decode.sock')
+## 运行时行为
 
-# 发送NALU
-size = len(nalu_data)
-sock.send(struct.pack('I', size))
-sock.send(nalu_data)
+- 监听端口：**20003**（与 `src/decode-daemon.c` 默认值一致）
+- 日志：`/data/local/tmp/decode-daemon.log`
+- PID 文件：`/data/local/tmp/decode-daemon.pid`
 
-# 接收帧信息
-width = struct.unpack('I', sock.recv(4))[0]
-height = struct.unpack('I', sock.recv(4))[0]
-stride = struct.unpack('I', sock.recv(4))[0]
+验证是否在运行：
+
+```bash
+adb shell "su -c 'cat /data/local/tmp/decode-daemon.log'"    # 应含 listening on 20003
+adb shell "su -c 'ps -A | grep decode-daemon'"
 ```
+
+## service.sh 的防 bootloop 设计
+
+这几条不是代码风格偏好，是硬要求。KernelSU 与 Magisk 都**不对模块脚本设置超时**，
+脚本阻塞会拖住开机流程。
+
+1. **所有等待必须有上界。** 早期版本用
+   `while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 1; done`
+   等待开机完成，一旦该属性因任何原因永不置 1，脚本就永久阻塞。
+   现在的实现带最大重试次数（120 次），超时也记录日志后继续。
+2. **不用 `killall` / `pkill` 按名字杀进程。** 名字匹配存在命中系统进程的风险。
+   现在只处理记录在 PID 文件里、且 `/proc/<pid>/exe` 确认指向 `decode-daemon` 的进程，
+   避免 PID 复用导致误杀。
+3. **停止旧实例后必须确认它真的退出。** daemon 阻塞在 `accept()` 时对 `SIGTERM`
+   的响应依赖 self-pipe 唤醒；若二进制是旧版本或异常，最多等 10 秒后升级为 `SIGKILL`。
+   不确认就直接启动新实例会导致两个进程同时监听同一端口
+   （`SO_REUSEADDR` 会让第二次 bind 也成功），连接分配变得不可预测。
+   这一点是真机实测发现的：旧版脚本会报告"已停止旧实例"但进程实际仍在运行。
+4. **任何情况下都以 `exit 0` 结束**，绝不因模块自身失败影响系统启动。
+
+## SELinux
+
+daemon 由 KernelSU 以 root 启动，运行在 `u:r:ksu:s0` 域下，实测可正常访问
+MediaCodec 与网络，**不需要额外策略**。
+
+`sepolicy.rule` 中的规则大部分是早期 Unix socket + dmabuf 方案的遗留
+（如 `sock_file`、`hal_graphics_allocator_default`、`surfaceflinger` 相关项），
+对当前 TCP 实现无用。保留待清理，请勿以其为准理解实现。
 
 ## 故障排除
-### 1. Daemon无法启动
-- 检查日志文件：`cat /data/local/tmp/decode-daemon.log`
-- 确认Magisk模块已激活
-- 重启设备
 
-### 2. SELinux权限问题
-- 检查SELinux状态：`getenforce`
-- 临时设为宽容模式测试：`setenforce 0`
-- 检查SELinux日志：`dmesg | grep avc`
+**日志为空或没有 `listening`**
+检查二进制是否存在且可执行：`adb shell "su -c 'ls -l /data/adb/modules/decode-daemon/'"`。
+若日志出现 `bind <port> failed: Address already in use`，说明已有实例占用端口。
 
-### 3. Socket连接失败
-- 确认socket文件存在：`ls -la /tmp/anland/decode.sock`
-- 检查文件权限：`chmod 666 /tmp/anland/decode.sock`
-- 确认容器有访问权限
+**容器连不上**
+确认容器与 Android 共享 net namespace（DroidSpaces 默认如此），
+容器内 `python3 -c "import socket;socket.create_connection(('127.0.0.1',20003),3)"` 应能连通。
 
-### 4. 解码失败
-- 检查MediaCodec支持：`dumpsys media.codec`
-- 确认NALU格式正确
-- 检查帧大小限制（最大8MB）
+**解码失败**
+检查设备是否有硬件 H.264 解码器：
+`adb shell "su -c 'grep -o \"OMX.qcom.video.decoder.avc\" /vendor/etc/media_codecs.xml'"`。
 
-## 卸载方法
-1. 打开Magisk Manager应用
-2. 点击"模块"
-3. 找到"MediaCodec Decode Daemon"
-4. 点击"卸载" → 重启设备
+**模块导致无法开机**
+KernelSU 的安全模式会禁用所有模块，可据此恢复；
+参见 [KernelSU 救援指南](https://kernelsu.org/zh_CN/guide/rescue-from-bootloop.html)。
+注意模块 `initrc/` 目录下的内容即使在安全模式下仍会执行 —— 本模块不使用 `initrc/`。
 
-## 技术规格
-- **协议格式**：
-  - 输入：`[4B size][NALU data]`
-  - 输出：`[4B width][4B height][4B stride][1B format][fd][frame data]`
-- **支持编解码器**：H.264 (video/avc), HEVC (video/hevc)
-- **最大帧大小**：8MB
-- **超时时间**：5秒
+## 待完善
 
-## 开发信息
-- 基于Android NDK MediaCodec API
-- 使用Unix domain socket通信
-- 支持文件描述符传递实现零拷贝
-- 自动检测H.264/HEVC格式
-
-## 许可证
-本模块为开源项目，遵循Apache 2.0许可证。
+- 安装流程未在真机上端到端验证（开发期使用手动推送方式）
+- `sepolicy.rule` 需按当前 TCP 实现精简
+- 端口不可配置，需改脚本；应支持通过配置文件覆盖

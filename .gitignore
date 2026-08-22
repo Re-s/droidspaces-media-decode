@@ -13,9 +13,11 @@
 *.idb
 *.pdb
 
-# Compiled binaries
-decode-daemon
-decode-daemon-arm64
+# Build output
+# 用锚定路径而非裸名：裸名 "decode-client" 会匹配任意深度的同名文件或目录，
+# 将来若把客户端源码目录命名成 decode-client/ 就会被整个吞掉。
+/build/
+/client/build/
 
 # Editor and IDE files
 .vscode/
