@@ -105,10 +105,8 @@ RBSP 转义）实测产出 15 字节 SPS 与 9 字节 PPS，**MediaCodec 接受�
 只要原样转发 slice 字节、不重写 slice header，那些命令本来就还在码流里，
 MediaCodec 自己解析。
 
-产物位置（工作区，未随仓库分发）：
-`/home/master/Documents/DSHWK/dmd-vaapi/research/h264-wip/h264_bitstream.c`
+这套码流合成后来正式进入仓库，即 `vaapi-driver/src/h264_bitstream.c`，
 公开接口 `dmd_h264_build_sps_nalu()` / `dmd_h264_build_pps_nalu()`。
-同目录的 `decode.c.wip` 是当时的接入方式（含已知缺陷，见下）。
 
 **卡住的地方是帧配对，不是码流。** 那次尝试的实测结果：
 
