@@ -396,23 +396,6 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
 
     /* B：num_ref_idx_l0/l1_default_active_minus1。
      *
-     * pic param 里没有这个字段。曾用 VASliceParameterBufferH264 的
-     * num_ref_idx_l0/l1_active_minus1 代替，但**那是错的**：参数集必须在首个
-     * VCL 之前发出，此刻手里只有 **IDR** 的 slice param，而 I slice 的
-     * num_ref_idx 恒为 0。于是 PPS 默认值被填成 0，未带
-     * num_ref_idx_active_override_flag 的 P/B slice 就只用 1 个参考帧。
-     * 实测本流真实 PPS 是 l0=2（3 个参考帧），合成值填 0 → 参考帧不足。
-     *
-     * 改用 num_ref_frames 作上界：任何合法 slice 的 num_ref_idx_active
-     * 都 ≤ num_ref_frames，所以这个默认值只会偏大不会偏小，
-     * 而解错的原因恰恰是偏小。带 override 的 slice 用自己的值，
-     * 不带的用这个上界，两者都不会缺参考帧。
-     *
-     * 注意这会让 PPS 与真实码流不逐字节一致（真实 l0=2，我们填 3）。
-     * **逐字节一致不是目标，解码正确才是** —— MediaCodec 自己解析 slice
-     * header 里的 override 值，PPS 默认值只是兜底上界。 */
-    /* B：num_ref_idx_l0/l1_default_active_minus1。
-     *
      * 照抄**当前帧** slice param 的 num_ref_idx_l0/l1_active_minus1，
      * 并且每当这两个值变化就重发 PPS（见 decode.c 的 h264_send_param_sets）。
      *
