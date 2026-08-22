@@ -72,9 +72,24 @@ MediaCodec 稳态滞后 2-3 个单元（实测送 1/2/3 个 VCL 后等 4000ms �
 `vaSyncSurface` 上不会再送数据 —— 双方互等。所以等待超过总超时一半时
 主动 `shutdown(SHUT_WR)`，每会话只做一次（它不可逆）。
 
-**已知限制**：流内分辨率变化（`switch.h264` / `grow.h264`）会失败 ——
-daemon 会话建立时就固定了分辨率，中途变更需重建会话，
-而 flush 之后写端已不可逆关闭。属于 seek/flush 支持的一部分。
+**因此 seek 需要重建 session**：写端一旦关闭，本会话就不能再送数据。
+daemon 也没有连接内的 reset，所以 seek 只能由 driver 重建会话来实现
+（尚未实现 —— 当前没有消费者在同一 context 上 seek）。
+
+### 流内分辨率变化：DestroyContext 必须先排空
+
+ffmpeg 在流内分辨率变化时先 `vaDestroyContext` 再建新的，但**之后仍会
+`vaSyncSurface` 旧 context 的 surface** —— 那些帧属于前一段分辨率，它还要取走。
+若 `DestroyContext` 把仍处于 PENDING 的 surface 直接标成失败，
+ffmpeg 就会收到 `VA_STATUS_ERROR_OPERATION_FAILED`，整条流解不下去
+（实测 `switch.h264` 在此处送入 62 单元只取回 44 帧，18 个 surface 被放弃）。
+
+这些帧并没有解错，只是还攥在 MediaCodec 里 —— 与流末尾同一个成因。
+所以 `DestroyContext` 在放弃 surface 之前先做一次 flush + 取帧循环
+（与 `vaSyncSurface` 共用 `dmd_pending_take_locked()`）。
+帧数据是 `memcpy` 进 surface 自有缓冲的，所以随后销毁会话不影响后续读取。
+
+`switch.h264`（720p→480p）与 `grow.h264`（480p→720p）现均与软解逐字节一致。
 
 **不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10）：硬件可能支持，
 但未验证。谎报能力会让消费者选中我们然后失败，比不报更糟。
