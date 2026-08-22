@@ -1355,9 +1355,9 @@ static void surface_store_frame_locked(struct dmd_surface *s,
 
 /* 从 daemon 取帧直到目标 surface 就绪或超时。
  *
- * 这是 VA-API 乱序语义与 MediaCodec 流式语义的配对点：取回的第 k 帧
- * 填给 pending 队列的第 k 个 surface。目标 surface 可能不在队首 ——
- * 那就一直取，把队首的先填掉，直到轮到目标。
+ * 这是 VA-API 乱序语义与 MediaCodec 流式语义的配对点。目标 surface 通常
+ * 不在"该被填"的位置 —— 那就一直取，把该先填的填掉，直到轮到目标。
+ * 谁该先填由 codec 决定：VP9/VP8 是队首，H.264/HEVC 是 (seq, POC) 最小者。
  */
 static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
                                     VASurfaceID target, int timeout_ms)
@@ -1371,6 +1371,9 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
     int spent = 0;
     /* 单次等待用较小的片，这样能周期性回到锁内检查状态。 */
     const int slice_ms = 100;
+    /* 等这么久还没帧就认为解码器在攥尾部帧，主动 flush。
+     * 取总超时的一半：留足后半段时间让 flush 后的帧真正流出来。 */
+    const int flush_after_ms = timeout_ms / 2;
 
     for (;;) {
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
@@ -1388,6 +1391,32 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             /* PENDING 但队列空：提交失败过。不能等，会永远等不到。 */
             s->state = DMD_SURFACE_IDLE;
             return VA_STATUS_ERROR_DECODING_ERROR;
+        }
+
+        /* 久等不到帧：解码器可能正攥着尾部帧等更多输入或 EOS。
+         *
+         * MediaCodec 稳态滞后 2-3 个单元（实测送 1/2/3 个 VCL 后等 4000ms
+         * 都不出帧，第 4 个才出），所以流末尾最后几帧必须关掉写端才能取出来。
+         * 而 ffmpeg 此刻正阻塞在 vaSyncSurface 上，不会再送新数据 —— 双方
+         * 互等，只能由我们主动 flush 打破。
+         *
+         * ⚠️ finish_input 是不可逆的 shutdown(SHUT_WR)：一旦关闭，本会话
+         * 再也不能送数据。所以只在"等了足够久、确实卡住"时才做，且只做一次。
+         * 代价是若 ffmpeg 之后还想解码，必须重建 context —— 但那时它已经
+         * 拿到了 TIMEDOUT 错误，本来也要重建。 */
+        if (!c->input_finished && spent >= flush_after_ms) {
+            struct dmd_session *fs = c->session;
+            c->input_finished = 1;
+            drv->io_busy[idx] = 1;
+            pthread_mutex_unlock(&drv->lock);
+            int frc = dmd_session_finish_input(fs);
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+            dmd_log("SyncSurface: 等了 %d ms 仍无帧，flush 输入（rc=%d）\n",
+                    spent, frc);
+            /* 重新查找：放锁期间对象可能被销毁。 */
+            continue;
         }
 
         if (spent >= timeout_ms) {
