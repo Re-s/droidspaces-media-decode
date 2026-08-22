@@ -188,3 +188,32 @@ MediaCodec 自己解析。
   "Impossible to convert between the formats"，看起来像 driver 的错
 - `dmd_client` 的 `send_unit` 不内部排空：批量提交多帧前必须先 `next_frame`，
   否则 daemon 会静默丢单元
+
+## 第二轮实测修正（IP 切换后重跑）
+
+上一轮的两条结论是错的，已在 `research/I-2b-decode-path.md` §5.2 详细更正：
+
+1. **PSNR 11.5dB 是测量错误。** 我按 1088 帧长读输出，但 `hwdownload` 出来的是
+   1920x1080（`size % 3110400 == 0` 可自检）。修正几何后真实值 **22.87dB**。
+   连带推翻"surface 取了 1088"这条曾被标为最可疑的线索 —— 几何本来就对。
+2. **帧数是 148 帧整**，与 daemon 回收数一致，driver→ffmpeg 一帧没丢。
+
+**真根因已确证**：PPS 的 `num_ref_idx_l0/l1_default_active_minus1` 取自
+`VASliceParameterBufferH264`，但参数集必须在首个 VCL 之前送，那时只有 IDR 的
+slice param —— I slice 的 `num_ref_idx` 恒为 0。运行时实测：
+
+```
+合成 PPS: [00 00 00 01 68 ef 8f 2c 8b]  l0=0 l1=0
+真实 PPS: [00 00 00 01 68 eb e3 cb 22 c0]  l0=2 l1=0
+```
+
+后果：未 override 的 P/B slice 只用 1 个参考帧 → 前 2 帧正确、第 3 帧起持续
+偏差、每个 IDR 处短暂恢复。逐帧 PSNR（148 帧里 5 帧 inf，恰为 5 个 IDR）
+与 md5 逐帧指纹（错误内容在软解输出里不存在，故非帧序问题）双重印证。
+
+第一轮离线自测显示"PPS 逐字节一致"是**假阳性**：测试用例手填了 l0=2。
+教训：自测输入必须取自真实运行时快照。
+
+**推荐修法（比我试的暂存方案简单）**：PPS 默认值改用 SPS 的
+`num_ref_frames`。任何合法 slice 的 `num_ref_idx_active` 都 ≤ 它，不会造成
+参考帧不足（不足才解错）。逐字节一致不是目标，解码正确才是。
