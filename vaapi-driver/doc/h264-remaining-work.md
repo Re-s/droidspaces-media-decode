@@ -217,3 +217,68 @@ slice param —— I slice 的 `num_ref_idx` 恒为 0。运行时实测：
 **推荐修法（比我试的暂存方案简单）**：PPS 默认值改用 SPS 的
 `num_ref_frames`。任何合法 slice 的 `num_ref_idx_active` 都 ≤ 它，不会造成
 参考帧不足（不足才解错）。逐字节一致不是目标，解码正确才是。
+
+## 第三轮：num_ref_idx 假设被推翻，真根因是 daemon 不传 PTS
+
+按第二轮的建议实施了「PPS 默认值改用 `num_ref_frames - 1`」，真机实测
+**PSNR 22.98dB**（改前 22.87dB）—— 几乎没变，逐帧模式完全相同
+（前 2 帧 inf、全片 5 帧 inf、第 3 帧起同样偏差）。
+
+**所以第二轮认定的根因（num_ref_idx 取自 IDR）是错的。** 它确实让合成的 PPS
+与真实码流不一致，但不是画面错的原因。这条假设至此排除。
+
+### 真根因：输出帧序 ≠ 提交帧序，且无法关联
+
+决定性证据 —— inf 帧位置 vs IDR 位置：
+
+```
+输出中 inf 帧序号：   1  2  31  61  93
+码流 IDR 解码序序号： 1  31  61  91  121
+```
+
+第 4 个 IDR 在解码序 91 却命中输出第 93 位（漂移 +2），第 5 个（121）完全没对上。
+md5 逐帧指纹进一步显示帧序是**乱的而非整体偏移**：
+
+```
+hw[31] -> sw[32]
+hw[32] -> sw[33]
+hw[33] -> sw[31]     ← 三帧互换位置
+```
+
+根因在 daemon：`decode-daemon.c` 的 `queueInputBuffer` **PTS 恒为 0**
+
+```c
+AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
+                                            ↑ presentationTimeUs = 0
+```
+
+全文件 grep `presentationTimeUs` / `pts` / `PTS` **零命中**。后果有两层：
+
+1. MediaCodec 拿不到时间戳，**无法按显示顺序重排** B 帧输出
+2. 更根本的是，输出帧**无法关联回**是哪个输入单元产生的 —— 而 VA-API 的语义
+   要求 driver 把某一帧放进 ffmpeg 指定的那个 surface
+
+VP9/VP8 之所以逐字节一致，是因为它们零流水线深度、严格 1:1，提交序即输出序，
+FIFO 配对天然正确。H.264/HEVC 有 B 帧重排，这个前提就不成立了。
+
+### 结论：H.264 的阻塞点在 driver 之外
+
+driver 侧该做的都已验证可行（SPS/PPS 合成字节级正确、slice 补起始码转发、
+daemon 接受参数集并真的解出 148 帧）。剩下的两个障碍都在 daemon：
+
+- **障碍 A**（丢尾部 2 帧）：EOS 后 output 线程立刻 break，不排空队列
+- **障碍 C**（帧序，本轮新发现，是画面错的真因）：PTS 恒 0，无法重排也无法关联
+
+两者都需要改 `src/decode-daemon.c`，超出本单元「只改 `vaapi-driver/`」的约束。
+
+### 给后续单元的建议（需要跨越 daemon 边界的授权）
+
+1. **daemon 传递 PTS**：上行协议加一个单调递增的序号/时间戳字段，
+   `queueInputBuffer` 填进去，下行帧头带回 `AMediaCodecBufferInfo.presentationTimeUs`。
+   driver 就能按它把帧投递到正确的 surface，而不依赖 FIFO 假设。
+   这是唯一能让 H.264/HEVC 正确的路径。
+2. **顺带加 `AMEDIAFORMAT_KEY_LOW_LATENCY`**（`decode-daemon.c:884-896` 未设，
+   全文件零命中）：流水线深度降到接近 0，同时消除障碍 A 与死锁。
+3. 在 daemon 具备 PTS 之前，**不要再尝试在 driver 侧修 H.264** —— 参数集
+   相关的三条假设（num_ref_idx、scaling matrix、VUI）已逐一排除，
+   继续在 driver 内调参数不会改善。
