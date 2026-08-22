@@ -7,34 +7,74 @@
 
 ## 当前能力边界
 
-**已实现：能力查询 + VP9/VP8 解码数据路径。** `vainfo` 能列出 profiles 与配置属性；
-VP9 与 VP8 已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
+**已实现：能力查询 + H.264 / VP9 / VP8 解码数据路径。** `vainfo` 能列出 profiles
+与配置属性；三者都已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
 
-**未实现：H.264 / HEVC 的解码数据路径。** 它们的 profile 仍然声明（能力查询正常），
-但 `vaEndPicture` 返回 `VA_STATUS_ERROR_UNIMPLEMENTED` —— 原因不是接口没接好，
-而是**码流重建做不到**：VA-API 交给 driver 的是已解析的 `VAPictureParameterBufferH264`
-加上不含起始码与 NAL header 的 slice 载荷，而 daemon 需要完整 Annex B 码流。
-要补回 SPS/PPS 就得反向合成比特流，而 `profile_idc`、`level_idc`、VUI 等字段
-在 VA-API 里根本不存在。详见 `research/I-2b-decode-path.md` 的遗留与风险。
+**未实现：HEVC 的解码数据路径。** profile 仍然声明（能力查询正常），
+但 `vaEndPicture` 返回 `VA_STATUS_ERROR_UNIMPLEMENTED`。
 
 各 codec 实际状态：
 
 | Profile | daemon codec | 能力查询 | 解码出画面 | 验证结果 |
 |---------|-------------|---------|-----------|---------|
+| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | **通过** | 1080p 150 帧 + 4K 90 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP9Profile0` | 2（VP9） | 正常 | **通过** | 720p 120 帧 + 1080p 60 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP8Version0_3` | 3（VP8） | 正常 | **通过** | 720p 120 帧，`cmp` 与软解逐字节一致 |
-| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | 未实现 | `vaEndPicture` 返回 UNIMPLEMENTED |
-| `VAProfileHEVCMain` | 1（HEVC） | 正常 | 未实现 | 同上 |
+| `VAProfileHEVCMain` | 1（HEVC） | 正常 | 未实现 | `vaEndPicture` 返回 UNIMPLEMENTED |
 
-为什么 VP9/VP8 容易而 H.264/HEVC 难，只有一个原因 —— **VA-API 传给 driver 的
-码流完整度不同**：
+各 codec 的难度差异只有一个来源 —— **VA-API 传给 driver 的码流完整度不同**：
 
 - VP9：`VASliceDataBufferType` 里就是**一整个 VP9 frame**（含 uncompressed
   header，从 `frame_marker` 那 2 bit 开始）。零 header 重建，原样转发
 - VP8：slice data 从 partition 0 开始，只缺 RFC 6386 §9.1 的 3 字节 frame tag
   （key frame 再加 7 字节）。`first_part_size` 可从
   `partition_size[0] + (macroblock_offset+7)/8` 精确推导
-- H.264/HEVC：slice 载荷连 NAL header 都没有，参数集完全不以码流形式存在
+- H.264：slice data 是**完整原始 NALU**（含 NAL header 与 slice header），
+  只缺 4 字节起始码。但参数集**完全不以码流形式存在** —— SPS/PPS 被 ffmpeg
+  解析成字段后原始比特流就丢了，必须从 `VAPictureParameterBufferH264`
+  反向合成。另外还要处理帧重排配对（见下）
+- HEVC：同为完整 NALU 只缺起始码，但参数集是三个（VPS/SPS/PPS），
+  `profile_tier_level` 可用字段更少，且 `conf_win_*` 在 `va_dec_hevc.h` 里
+  根本没有、`slice_data_num_emu_prevn_bytes` 多数客户端填 0
+
+### H.264 的两个坑（都会导致画面错而不是报错）
+
+**一、帧重排配对：不能按提交顺序配对 surface。**
+ffmpeg 按**解码序**调 `vaEndPicture`，而 MediaCodec 按**显示序**吐帧。
+本测试流实测解码序 `I P B B B`（P 在第 2 位，因为 B 要参考它），
+显示序 `I B B B P`。按 FIFO 配对会从第 2 帧起全部错位。
+所以按 `CurrPic.TopFieldOrderCnt`（POC）配对：daemon 的第 k 帧给 POC 第 k 小
+的 surface。ffmpeg 填的是已解包的 `field_poc[0]`，不是码流里会回绕的
+6 bit `poc_lsb`，可直接比大小。
+
+但 POC 只在**同一个 coded video sequence 内**单调，每个 IDR 都会重置
+（实测第 2 个 IDR 处从 65562 跳回 65536）。所以还要带一个序列号，
+排序时先比 seq 再比 POC，否则新序列的帧会抢在旧序列未配对的帧之前。
+**序列号的判据必须是 `frame_num` 归零**（规范 7.4.3），
+不能用"POC 比上一帧小"—— 提交顺序是解码序，GOP 内 POC 本来就起伏。
+
+**二、PPS 的 `num_ref_idx_l0/l1_default_active_minus1` 必须照抄当前帧的生效值。**
+VA-API 给的是"该 slice 的生效值"：对未带 `num_ref_idx_active_override_flag`
+的 slice，生效值就等于 PPS 默认值；对带 override 的 slice，PPS 默认值不起作用。
+所以照抄总是对的，且不需要区分 `override_flag`（VA-API 未暴露它）。
+值变化时重发 PPS —— MediaCodec 接受流中反复出现的参数集。
+
+两条歧路均已实测证伪：取**首个 IDR** 的 slice param（I slice 无此语法元素，
+恒为 0，非 override 的 B slice 就只用 1 个参考帧）；用 `num_ref_frames-1`
+当"安全上界"（**l0 可偏大，l1 一位都不能偏大** —— `l1_default_active`
+决定非 override B slice 里 `ref_idx_l1` 的**熵解码码长**，
+改了它是语法解析层错位，不是预测质量问题）。
+
+### 流末尾需要主动 flush
+
+MediaCodec 稳态滞后 2-3 个单元（实测送 1/2/3 个 VCL 后等 4000ms 都不出帧，
+第 4 个才出）。流末尾最后几帧攥在解码器里，而此刻 ffmpeg 正阻塞在
+`vaSyncSurface` 上不会再送数据 —— 双方互等。所以等待超过总超时一半时
+主动 `shutdown(SHUT_WR)`，每会话只做一次（它不可逆）。
+
+**已知限制**：流内分辨率变化（`switch.h264` / `grow.h264`）会失败 ——
+daemon 会话建立时就固定了分辨率，中途变更需重建会话，
+而 flush 之后写端已不可逆关闭。属于 seek/flush 支持的一部分。
 
 **不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10）：硬件可能支持，
 但未验证。谎报能力会让消费者选中我们然后失败，比不报更糟。
