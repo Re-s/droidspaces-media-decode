@@ -1,0 +1,1417 @@
+/* 解码数据路径：surface / context / buffer 对象表 + 帧提交与取回
+ *
+ * ── 语义错配是这里的核心难点 ──────────────────────────────────
+ * VA-API：一次 BeginPicture/EndPicture = 解一帧到**指定** surface，
+ *         显示顺序由客户端安排，surface 之间无隐含顺序。
+ * MediaCodec（经 daemon）：流式 in/out，输出按**解码顺序**吐出，
+ *         没有"这一帧属于哪个 surface"的概念。
+ *
+ * 桥接办法：context 维护一个 FIFO 待解码队列 pending[]。EndPicture 把
+ * 本帧码流送给 daemon 并把 render_target 入队；从 daemon 取回的第 k 帧
+ * 就填给队列里的第 k 个 surface。这要求 **N 次提交 ⇔ N 个输出帧**：
+ *   - VP9/VP8：每个数据单元恰好一帧（含 invisible 帧，show_frame==0 也产
+ *     output buffer），天然 1:1
+ *   - H.264/HEVC：SPS/PPS 等参数集 NALU 不产帧，所以送参数集时**不入队**
+ * 这个不变式一旦破坏，画面会整体错位一帧且再也追不回来。
+ *
+ * IO 与锁：所有 daemon 收发都在放锁之后做，靠 io_busy[] 串行化同一 context
+ * 上的 IO。持锁做阻塞 IO 会让其他线程的 CreateBuffer 一起卡死。
+ */
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "driver.h"
+
+unsigned int dmd_align_up(unsigned int v, unsigned int align)
+{
+    if (align == 0)
+        return v;
+    return (v + align - 1) / align * align;
+}
+
+/* ================================ 对象查找 ================================ */
+
+struct dmd_surface *dmd_find_surface_locked(struct dmd_driver *drv,
+                                            VASurfaceID id)
+{
+    if (id == VA_INVALID_ID)
+        return NULL;
+    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+        if (drv->surfaces[i].in_use && drv->surfaces[i].id == id)
+            return &drv->surfaces[i];
+    }
+    return NULL;
+}
+
+struct dmd_context *dmd_find_context_locked(struct dmd_driver *drv,
+                                            VAContextID id)
+{
+    if (id == VA_INVALID_ID)
+        return NULL;
+    for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
+        if (drv->contexts[i].in_use && drv->contexts[i].id == id)
+            return &drv->contexts[i];
+    }
+    return NULL;
+}
+
+struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv, VABufferID id)
+{
+    if (id == VA_INVALID_ID)
+        return NULL;
+    for (int i = 0; i < DMD_MAX_BUFFERS; i++) {
+        if (drv->buffers[i].in_use && drv->buffers[i].id == id)
+            return &drv->buffers[i];
+    }
+    return NULL;
+}
+
+void dmd_surface_reset_locked(struct dmd_surface *s)
+{
+    free(s->data);
+    memset(s, 0, sizeof(*s));
+    s->id = VA_INVALID_ID;
+    s->context = VA_INVALID_ID;
+}
+
+void dmd_context_reset_locked(struct dmd_context *c)
+{
+    /* session_destroy 会 close socket。它不阻塞（close 不等对端），
+     * 所以在这里做是安全的。 */
+    if (c->session)
+        dmd_session_destroy(c->session);
+    free(c->slice_data);
+    memset(c, 0, sizeof(*c));
+    c->id = VA_INVALID_ID;
+    c->current_target = VA_INVALID_ID;
+}
+
+/* ================================ surface ================================ */
+
+/* 按显示尺寸分配一个 surface 的 NV12 缓冲。
+ *
+ * 几何：宽对齐 128、高对齐 32（Venus 的真机行为，1080p → 1920x1088）。
+ * 预先按对齐尺寸分配，这样 daemon 回来的帧一定装得下 —— 否则要等收到
+ * 格式块才知道该分配多大，而 ffmpeg 在建 context 之前就要 surface。
+ */
+static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
+                                     unsigned int width, unsigned int height,
+                                     unsigned int format)
+{
+    unsigned int bw = dmd_align_up(width, DMD_WIDTH_ALIGN);
+    unsigned int bh = dmd_align_up(height, DMD_HEIGHT_ALIGN);
+    /* NV12：Y 平面 stride*slice_height，UV 平面是它的一半 */
+    size_t size = (size_t)bw * bh * 3 / 2;
+
+    unsigned char *data = calloc(1, size);
+    if (!data)
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+    memset(s, 0, sizeof(*s));
+    s->in_use = 1;
+    s->id = id;
+    s->width = width;
+    s->height = height;
+    s->buf_width = bw;
+    s->buf_height = bh;
+    s->stride = bw;
+    s->slice_height = bh;
+    s->format = format;
+    s->data = data;
+    s->data_size = size;
+    s->state = DMD_SURFACE_IDLE;
+    s->decode_status = VA_STATUS_SUCCESS;
+    s->context = VA_INVALID_ID;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus create_surfaces_common(VADriverContextP ctx,
+                                       unsigned int format, unsigned int width,
+                                       unsigned int height,
+                                       VASurfaceID *surfaces,
+                                       unsigned int num_surfaces)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !surfaces)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (num_surfaces == 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (width < DMD_MIN_WIDTH || height < DMD_MIN_HEIGHT ||
+        width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT)
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    /* 只支持 8-bit 4:2:0。谎报会让消费者选中我们然后拿到花屏。 */
+    if (format != VA_RT_FORMAT_YUV420)
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+
+    VAStatus status = VA_STATUS_SUCCESS;
+    unsigned int created = 0;
+
+    pthread_mutex_lock(&drv->lock);
+    for (unsigned int n = 0; n < num_surfaces; n++) {
+        struct dmd_surface *slot = NULL;
+        for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+            if (!drv->surfaces[i].in_use) {
+                slot = &drv->surfaces[i];
+                break;
+            }
+        }
+        if (!slot) {
+            status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            break;
+        }
+
+        VASurfaceID id = (VASurfaceID)(drv->next_surface_id++);
+        status = surface_alloc_locked(slot, id, width, height, format);
+        if (status != VA_STATUS_SUCCESS)
+            break;
+
+        surfaces[n] = id;
+        created++;
+    }
+
+    /* 部分失败要回滚：VA-API 语义是全成或全败，留下半个数组会让
+     * 消费者把未初始化的 ID 当合法 surface 用。 */
+    if (status != VA_STATUS_SUCCESS) {
+        for (unsigned int n = 0; n < created; n++) {
+            struct dmd_surface *s = dmd_find_surface_locked(drv, surfaces[n]);
+            if (s)
+                dmd_surface_reset_locked(s);
+            surfaces[n] = VA_INVALID_ID;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    if (status == VA_STATUS_SUCCESS)
+        dmd_log("CreateSurfaces: %ux%u fourcc=NV12 n=%u -> id %u..\n", width,
+                height, num_surfaces, (unsigned)surfaces[0]);
+    else
+        dmd_log("CreateSurfaces: 失败 status=0x%x（已创建 %u 个，已回滚）\n",
+                status, created);
+
+    return status;
+}
+
+VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height,
+                            int format, int num_surfaces, VASurfaceID *surfaces)
+{
+    if (width <= 0 || height <= 0 || num_surfaces <= 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    return create_surfaces_common(ctx, (unsigned int)format,
+                                  (unsigned int)width, (unsigned int)height,
+                                  surfaces, (unsigned int)num_surfaces);
+}
+
+VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
+                             unsigned int width, unsigned int height,
+                             VASurfaceID *surfaces, unsigned int num_surfaces,
+                             VASurfaceAttrib *attrib_list,
+                             unsigned int num_attribs)
+{
+    /* attrib_list 里 ffmpeg 只可能传 PixelFormat（要 NV12）与
+     * MemoryType（要 VA 内部，我们不支持外部内存导入）。
+     * 我们唯一支持的组合就是默认组合，因此校验后忽略。 */
+    if (num_attribs > 0 && !attrib_list)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    for (unsigned int i = 0; i < num_attribs; i++) {
+        if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
+            if (attrib_list[i].value.type != VAGenericValueTypeInteger)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            if ((unsigned int)attrib_list[i].value.value.i != VA_FOURCC_NV12)
+                return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        } else if (attrib_list[i].type == VASurfaceAttribMemoryType) {
+            /* 只支持驱动自己分配的内存。dmabuf/用户指针导入这条路
+             * 在容器里走不通（ION 不可用、无 /dev/dma_heap）。 */
+            if (attrib_list[i].value.type != VAGenericValueTypeInteger)
+                return VA_STATUS_ERROR_INVALID_PARAMETER;
+            if (!(attrib_list[i].value.value.i &
+                  VA_SURFACE_ATTRIB_MEM_TYPE_VA))
+                return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
+            return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        }
+        /* 其余属性（Usage hint 等）无害，忽略。 */
+    }
+
+    return create_surfaces_common(ctx, format, width, height, surfaces,
+                                  num_surfaces);
+}
+
+VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
+                             int num_surfaces)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !surface_list || num_surfaces <= 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    VAStatus status = VA_STATUS_SUCCESS;
+
+    pthread_mutex_lock(&drv->lock);
+    for (int i = 0; i < num_surfaces; i++) {
+        struct dmd_surface *s = dmd_find_surface_locked(drv, surface_list[i]);
+        if (!s) {
+            /* 继续销毁其余的：半途返回会泄漏后面那些。
+             * 但仍要把错误报上去，调用方有 bug 该知道。 */
+            status = VA_STATUS_ERROR_INVALID_SURFACE;
+            continue;
+        }
+        dmd_surface_reset_locked(s);
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return status;
+}
+
+/* ================================ context ================================ */
+
+/* 建 daemon 会话。调用方**不得持锁** —— connect 与握手是阻塞 IO。 */
+static struct dmd_session *session_open(int codec, unsigned int width,
+                                        unsigned int height)
+{
+    struct dmd_session_config cfg;
+    struct dmd_error err;
+
+    dmd_session_config_init(&cfg);
+    cfg.codec = codec;
+    cfg.width = (int)width;
+    cfg.height = (int)height;
+    /* 阶段 1 固定 TCP：SHM 是后续优化，先把正确性做对。 */
+    cfg.want_shm = 0;
+    cfg.io_timeout_ms = DMD_FRAME_TIMEOUT_MS;
+
+    memset(&err, 0, sizeof(err));
+    struct dmd_session *s = dmd_session_create(&cfg, &err);
+    if (!s)
+        dmd_log("会话建立失败: code=%d handshake=%d %s\n", err.code,
+                err.handshake_status, err.msg);
+    else
+        dmd_log("会话已建立: codec=%d %ux%u xfer=%d\n", codec, width, height,
+                dmd_session_xfer_mode(s));
+    return s;
+}
+
+VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
+                           int picture_width, int picture_height, int flag,
+                           VASurfaceID *render_targets, int num_render_targets,
+                           VAContextID *context)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !context)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (num_render_targets < 0 ||
+        (num_render_targets > 0 && !render_targets))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (num_render_targets > DMD_MAX_SURFACES)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (picture_width < DMD_MIN_WIDTH || picture_height < DMD_MIN_HEIGHT ||
+        picture_width > DMD_MAX_WIDTH || picture_height > DMD_MAX_HEIGHT)
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+
+    *context = VA_INVALID_ID;
+
+    VAProfile profile;
+    int codec;
+    int slot_idx = -1;
+
+    pthread_mutex_lock(&drv->lock);
+
+    /* config 必须有效，并从它推导 codec。 */
+    struct dmd_config *cfg = NULL;
+    for (int i = 0; i < DMD_MAX_CONFIGS; i++) {
+        if (drv->configs[i].in_use && drv->configs[i].id == config_id) {
+            cfg = &drv->configs[i];
+            break;
+        }
+    }
+    if (!cfg) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+    profile = cfg->profile;
+    codec = dmd_profile_to_codec(profile);
+    if (codec < 0) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    }
+
+    /* render target 必须都是已存在的 surface。 */
+    for (int i = 0; i < num_render_targets; i++) {
+        if (!dmd_find_surface_locked(drv, render_targets[i])) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+    }
+
+    for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
+        if (!drv->contexts[i].in_use) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx < 0) {
+        pthread_mutex_unlock(&drv->lock);
+        dmd_log("CreateContext: 槽位耗尽（上限 %d）\n", DMD_MAX_CONTEXTS);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    struct dmd_context *c = &drv->contexts[slot_idx];
+    memset(c, 0, sizeof(*c));
+    c->in_use = 1;
+    c->id = (VAContextID)(drv->next_context_id++);
+    c->config_id = config_id;
+    c->profile = profile;
+    c->codec = codec;
+    c->picture_width = (unsigned int)picture_width;
+    c->picture_height = (unsigned int)picture_height;
+    c->flag = flag;
+    c->current_target = VA_INVALID_ID;
+
+    VAContextID new_id = c->id;
+    pthread_mutex_unlock(&drv->lock);
+
+    /* 会话建立在放锁后做 —— connect + 握手是阻塞 IO，持锁做会卡住
+     * 其他线程的所有对象操作。 */
+    struct dmd_session *sess =
+        session_open(codec, (unsigned int)picture_width,
+                     (unsigned int)picture_height);
+
+    pthread_mutex_lock(&drv->lock);
+    /* 重新查找：理论上没人能销毁一个还没交给调用方的 context，
+     * 但按 ID 复查比缓存指针更耐并发。 */
+    c = dmd_find_context_locked(drv, new_id);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        if (sess)
+            dmd_session_destroy(sess);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    c->session = sess;
+    /* 会话建不起来不让 CreateContext 失败：daemon 可能只是暂时不可用，
+     * 首次 EndPicture 会重试。失败时报的错更贴近真实原因。 */
+    c->session_failed = sess ? 0 : 1;
+    pthread_mutex_unlock(&drv->lock);
+
+    *context = new_id;
+    dmd_log("CreateContext: config=%u profile=%d %dx%d -> context=%u%s\n",
+            (unsigned)config_id, (int)profile, picture_width, picture_height,
+            (unsigned)new_id, sess ? "" : "（会话待重试）");
+
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_context *c = dmd_find_context_locked(drv, context);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
+     * 会话也不能挂死宿主进程的 Terminate 路径。 */
+    int idx = (int)(c - drv->contexts);
+    int waited = 0;
+    while (drv->io_busy[idx] && waited < DMD_FRAME_TIMEOUT_MS) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts);
+        waited += 50;
+        c = dmd_find_context_locked(drv, context);
+        if (!c) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
+    }
+
+    /* 归还所有属于本 context 的 buffer：ffmpeg 正常会自己 Destroy，
+     * 但异常路径下可能漏，driver 不能因此泄漏。 */
+    for (int i = 0; i < DMD_MAX_BUFFERS; i++) {
+        struct dmd_buffer *b = &drv->buffers[i];
+        if (b->in_use && b->context == context) {
+            free(b->data);
+            memset(b, 0, sizeof(*b));
+        }
+    }
+
+    /* 待解码队列里的 surface 状态要复位，否则它们永远停在 PENDING，
+     * 后续 SyncSurface 会等一个永不到来的帧。 */
+    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+        struct dmd_surface *s = &drv->surfaces[i];
+        if (s->in_use && s->context == context &&
+            s->state == DMD_SURFACE_PENDING) {
+            s->state = DMD_SURFACE_IDLE;
+            s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
+            s->context = VA_INVALID_ID;
+        }
+    }
+
+    dmd_log("DestroyContext: context=%u（送入 %llu 单元，取回 %llu 帧）\n",
+            (unsigned)context,
+            c->session ? (unsigned long long)dmd_session_units_sent(c->session)
+                       : 0ULL,
+            c->session
+                ? (unsigned long long)dmd_session_frames_received(c->session)
+                : 0ULL);
+
+    dmd_context_reset_locked(c);
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_SUCCESS;
+}
+
+/* ================================ buffer ================================ */
+
+VAStatus dmd_CreateBuffer(VADriverContextP ctx, VAContextID context,
+                          VABufferType type, unsigned int size,
+                          unsigned int num_elements, void *data,
+                          VABufferID *buf_id)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !buf_id)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (size == 0 || num_elements == 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    /* 溢出检查：size 与 num_elements 都是 unsigned int，乘积可能回绕。 */
+    if ((size_t)size * num_elements > DMD_MAX_FRAME_BYTES)
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+    *buf_id = VA_INVALID_ID;
+    size_t total = (size_t)size * num_elements;
+
+    /* 分配放在锁外：大块 calloc 可能触发 mmap 与页错误。 */
+    void *mem = calloc(1, total);
+    if (!mem)
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    if (data)
+        memcpy(mem, data, total);
+
+    pthread_mutex_lock(&drv->lock);
+
+    /* context 必须有效。VA-API 允许 VA_INVALID_ID 建"无 context" buffer，
+     * 但解码路径里 ffmpeg 总是带 context，所以只接受有效 context。 */
+    if (!dmd_find_context_locked(drv, context)) {
+        pthread_mutex_unlock(&drv->lock);
+        free(mem);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    struct dmd_buffer *slot = NULL;
+    for (int i = 0; i < DMD_MAX_BUFFERS; i++) {
+        if (!drv->buffers[i].in_use) {
+            slot = &drv->buffers[i];
+            break;
+        }
+    }
+    if (!slot) {
+        pthread_mutex_unlock(&drv->lock);
+        free(mem);
+        dmd_log("CreateBuffer: 槽位耗尽（上限 %d）\n", DMD_MAX_BUFFERS);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = 1;
+    slot->id = (VABufferID)(drv->next_buffer_id++);
+    slot->context = context;
+    slot->type = type;
+    slot->element_size = size;
+    slot->num_elements = num_elements;
+    slot->size = total;
+    slot->data = mem;
+
+    *buf_id = slot->id;
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
+                                  unsigned int num_elements)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || num_elements == 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+    if (!b) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (b->mapped) {
+        /* 映射中改大小会让调用方手上的指针失效。 */
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    size_t total = (size_t)b->element_size * num_elements;
+    if (total > DMD_MAX_FRAME_BYTES) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    VAStatus status = VA_STATUS_SUCCESS;
+    if (total > b->size) {
+        void *mem = realloc(b->data, total);
+        if (!mem) {
+            status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+        } else {
+            memset((unsigned char *)mem + b->size, 0, total - b->size);
+            b->data = mem;
+        }
+    }
+    if (status == VA_STATUS_SUCCESS) {
+        b->num_elements = num_elements;
+        b->size = total;
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return status;
+}
+
+VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !pbuf)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    *pbuf = NULL;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+    if (b) {
+        b->mapped++;
+        *pbuf = b->data;
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
+
+    /* VAImage 的后备存储也通过 vaMapBuffer 访问（image.buf 是个 buffer ID）。
+     * ffmpeg 的回读路径正是这么取像素的。 */
+    struct dmd_image *img = NULL;
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        if (drv->images[i].in_use && drv->images[i].buf_id == buf_id) {
+            img = &drv->images[i];
+            break;
+        }
+    }
+    if (!img) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    img->mapped++;
+    *pbuf = img->data;
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_SUCCESS;
+}
+
+/* vaMapBuffer2 = vaMapBuffer + 读写意图提示。
+ *
+ * ⚠️ 必须实现，不能留桩：libva 只在**槽位为 NULL** 时才回落到 vaMapBuffer
+ * （va.c 的 vaMapBuffer2），而我们为了通过 CHECK_VTABLE 把所有槽位都填了桩，
+ * 于是 ffmpeg 的 vaapi_map_frame（hwcontext_vaapi.c:928）拿到 UNIMPLEMENTED
+ * 就直接失败，永远走不到 vaMapBuffer 那条兼容分支。
+ * 这是"填满 vtable"与"libva 靠 NULL 判断能力"之间的一个真实冲突。
+ *
+ * flags 对我们无意义：后备存储是普通 heap 内存，读写都是直接访问。 */
+VAStatus dmd_MapBuffer2(VADriverContextP ctx, VABufferID buf_id, void **pbuf,
+                        uint32_t flags)
+{
+    (void)flags;
+    return dmd_MapBuffer(ctx, buf_id, pbuf);
+}
+
+VAStatus dmd_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+    if (b) {
+        if (b->mapped > 0)
+            b->mapped--;
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
+
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->buf_id == buf_id) {
+            if (img->mapped > 0)
+                img->mapped--;
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_ERROR_INVALID_BUFFER;
+}
+
+VAStatus dmd_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv, buffer_id);
+    if (!b) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    void *mem = b->data;
+    memset(b, 0, sizeof(*b));
+    pthread_mutex_unlock(&drv->lock);
+
+    free(mem);
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_BufferInfo(VADriverContextP ctx, VABufferID buf_id,
+                        VABufferType *type, unsigned int *size,
+                        unsigned int *num_elements)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !type || !size || !num_elements)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_buffer *b = dmd_find_buffer_locked(drv, buf_id);
+    if (b) {
+        *type = b->type;
+        *size = b->element_size;
+        *num_elements = b->num_elements;
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_SUCCESS;
+    }
+
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->buf_id == buf_id) {
+            *type = VAImageBufferType;
+            *size = (unsigned int)img->data_size;
+            *num_elements = 1;
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_ERROR_INVALID_BUFFER;
+}
+
+/* ============================ 帧提交（码流组装） ============================ */
+
+/* 往 context 的本帧码流缓冲追加数据。调用方持锁。 */
+static int slice_append_locked(struct dmd_context *c, const void *data,
+                               size_t len)
+{
+    if (len == 0)
+        return 0;
+    if (c->slice_len + len > DMD_MAX_UNIT_BYTES)
+        return -1; /* 超过 daemon 的 8MB 上限，送过去只会被判非法长度 */
+
+    if (c->slice_len + len > c->slice_cap) {
+        size_t cap = c->slice_cap ? c->slice_cap * 2 : 65536;
+        while (cap < c->slice_len + len)
+            cap *= 2;
+        unsigned char *mem = realloc(c->slice_data, cap);
+        if (!mem)
+            return -1;
+        c->slice_data = mem;
+        c->slice_cap = cap;
+    }
+    memcpy(c->slice_data + c->slice_len, data, len);
+    c->slice_len += len;
+    return 0;
+}
+
+VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
+                          VASurfaceID render_target)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_context *c = dmd_find_context_locked(drv, context);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    struct dmd_surface *s = dmd_find_surface_locked(drv, render_target);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    /* 上一帧没 EndPicture 就又 Begin：丢掉残留数据，否则会拼进新帧。 */
+    if (c->current_target != VA_INVALID_ID)
+        dmd_log("BeginPicture: 上一帧未 EndPicture，丢弃 %zu 字节残留\n",
+                c->slice_len);
+
+    c->current_target = render_target;
+    c->slice_len = 0;
+    c->have_vp8_slice_param = 0;
+    c->have_vp8_pic_param = 0;
+
+    s->state = DMD_SURFACE_PENDING;
+    s->decode_status = VA_STATUS_SUCCESS;
+    s->context = context;
+
+    pthread_mutex_unlock(&drv->lock);
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
+                           VABufferID *buffers, int num_buffers)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || (num_buffers > 0 && !buffers))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (num_buffers < 0)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_context *c = dmd_find_context_locked(drv, context);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (c->current_target == VA_INVALID_ID) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT; /* 没 BeginPicture */
+    }
+
+    VAStatus status = VA_STATUS_SUCCESS;
+
+    for (int i = 0; i < num_buffers; i++) {
+        struct dmd_buffer *b = dmd_find_buffer_locked(drv, buffers[i]);
+        if (!b) {
+            status = VA_STATUS_ERROR_INVALID_BUFFER;
+            break;
+        }
+
+        switch (b->type) {
+        case VASliceDataBufferType:
+            /* 这里是真正的码流。
+             * VP9：整帧（含 uncompressed header，从 frame_marker 起），原样转发
+             * VP8：partition 0 起，缺 RFC 6386 §9.1 的 uncompressed chunk
+             * H.264/HEVC：slice NALU 的**载荷**，不含起始码 */
+            if (slice_append_locked(c, b->data, b->size) != 0) {
+                status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            break;
+
+        case VASliceParameterBufferType:
+            /* VP8 需要 partition_size[0] 与 macroblock_offset 来推导
+             * first_part_size，其余 codec 当前不需要 slice 参数。 */
+            if (c->codec == DMD_CODEC_VP8 &&
+                b->size >= sizeof(VASliceParameterBufferVP8)) {
+                memcpy(&c->vp8_slice_param, b->data,
+                       sizeof(VASliceParameterBufferVP8));
+                c->have_vp8_slice_param = 1;
+            }
+            break;
+
+        case VAPictureParameterBufferType:
+            /* VP8 的 key_frame / version / show_frame 相关位在这里。 */
+            if (c->codec == DMD_CODEC_VP8 &&
+                b->size >= sizeof(VAPictureParameterBufferVP8)) {
+                memcpy(&c->vp8_pic_param, b->data,
+                       sizeof(VAPictureParameterBufferVP8));
+                c->have_vp8_pic_param = 1;
+            }
+            break;
+
+        case VAIQMatrixBufferType:
+        case VAProbabilityBufferType:
+        case VAHuffmanTableBufferType:
+            /* daemon 侧是完整解码器（MediaCodec），这些表都在码流里，
+             * 不需要我们转发。接受但忽略。 */
+            break;
+
+        default:
+            /* 未知类型不报错：某些消费者会附带我们不关心的 buffer，
+             * 拒绝会让整帧失败。 */
+            break;
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return status;
+}
+
+/* ---- VP8：合成 RFC 6386 §9.1 的 uncompressed data chunk ----
+ *
+ * VA-API 的 slice data 从 partition 0（压缩帧头）开始，缺开头 3 字节
+ * frame tag（key frame 再加 7 字节的 start code + 尺寸）。MediaCodec 要的是
+ * 完整帧，所以必须补回来。
+ *
+ * frame tag（3 字节，小端 19 位 + 尺寸）：
+ *   bit0      frame_type（0=key）
+ *   bit1-3    version
+ *   bit4      show_frame
+ *   bit5-23   first_part_size
+ * first_part_size 的推导（关键）：VA-API 的 partition_size[0] 是"应用解析后
+ * 剩余的控制分区字节数"，加上已被解析掉的头部字节 (macroblock_offset+7)/8
+ * 才是 RFC 定义的 first_part_size。
+ * show_frame 在 VA-API 里没有对应字段，只能假定 1 —— VP8 极少用 invisible 帧。
+ */
+static size_t vp8_build_frame(struct dmd_context *c, unsigned char *out,
+                              size_t out_cap)
+{
+    if (!c->have_vp8_slice_param || !c->have_vp8_pic_param)
+        return 0;
+
+    const VASliceParameterBufferVP8 *sp = &c->vp8_slice_param;
+    const VAPictureParameterBufferVP8 *pp = &c->vp8_pic_param;
+
+    unsigned int key_frame = pp->pic_fields.bits.key_frame ? 0 : 1;
+    /* VA-API 注释："0 means a key frame"，与 RFC 的 frame_type 同义
+     * （RFC: 0=key frame）。这里 key_frame 变量表示"是关键帧"。 */
+    key_frame = pp->pic_fields.bits.key_frame == 0 ? 1 : 0;
+    unsigned int version = pp->pic_fields.bits.version & 0x7;
+    unsigned int header_bytes = (sp->macroblock_offset + 7) / 8;
+    unsigned int first_part_size = sp->partition_size[0] + header_bytes;
+    if (first_part_size > 0x7FFFF)
+        return 0; /* 19 位装不下，码流异常 */
+
+    size_t tag_len = key_frame ? 10 : 3;
+    if (out_cap < tag_len + c->slice_len)
+        return 0;
+
+    /* frame tag：3 字节小端位域 */
+    uint32_t tag = (key_frame ? 0u : 1u) | (version << 1) |
+                   (1u << 4) /* show_frame：VA-API 无此字段，假定可见 */
+                   | (first_part_size << 5);
+    out[0] = (unsigned char)(tag & 0xFF);
+    out[1] = (unsigned char)((tag >> 8) & 0xFF);
+    out[2] = (unsigned char)((tag >> 16) & 0xFF);
+
+    if (key_frame) {
+        /* key frame 额外 7 字节：3 字节 start code 9D 01 2A + 2+2 字节尺寸。
+         * 尺寸的高 2 bit 是 scaling，我们不缩放，填 0。 */
+        out[3] = 0x9D;
+        out[4] = 0x01;
+        out[5] = 0x2A;
+        unsigned int w = pp->frame_width & 0x3FFF;
+        unsigned int h = pp->frame_height & 0x3FFF;
+        out[6] = (unsigned char)(w & 0xFF);
+        out[7] = (unsigned char)((w >> 8) & 0x3F);
+        out[8] = (unsigned char)(h & 0xFF);
+        out[9] = (unsigned char)((h >> 8) & 0x3F);
+    }
+
+    memcpy(out + tag_len, c->slice_data, c->slice_len);
+    return tag_len + c->slice_len;
+}
+
+/* 组装最终要送给 daemon 的数据单元。
+ * 返回要送的缓冲（可能就是 c->slice_data 本身）与长度；失败返回 NULL。
+ * scratch 由调用方提供并负责释放。 */
+static const unsigned char *build_unit(struct dmd_context *c,
+                                       unsigned char **scratch, size_t *out_len)
+{
+    *scratch = NULL;
+
+    if (c->slice_len == 0)
+        return NULL;
+
+    switch (c->codec) {
+    case DMD_CODEC_VP9:
+        /* 零 header 重建：VASliceDataBufferType 里就是完整的 VP9 frame
+         * （va_dec_vp9.h:274-284 的规范注释：slice data 含整帧，
+         * slice_data_size 实际就是 frame_data_size）。 */
+        *out_len = c->slice_len;
+        return c->slice_data;
+
+    case DMD_CODEC_VP8: {
+        size_t cap = c->slice_len + 16;
+        unsigned char *buf = malloc(cap);
+        if (!buf)
+            return NULL;
+        size_t n = vp8_build_frame(c, buf, cap);
+        if (n == 0) {
+            free(buf);
+            return NULL;
+        }
+        *scratch = buf;
+        *out_len = n;
+        return buf;
+    }
+
+    case DMD_CODEC_H264:
+    case DMD_CODEC_HEVC:
+        /* 未实现：需要从 VAPictureParameterBuffer 反向重建 SPS/PPS 比特流，
+         * 多个关键字段（profile_idc/level_idc/VUI）在 VA-API 里不存在。
+         * 详见报告的"遗留与风险"。 */
+        return NULL;
+
+    default:
+        return NULL;
+    }
+}
+
+VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_context *c = dmd_find_context_locked(drv, context);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (c->current_target == VA_INVALID_ID) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    VASurfaceID target = c->current_target;
+    int idx = (int)(c - drv->contexts);
+
+    /* 组装码流（持锁做，纯内存操作）。 */
+    unsigned char *scratch = NULL;
+    size_t unit_len = 0;
+    const unsigned char *unit = build_unit(c, &scratch, &unit_len);
+
+    if (!unit) {
+        struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (s) {
+            s->state = DMD_SURFACE_IDLE;
+            s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;
+        }
+        c->current_target = VA_INVALID_ID;
+        c->slice_len = 0;
+        int codec = c->codec;
+        pthread_mutex_unlock(&drv->lock);
+        free(scratch);
+        dmd_log("EndPicture: codec=%d 尚未支持码流重建，帧被丢弃\n", codec);
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    }
+
+    /* 会话惰性重试：CreateContext 时 daemon 可能还没起来。 */
+    if (!c->session && !c->session_failed) {
+        /* 不可能：session_failed 与 session 互补。保守处理。 */
+        c->session_failed = 1;
+    }
+
+    struct dmd_session *sess = c->session;
+    int codec = c->codec;
+    unsigned int pw = c->picture_width;
+    unsigned int ph = c->picture_height;
+
+    if (!sess) {
+        /* 放锁重试建会话，避免持锁做 connect。 */
+        drv->io_busy[idx] = 1;
+        pthread_mutex_unlock(&drv->lock);
+        struct dmd_session *retry = session_open(codec, pw, ph);
+        pthread_mutex_lock(&drv->lock);
+        drv->io_busy[idx] = 0;
+        pthread_cond_broadcast(&drv->io_done);
+        c = dmd_find_context_locked(drv, context);
+        if (!c) {
+            pthread_mutex_unlock(&drv->lock);
+            if (retry)
+                dmd_session_destroy(retry);
+            free(scratch);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        if (!c->session) {
+            c->session = retry;
+            c->session_failed = retry ? 0 : 1;
+        } else if (retry) {
+            dmd_session_destroy(retry); /* 别的线程先建好了 */
+        }
+        sess = c->session;
+        if (!sess) {
+            struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+            if (s) {
+                s->state = DMD_SURFACE_IDLE;
+                s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+    }
+
+    /* 入队：**在放锁发送之前**入队，保证队列顺序严格等于提交顺序。
+     * 若发送失败再出队回滚。 */
+    if (c->pending_count >= DMD_MAX_SURFACES) {
+        pthread_mutex_unlock(&drv->lock);
+        free(scratch);
+        dmd_log("EndPicture: 待解码队列已满（%d）\n", DMD_MAX_SURFACES);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
+    c->pending[qpos] = target;
+    c->pending_count++;
+    c->current_target = VA_INVALID_ID;
+
+    /* 拷一份码流到局部缓冲：放锁后 c->slice_data 可能被别的线程复用。 */
+    unsigned char *tx = scratch;
+    if (!tx) {
+        tx = malloc(unit_len);
+        if (!tx) {
+            c->pending_count--;
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        memcpy(tx, unit, unit_len);
+    }
+    c->slice_len = 0;
+
+    /* 串行化同 context 的 IO。 */
+    while (drv->io_busy[idx]) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += DMD_FRAME_TIMEOUT_MS / 1000;
+        if (pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts) == ETIMEDOUT)
+            break;
+    }
+    drv->io_busy[idx] = 1;
+    pthread_mutex_unlock(&drv->lock);
+
+    int rc = dmd_session_send_unit(sess, tx, unit_len);
+    free(tx);
+
+    pthread_mutex_lock(&drv->lock);
+    drv->io_busy[idx] = 0;
+    pthread_cond_broadcast(&drv->io_done);
+
+    c = dmd_find_context_locked(drv, context);
+    if (!c) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    if (rc != DMD_OK) {
+        /* 回滚入队：这一帧永远不会有对应输出。从队尾摘掉。 */
+        if (c->pending_count > 0)
+            c->pending_count--;
+        struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (s) {
+            s->state = DMD_SURFACE_IDLE;
+            s->decode_status = VA_STATUS_ERROR_DECODING_ERROR;
+        }
+        const char *msg = dmd_session_last_error(sess);
+        pthread_mutex_unlock(&drv->lock);
+        dmd_log("EndPicture: 送单元失败 rc=%d: %s\n", rc, msg);
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_SUCCESS;
+}
+
+/* ============================ 帧取回（Sync 路径） ============================ */
+
+/* 把 daemon 回来的一帧拷进 surface 缓冲。调用方持锁。
+ *
+ * 几何：daemon 的帧按 fmt.stride / fmt.slice_height 布局，UV 起点 =
+ * stride*slice_height。surface 按对齐尺寸预分配，两者通常一致；
+ * 不一致时（解码器给了不同对齐）按行拷贝，绝不整块 memcpy —— 那会错位。
+ */
+static void surface_store_frame_locked(struct dmd_surface *s,
+                                       const struct dmd_frame *f)
+{
+    unsigned int src_stride = f->stride > 0 ? (unsigned int)f->stride
+                                            : (unsigned int)f->width;
+    unsigned int src_slice = f->slice_height > 0
+                                 ? (unsigned int)f->slice_height
+                                 : (unsigned int)f->height;
+
+    /* 以解码器给的几何为准更新 surface：VAImage 的 offsets[1] 必须
+     * 用 slice_height（1088）而不是显示高（1080），否则色度平面错位。 */
+    s->stride = src_stride;
+    s->slice_height = src_slice;
+    s->buf_width = (unsigned int)f->width;
+    s->buf_height = (unsigned int)f->height;
+
+    size_t need = (size_t)src_stride * src_slice * 3 / 2;
+    if (need > s->data_size) {
+        /* 解码器给的缓冲比预分配的大（流内分辨率变大）。扩容而不是截断。 */
+        unsigned char *mem = realloc(s->data, need);
+        if (!mem) {
+            s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            return;
+        }
+        s->data = mem;
+        s->data_size = need;
+    }
+
+    size_t copy = f->size < need ? f->size : need;
+    memcpy(s->data, f->data, copy);
+    if (copy < need)
+        memset(s->data + copy, 0, need - copy);
+
+    s->decode_status = VA_STATUS_SUCCESS;
+}
+
+/* 从 daemon 取帧直到目标 surface 就绪或超时。
+ *
+ * 这是 VA-API 乱序语义与 MediaCodec 流式语义的配对点：取回的第 k 帧
+ * 填给 pending 队列的第 k 个 surface。目标 surface 可能不在队首 ——
+ * 那就一直取，把队首的先填掉，直到轮到目标。
+ */
+static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
+                                    VASurfaceID target, int timeout_ms)
+{
+    int idx;
+    struct dmd_context *c = dmd_find_context_locked(drv, context);
+    if (!c)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    idx = (int)(c - drv->contexts);
+
+    int spent = 0;
+    /* 单次等待用较小的片，这样能周期性回到锁内检查状态。 */
+    const int slice_ms = 100;
+
+    for (;;) {
+        struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (!s)
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        if (s->state != DMD_SURFACE_PENDING)
+            return s->decode_status;
+
+        c = dmd_find_context_locked(drv, context);
+        if (!c)
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        if (!c->session)
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        if (c->pending_count <= 0) {
+            /* PENDING 但队列空：提交失败过。不能等，会永远等不到。 */
+            s->state = DMD_SURFACE_IDLE;
+            return VA_STATUS_ERROR_DECODING_ERROR;
+        }
+
+        if (spent >= timeout_ms) {
+            dmd_log("SyncSurface: 等帧超时 %d ms（surface=%u 队列 %d）\n",
+                    timeout_ms, (unsigned)target, c->pending_count);
+            return VA_STATUS_ERROR_TIMEDOUT;
+        }
+
+        struct dmd_session *sess = c->session;
+
+        /* 串行化 IO，然后放锁收帧。 */
+        while (drv->io_busy[idx]) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 20 * 1000 * 1000;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts);
+            spent += 20;
+            if (spent >= timeout_ms)
+                return VA_STATUS_ERROR_TIMEDOUT;
+            /* 别的线程可能已经把我们的帧填好了 */
+            s = dmd_find_surface_locked(drv, target);
+            if (!s)
+                return VA_STATUS_ERROR_INVALID_SURFACE;
+            if (s->state != DMD_SURFACE_PENDING)
+                return s->decode_status;
+        }
+        drv->io_busy[idx] = 1;
+        pthread_mutex_unlock(&drv->lock);
+
+        struct dmd_frame frame;
+        memset(&frame, 0, sizeof(frame));
+        int rc = dmd_session_next_frame(sess, &frame, slice_ms);
+
+        pthread_mutex_lock(&drv->lock);
+        drv->io_busy[idx] = 0;
+        pthread_cond_broadcast(&drv->io_done);
+        spent += slice_ms;
+
+        c = dmd_find_context_locked(drv, context);
+        if (!c) {
+            if (rc == DMD_OK)
+                dmd_session_release_frame(sess, &frame);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+
+        if (rc == DMD_OK) {
+            /* 配对：帧填给队首 surface。 */
+            VASurfaceID head = VA_INVALID_ID;
+            if (c->pending_count > 0) {
+                head = c->pending[c->pending_head];
+                c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
+                c->pending_count--;
+            }
+            struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
+            if (hs) {
+                surface_store_frame_locked(hs, &frame);
+                hs->state = DMD_SURFACE_READY;
+            } else {
+                dmd_log("SyncSurface: 队首 surface %u 已销毁，帧被丢弃\n",
+                        (unsigned)head);
+            }
+            /* release 不做阻塞 IO（TCP 模式只是标记缓冲可复用）。 */
+            dmd_session_release_frame(sess, &frame);
+            continue;
+        }
+
+        if (rc == DMD_ERR_TIMEOUT) {
+            /* 帧还没出来。daemon 未开 low-latency，解码器会攒几帧，
+             * 这是正常现象 —— 继续等到总超时。 */
+            continue;
+        }
+
+        if (rc == DMD_EOS) {
+            /* 流已结束但我们还在等帧：说明送入单元数与输出帧数不匹配。 */
+            struct dmd_surface *s2 = dmd_find_surface_locked(drv, target);
+            if (s2 && s2->state == DMD_SURFACE_PENDING) {
+                s2->state = DMD_SURFACE_IDLE;
+                s2->decode_status = VA_STATUS_ERROR_DECODING_ERROR;
+            }
+            dmd_log("SyncSurface: 流已结束但仍有 %d 帧待配对\n",
+                    c->pending_count);
+            return VA_STATUS_ERROR_DECODING_ERROR;
+        }
+
+        /* 真错误 */
+        dmd_log("SyncSurface: 取帧失败 rc=%d: %s\n", rc,
+                dmd_session_last_error(sess));
+        struct dmd_surface *s3 = dmd_find_surface_locked(drv, target);
+        if (s3 && s3->state == DMD_SURFACE_PENDING) {
+            s3->state = DMD_SURFACE_IDLE;
+            s3->decode_status = VA_STATUS_ERROR_DECODING_ERROR;
+        }
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+}
+
+/* 找到 surface 所属 context（用于 Sync）。调用方持锁。 */
+static VAContextID surface_context_locked(struct dmd_driver *drv,
+                                          VASurfaceID id)
+{
+    struct dmd_surface *s = dmd_find_surface_locked(drv, id);
+    return s ? s->context : VA_INVALID_ID;
+}
+
+/* 供 image.c 做隐式同步：GetImage 时 surface 还没解出来就先等它。
+ * 调用方持锁；本函数内部会临时放锁做 IO，返回时仍持锁，
+ * 因此调用方必须重新查找它缓存的对象指针。 */
+VAStatus dmd_surface_sync_locked(struct dmd_driver *drv, VASurfaceID surface,
+                                 int timeout_ms)
+{
+    struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
+    if (!s)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (s->state != DMD_SURFACE_PENDING)
+        return s->decode_status;
+
+    VAContextID context = surface_context_locked(drv, surface);
+    if (context == VA_INVALID_ID)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    return sync_surface_locked(drv, context, surface, timeout_ms);
+}
+
+VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target)
+{
+    return dmd_SyncSurface2(ctx, render_target,
+                            (uint64_t)DMD_FRAME_TIMEOUT_MS * 1000000ULL);
+}
+
+VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
+                          uint64_t timeout_ns)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* VA_TIMEOUT_INFINITE 也要给上限：driver 挂死会拖死宿主进程。 */
+    int timeout_ms;
+    if (timeout_ns == VA_TIMEOUT_INFINITE ||
+        timeout_ns / 1000000ULL > (uint64_t)DMD_FRAME_TIMEOUT_MS)
+        timeout_ms = DMD_FRAME_TIMEOUT_MS;
+    else
+        timeout_ms = (int)(timeout_ns / 1000000ULL);
+    if (timeout_ms <= 0)
+        timeout_ms = 1;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (s->state != DMD_SURFACE_PENDING) {
+        VAStatus st = s->decode_status;
+        pthread_mutex_unlock(&drv->lock);
+        return st;
+    }
+    VAContextID context = surface_context_locked(drv, surface);
+    if (context == VA_INVALID_ID) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+
+    VAStatus status = sync_surface_locked(drv, context, surface, timeout_ms);
+    pthread_mutex_unlock(&drv->lock);
+
+    return status;
+}
+
+VAStatus dmd_QuerySurfaceStatus(VADriverContextP ctx,
+                                VASurfaceID render_target,
+                                VASurfaceStatus *status)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !status)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, render_target);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    /* 不在这里做 IO：QuerySurfaceStatus 的语义是"立即返回当前状态"，
+     * 阻塞取帧是 SyncSurface 的活。 */
+    *status = (s->state == DMD_SURFACE_PENDING) ? VASurfaceRendering
+                                                : VASurfaceReady;
+    pthread_mutex_unlock(&drv->lock);
+
+    return VA_STATUS_SUCCESS;
+}

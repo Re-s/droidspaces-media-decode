@@ -62,6 +62,52 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
 
     dmd_log("Terminate\n");
 
+    /* 释放全部对象：消费者理应自己销毁，但异常退出路径下不会。
+     * driver 被 dlclose 后这些内存就再也回收不了，所以必须在这里兜。
+     *
+     * 顺序有讲究：context 先拆（它持有 daemon 会话与 socket），
+     * 再拆 image（可能借用 surface 缓冲），最后 surface 与 buffer。 */
+    pthread_mutex_lock(&drv->lock);
+
+    int leaked_ctx = 0, leaked_surf = 0, leaked_buf = 0, leaked_img = 0;
+
+    for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
+        if (drv->contexts[i].in_use) {
+            leaked_ctx++;
+            dmd_context_reset_locked(&drv->contexts[i]);
+        }
+    }
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        struct dmd_image *img = &drv->images[i];
+        if (!img->in_use)
+            continue;
+        leaked_img++;
+        /* derive 的 image 借用 surface 缓冲，不能重复 free。 */
+        if (img->derived_from == VA_INVALID_ID)
+            free(img->data);
+        memset(img, 0, sizeof(*img));
+    }
+    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+        if (drv->surfaces[i].in_use) {
+            leaked_surf++;
+            dmd_surface_reset_locked(&drv->surfaces[i]);
+        }
+    }
+    for (int i = 0; i < DMD_MAX_BUFFERS; i++) {
+        if (drv->buffers[i].in_use) {
+            leaked_buf++;
+            free(drv->buffers[i].data);
+            memset(&drv->buffers[i], 0, sizeof(drv->buffers[i]));
+        }
+    }
+    pthread_mutex_unlock(&drv->lock);
+
+    if (leaked_ctx || leaked_surf || leaked_buf || leaked_img)
+        dmd_log("Terminate: 兜底回收 context=%d surface=%d buffer=%d image=%d"
+                "（消费者未自行销毁）\n",
+                leaked_ctx, leaked_surf, leaked_buf, leaked_img);
+
+    pthread_cond_destroy(&drv->io_done);
     pthread_mutex_destroy(&drv->lock);
     free(drv);
     ctx->pDriverData = NULL;
@@ -126,9 +172,20 @@ static VAStatus dmd_driver_init(VADriverContextP ctx)
         free(drv);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    if (pthread_cond_init(&drv->io_done, NULL) != 0) {
+        pthread_mutex_destroy(&drv->lock);
+        free(drv);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
-    /* config ID 从 1 起，0 不发给调用方。 */
+    /* 各类 ID 从 1 起，0 不发给调用方。
+     * 各表用独立的 ID 空间，但 image 的 buf_id 借用 buffer 空间 ——
+     * MapBuffer 要能用一个 ID 同时在两张表里查（见 image.c 的说明）。 */
     drv->next_config_id = 1;
+    drv->next_surface_id = 1;
+    drv->next_context_id = 1;
+    drv->next_buffer_id = 1;
+    drv->next_image_id = 1;
 
     /* drm_state 由 libva 填好（display_type 0x31 = DRM_RENDERNODES）。
      * 当前只记录 fd，解码路径接入后才会用到。 */

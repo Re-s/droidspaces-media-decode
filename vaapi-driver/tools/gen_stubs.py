@@ -30,6 +30,32 @@ IMPLEMENTED = {
     "vaGetDisplayAttributes",
     "vaSetDisplayAttributes",
     "vaQuerySubpictureFormats",
+    # ---- 解码数据路径（decode.c） ----
+    "vaCreateSurfaces",
+    "vaCreateSurfaces2",
+    "vaDestroySurfaces",
+    "vaCreateContext",
+    "vaDestroyContext",
+    "vaCreateBuffer",
+    "vaBufferSetNumElements",
+    "vaMapBuffer",
+    # 必须实现：libva 只在槽位为 NULL 时才回落到 vaMapBuffer，
+    # 而我们所有槽位都填了桩，留桩会让 ffmpeg 的回读路径直接失败。
+    "vaMapBuffer2",
+    "vaUnmapBuffer",
+    "vaDestroyBuffer",
+    "vaBufferInfo",
+    "vaBeginPicture",
+    "vaRenderPicture",
+    "vaEndPicture",
+    "vaSyncSurface",
+    "vaSyncSurface2",
+    "vaQuerySurfaceStatus",
+    # ---- VAImage 出口（image.c） ----
+    "vaCreateImage",
+    "vaDeriveImage",
+    "vaDestroyImage",
+    "vaGetImage",
 }
 
 funcs = json.load(open(sys.argv[1], encoding="utf-8"))

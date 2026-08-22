@@ -7,126 +7,6 @@
 
 #include "driver.h"
 
-VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height, int format, int num_surfaces, VASurfaceID *surfaces)
-{
-    (void)ctx;
-    (void)width;
-    (void)height;
-    (void)format;
-    (void)num_surfaces;
-    (void)surfaces;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces)
-{
-    (void)ctx;
-    (void)surface_list;
-    (void)num_surfaces;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width, int picture_height, int flag, VASurfaceID *render_targets, int num_render_targets, VAContextID *context)
-{
-    (void)ctx;
-    (void)config_id;
-    (void)picture_width;
-    (void)picture_height;
-    (void)flag;
-    (void)render_targets;
-    (void)num_render_targets;
-    (void)context;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
-{
-    (void)ctx;
-    (void)context;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferType type, unsigned int size, unsigned int num_elements, void *data, VABufferID *buf_id)
-{
-    (void)ctx;
-    (void)context;
-    (void)type;
-    (void)size;
-    (void)num_elements;
-    (void)data;
-    (void)buf_id;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id, unsigned int num_elements)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)num_elements;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)pbuf;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id)
-{
-    (void)ctx;
-    (void)buf_id;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id)
-{
-    (void)ctx;
-    (void)buffer_id;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context, VASurfaceID render_target)
-{
-    (void)ctx;
-    (void)context;
-    (void)render_target;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context, VABufferID *buffers, int num_buffers)
-{
-    (void)ctx;
-    (void)context;
-    (void)buffers;
-    (void)num_buffers;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
-{
-    (void)ctx;
-    (void)context;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target)
-{
-    (void)ctx;
-    (void)render_target;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfaceStatus *status)
-{
-    (void)ctx;
-    (void)render_target;
-    (void)status;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_QuerySurfaceError(VADriverContextP ctx, VASurfaceID render_target, VAStatus error_status, void **error_info)
 {
     (void)ctx;
@@ -155,48 +35,11 @@ VAStatus dmd_PutSurface(VADriverContextP ctx, VASurfaceID surface, void*draw, sh
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format, int width, int height, VAImage *image)
-{
-    (void)ctx;
-    (void)format;
-    (void)width;
-    (void)height;
-    (void)image;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image)
-{
-    (void)ctx;
-    (void)surface;
-    (void)image;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
-{
-    (void)ctx;
-    (void)image;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette)
 {
     (void)ctx;
     (void)image;
     (void)palette;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image)
-{
-    (void)ctx;
-    (void)surface;
-    (void)x;
-    (void)y;
-    (void)width;
-    (void)height;
-    (void)image;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -284,16 +127,6 @@ VAStatus dmd_DeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpictu
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_BufferInfo(VADriverContextP ctx, VABufferID buf_id, VABufferType *type, unsigned int *size, unsigned int *num_elements)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)type;
-    (void)size;
-    (void)num_elements;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_LockSurface(VADriverContextP ctx, VASurfaceID surface, unsigned int *fourcc, unsigned int *luma_stride, unsigned int *chroma_u_stride, unsigned int *chroma_v_stride, unsigned int *luma_offset, unsigned int *chroma_u_offset, unsigned int *chroma_v_offset, unsigned int *buffer_name, void **buffer)
 {
     (void)ctx;
@@ -321,19 +154,6 @@ VAStatus dmd_GetSurfaceAttributes(VADriverContextP dpy, VAConfigID config, VASur
 {
     (void)dpy;
     (void)config;
-    (void)attrib_list;
-    (void)num_attribs;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsigned int width, unsigned int height, VASurfaceID *surfaces, unsigned int num_surfaces, VASurfaceAttrib *attrib_list, unsigned int num_attribs)
-{
-    (void)ctx;
-    (void)format;
-    (void)width;
-    (void)height;
-    (void)surfaces;
-    (void)num_surfaces;
     (void)attrib_list;
     (void)num_attribs;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
@@ -418,14 +238,6 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, u
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface, uint64_t timeout_ns)
-{
-    (void)ctx;
-    (void)surface;
-    (void)timeout_ns;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
 {
     (void)ctx;
@@ -440,14 +252,5 @@ VAStatus dmd_Copy(VADriverContextP ctx, VACopyObject *dst, VACopyObject *src, VA
     (void)dst;
     (void)src;
     (void)option;
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_MapBuffer2(VADriverContextP ctx, VABufferID buf_id, void **pbuf, uint32_t flags)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)pbuf;
-    (void)flags;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }

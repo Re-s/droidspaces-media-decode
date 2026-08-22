@@ -12,9 +12,12 @@
 
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_dec_vp8.h>
+#include <va/va_dec_vp9.h>
 /* struct drm_state 定义在这里，va_backend.h 只做前向声明。 */
 #include <va/va_drmcommon.h>
 
+#include "dmd_client.h"
 #include "stubs.h"
 
 /* 驱动版本，随 vendor 串一起被消费者看到。
@@ -43,6 +46,123 @@
  * 消费者通常只建 1-2 个；给足余量即可。 */
 #define DMD_MAX_CONFIGS 32
 
+/* surface 上限：ffmpeg 的 hwframe pool 默认 20+ 个（initial_pool_size 加
+ * 解码器的 DPB 需求），Firefox 会更多。64 对 8 个并发实例足够。 */
+#define DMD_MAX_SURFACES 64
+/* context 上限对齐 media_codecs.xml 声明的并发解码实例数（16）。 */
+#define DMD_MAX_CONTEXTS 16
+/* buffer 上限：每帧 4 个左右（pic param / IQ matrix / slice param / slice data），
+ * ffmpeg 在 EndPicture 后才 Destroy，同时存活量与 DPB 深度相关。 */
+#define DMD_MAX_BUFFERS 256
+/* image 上限：ffmpeg 每次 map 建一个、unmap 即销毁，同时存活量很小。 */
+#define DMD_MAX_IMAGES 64
+
+/* 缓冲几何对齐：Venus 解码器输出宽对齐 128、高对齐 32
+ * （1080p → 1920x1088，真机取证）。surface 按此预分配，
+ * 保证 daemon 回来的帧一定装得下，不必等到收到格式块才分配。 */
+#define DMD_WIDTH_ALIGN 128
+#define DMD_HEIGHT_ALIGN 32
+
+/* 等一帧从 daemon 回来的上限。driver 跑在宿主进程里，绝不允许无限等：
+ * 超时返回错误让消费者自己决定重试或放弃，比挂死整个进程好。 */
+#define DMD_FRAME_TIMEOUT_MS 5000
+
+/* 一个 surface：VA-API 的解码目标，持有一块 NV12 缓冲。
+ *
+ * 数据流：EndPicture 把 slice data 送给 daemon 并把 surface 挂进 context 的
+ * 待解码队列；SyncSurface 从 daemon 取帧、按 FIFO 顺序填进队首 surface 的缓冲。
+ */
+struct dmd_surface {
+    int in_use;
+    VASurfaceID id;
+    /* 请求尺寸（显示尺寸，ffmpeg 传 1920x1080）。VAImage 以此为准。 */
+    unsigned int width;
+    unsigned int height;
+    /* 缓冲几何：宽对齐 128、高对齐 32 后的值，data 按此分配。 */
+    unsigned int buf_width;
+    unsigned int buf_height;
+    unsigned int stride;
+    unsigned int slice_height;
+    unsigned int format; /* VA_RT_FORMAT_* */
+    unsigned char *data;
+    size_t data_size;
+    /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
+     * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
+    int state;
+    /* 该 surface 上一次解码的结果，SyncSurface 返回它。 */
+    VAStatus decode_status;
+    VAContextID context; /* 提交时所属 context，未提交为 VA_INVALID_ID */
+};
+
+#define DMD_SURFACE_IDLE 0
+#define DMD_SURFACE_PENDING 1
+#define DMD_SURFACE_READY 2
+
+/* 一个 buffer：VA-API 参数/码流缓冲。 */
+struct dmd_buffer {
+    int in_use;
+    VABufferID id;
+    VAContextID context;
+    VABufferType type;
+    unsigned int element_size;
+    unsigned int num_elements;
+    size_t size; /* element_size * num_elements */
+    void *data;
+    int mapped;
+};
+
+/* 一个 image：VAImage 的后备存储。data 是普通 heap 内存
+ * （容器内 ION/dma_heap 均不可用，dmabuf 零拷贝这条路已被否掉）。 */
+struct dmd_image {
+    int in_use;
+    VAImageID id;
+    VABufferID buf_id; /* 供 vaMapBuffer 用的伪 buffer ID */
+    VAImage image;
+    unsigned char *data;
+    size_t data_size;
+    int mapped;
+    /* derive 出来的 image 绑定在某个 surface 上；CreateImage 的为 VA_INVALID_ID */
+    VASurfaceID derived_from;
+};
+
+/* 一个 context：config + render target 集合 + 一条 daemon 会话。
+ *
+ * 待解码队列 pending[] 是 VA-API 乱序语义与 MediaCodec 流式语义之间的桥：
+ * EndPicture 按提交顺序入队，daemon 按解码顺序出帧，两者一一配对。
+ */
+struct dmd_context {
+    int in_use;
+    VAContextID id;
+    VAConfigID config_id;
+    VAProfile profile;
+    int codec; /* DMD_CODEC_* */
+    unsigned int picture_width;
+    unsigned int picture_height;
+    int flag;
+
+    /* daemon 会话。惰性创建：CreateContext 时建，失败则留 NULL 由
+     * EndPicture 重试 —— 建 context 时 daemon 不可用不该让整个初始化失败。 */
+    struct dmd_session *session;
+    int session_failed; /* 建会话失败过，避免每帧重试拖慢失败路径 */
+
+    /* 待解码队列：EndPicture 提交的 surface，按 FIFO 与 daemon 出帧配对 */
+    VASurfaceID pending[DMD_MAX_SURFACES];
+    int pending_head;
+    int pending_count;
+
+    /* 当前 BeginPicture 选定的目标 surface，EndPicture 用完清空 */
+    VASurfaceID current_target;
+    /* 本帧累积的码流数据（RenderPicture 可能分多次给 slice data） */
+    unsigned char *slice_data;
+    size_t slice_len;
+    size_t slice_cap;
+    /* 本帧的 VP8 slice 参数，合成 uncompressed chunk 需要 */
+    int have_vp8_slice_param;
+    VASliceParameterBufferVP8 vp8_slice_param;
+    int have_vp8_pic_param;
+    VAPictureParameterBufferVP8 vp8_pic_param;
+};
+
 /* 一个 VA-API config 对象：profile + entrypoint + 属性集合 */
 struct dmd_config {
     int in_use;
@@ -53,11 +173,33 @@ struct dmd_config {
     int num_attribs;
 };
 
-/* 驱动私有数据，挂在 ctx->pDriverData */
+/* 驱动私有数据，挂在 ctx->pDriverData
+ *
+ * 锁策略：单把 lock 保护所有对象表。这不是性能瓶颈 —— 表操作都是 O(表长)
+ * 的内存操作。**但阻塞 IO 绝不能持锁做**：与 daemon 的收发在放锁后进行，
+ * 靠 context 的 busy 标志串行化同一 context 上的 IO。
+ */
 struct dmd_driver {
-    pthread_mutex_t lock; /* 保护 configs 与 next_config_id */
+    pthread_mutex_t lock;
+    /* IO 完成时广播，等 context 的 busy 标志用 */
+    pthread_cond_t io_done;
+
     struct dmd_config configs[DMD_MAX_CONFIGS];
+    struct dmd_surface surfaces[DMD_MAX_SURFACES];
+    struct dmd_context contexts[DMD_MAX_CONTEXTS];
+    struct dmd_buffer buffers[DMD_MAX_BUFFERS];
+    struct dmd_image images[DMD_MAX_IMAGES];
+
     unsigned int next_config_id;
+    unsigned int next_surface_id;
+    unsigned int next_context_id;
+    unsigned int next_buffer_id;
+    unsigned int next_image_id;
+
+    /* 某个 context 正在做 daemon IO（放锁期间的互斥标志）。
+     * 用数组下标而非 ID，查找更快。 */
+    int io_busy[DMD_MAX_CONTEXTS];
+
     int drm_fd; /* 来自 ctx->drm_state，仅记录，当前不做 ioctl */
 };
 
@@ -118,9 +260,115 @@ VAStatus dmd_SetDisplayAttributes(VADriverContextP ctx,
                                   VADisplayAttribute *attr_list,
                                   int num_attributes);
 
+/* ---- decode.c：解码数据路径 ---- */
+
+VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height,
+                            int format, int num_surfaces,
+                            VASurfaceID *surfaces);
+
+VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
+                             unsigned int width, unsigned int height,
+                             VASurfaceID *surfaces, unsigned int num_surfaces,
+                             VASurfaceAttrib *attrib_list,
+                             unsigned int num_attribs);
+
+VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
+                             int num_surfaces);
+
+VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
+                           int picture_width, int picture_height, int flag,
+                           VASurfaceID *render_targets, int num_render_targets,
+                           VAContextID *context);
+
+VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context);
+
+VAStatus dmd_CreateBuffer(VADriverContextP ctx, VAContextID context,
+                          VABufferType type, unsigned int size,
+                          unsigned int num_elements, void *data,
+                          VABufferID *buf_id);
+
+VAStatus dmd_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id,
+                                  unsigned int num_elements);
+
+VAStatus dmd_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf);
+
+VAStatus dmd_MapBuffer2(VADriverContextP ctx, VABufferID buf_id, void **pbuf,
+                        uint32_t flags);
+
+VAStatus dmd_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id);
+
+VAStatus dmd_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id);
+
+VAStatus dmd_BufferInfo(VADriverContextP ctx, VABufferID buf_id,
+                        VABufferType *type, unsigned int *size,
+                        unsigned int *num_elements);
+
+VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
+                          VASurfaceID render_target);
+
+VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
+                           VABufferID *buffers, int num_buffers);
+
+VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context);
+
+VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target);
+
+VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
+                          uint64_t timeout_ns);
+
+VAStatus dmd_QuerySurfaceStatus(VADriverContextP ctx,
+                                VASurfaceID render_target,
+                                VASurfaceStatus *status);
+
+/* ---- image.c：VAImage 出口 ---- */
+
+VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format,
+                         int width, int height, VAImage *image);
+
+VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
+                         VAImage *image);
+
+VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image);
+
+VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
+                      unsigned int width, unsigned int height, VAImageID image);
+
+/* ---- 跨文件内部辅助（均要求调用方已持 drv->lock） ---- */
+
+struct dmd_surface *dmd_find_surface_locked(struct dmd_driver *drv,
+                                            VASurfaceID id);
+struct dmd_context *dmd_find_context_locked(struct dmd_driver *drv,
+                                            VAContextID id);
+struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv,
+                                          VABufferID id);
+struct dmd_image *dmd_find_image_locked(struct dmd_driver *drv, VAImageID id);
+
+/* 隐式同步一个 surface（GetImage 在 surface 未就绪时用）。
+ * 要求调用方已持锁；内部会临时放锁做 IO，返回时仍持锁 ——
+ * 调用方必须重新查找所有缓存的对象指针。 */
+VAStatus dmd_surface_sync_locked(struct dmd_driver *drv, VASurfaceID surface,
+                                 int timeout_ms);
+
+/* 释放一个 surface 槽位持有的资源（不加锁）。 */
+void dmd_surface_reset_locked(struct dmd_surface *s);
+/* 释放一个 context 槽位持有的资源，含 daemon 会话（不加锁；会做 socket 关闭）。 */
+void dmd_context_reset_locked(struct dmd_context *c);
+
+/* 按 surface 几何填一个 VAImage 描述（不含 image_id/buf）。
+ * 这是 1088-vs-1080 那处几何的唯一真源，derive 与 create 共用。 */
+void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
+                             unsigned int disp_height, unsigned int stride,
+                             unsigned int slice_height);
+
+/* 对齐辅助 */
+unsigned int dmd_align_up(unsigned int v, unsigned int align);
+
 /* ---- profiles.c 内部辅助 ---- */
 
 /* 该 profile 是否由本驱动支持（即 Android 侧 MediaCodec 有对应硬件解码器）。 */
 int dmd_profile_supported(VAProfile profile);
+
+/* profile → 协议 codec id（DMD_CODEC_*）。不支持的 profile 返回 -1。 */
+int dmd_profile_to_codec(VAProfile profile);
 
 #endif /* DMD_DRIVER_H */

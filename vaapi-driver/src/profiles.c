@@ -31,6 +31,26 @@ int dmd_profile_supported(VAProfile profile)
     return 0;
 }
 
+/* profile → 协议 codec id。
+ * 注意 HEVC/VP9/VP8 各只有一个 profile 被声明，高位深未验证故不映射。 */
+int dmd_profile_to_codec(VAProfile profile)
+{
+    switch (profile) {
+    case VAProfileH264ConstrainedBaseline:
+    case VAProfileH264Main:
+    case VAProfileH264High:
+        return DMD_CODEC_H264;
+    case VAProfileHEVCMain:
+        return DMD_CODEC_HEVC;
+    case VAProfileVP9Profile0:
+        return DMD_CODEC_VP9;
+    case VAProfileVP8Version0_3:
+        return DMD_CODEC_VP8;
+    default:
+        return -1;
+    }
+}
+
 VAStatus dmd_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
                                  int *num_profiles)
 {
