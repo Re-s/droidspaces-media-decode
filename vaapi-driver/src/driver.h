@@ -127,8 +127,22 @@ struct dmd_image {
 
 /* 一个 context：config + render target 集合 + 一条 daemon 会话。
  *
- * 待解码队列 pending[] 是 VA-API 乱序语义与 MediaCodec 流式语义之间的桥：
- * EndPicture 按提交顺序入队，daemon 按解码顺序出帧，两者一一配对。
+ * 待解码队列 pending[] 是 VA-API 乱序语义与 MediaCodec 流式语义之间的桥。
+ *
+ * ⚠️ 配对规则按 codec 分两种，因为两侧的顺序不一定相同：
+ *
+ * - VP9/VP8（无帧重排）：ffmpeg 的提交顺序 == daemon 的出帧顺序，
+ *   直接 FIFO 配对（取队首）。实测严格 1 进 1 出。
+ *
+ * - H.264/HEVC（有 B 帧重排）：ffmpeg 按**解码顺序**调 EndPicture，
+ *   而 MediaCodec 按**显示顺序**吐帧 —— 两者不同序！
+ *   本流实测解码序 I P B B B...（P 在第 2 位，因为 B 要参考它），
+ *   显示序 I B B B P...。若按 FIFO 配对，第 2 个提交（P 的 surface）
+ *   会被填进第 2 个输出（B 的内容），从第 2 帧起全错。
+ *   所以必须按 POC（显示顺序）配对：daemon 的第 k 帧给 POC 第 k 小的 surface。
+ *   POC 取自 VAPictureParameterBufferH264.CurrPic.TopFieldOrderCnt，
+ *   ffmpeg 传的是已解包的 field_poc[0]（vaapi_h264.c:74），
+ *   不是码流里 6 bit 会回绕的 poc_lsb，故可直接比较大小。
  */
 struct dmd_context {
     int in_use;
@@ -145,10 +159,16 @@ struct dmd_context {
     struct dmd_session *session;
     int session_failed; /* 建会话失败过，避免每帧重试拖慢失败路径 */
 
-    /* 待解码队列：EndPicture 提交的 surface，按 FIFO 与 daemon 出帧配对 */
+    /* 待解码队列：EndPicture 提交的 surface。
+     * VP9/VP8 取队首；H.264/HEVC 取 pending_poc 最小者（见结构体头注释）。 */
     VASurfaceID pending[DMD_MAX_SURFACES];
+    int32_t pending_poc[DMD_MAX_SURFACES];
     int pending_head;
     int pending_count;
+    /* 本帧的 POC，BeginPicture 清零、RenderPicture 从 pic param 取、
+     * EndPicture 随 surface 一起入队。仅 H.264/HEVC 有意义。 */
+    int32_t current_poc;
+    int have_current_poc;
 
     /* 当前 BeginPicture 选定的目标 surface，EndPicture 用完清空 */
     VASurfaceID current_target;

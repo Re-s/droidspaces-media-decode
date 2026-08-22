@@ -849,6 +849,15 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->vp8_pic_param, b->data,
                        sizeof(VAPictureParameterBufferVP8));
                 c->have_vp8_pic_param = 1;
+            } else if (c->codec == DMD_CODEC_H264 &&
+                       b->size >= sizeof(VAPictureParameterBufferH264)) {
+                /* 取本帧的 POC（显示顺序）用于配对 —— MediaCodec 按显示序
+                 * 吐帧而 ffmpeg 按解码序提交，只有 POC 能把两者对上。
+                 * ffmpeg 填的是已解包的 field_poc[0]（vaapi_h264.c:74），
+                 * 不是码流里会回绕的 6 bit poc_lsb，可直接比较大小。 */
+                const VAPictureParameterBufferH264 *pp = b->data;
+                c->current_poc = pp->CurrPic.TopFieldOrderCnt;
+                c->have_current_poc = 1;
             }
             break;
 
@@ -1080,7 +1089,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     c->pending[qpos] = target;
+    /* 记下本帧 POC 供按显示序配对。取不到时用 INT32_MAX，
+     * 这样它会排在最后而不会抢占别人的帧。 */
+    c->pending_poc[qpos] = c->have_current_poc ? c->current_poc : INT32_MAX;
     c->pending_count++;
+    c->have_current_poc = 0;
     c->current_target = VA_INVALID_ID;
 
     /* 拷一份码流到局部缓冲：放锁后 c->slice_data 可能被别的线程复用。 */
@@ -1268,10 +1281,34 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         }
 
         if (rc == DMD_OK) {
-            /* 配对：帧填给队首 surface。 */
+            /* 配对。选谁取决于两侧顺序是否一致（见 driver.h 的说明）：
+             *
+             * - VP9/VP8：无帧重排，提交序 == 出帧序，取队首
+             * - H.264/HEVC：ffmpeg 按解码序提交、MediaCodec 按显示序出帧，
+             *   必须取队列中 POC 最小的那个，否则从第 2 帧起全部错位
+             *
+             * 用线性扫描找最小 POC：队列最多 64 项且实测重排深度只有 2-3，
+             * 每帧一次 O(n) 扫描的代价可以忽略，换来的是不需要维护堆。 */
             VASurfaceID head = VA_INVALID_ID;
             if (c->pending_count > 0) {
-                head = c->pending[c->pending_head];
+                int pick = c->pending_head;
+                if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
+                    int32_t best = c->pending_poc[pick];
+                    for (int k = 1; k < c->pending_count; k++) {
+                        int idx2 = (c->pending_head + k) % DMD_MAX_SURFACES;
+                        if (c->pending_poc[idx2] < best) {
+                            best = c->pending_poc[idx2];
+                            pick = idx2;
+                        }
+                    }
+                }
+                head = c->pending[pick];
+                /* 把被选中的位置用队首填补，再收缩队首，
+                 * 这样无需搬移整个队列也能保持"连续 pending_count 项有效"。 */
+                if (pick != c->pending_head) {
+                    c->pending[pick] = c->pending[c->pending_head];
+                    c->pending_poc[pick] = c->pending_poc[c->pending_head];
+                }
                 c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
                 c->pending_count--;
             }
@@ -1280,7 +1317,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
                 surface_store_frame_locked(hs, &frame);
                 hs->state = DMD_SURFACE_READY;
             } else {
-                dmd_log("SyncSurface: 队首 surface %u 已销毁，帧被丢弃\n",
+                dmd_log("SyncSurface: 待配对 surface %u 已销毁，帧被丢弃\n",
                         (unsigned)head);
             }
             /* release 不做阻塞 IO（TCP 模式只是标记缓冲可复用）。 */
