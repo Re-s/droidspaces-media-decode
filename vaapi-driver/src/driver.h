@@ -163,12 +163,22 @@ struct dmd_context {
      * VP9/VP8 取队首；H.264/HEVC 取 pending_poc 最小者（见结构体头注释）。 */
     VASurfaceID pending[DMD_MAX_SURFACES];
     int32_t pending_poc[DMD_MAX_SURFACES];
+    /* 所属 coded video sequence 序号：POC 每逢 IDR 会重置，跨序列比 POC
+     * 大小没有意义，所以排序时先比 seq 再比 POC。 */
+    unsigned int pending_seq[DMD_MAX_SURFACES];
     int pending_head;
     int pending_count;
-    /* 本帧的 POC，BeginPicture 清零、RenderPicture 从 pic param 取、
-     * EndPicture 随 surface 一起入队。仅 H.264/HEVC 有意义。 */
+    /* 本帧的 POC，RenderPicture 从 pic param 取、EndPicture 随 surface 入队。
+     * 仅 H.264/HEVC 有意义。 */
     int32_t current_poc;
     int have_current_poc;
+    /* frame_num 在每个 IDR 处归零（规范 7.4.3），用它检测新序列 ——
+     * 不能用 POC 比较，因为解码序内 POC 本来就起伏。 */
+    unsigned int current_frame_num;
+    int32_t last_poc;
+    unsigned int last_frame_num;
+    int have_last_poc;
+    unsigned int last_seq;
 
     /* 当前 BeginPicture 选定的目标 surface，EndPicture 用完清空 */
     VASurfaceID current_target;
@@ -181,6 +191,26 @@ struct dmd_context {
     VASliceParameterBufferVP8 vp8_slice_param;
     int have_vp8_pic_param;
     VAPictureParameterBufferVP8 vp8_pic_param;
+
+    /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
+     * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
+    int have_h264_pic_param;
+    VAPictureParameterBufferH264 h264_pic_param;
+    int have_h264_slice_param;
+    VASliceParameterBufferH264 h264_slice_param;
+    int have_h264_iq_matrix;
+    VAIQMatrixBufferH264 h264_iq_matrix;
+    int param_sets_sent;
+    unsigned int sent_mbs_wide;
+    unsigned int sent_mbs_high;
+    /* 上次随 PPS 发出的 num_ref_idx 默认值。它必须跟随当前帧的生效值，
+     * 变化时要重发 PPS —— l1 偏大会改变 ref_idx_l1 的熵解码码长。 */
+    unsigned int sent_l0;
+    unsigned int sent_l1;
+    unsigned int pending_l0;
+    unsigned int pending_l1;
+    /* 已 shutdown(SHUT_WR)：不能再发送，也不必重复 flush */
+    int input_finished;
 };
 
 /* 一个 VA-API config 对象：profile + entrypoint + 属性集合 */
@@ -390,5 +420,20 @@ int dmd_profile_supported(VAProfile profile);
 
 /* profile → 协议 codec id（DMD_CODEC_*）。不支持的 profile 返回 -1。 */
 int dmd_profile_to_codec(VAProfile profile);
+
+/* ---- h264_bitstream.c ---- */
+
+/* 从 VA-API 的 pic param 反向合成带 4 字节起始码的 SPS / PPS NALU。
+ * VA-API 从不传递参数集原始比特流，而 daemon 靠起始码识别 NAL 类型把它们
+ * 累积成 codec-specific data，所以必须自己写出来。
+ * 返回写入 out 的字节数，0 表示失败（含 out_cap 不足）。 */
+size_t dmd_h264_build_sps_nalu(const VAPictureParameterBufferH264 *pp,
+                               VAProfile profile, unsigned int disp_width,
+                               unsigned int disp_height, unsigned char *out,
+                               size_t out_cap);
+size_t dmd_h264_build_pps_nalu(const VAPictureParameterBufferH264 *pp,
+                               const VAIQMatrixBufferH264 *iq, int have_iq,
+                               const VASliceParameterBufferH264 *sp,
+                               unsigned char *out, size_t out_cap);
 
 #endif /* DMD_DRIVER_H */

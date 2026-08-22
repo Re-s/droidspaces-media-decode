@@ -22,7 +22,8 @@ LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
 SOURCES := $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
-           $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c
+           $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
+           $(SRCDIR)/h264_bitstream.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
 # 客户端库的自测程序：独立目标，make all 不依赖它。

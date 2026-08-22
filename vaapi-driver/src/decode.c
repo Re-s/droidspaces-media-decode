@@ -839,6 +839,14 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->vp8_slice_param, b->data,
                        sizeof(VASliceParameterBufferVP8));
                 c->have_vp8_slice_param = 1;
+            } else if (c->codec == DMD_CODEC_H264 &&
+                       b->size >= sizeof(VASliceParameterBufferH264)) {
+                /* 留存备用。注意 PPS 的 num_ref_idx_default 不能取自这里：
+                 * 参数集要在首个 VCL 之前发，那时只有 IDR 的 slice param，
+                 * 而 I slice 的 num_ref_idx 恒为 0（详见 h264_bitstream.c）。 */
+                memcpy(&c->h264_slice_param, b->data,
+                       sizeof(VASliceParameterBufferH264));
+                c->have_h264_slice_param = 1;
             }
             break;
 
@@ -851,12 +859,18 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 c->have_vp8_pic_param = 1;
             } else if (c->codec == DMD_CODEC_H264 &&
                        b->size >= sizeof(VAPictureParameterBufferH264)) {
-                /* 取本帧的 POC（显示顺序）用于配对 —— MediaCodec 按显示序
-                 * 吐帧而 ffmpeg 按解码序提交，只有 POC 能把两者对上。
-                 * ffmpeg 填的是已解包的 field_poc[0]（vaapi_h264.c:74），
-                 * 不是码流里会回绕的 6 bit poc_lsb，可直接比较大小。 */
-                const VAPictureParameterBufferH264 *pp = b->data;
-                c->current_poc = pp->CurrPic.TopFieldOrderCnt;
+                /* 两个用途：
+                 * 1) 反向合成 SPS/PPS —— ffmpeg 自己消费掉了参数集 NALU
+                 *    （h264dec.c:699/:717），driver 只能从这些字段重建
+                 * 2) 取本帧 POC（显示顺序）用于配对 —— MediaCodec 按显示序
+                 *    吐帧而 ffmpeg 按解码序提交，只有 POC 能把两者对上。
+                 *    ffmpeg 填的是已解包的 field_poc[0]（vaapi_h264.c:74），
+                 *    不是码流里会回绕的 6 bit poc_lsb，可直接比较大小。 */
+                memcpy(&c->h264_pic_param, b->data,
+                       sizeof(VAPictureParameterBufferH264));
+                c->have_h264_pic_param = 1;
+                c->current_poc = c->h264_pic_param.CurrPic.TopFieldOrderCnt;
+                c->current_frame_num = c->h264_pic_param.frame_num;
                 c->have_current_poc = 1;
             }
             break;
@@ -978,16 +992,81 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return buf;
     }
 
-    case DMD_CODEC_H264:
+    case DMD_CODEC_H264: {
+        /* slice data 是**完整原始 NALU**（含 NAL header 与 slice header），
+         * 只缺起始码。已核实：h264dec.c:674 传 nal->raw_data/raw_size，
+         * h2645_parse.c:92/145 的 raw_data 指向起始码之后且保留转义字节，
+         * h2645_parse.c:448-456 从 gb 读 NAL header 反证 header 在 buffer 内，
+         * vaapi_h264.c:386-388 原样进 slice data buffer。
+         * 所以这里只补 4 字节 00 00 00 01，不做任何 slice header 重建 ——
+         * 重排序与 MMCO 命令本来就还在原始字节里，MediaCodec 自己解析。 */
+        size_t cap = c->slice_len + 4;
+        unsigned char *buf = malloc(cap);
+        if (!buf)
+            return NULL;
+        buf[0] = 0x00;
+        buf[1] = 0x00;
+        buf[2] = 0x00;
+        buf[3] = 0x01;
+        memcpy(buf + 4, c->slice_data, c->slice_len);
+        *scratch = buf;
+        *out_len = cap;
+        return buf;
+    }
+
     case DMD_CODEC_HEVC:
-        /* 未实现：需要从 VAPictureParameterBuffer 反向重建 SPS/PPS 比特流，
-         * 多个关键字段（profile_idc/level_idc/VUI）在 VA-API 里不存在。
-         * 详见报告的"遗留与风险"。 */
+        /* HEVC 同样只缺起始码（同一个 h2645 解析器），但参数集是三个
+         * （VPS/SPS/PPS）且 profile_tier_level 里 VA-API 提供的字段更少，
+         * 另需处理 conf_win 与 EPB 计数。先把 H.264 验通再做，
+         * 避免同时引入两处不确定性。 */
         return NULL;
 
     default:
         return NULL;
     }
+}
+
+/* H.264：在首个 slice 之前把合成的 SPS/PPS 送给 daemon。
+ *
+ * daemon 靠起始码定位 nal_unit_header 识别参数集并累积为 codec config
+ * （decode-daemon.c 的 input 线程），遇到第一个非参数集才以
+ * FLAG_CODEC_CONFIG 送出。所以 SPS 与 PPS 必须**各自作为独立的数据单元**
+ * 先送，且必须在第一个 VCL NALU 之前。
+ *
+ * 调用方不得持锁（这里会做阻塞发送）。返回 0 成功。 */
+static int h264_send_param_sets(struct dmd_session *sess,
+                                const VAPictureParameterBufferH264 *pp,
+                                const VAIQMatrixBufferH264 *iq, int have_iq,
+                                const VASliceParameterBufferH264 *sp,
+                                VAProfile profile, unsigned int disp_width,
+                                unsigned int disp_height)
+{
+    unsigned char nalu[512];
+
+    size_t n = dmd_h264_build_sps_nalu(pp, profile, disp_width, disp_height,
+                                       nalu, sizeof(nalu));
+    if (n == 0) {
+        dmd_log("H.264: SPS 合成失败\n");
+        return -1;
+    }
+    if (dmd_session_send_unit(sess, nalu, n) != DMD_OK) {
+        dmd_log("H.264: SPS 发送失败: %s\n", dmd_session_last_error(sess));
+        return -1;
+    }
+    dmd_log("H.264: 已送 SPS %zu 字节\n", n);
+
+    n = dmd_h264_build_pps_nalu(pp, iq, have_iq, sp, nalu, sizeof(nalu));
+    if (n == 0) {
+        dmd_log("H.264: PPS 合成失败\n");
+        return -1;
+    }
+    if (dmd_session_send_unit(sess, nalu, n) != DMD_OK) {
+        dmd_log("H.264: PPS 发送失败: %s\n", dmd_session_last_error(sess));
+        return -1;
+    }
+    dmd_log("H.264: 已送 PPS %zu 字节\n", n);
+
+    return 0;
 }
 
 VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
@@ -1089,8 +1168,31 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     c->pending[qpos] = target;
-    /* 记下本帧 POC 供按显示序配对。取不到时用 INT32_MAX，
-     * 这样它会排在最后而不会抢占别人的帧。 */
+    /* 记下本帧 POC 供按显示序配对，并带上"序列号"。
+     *
+     * ⚠️ POC 只在**同一个 coded video sequence 内**单调，每个 IDR 都会把它
+     * 重置回起点。实测第 2 个 IDR 处 POC 从 65562 跳回 65536 —— 若只按 POC
+     * 全局取最小，新序列的帧会抢在旧序列未配对的帧之前，导致同一个 surface
+     * 被配对两次、画面从该 IDR 起错乱。
+     * 所以先按 seq 再按 POC 排序：只有同序列内才比 POC 大小。 */
+    if (c->have_current_poc) {
+        /* 判定是否进入新序列。
+         *
+         * ⚠️ 不能用"POC 比上一帧小"来判断 —— 提交顺序是**解码序**，
+         * 同一个 GOP 内 POC 本来就上下起伏（实测 65536, 65544, 65540, 65538），
+         * 那样会把每个 B 帧都误判成新序列。
+         *
+         * 用 frame_num：它在每个 IDR 处归零（H.264 规范 7.4.3），
+         * 而 GOP 内是递增的，所以"frame_num 归零且不是首帧"就是 IDR。
+         * VA-API 在 VAPictureParameterBufferH264.frame_num 提供它（va.h:3618）。 */
+        if (c->have_last_poc && c->current_frame_num == 0 &&
+            c->last_frame_num != 0)
+            c->last_seq++;
+        c->last_poc = c->current_poc;
+        c->last_frame_num = c->current_frame_num;
+        c->have_last_poc = 1;
+    }
+    c->pending_seq[qpos] = c->last_seq;
     c->pending_poc[qpos] = c->have_current_poc ? c->current_poc : INT32_MAX;
     c->pending_count++;
     c->have_current_poc = 0;
@@ -1117,10 +1219,57 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         if (pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts) == ETIMEDOUT)
             break;
     }
+    /* H.264：参数集必须在首个 VCL 之前送。先在持锁时快照所需数据，
+     * 放锁后再发（发送是阻塞 IO，不能持锁做）。 */
+    int need_param_sets = 0;
+    VAPictureParameterBufferH264 pp_snap;
+    VAIQMatrixBufferH264 iq_snap;
+    VASliceParameterBufferH264 sp_snap;
+    int have_iq_snap = 0;
+    int have_sp_snap = 0;
+    VAProfile profile_snap = c->profile;
+    unsigned int mbs_wide = 0, mbs_high = 0;
+
+    if (codec == DMD_CODEC_H264 && c->have_h264_pic_param) {
+        mbs_wide = (unsigned int)c->h264_pic_param.picture_width_in_mbs_minus1 + 1;
+        mbs_high = (unsigned int)c->h264_pic_param.picture_height_in_mbs_minus1 + 1;
+        /* 重发条件：首次、流内几何变化、或 PPS 的 num_ref_idx 默认值变化。
+         *
+         * 最后一条是必需的：PPS 默认值必须照抄**当前帧**的生效值
+         * （详见 h264_bitstream.c 的说明），而不同帧的生效值会变。
+         * MediaCodec 接受流中反复出现的 PPS，每次只多几字节。 */
+        unsigned int l0 = c->have_h264_slice_param
+                              ? c->h264_slice_param.num_ref_idx_l0_active_minus1
+                              : 0;
+        unsigned int l1 = c->have_h264_slice_param
+                              ? c->h264_slice_param.num_ref_idx_l1_active_minus1
+                              : 0;
+        if (!c->param_sets_sent || c->sent_mbs_wide != mbs_wide ||
+            c->sent_mbs_high != mbs_high || c->sent_l0 != l0 ||
+            c->sent_l1 != l1) {
+            c->pending_l0 = l0;
+            c->pending_l1 = l1;
+            need_param_sets = 1;
+            pp_snap = c->h264_pic_param;
+            iq_snap = c->h264_iq_matrix;
+            have_iq_snap = c->have_h264_iq_matrix;
+            sp_snap = c->h264_slice_param;
+            have_sp_snap = c->have_h264_slice_param;
+        }
+    }
+
     drv->io_busy[idx] = 1;
     pthread_mutex_unlock(&drv->lock);
 
-    int rc = dmd_session_send_unit(sess, tx, unit_len);
+    int rc = DMD_OK;
+    if (need_param_sets) {
+        if (h264_send_param_sets(sess, &pp_snap, &iq_snap, have_iq_snap,
+                                 have_sp_snap ? &sp_snap : NULL, profile_snap,
+                                 pw, ph) != 0)
+            rc = DMD_ERR_PROTOCOL;
+    }
+    if (rc == DMD_OK)
+        rc = dmd_session_send_unit(sess, tx, unit_len);
     free(tx);
 
     pthread_mutex_lock(&drv->lock);
@@ -1146,6 +1295,14 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         pthread_mutex_unlock(&drv->lock);
         dmd_log("EndPicture: 送单元失败 rc=%d: %s\n", rc, msg);
         return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+
+    if (need_param_sets) {
+        c->param_sets_sent = 1;
+        c->sent_mbs_wide = mbs_wide;
+        c->sent_mbs_high = mbs_high;
+        c->sent_l0 = c->pending_l0;
+        c->sent_l1 = c->pending_l1;
     }
     pthread_mutex_unlock(&drv->lock);
 
@@ -1293,21 +1450,37 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             if (c->pending_count > 0) {
                 int pick = c->pending_head;
                 if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
+                    unsigned int bseq = c->pending_seq[pick];
                     int32_t best = c->pending_poc[pick];
                     for (int k = 1; k < c->pending_count; k++) {
                         int idx2 = (c->pending_head + k) % DMD_MAX_SURFACES;
-                        if (c->pending_poc[idx2] < best) {
+                        /* 先比序列号：旧序列必须先配完，否则新序列（IDR 后
+                         * POC 重置回小值）会抢占旧序列未配对的帧。 */
+                        if (c->pending_seq[idx2] < bseq ||
+                            (c->pending_seq[idx2] == bseq &&
+                             c->pending_poc[idx2] < best)) {
+                            bseq = c->pending_seq[idx2];
                             best = c->pending_poc[idx2];
                             pick = idx2;
                         }
                     }
                 }
                 head = c->pending[pick];
-                /* 把被选中的位置用队首填补，再收缩队首，
-                 * 这样无需搬移整个队列也能保持"连续 pending_count 项有效"。 */
-                if (pick != c->pending_head) {
-                    c->pending[pick] = c->pending[c->pending_head];
-                    c->pending_poc[pick] = c->pending_poc[c->pending_head];
+                dmd_log("配对: 帧 -> surface %u (seq %u POC %d, 队列剩 %d)\n",
+                        (unsigned)head, c->pending_seq[pick],
+                        (int)c->pending_poc[pick], c->pending_count - 1);
+                /* 摘除 pick：把它之后的项整体前移一格。
+                 *
+                 * ⚠️ 不能用"拿队首填补空位"的省事写法 —— 那会把队首元素挪到
+                 * 队列中间，**破坏剩余项与提交顺序的对应关系**，后续找最小
+                 * POC 时就会选错（实测表现为部分帧对、部分帧错）。
+                 * 队列最多 64 项、重排深度实测 2-3，这次搬移代价可忽略。 */
+                for (int k = pick; k != c->pending_head;) {
+                    int prev = (k - 1 + DMD_MAX_SURFACES) % DMD_MAX_SURFACES;
+                    c->pending[k] = c->pending[prev];
+                    c->pending_poc[k] = c->pending_poc[prev];
+                    c->pending_seq[k] = c->pending_seq[prev];
+                    k = prev;
                 }
                 c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
                 c->pending_count--;
