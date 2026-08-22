@@ -1,0 +1,138 @@
+/* vaExportSurfaceHandle：把 surface 导出成 dmabuf（DRM_PRIME_2）。
+ *
+ * 为什么必须实现：**Firefox 取帧只走这条路**。
+ * `FFmpegVideoDecoder::CreateImageVAAPI`（FFmpegVideoDecoder.cpp:1649）拿到
+ * 解码帧后立刻调 `GetVAAPISurfaceDescriptor` → `vaExportSurfaceHandle`，
+ * 失败就返回 `NS_ERROR_DOM_MEDIA_DECODE_ERR`，播放器随即 ProcessFlush()
+ * 并重建成**软解**。整个过程没有任何错误日志，也**没有回退到拷贝的路径** ——
+ * 症状就是"硬解出 1 帧然后永久软解"，极难定位（我们靠给未实现桩加日志才发现）。
+ *
+ * ffmpeg 命令行不需要它：`hwdownload` 走 vaDeriveImage + vaMapBuffer。
+ * 所以此前一直"ffmpeg 全绿、浏览器不动"。
+ *
+ * 这不是零拷贝。MediaCodec 那块输出内存我们拿不到 fd（容器 ION 不可用、
+ * 无 /dev/dma_heap、NDK 也不暴露输出缓冲的 fd）。做法是 surface 本身就分配在
+ * msm_drm 的 dumb buffer 里（见 decode.c 的 surface_alloc_dumb），
+ * daemon 回传的帧直接拷进这块可导出内存 —— 拷贝次数和原来一样，
+ * 但多了"能被 GL/合成器导入"这个关键能力。
+ */
+
+#include <fcntl.h> /* O_CLOEXEC —— drm.h 的 DRM_CLOEXEC 是它的别名 */
+#include <string.h>
+#include <sys/ioctl.h>
+
+#include <drm/drm.h>
+#include <drm_fourcc.h>
+
+#include "driver.h"
+
+VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
+                                 uint32_t mem_type, uint32_t flags,
+                                 void *descriptor)
+{
+    struct dmd_driver *drv = dmd_get_driver(ctx);
+
+    if (!drv || !descriptor)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    /* 只支持 DRM_PRIME_2。Firefox 传的正是这个；老的 DRM_PRIME（v1）
+     * 结构不同，不声明支持比给个错结构安全。 */
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        dmd_log("ExportSurfaceHandle: 不支持的 mem_type=0x%x\n", mem_type);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
+    /* 导出前帧必须已经在 surface 里：Firefox 是在拿到解码帧之后才导出的，
+     * 但 VA-API 不保证这一点，稳妥起见先等就绪（内部自行加锁）。 */
+    VAStatus wait = dmd_surface_wait(drv, surface_id);
+    if (wait != VA_STATUS_SUCCESS)
+        return wait;
+
+    pthread_mutex_lock(&drv->lock);
+    struct dmd_surface *s = dmd_find_surface_locked(drv, surface_id);
+    if (!s) {
+        pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    if (!s->exportable || !s->dumb_handle || s->dumb_drm_fd < 0) {
+        /* 分配时回落成普通 heap 了（dumb buffer 不可用）。
+         * 明确报不支持，别给出一个假的 fd。 */
+        pthread_mutex_unlock(&drv->lock);
+        dmd_log("ExportSurfaceHandle: surface %u 不是可导出内存\n",
+                (unsigned)surface_id);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
+    unsigned int stride = s->stride;
+    unsigned int slice_h = s->slice_height;
+    unsigned int disp_w = s->width;
+    unsigned int disp_h = s->height;
+    uint32_t handle = s->dumb_handle;
+    int drm_fd = s->dumb_drm_fd;
+    size_t total = s->dumb_size;
+    pthread_mutex_unlock(&drv->lock);
+
+    /* 导出 fd 时不持锁：ioctl 是内核调用，且调用方拿到 fd 后由它负责 close。 */
+    struct drm_prime_handle prime;
+    memset(&prime, 0, sizeof(prime));
+    prime.handle = handle;
+    /* DRM_CLOEXEC 就是 O_CLOEXEC 的别名（drm.h），用它避免额外包含 fcntl.h。
+     * fd 必须 CLOEXEC：驱动跑在浏览器进程里，泄漏到子进程是安全问题。 */
+    prime.flags = DRM_CLOEXEC;
+    if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
+        dmd_log("ExportSurfaceHandle: PRIME_HANDLE_TO_FD 失败\n");
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    VADRMPRIMESurfaceDescriptor *desc =
+        (VADRMPRIMESurfaceDescriptor *)descriptor;
+    memset(desc, 0, sizeof(*desc));
+
+    desc->fourcc = VA_FOURCC_NV12;
+    desc->width = disp_w;
+    desc->height = disp_h;
+
+    /* 单个 dmabuf object 承载 Y 与 UV 两个平面。 */
+    desc->num_objects = 1;
+    desc->objects[0].fd = prime.fd;
+    desc->objects[0].size = (uint32_t)total;
+    desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+
+    /* Firefox 传 VA_EXPORT_SURFACE_SEPARATE_LAYERS，要求 Y / UV 各成一层。
+     * 合并成一层（NV12 单 layer）只有在对方传 COMPOSED_LAYERS 时才合适。 */
+    if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
+        desc->num_layers = 1;
+        desc->layers[0].drm_format = DRM_FORMAT_NV12;
+        desc->layers[0].num_planes = 2;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].pitch[0] = stride;
+        desc->layers[0].object_index[1] = 0;
+        desc->layers[0].offset[1] = (uint32_t)stride * slice_h;
+        desc->layers[0].pitch[1] = stride;
+    } else {
+        desc->num_layers = 2;
+        /* Y 平面：8bpp 单通道 */
+        desc->layers[0].drm_format = DRM_FORMAT_R8;
+        desc->layers[0].num_planes = 1;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = 0;
+        desc->layers[0].pitch[0] = stride;
+        /* UV 平面：交织的两通道，宽度减半（每个采样 2 字节，
+         * 所以 pitch 与 Y 相同）。offset 用 **slice_height** 不是显示高 ——
+         * 与 VAImage.offsets[1] 同一个坑。 */
+        desc->layers[1].drm_format = DRM_FORMAT_GR88;
+        desc->layers[1].num_planes = 1;
+        desc->layers[1].object_index[0] = 0;
+        desc->layers[1].offset[0] = (uint32_t)stride * slice_h;
+        desc->layers[1].pitch[0] = stride;
+    }
+
+    dmd_log("ExportSurfaceHandle: surface=%u -> fd=%d %ux%u stride=%u "
+            "uv_offset=%u layers=%u\n",
+            (unsigned)surface_id, prime.fd, disp_w, disp_h, stride,
+            (unsigned)(stride * slice_h), desc->num_layers);
+
+    return VA_STATUS_SUCCESS;
+}

@@ -14,16 +14,22 @@ BUILD   := build
 # 符号由宿主进程提供，不要链接 libva 本体。
 VA_CFLAGS := $(shell pkg-config --cflags libva 2>/dev/null)
 
+# libdrm 头：surface 用 msm_drm 的 dumb buffer 分配，才能导出 dmabuf
+# （Firefox 取帧的唯一途径）。只用头文件里的 ioctl 定义与 fourcc 常量，
+# 不链接 libdrm 本体 —— ioctl 直接走 syscall。
+DRM_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
+
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
-           -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) -I$(SRCDIR)
+           -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) $(DRM_CFLAGS) \
+           -I$(SRCDIR)
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
 SOURCES := $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
            $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
-           $(SRCDIR)/h264_bitstream.c
+           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/export.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
 # 客户端库的自测程序：独立目标，make all 不依赖它。

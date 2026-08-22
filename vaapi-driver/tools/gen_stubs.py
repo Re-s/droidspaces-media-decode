@@ -56,6 +56,10 @@ IMPLEMENTED = {
     "vaDeriveImage",
     "vaDestroyImage",
     "vaGetImage",
+    # ---- dmabuf 出口（export.c） ----
+    # Firefox 取帧只走这条路：CreateImageVAAPI 要 DRM_PRIME_2 描述符，
+    # 失败即整条流回落软解，且没有拷贝回退路径。
+    "vaExportSurfaceHandle",
 }
 
 funcs = json.load(open(sys.argv[1], encoding="utf-8"))

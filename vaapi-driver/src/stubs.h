@@ -27,7 +27,6 @@ VAStatus dmd_MFReleaseContext(VADriverContextP ctx, VAMFContextID mf_context, VA
 VAStatus dmd_MFSubmit(VADriverContextP ctx, VAMFContextID mf_context, VAContextID *contexts, int num_contexts);
 VAStatus dmd_CreateBuffer2(VADriverContextP ctx, VAContextID context, VABufferType type, unsigned int width, unsigned int height, unsigned int *unit_size, unsigned int *pitch, VABufferID *buf_id);
 VAStatus dmd_QueryProcessingRate(VADriverContextP ctx, VAConfigID config_id, VAProcessingRateParameter *proc_buf, unsigned int *processing_rate);
-VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor);
 VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns);
 VAStatus dmd_Copy(VADriverContextP ctx, VACopyObject *dst, VACopyObject *src, VACopyOption option);
 

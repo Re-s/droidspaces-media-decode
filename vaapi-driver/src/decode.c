@@ -21,6 +21,12 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+/* surface 分配在 msm_drm 的 dumb buffer 里，为的是能导出 dmabuf
+ * （Firefox 取帧的唯一途径，见 export.c）。 */
+#include <drm/drm.h>
 
 #include "driver.h"
 
@@ -76,7 +82,19 @@ struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv, VABufferID id)
 
 void dmd_surface_reset_locked(struct dmd_surface *s)
 {
-    free(s->data);
+    if (s->exportable) {
+        /* dumb buffer：先 munmap 再销毁 handle，顺序不能颠倒。 */
+        if (s->data)
+            munmap(s->data, s->dumb_size);
+        if (s->dumb_handle && s->dumb_drm_fd >= 0) {
+            struct drm_mode_destroy_dumb dreq;
+            memset(&dreq, 0, sizeof(dreq));
+            dreq.handle = s->dumb_handle;
+            ioctl(s->dumb_drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+        }
+    } else {
+        free(s->data);
+    }
     memset(s, 0, sizeof(*s));
     s->id = VA_INVALID_ID;
     s->context = VA_INVALID_ID;
@@ -102,20 +120,100 @@ void dmd_context_reset_locked(struct dmd_context *c)
  * 预先按对齐尺寸分配，这样 daemon 回来的帧一定装得下 —— 否则要等收到
  * 格式块才知道该分配多大，而 ffmpeg 在建 context 之前就要 surface。
  */
+/* 用 msm_drm 的 dumb buffer 分配一块**可导出为 dmabuf** 的内存。
+ *
+ * 为什么需要：Firefox 拿帧走 vaExportSurfaceHandle → DRM_PRIME_2，
+ * 失败就整条流回落软解，且**没有拷贝回退路径**
+ * （FFmpegVideoDecoder.cpp:1632 GetVAAPISurfaceDescriptor）。
+ * 所以帧必须落在能导出 fd 的内存里。
+ *
+ * 注意这**不是**零拷贝：MediaCodec 那块内存我们仍然拿不到 fd
+ * （容器 ION 不可用、无 /dev/dma_heap、NDK 也不给输出缓冲的 fd）。
+ * 这里是自己分配可导出内存，让 daemon 回传的帧直接落进来 ——
+ * 拷贝次数与原来的 calloc 方案相同，但多了"可被合成器导入"这个能力。
+ *
+ * 失败返回 -1，调用方回落到普通 heap（ffmpeg 的 hwdownload 路径不需要导出）。
+ */
+static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
+                              unsigned int bw, unsigned int bh, size_t size)
+{
+    if (drm_fd < 0)
+        return -1;
+
+    struct drm_mode_create_dumb creq;
+    memset(&creq, 0, sizeof(creq));
+    creq.width  = bw;
+    /* NV12 总行数 = Y 的 bh 再加 UV 的 bh/2。按 8bpp 单平面申请，
+     * 我们自己按 offset 切分 Y/UV。 */
+    creq.height = bh * 3 / 2;
+    creq.bpp    = 8;
+    if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) != 0)
+        return -1;
+
+    /* pitch 必须正好是我们期望的 stride，否则几何对不上 daemon 的帧。 */
+    if (creq.pitch != bw || creq.size < size) {
+        struct drm_mode_destroy_dumb dreq;
+        memset(&dreq, 0, sizeof(dreq));
+        dreq.handle = creq.handle;
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+        dmd_log("dumb buffer 几何不符：pitch=%u 期望 %u，size=%llu 需要 %zu\n",
+                creq.pitch, bw, (unsigned long long)creq.size, size);
+        return -1;
+    }
+
+    struct drm_mode_map_dumb mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.handle = creq.handle;
+    if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) != 0) {
+        struct drm_mode_destroy_dumb dreq;
+        memset(&dreq, 0, sizeof(dreq));
+        dreq.handle = creq.handle;
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+        return -1;
+    }
+
+    void *map = mmap(NULL, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     drm_fd, (off_t)mreq.offset);
+    if (map == MAP_FAILED) {
+        struct drm_mode_destroy_dumb dreq;
+        memset(&dreq, 0, sizeof(dreq));
+        dreq.handle = creq.handle;
+        ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+        return -1;
+    }
+    memset(map, 0, creq.size);
+
+    s->dumb_handle = creq.handle;
+    s->dumb_size = creq.size;
+    s->dumb_drm_fd = drm_fd;
+    s->data = (unsigned char *)map;
+    s->data_size = creq.size;
+    s->exportable = 1;
+    return 0;
+}
+
 static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
                                      unsigned int width, unsigned int height,
-                                     unsigned int format)
+                                     unsigned int format, int drm_fd)
 {
     unsigned int bw = dmd_align_up(width, DMD_WIDTH_ALIGN);
     unsigned int bh = dmd_align_up(height, DMD_HEIGHT_ALIGN);
     /* NV12：Y 平面 stride*slice_height，UV 平面是它的一半 */
     size_t size = (size_t)bw * bh * 3 / 2;
 
-    unsigned char *data = calloc(1, size);
-    if (!data)
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
     memset(s, 0, sizeof(*s));
+
+    /* 优先用可导出的 dumb buffer；不支持就退回普通 heap。 */
+    if (surface_alloc_dumb(s, drm_fd, bw, bh, size) != 0) {
+        unsigned char *data = calloc(1, size);
+        if (!data)
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        s->data = data;
+        s->data_size = size;
+        s->exportable = 0;
+        s->dumb_handle = 0;
+    }
+
     s->in_use = 1;
     s->id = id;
     s->width = width;
@@ -125,8 +223,6 @@ static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
     s->stride = bw;
     s->slice_height = bh;
     s->format = format;
-    s->data = data;
-    s->data_size = size;
     s->state = DMD_SURFACE_IDLE;
     s->decode_status = VA_STATUS_SUCCESS;
     s->context = VA_INVALID_ID;
@@ -170,7 +266,8 @@ static VAStatus create_surfaces_common(VADriverContextP ctx,
         }
 
         VASurfaceID id = (VASurfaceID)(drv->next_surface_id++);
-        status = surface_alloc_locked(slot, id, width, height, format);
+        status = surface_alloc_locked(slot, id, width, height, format,
+                                      drv->drm_fd);
         if (status != VA_STATUS_SUCCESS)
             break;
 

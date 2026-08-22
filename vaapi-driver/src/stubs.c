@@ -250,17 +250,6 @@ VAStatus dmd_QueryProcessingRate(VADriverContextP ctx, VAConfigID config_id, VAP
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor)
-{
-    (void)ctx;
-    (void)surface_id;
-    (void)mem_type;
-    (void)flags;
-    (void)descriptor;
-    dmd_log("未实现入口被调用: vaExportSurfaceHandle\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
 {
     (void)ctx;

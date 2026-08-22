@@ -102,6 +102,16 @@ struct dmd_surface {
     unsigned int format; /* VA_RT_FORMAT_* */
     unsigned char *data;
     size_t data_size;
+    /* dumb buffer 后备存储：exportable 非 0 表示 data 是 mmap 出来的可导出
+     * 内存，可通过 DRM_IOCTL_PRIME_HANDLE_TO_FD 导出 dmabuf fd。
+     * Firefox 取帧走 vaExportSurfaceHandle，没有它就整条流回落软解；
+     * 分配失败时回落普通 heap（exportable=0），ffmpeg 的 hwdownload 仍可用。 */
+    uint32_t dumb_handle;
+    size_t dumb_size;
+    int exportable;
+    /* 释放 dumb buffer 需要当初分配它的 drm fd。存在 surface 上而不是让
+     * 释放函数多收一个参数 —— 这样不可能传错 fd。 */
+    int dumb_drm_fd;
     /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
      * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
     int state;
@@ -381,6 +391,17 @@ VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target);
 
 VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
                           uint64_t timeout_ns);
+
+/* ---- export.c：dmabuf 出口 ---- */
+
+/* 把 surface 导出成 dmabuf（DRM_PRIME_2）。
+ *
+ * Firefox 取帧只走这条路：CreateImageVAAPI 拿不到 DRM_PRIME_2 描述符就
+ * 返回 DECODE_ERR，播放器随即回落软解，且没有拷贝回退路径。
+ * ffmpeg 命令行不需要它（hwdownload 走 vaDeriveImage + vaMapBuffer）。 */
+VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
+                                 uint32_t mem_type, uint32_t flags,
+                                 void *descriptor);
 
 /* 等到 surface 像素真的就绪（内部自行加锁，调用方不得持锁）。
  *
