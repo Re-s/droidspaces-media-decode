@@ -1719,7 +1719,28 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * 滞后 4 帧（实测 probe_lag：有 B 帧 4，无 B 帧 1），双方差一帧
          * 必然触发这里的 flush。若 flush 即报废，浏览器拿到 I/O error
          * 后会永久回落软解（实测 Firefox 140 只硬解 1 帧就掉回软解）。 */
-        if (!c->input_finished && spent >= flush_after_ms) {
+        /* 何时该 flush：判据是"再等下去也不可能有帧"，不是"等够久了"。
+         *
+         * 消费者送料深度低于解码器出帧所需深度时，双方必然互等：
+         * 消费者要先拿到帧才肯送下一个单元，解码器要再收一个单元才肯出帧。
+         * 这时继续等是徒劳的 —— 队列深度不会自己变化。
+         *
+         * 实测 Firefox 的循环正是这样："送 3 帧 → 等第 1 帧"，而 MediaCodec
+         * 有 B 帧时要第 4 个单元才出首帧（tools/probe_lag.c 量得；daemon 侧
+         * 的 low-latency 也降不下来，那是解码器固有的流水线深度）。
+         * 若按耐心阈值等满 2000ms 再 flush，每帧就要 2 秒，播放等于卡死；
+         * 立刻 flush 则马上出帧。
+         *
+         * flush 的代价（会话作废）已由 EndPicture 的透明重建消掉：
+         * 重送 SPS/PPS 后可从非 IDR 帧续传，上层察觉不到
+         * （tools/probe_rebuild.c 验证过）。
+         *
+         * 队列够深时仍按耐心阈值等 —— 那种情况下帧确实在路上，
+         * 提前 flush 会白白打断一个正常会话。 */
+        int wait_is_futile = (c->pending_count < DMD_PIPELINE_DEPTH);
+
+        if (!c->input_finished &&
+            (wait_is_futile || spent >= flush_after_ms)) {
             struct dmd_session *fs = c->session;
             c->input_finished = 1;
             drv->io_busy[idx] = 1;
