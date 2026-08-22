@@ -24,14 +24,13 @@ if [ -f "$MODPATH/decode-daemon" ]; then
     ui_print "  decode-daemon ready at $MODPATH/decode-daemon"
 else
     ui_print "  WARNING: decode-daemon binary not found!"
+    ui_print "  Build it first:  ./build.sh && cp build/decode-daemon magisk-module/"
 fi
 
-# Prepare socket directory
-ui_print "- Preparing socket dir"
-mkdir -p /data/local/tmp/anland
-chmod 777 /data/local/tmp/anland
+# 通信走 TCP 127.0.0.1（容器与 Android 共享 net namespace），不需要 socket 目录。
+# 早期基于 Unix socket 的方案会在此创建 /data/local/tmp/anland，已移除。
 
 ui_print ""
 ui_print "- Installed! Reboot to start the daemon."
-ui_print "- Socket: /data/local/tmp/anland/decode.sock"
+ui_print "- Listens on TCP 127.0.0.1:20003"
 ui_print "- Log: /data/local/tmp/decode-daemon.log"
