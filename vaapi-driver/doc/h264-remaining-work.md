@@ -245,42 +245,72 @@ hw[32] -> sw[33]
 hw[33] -> sw[31]     ← 三帧互换位置
 ```
 
-根因在 daemon：`decode-daemon.c` 的 `queueInputBuffer` **PTS 恒为 0**
+当时的推断是「根因在 daemon：`queueInputBuffer` 的 PTS 恒为 0」。
 
 ```c
 AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
                                             ↑ presentationTimeUs = 0
 ```
 
-全文件 grep `presentationTimeUs` / `pts` / `PTS` **零命中**。后果有两层：
+代码事实成立：全文件 grep `presentationTimeUs` / `pts` **零命中**，
+输出侧也只读 `info.flags/offset/size`，从不读 `info.presentationTimeUs`。
 
-1. MediaCodec 拿不到时间戳，**无法按显示顺序重排** B 帧输出
-2. 更根本的是，输出帧**无法关联回**是哪个输入单元产生的 —— 而 VA-API 的语义
-   要求 driver 把某一帧放进 ffmpeg 指定的那个 surface
+> ## ⚠️ 但这个推断已被实测推翻（见下节）
+>
+> **MediaCodec 自己就按显示序正确重排了 B 帧，不依赖调用方给的 PTS。**
+> 因此**不需要给协议加 PTS 字段，也不需要修改 `src/decode-daemon.c`**。
 
-VP9/VP8 之所以逐字节一致，是因为它们零流水线深度、严格 1:1，提交序即输出序，
-FIFO 配对天然正确。H.264/HEVC 有 B 帧重排，这个前提就不成立了。
+### 决定性复核：daemon 侧 150 帧全对（推翻上面三轮的全部根因）
 
-### 结论：H.264 的阻塞点在 driver 之外
+方法：用 `tests/test_dmd_client` 直连 daemon、**完全绕过 driver**，
+对同一个 `test1080.h264`（该流确实是 B 帧重排流，`ffprobe` 显示 I,B,B,B,P,...）：
 
-driver 侧该做的都已验证可行（SPS/PPS 合成字节级正确、slice 补起始码转发、
-daemon 接受参数集并真的解出 148 帧）。剩下的两个障碍都在 daemon：
+```
+统计: 送入单元=161 (库计数 161) 收到帧=150 (库计数 150)
 
-- **障碍 A**（丢尾部 2 帧）：EOS 后 output 线程立刻 break，不排空队列
-- **障碍 C**（帧序，本轮新发现，是画面错的真因）：PTS 恒 0，无法重排也无法关联
+帧序（md5 指纹映射，research/frame_order.py）：
+  hw[  0] -> sw[0]  ...  hw[ 31] -> sw[31]   hw[ 32] -> sw[32]
+  hw[ 33] -> sw[33] ...  hw[149] -> sw[149]
+硬解帧数 150，未在软解中找到 0 帧
+已找到的帧是否单调递增: 是
+结论: 输出即显示序，完全正确
 
-两者都需要改 `src/decode-daemon.c`，超出本单元「只改 `vaapi-driver/`」的约束。
+像素（tools/cmp_frames.py，1920x1080 显示 / 1920x1088 缓冲）：
+合计: 150 帧一致, 0 帧不同
+```
 
-### 给后续单元的建议（需要跨越 daemon 边界的授权）
+**特别注意 31/32/33** —— 正是上一轮测到「三帧互换」的位置，
+直连 daemon 时**完全对位**。多轮、跨容器重启复现。
 
-1. **daemon 传递 PTS**：上行协议加一个单调递增的序号/时间戳字段，
-   `queueInputBuffer` 填进去，下行帧头带回 `AMediaCodecBufferInfo.presentationTimeUs`。
-   driver 就能按它把帧投递到正确的 surface，而不依赖 FIFO 假设。
-   这是唯一能让 H.264/HEVC 正确的路径。
-2. **顺带加 `AMEDIAFORMAT_KEY_LOW_LATENCY`**（`decode-daemon.c:884-896` 未设，
-   全文件零命中）：流水线深度降到接近 0，同时消除障碍 A 与死锁。
-3. 在 daemon 具备 PTS 之前，**不要再尝试在 driver 侧修 H.264** —— 参数集
-   相关的三条假设（num_ref_idx、scaling matrix、VUI）已逐一排除，
+由此可确定：**daemon + MediaCodec 这一段对 H.264 完全正确**
+（150 帧、逐字节一致、显示序），画面错与丢帧**都发生在 driver 侧**。
+
+### 结论：阻塞点在 driver 内，不在 daemon
+
+- **障碍 A（丢尾部 2 帧）已定位在 driver**：`decode.c:1413-1447` 在
+  `vaSyncSurface` 等帧超时后调用**不可逆**的 `dmd_session_finish_input()`
+  （`shutdown(SHUT_WR)`）来触发 EOS flush。
+  这是 VA-API 同步语义与 MediaCodec 流式语义的真实冲突：
+  ffmpeg 阻塞等第 N 帧 → 不再送新数据 → MediaCodec 攥着 B 帧重排队列不吐 → 互等。
+  VP9/VP8 流水线深度为 0，走不到这条分支。
+  （`decode.c:1423-1426` 把丢帧归因于 daemon 的注释是错的，待修正。）
+- **障碍 C（画面错）最可疑项：FIFO 配对与单元切分不匹配。**
+  daemon 输出已证明严格按显示序，所以问题在**提交侧计数**：
+  客户端库口径是 161 单元 → 150 帧（每帧约 5-6 个 VCL NALU），
+  而 ffmpeg 每帧只调一次 `Begin/Render*/EndPicture`、一帧内多个 slice
+  经**多次 `vaRenderPicture`** 累积。
+  若某些帧的 slice 被拆成多个单元发出，配对就会从该处整体错位 ——
+  这与「前 2 帧对、第 3 帧起持续错、每个 IDR 处短暂恢复」吻合
+  （IDR 的 slice 数与 P/B 帧不同，会周期性重新对齐）。
+  **验证方法**：在 `EndPicture` 里打印每帧实际发出的单元数，确认是否恒为 1。
+
+### 给后续单元的建议
+
+1. **不要改 `src/decode-daemon.c`，不要加 PTS 字段。** daemon 在 H.264 上已被
+   证明 150/150 完全正确，改它是在修一个不存在的问题。
+2. 排查范围锁定 `decode.c` 的 **`EndPicture`（单元切分）** 与
+   **`SyncSurface`（配对与 flush）** 两处。
+3. **不要再调参数集字段** —— num_ref_idx、scaling matrix、VUI 三条假设已逐一排除，
    继续在 driver 内调参数不会改善。
 
 ## 与主会话 M-2 复核的对照（含两条更正）
@@ -336,3 +366,60 @@ M-2 看到的 `:1117-1147` 与 `:1149-1184` 两份 `sess`/`codec`/`pw`/`ph` 声�
 
 三者都归结到 `queueInputBuffer` 的 `presentationTimeUs` 恒为 0：MediaCodec
 既无法按显示序重排，driver 也无法把输出帧关联回它对应的 surface。
+
+## 对照主会话 M-3 量化数据（161→150）：疑点 A 确定性证伪，但丢帧归因需修正
+
+主会话用 HEAD 的 `test_dmd_client` 绕过 driver 直连 dmd_client 库，
+同一 `test1080.h264`，TCP 与 SHM 均为 **161 单元 → 150 帧**。
+
+### 疑点 A（入队未按 VCL 过滤）：算术闭合，确定性证伪
+
+```
+test_dmd_client: 161 = 150 VCL + 5 SPS + 5 PPS + 1 SEI   （送整条码流全部 NALU）
+driver:          152 = 150 VCL + 我自己合成的 1 SPS + 1 PPS
+```
+
+差别的根源：**ffmpeg 不把非 VCL NALU 交给 driver**。`h264dec.c` 里
+`FF_HW_CALL(avctx, decode_slice, ...)` 只出现在 `case H264_NAL_SLICE`
+（`:652` 入队、`:674` 调用）；SPS 在 `:699`、PPS 在 `:717`、SEI 在 `:687`
+都被 ffmpeg 自己消费掉。所以 **driver 的 `EndPicture` 天然只收到 VCL，
+不存在"需要过滤非 VCL"的问题**。
+
+driver 送出的 152 个单元里，150 个是 ffmpeg 给的 VCL（一一对应 `pending[]` 槽位），
+另 2 个是我自己合成的参数集，走 `h264_send_param_sets()` 独立发送路径，
+**只进 socket 不进 `pending[]`**。
+
+反证：若参数集占了槽位，`pending` 会有 152 项而只有 148 帧填充，**第 1 帧就该错**。
+实测前 2 帧 PSNR = inf（逐字节一致），第 3 帧起才错 —— 与该假设矛盾。
+
+### 修正：丢 2 帧的归因错了，不是 daemon EOS 竞态
+
+M-3 数据证明 **daemon 与客户端库都能跑满 150 帧**（TCP/SHM 双模式）。
+所以此前把丢帧归给"daemon 的 output 线程 EOS 后立即 break"是**不准确的** ——
+daemon 侧没问题，问题在 driver 的调用模式：
+
+| | 调用模式 | 结果 |
+|---|---|---|
+| `test_dmd_client` | 送完**全部** 161 单元后才 `finish_input` | 150 帧 |
+| driver | 每送 1 单元就阻塞等 1 帧（被 `vaSyncSurface` 驱动） | 148 帧 |
+
+driver 是在 ffmpeg 还没送完后续 slice 时就被迫 `finish_input` 来打破死锁
+（ffmpeg 阻塞在 `SyncSurface` 等帧、解码器等更多输入），此刻解码器里还有
+未解完的帧。**那 2 帧本来是可以救回的**，需要的是避免过早 `finish_input`，
+而不是改 daemon 的 EOS 处理。
+
+### 但帧序错乱是独立问题，且是画面错的主因
+
+`test_dmd_client` **只计数、不校验帧序或内容**（`tests/test_dmd_client.c:376`
+只打印计数，`:155` 是可选 dump，全文无 md5/memcmp 帧序校验）。所以它的
+150/150 证明了 daemon 的**吞吐能力**，不能证明**帧序正确**。
+
+driver 面对的是 VA-API 的额外约束：必须把第 k 个输出帧放进 ffmpeg 指定的
+那个 surface。实测帧序是乱的（`hw[31]→sw[32]`、`hw[32]→sw[33]`、
+`hw[33]→sw[31]` 三帧互换；inf 帧位置 `1 2 31 61 93` 对不上 IDR 解码序
+`1 31 61 91 121`），根因仍是 `queueInputBuffer` 的
+`presentationTimeUs` 恒为 0 —— MediaCodec 无法按显示序重排，driver 也无法
+把输出帧关联回对应 surface。
+
+**结论**：丢帧（可在 driver 侧改善）与帧序错乱（需 daemon 传 PTS）是两个独立
+缺陷。前者不影响正确性判定 —— 即使救回那 2 帧，帧序问题仍使画面无法逐字节一致。
