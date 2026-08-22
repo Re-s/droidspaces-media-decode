@@ -282,3 +282,57 @@ daemon 接受参数集并真的解出 148 帧）。剩下的两个障碍都在 d
 3. 在 daemon 具备 PTS 之前，**不要再尝试在 driver 侧修 H.264** —— 参数集
    相关的三条假设（num_ref_idx、scaling matrix、VUI）已逐一排除，
    继续在 driver 内调参数不会改善。
+
+## 与主会话 M-2 复核的对照（含两条更正）
+
+主会话在 19:37 独立复核了当时的工作区快照，证据见
+`dmd-vaapi/research/M-2-h264-defect-evidence.md`。它的结论「H.264 未通过」正确，
+但有两处需要更正，且两个疑点均可排除。
+
+### 更正一：错误码 38 是 TIMEDOUT，不是 UNIMPLEMENTED
+
+M-2 §3 把 `Failed to sync surface: 38` 判为 `VA_STATUS_ERROR_UNIMPLEMENTED`。
+实际查 `/usr/include/va/va.h`：
+
+```
+va.h:284  VA_STATUS_ERROR_UNIMPLEMENTED  0x00000014  = 20
+va.h:308  VA_STATUS_ERROR_TIMEDOUT       0x00000026  = 38   ← 就是这个
+va.h:287  VA_STATUS_ERROR_DECODING_ERROR 0x00000017  = 23
+```
+
+**38 = TIMEDOUT。** 这改变诊断方向：不是"某个入口没实现"，而是 `SyncSurface`
+在超时预算内等不到帧。而等不到帧的原因正是解码器攥着帧不吐 —— 与 PTS/流水线
+根因一致，不是独立缺陷。
+
+### 更正二：两次实测的码流不同，帧数不可直接对比
+
+M-2 测的 `test1080.h264` 每约 30 帧重复一组 SPS/PPS（NALU 分布
+`{7:5, 8:5, 6:1, 5:5, 1:145}`）；我第三轮重建的测试流只有 1 组
+（`{7:1, 8:1, 6:1, 5:1, 1:149}`）。所以「147 帧 vs 148 帧」「第 2 帧错 vs
+第 3 帧错」的差异部分来自码流本身，不能直接相减推论。
+
+### 疑点 A（参数集占 pending 槽位）：排除
+
+数学检验：第三轮送入 152 单元（150 VCL + SPS + PPS）、取回 148 帧。若参数集
+占了 `pending[]` 槽位，队列会比帧数多 2，**第 1 帧就该错**。实测是前 2 帧
+逐字节一致（PSNR inf）、第 3 帧起才错 —— 不吻合。
+
+实现上参数集走 `h264_send_param_sets()` 独立发送路径，只进 socket 不进
+`pending[]`，入队仍是「一次 EndPicture 一个 surface」。
+
+M-2 引用的「送入 26 单元，取回 5 帧」是 `-frames:v 5` 提前终止造成的，
+不是配对错位。
+
+### 疑点 B（decode.c 重复代码块）：确实存在过，已随回退消失
+
+M-2 看到的 `:1117-1147` 与 `:1149-1184` 两份 `sess`/`codec`/`pw`/`ph` 声明是
+我编辑期间的中间态。当前 `decode.c` 为回退后的 1417 行，无重复块。
+
+### 结论：M-2 的三个症状与 PTS 根因同源
+
+- 丢帧 → daemon EOS 后 output 线程立即 break，不排空队列
+- 内容早期错位 → 输出按解码序、ffmpeg 期待显示序，B 帧重排下二者不同
+- SyncSurface **TIMEDOUT** → 解码器等更多输入或等 EOS 才吐帧
+
+三者都归结到 `queueInputBuffer` 的 `presentationTimeUs` 恒为 0：MediaCodec
+既无法按显示序重排，driver 也无法把输出帧关联回它对应的 surface。
