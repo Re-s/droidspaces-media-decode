@@ -294,15 +294,46 @@ AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
   ffmpeg 阻塞等第 N 帧 → 不再送新数据 → MediaCodec 攥着 B 帧重排队列不吐 → 互等。
   VP9/VP8 流水线深度为 0，走不到这条分支。
   （`decode.c:1423-1426` 把丢帧归因于 daemon 的注释是错的，待修正。）
-- **障碍 C（画面错）最可疑项：FIFO 配对与单元切分不匹配。**
-  daemon 输出已证明严格按显示序，所以问题在**提交侧计数**：
-  客户端库口径是 161 单元 → 150 帧（每帧约 5-6 个 VCL NALU），
-  而 ffmpeg 每帧只调一次 `Begin/Render*/EndPicture`、一帧内多个 slice
-  经**多次 `vaRenderPicture`** 累积。
-  若某些帧的 slice 被拆成多个单元发出，配对就会从该处整体错位 ——
-  这与「前 2 帧对、第 3 帧起持续错、每个 IDR 处短暂恢复」吻合
-  （IDR 的 slice 数与 P/B 帧不同，会周期性重新对齐）。
-  **验证方法**：在 `EndPicture` 里打印每帧实际发出的单元数，确认是否恒为 1。
+- **障碍 C（画面错）根因已确定：FIFO 配对模型与 B 帧重排不兼容。**
+
+  从码流直接解析 VCL 的 `slice_type` 得到**真实解码序**，
+  与 `ffprobe` 报的**显示序**对照：
+
+  ```
+  解码序（码流实际顺序）: I P B B B P B B B P B B
+                            ↑ P 在第 2 位（B 帧要参考它，必须先解）
+  显示序（ffprobe 报告）: I B B B P B B B P B B B
+                            ↑ 第 2 位是 B
+  ```
+
+  两者**从第 2 帧起就不同**。而：
+  - ffmpeg 按**解码序**调用 `EndPicture` → 提交 I, **P**, B, B, B...
+  - daemon 按**显示序**返回帧（MediaCodec 已重排，已实测证明）
+    → 返回 I, **B**, B, B, P...
+
+  FIFO 把「第 2 个提交」（surface 属于 P）配上「第 2 个输出」（内容是 B）
+  → **错**。第 1 帧两序一致所以对，从第 2 个提交起全错，
+  每个 IDR 是重排边界故在此短暂重新对齐 ——
+  与实测「前 2 帧 inf、第 3 帧起持续偏差、inf 帧位置随 IDR 渐进漂移」吻合。
+
+  **注意这不是"单元切分"问题**：本流 NAL 分布实测
+  `{7:5 SPS, 8:5 PPS, 6:1 SEI, 5:5 IDR, 1:145 非IDR}`，
+  VCL 合计 150 = 帧数 150，**每帧都是单 slice**。
+  也不是"参数集占槽位"问题：ffmpeg 不把非 VCL 交给 driver
+  （`h264dec.c:674` 的 `decode_slice` 只在 `case H264_NAL_SLICE` 内，
+  SPS/PPS/SEI 分别在 `:699`/`:717`/`:687` 被 ffmpeg 自己消费）。
+
+  **修法：按 POC 配对，不按提交顺序。**
+  VA-API 本来就提供显示序 —— `VAPictureParameterBufferH264.CurrPic` 的
+  `TopFieldOrderCnt` 就是 POC（`va.h:3546` 的 `VAPictureH264`）。
+  当前 `decode.c` 里 grep `CurrPic`/`TopFieldOrderCnt`/`poc` **零命中**，
+  完全没用这个信息。所以**不需要 daemon 传 PTS**：
+  在 `EndPicture` 记录 `POC → render_target` 映射，
+  `SyncSurface` 收到第 n 个帧时投递给 POC 第 n 小的待填充 surface。
+
+  实现要点与风险：B 帧重排深度实测 5-6，需要一个"已提交未填充"的窗口来排序；
+  ffmpeg 可能在某帧到达前就 `vaSyncSurface` 该 surface，
+  此时需缓存先到的其他帧。复杂度中等，但**全部在 driver 内，不动 daemon**。
 
 ### 给后续单元的建议
 
