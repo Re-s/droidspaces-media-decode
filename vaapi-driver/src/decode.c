@@ -1631,8 +1631,9 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             pthread_mutex_lock(&drv->lock);
             drv->io_busy[idx] = 0;
             pthread_cond_broadcast(&drv->io_done);
-            dmd_log("SyncSurface: 等了 %d ms 仍无帧，flush 输入（rc=%d）\n",
-                    spent, frc);
+            dmd_log("SyncSurface: 等了 %d ms 仍无帧，flush 输入（rc=%d，"
+                    "阈值 %d ms，队列 %d）\n",
+                    spent, frc, flush_after_ms, c->pending_count);
             /* 重新查找：放锁期间对象可能被销毁。 */
             continue;
         }
@@ -1811,6 +1812,10 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
      * 在飞帧数低于它时放行（让流水线填满，这是打破死锁的必要条件），
      * 达到之后就老实阻塞等帧 —— 此刻解码器已经不欠料，等得到，
      * 于是队列被排空，形成稳定的背压。 */
+    dmd_log("Sync: surface=%u pending=%d timeout=%dms %s\n",
+            (unsigned)surface, c_pending, timeout_ms,
+            c_pending >= DMD_PIPELINE_DEPTH ? "阻塞等帧" : "放行");
+
     if (c_pending >= DMD_PIPELINE_DEPTH) {
         VAStatus st = sync_surface_locked(drv, context, surface, timeout_ms);
         pthread_mutex_unlock(&drv->lock);

@@ -103,6 +103,10 @@ for f in funcs:
     lines.append("{")
     for p in f["params"]:
         lines.append(f"    (void){p['name']};")
+    # 桩被调用是重要诊断信息：消费者踩到未实现入口时，症状往往是"悄悄
+    # 回落软解"而不是报错。静默返回 UNIMPLEMENTED 会让这种情况完全不可观测
+    # （定位 Firefox 问题时就吃过这个亏），所以在 DMD_VA_LOG 下留一行。
+    lines.append(f'    dmd_log("未实现入口被调用: {f["name"]}\\n");')
     lines.append("    return VA_STATUS_ERROR_UNIMPLEMENTED;")
     lines.append("}")
     lines.append("")
