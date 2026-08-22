@@ -43,3 +43,5 @@ Thumbs.db
 *.mp4
 *.mkv
 *.avi
+# VA-API driver 构建产物
+vaapi-driver/build/
