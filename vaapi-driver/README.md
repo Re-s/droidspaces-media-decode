@@ -7,24 +7,72 @@
 
 ## 当前能力边界
 
-**已实现：能力查询。** `vainfo` 能列出 profiles 与配置属性，ffmpeg 能建立 VAAPI 连接。
+**已实现：能力查询 + VP9/VP8 解码数据路径。** `vainfo` 能列出 profiles 与配置属性；
+VP9 与 VP8 已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
 
-**未实现：解码数据路径。** `vaCreateSurfaces` / `vaCreateContext` / `vaCreateBuffer` /
-`vaBeginPicture` / `vaRenderPicture` / `vaEndPicture` / `vaSyncSurface` /
-`vaDeriveImage` / `vaExportSurfaceHandle` 目前全部返回 `VA_STATUS_ERROR_UNIMPLEMENTED`。
-现在还**不能真正解码出画面** —— 这一步是骨架，不是完整驱动。
+**未实现：H.264 / HEVC 的解码数据路径。** 它们的 profile 仍然声明（能力查询正常），
+但 `vaEndPicture` 返回 `VA_STATUS_ERROR_UNIMPLEMENTED` —— 原因不是接口没接好，
+而是**码流重建做不到**：VA-API 交给 driver 的是已解析的 `VAPictureParameterBufferH264`
+加上不含起始码与 NAL header 的 slice 载荷，而 daemon 需要完整 Annex B 码流。
+要补回 SPS/PPS 就得反向合成比特流，而 `profile_idc`、`level_idc`、VUI 等字段
+在 VA-API 里根本不存在。详见 `research/I-2b-decode-path.md` 的遗留与风险。
 
-声明的 profile 严格对应 daemon 已验证的能力：
+各 codec 实际状态：
 
-| Profile | 对应 daemon codec | 真机验证 |
-|---------|------------------|---------|
-| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 已验证 |
-| `VAProfileHEVCMain` | 1（HEVC） | 已验证 |
-| `VAProfileVP9Profile0` | 2（VP9） | 已验证 |
-| `VAProfileVP8Version0_3` | 3（VP8） | 已验证 |
+| Profile | daemon codec | 能力查询 | 解码出画面 | 验证结果 |
+|---------|-------------|---------|-----------|---------|
+| `VAProfileVP9Profile0` | 2（VP9） | 正常 | **通过** | 720p 120 帧 + 1080p 60 帧，`cmp` 与软解逐字节一致 |
+| `VAProfileVP8Version0_3` | 3（VP8） | 正常 | **通过** | 720p 120 帧，`cmp` 与软解逐字节一致 |
+| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | 未实现 | `vaEndPicture` 返回 UNIMPLEMENTED |
+| `VAProfileHEVCMain` | 1（HEVC） | 正常 | 未实现 | 同上 |
+
+为什么 VP9/VP8 容易而 H.264/HEVC 难，只有一个原因 —— **VA-API 传给 driver 的
+码流完整度不同**：
+
+- VP9：`VASliceDataBufferType` 里就是**一整个 VP9 frame**（含 uncompressed
+  header，从 `frame_marker` 那 2 bit 开始）。零 header 重建，原样转发
+- VP8：slice data 从 partition 0 开始，只缺 RFC 6386 §9.1 的 3 字节 frame tag
+  （key frame 再加 7 字节）。`first_part_size` 可从
+  `partition_size[0] + (macroblock_offset+7)/8` 精确推导
+- H.264/HEVC：slice 载荷连 NAL header 都没有，参数集完全不以码流形式存在
 
 **不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10）：硬件可能支持，
 但未验证。谎报能力会让消费者选中我们然后失败，比不报更糟。
+
+### 出口只有 CPU 路径（VAImage）
+
+`vaExportSurfaceHandle` 保持 UNIMPLEMENTED，surface 数据放普通 heap 内存。
+这不是偷懒，是容器环境的硬限制：ION 完全不可用（legacy `EINVAL` / modern
+`ENODEV`），`/dev/dma_heap` 不存在（内核 4.14），MediaCodec 的 NDK 公开 API
+也拿不到输出缓冲的 dmabuf fd。零拷贝这条路是死的。
+
+回读走 `vaDeriveImage` 与 `vaCreateImage` + `vaGetImage` 两条路，**都要实现**：
+ffmpeg 探测时用 derive，但 `hwdownload` 是读访问（`MAP_READ`），
+`vaapi_map_frame` 的条件里 `!(flags & MAP_READ)` 不成立，所以实际取数据时
+仍走 `vaCreateImage` + `vaGetImage`（`hwcontext_vaapi.c:900`/`:910`）。
+
+### 三个使用注意
+
+**必须显式 `-hwaccel_output_format vaapi`。** 只给 `-hwaccel vaapi` 时 ffmpeg 会
+自动把帧下载成软件格式，滤镜链拿到 nv12 而不是 vaapi 帧，`hwdownload`
+报 "Impossible to convert between the formats"。正确的验收命令：
+
+```bash
+ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+       -hwaccel_output_format vaapi \
+       -i in.ivf -vf hwdownload,format=nv12 -f rawvideo -y out.yuv
+```
+
+**`vaMapBuffer2` 必须真实现，不能留桩。** libva 只在该槽位为 **NULL** 时才回落到
+`vaMapBuffer`，而本驱动为通过 `CHECK_VTABLE` 把所有槽位都填了桩函数 ——
+留桩会让 ffmpeg 的回读路径（`hwcontext_vaapi.c:928`）拿到 UNIMPLEMENTED
+直接失败，永远走不到兼容分支。这是"填满 vtable"与"libva 靠 NULL 判断能力"
+之间的真实冲突，新增槽位时要留意同类陷阱。
+
+**`VAImage.offsets[1]` 用缓冲高不是显示高。** 1080p 的解码输出是缓冲 1920x1088、
+显示 1920x1080。`VAImage.width/height` 必须报显示尺寸（否则 ffmpeg 尺寸校验
+失败），但 `offsets[1] = stride * slice_height` 要用 **1088**。按 1080 算会让
+色度平面偏移 `stride*8` 字节，症状是绿边、花屏、色度错位。
 
 ## 无感发现机制（改名即失效）
 
