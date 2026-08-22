@@ -121,27 +121,57 @@ MediaCodec 自己解析。
 且 `cmp` 显示第 3141541 字节（= 1.01 帧）起就不同 —— **第 2 帧刚开头就错**，
 不是尾部丢帧造成的整体偏移。另有 `vaSyncSurface` 返回 38（UNIMPLEMENTED）。
 
-**根因已定位（量化证据）**：用 `test_dmd_client` 绕过 driver 直接走客户端库，
-同一个 `test1080.h264`：
+另一次尝试实现完整后帧数达到 148/150，但 **PSNR 仅 11.5dB**（画面错），
+同样回退。
 
-```
-统计: 送入单元=161 (库计数 161) 收到帧=150 (库计数 150)
-```
+### 已被实测排除的四条假设（不要重走）
 
-**161 单元 → 150 帧，差 11 个**，这 11 个就是不产帧的参数集类 NALU。
-而 `decode.c` 的 FIFO `pending[]` 按"一个单元一帧"入队 —— 这在 VP9/VP8 下成立
-（实测严格 1:1），在 H.264 下必然从第一个非 VCL NALU 处开始整体错位。
+排除方法统一为：用 `tests/test_dmd_client` 绕过 driver 直连 daemon，隔离变量。
+
+1. **daemon 丢尾部帧 —— 不成立。** 曾怀疑 `decode-daemon.c` 的 output 线程拿到
+   EOS 后立刻 `break` 不排空队列。实测 `test1080.h264` 连跑 3 次均为
+   `送入单元=161 收到帧=150`，与软解基准 150 帧一致。**daemon 侧无缺陷，
+   不要修改 `src/decode-daemon.c`。**
+2. **surface 尺寸 1088 —— 不是根因。** H.264 路径 ffmpeg 确实按宏块对齐请求
+   1920x1088（VP9 请求精确的 1280x720），日志可证。但 daemon 的 crop 来自
+   **码流 SPS** 而非握手参数：握手声明 1080 或 1088，返回几何都是
+   `缓冲 1920x1088 / crop=(0,0)-(1919,1079) / 显示 1920x1080`。传 1088 无害。
+3. **合成 SPS 缺 VUI —— 不是根因。** 真实 x264 SPS 是 27 字节而合成版仅 11 字节，
+   差值几乎全是 VUI。用 `tools/strip_vui.py` 把码流里 5 个 SPS 改写为
+   "`vui_present` 置 0、其余比特逐位不变"（27 → **12 字节**）后：软解与原流
+   逐字节一致（证明 VUI 不含像素信息），硬解 **150 帧且与软解逐字节一致**。
+   **MediaCodec 不需要 SPS 里的 VUI。**
+4. **VAImage buffer ID 撞号 —— 不成立。** `image.c:87` 的 `buf_id` 与真 buffer
+   共用 `next_buffer_id` 计数器，两者本就不会重号；曾被误读为撞号的
+   `image=2/buf=2` 是 image **id** 与 **buf** 分属不同命名空间。
+
+### 比较方法上的陷阱（曾导致误判）
+
+不要直接 `cmp` daemon 的 3133440 字节帧与软解帧：daemon 帧是 **1920x1088 缓冲**，
+后 8 行 Y 与对应 UV 区域是**未定义填充**。必须只比较前 1080 行 Y，
+且 UV 从偏移 **1920×1088** 起算。用 `tools/cmp_frames.py` 做这个对齐比较。
 
 ## 5. 接手建议的顺序
 
 1. **直接复用已有的 `h264_bitstream.c`**（见第 4 节），不要重写序列化器。
-2. **修 FIFO 入队：只有含 VCL NALU 的帧才占 `pending[]` 槽位。**
-   H.264 的 VCL 是 `nal_unit_type` 1-5，HEVC 是 0-31。
-   参数集照常发给 daemon 但不入队。注意若 SPS/PPS 是通过独立的
-   `h264_send_param_sets()` 发送的，要确认那条路径本来就没有入队。
-   实测 H.264 1080p 每帧约 7 个单元、其中 5-6 个是 VCL。
-3. **先做 H.264 再做 HEVC**。HEVC 多一层 VPS，字段更多，先用 H.264 验证路线可行性。
-4. **补 seek/flush**：需要给 daemon 加一类控制消息，或约定客户端 seek 时重建会话。
+2. **最可疑项：PPS 的 `num_ref_idx_l0/l1_default_active_minus1`。**
+   这个值只能从 `VASliceParameterBufferH264` 取，但那里的值在
+   `override_flag==1` 的 slice 里是**该 slice 自己的**值，不是 PPS 默认值。
+   填错会让 `override_flag==0` 的 slice 用错参考帧数量 ——
+   症状正是"帧数对、画面糊"，与 11.5dB 吻合。
+3. **排查方法：与已知正确答案 diff，不要靠猜。** 把 driver 合成的 SPS/PPS 用
+   `DMD_VA_LOG=1` 打成 hex，与真实码流的参数集逐字节比对。
+   `test1080.h264` 的真实 PPS 是 `68 eb e3 cb 22`（5 字节），
+   真实精简 SPS 由 `tools/strip_vui.py` 生成（12 字节）。
+   真实 SPS 逐字段值：`profile_idc=100 level_idc=40 chroma_format_idc=1`
+   `log2_max_frame_num_m4=0 poc_type=0 log2_max_poc_lsb_m4=2`
+   `max_num_ref_frames=4 w_mbs_m1=119 h_map_m1=67 frame_mbs_only=1`
+   `direct8x8=1 frame_cropping=1 crop_L/R/T/B=0/0/0/4`。
+4. **多 slice 帧的拼接**：实测 H.264 1080p 每帧约 7 个单元、其中 5-6 个是 VCL。
+   这些 slice 必须拼成**一个** access unit 发给 daemon（每个 slice NALU 前各补
+   一次起始码），而不是各自单独发送。
+5. **先做 H.264 再做 HEVC**。HEVC 多一层 VPS，字段更多，先用 H.264 验证路线可行性。
+6. **补 seek/flush**：需要给 daemon 加一类控制消息，或约定客户端 seek 时重建会话。
    VP9/VP8 的全帧独立性让这个缺失在顺序播放下不可见，但 Firefox 拖进度条会错位。
 
 ## 6. 已确证可复用的事实
