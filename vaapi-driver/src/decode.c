@@ -24,6 +24,12 @@
 
 #include "driver.h"
 
+/* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
+ * 解码路径小节里（放在那里更贴近使用现场）。 */
+static VASurfaceID dmd_pending_take_locked(struct dmd_context *c);
+static void surface_store_frame_locked(struct dmd_surface *s,
+                                       const struct dmd_frame *f);
+
 unsigned int dmd_align_up(unsigned int v, unsigned int align)
 {
     if (align == 0)
@@ -449,8 +455,75 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
         }
     }
 
-    /* 待解码队列里的 surface 状态要复位，否则它们永远停在 PENDING，
-     * 后续 SyncSurface 会等一个永不到来的帧。 */
+    /* 先把解码器里还在飞的帧排空，再考虑放弃剩下的。
+     *
+     * 为什么必需：ffmpeg 在**流内分辨率变化**时会先 DestroyContext 再建新的，
+     * 但它**之后仍会 vaSyncSurface 旧 context 的 surface**（那些帧属于前一段
+     * 分辨率，它还要取走）。实测 switch.h264 在此处送入 62 单元只取回 44 帧
+     * —— 若直接把余下 18 个 surface 标成失败，ffmpeg 就会收到
+     * "1 (operation failed)"，整条流解不下去。
+     *
+     * 这些帧并没有错，只是还攥在 MediaCodec 里：和流末尾一样，需要关掉写端
+     * 才会吐出来。所以这里做一次和 SyncSurface 相同的 flush + 取帧循环。
+     * 上面已经等过 io_busy，此刻没有别的线程在这个 context 上做 IO。 */
+    if (c->session && c->pending_count > 0) {
+        struct dmd_session *fs = c->session;
+        if (!c->input_finished) {
+            c->input_finished = 1;
+            drv->io_busy[idx] = 1;
+            pthread_mutex_unlock(&drv->lock);
+            dmd_session_finish_input(fs);
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_SUCCESS;
+            }
+        }
+
+        int drained = 0;
+        int budget = DMD_FRAME_TIMEOUT_MS;
+        while (c->pending_count > 0 && budget > 0) {
+            struct dmd_frame frame;
+            memset(&frame, 0, sizeof(frame));
+            drv->io_busy[idx] = 1;
+            pthread_mutex_unlock(&drv->lock);
+            int frc = dmd_session_next_frame(fs, &frame, 100);
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+            budget -= 100;
+
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                if (frc == DMD_OK)
+                    dmd_session_release_frame(fs, &frame);
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_SUCCESS;
+            }
+            if (frc == DMD_ERR_TIMEOUT)
+                continue;
+            if (frc != DMD_OK)
+                break; /* EOS 或真错误：剩下的确实取不到了 */
+
+            VASurfaceID id = dmd_pending_take_locked(c);
+            struct dmd_surface *ds = dmd_find_surface_locked(drv, id);
+            if (ds) {
+                surface_store_frame_locked(ds, &frame);
+                ds->state = DMD_SURFACE_READY;
+                drained++;
+            }
+            dmd_session_release_frame(fs, &frame);
+        }
+        if (drained)
+            dmd_log("DestroyContext: 排空补齐 %d 帧\n", drained);
+    }
+
+    /* 仍未就绪的 surface 状态要复位，否则它们永远停在 PENDING，
+     * 后续 SyncSurface 会等一个永不到来的帧。
+     * 注意保留 context 归属与 READY 状态：上面排空填好的帧 ffmpeg 还要取。 */
     for (int i = 0; i < DMD_MAX_SURFACES; i++) {
         struct dmd_surface *s = &drv->surfaces[i];
         if (s->in_use && s->context == context &&
@@ -1317,6 +1390,61 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
  * stride*slice_height。surface 按对齐尺寸预分配，两者通常一致；
  * 不一致时（解码器给了不同对齐）按行拷贝，绝不整块 memcpy —— 那会错位。
  */
+/* 从待解码队列里取出"下一个该被填充"的 surface 并摘除它。
+ * 队列空返回 VA_INVALID_ID。调用方持锁。
+ *
+ * 谁该先填由 codec 决定：
+ * - VP9/VP8：无帧重排，提交序 == 出帧序，取队首
+ * - H.264/HEVC：ffmpeg 按解码序提交、MediaCodec 按显示序出帧，
+ *   必须取 (seq, POC) 最小者，否则从第 2 帧起全部错位
+ *
+ * 用线性扫描而非堆：队列最多 64 项且实测重排深度只有 2-3，
+ * 每帧一次 O(n) 扫描的代价可以忽略。
+ */
+static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
+{
+    if (c->pending_count <= 0)
+        return VA_INVALID_ID;
+
+    int pick = c->pending_head;
+    if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
+        unsigned int bseq = c->pending_seq[pick];
+        int32_t best = c->pending_poc[pick];
+        for (int k = 1; k < c->pending_count; k++) {
+            int idx2 = (c->pending_head + k) % DMD_MAX_SURFACES;
+            /* 先比序列号：旧序列必须先配完，否则新序列（IDR 后 POC 重置回
+             * 小值）会抢占旧序列尚未配对的帧。 */
+            if (c->pending_seq[idx2] < bseq ||
+                (c->pending_seq[idx2] == bseq && c->pending_poc[idx2] < best)) {
+                bseq = c->pending_seq[idx2];
+                best = c->pending_poc[idx2];
+                pick = idx2;
+            }
+        }
+    }
+
+    VASurfaceID head = c->pending[pick];
+    dmd_log("配对: 帧 -> surface %u (seq %u POC %d, 队列剩 %d)\n",
+            (unsigned)head, c->pending_seq[pick], (int)c->pending_poc[pick],
+            c->pending_count - 1);
+
+    /* 摘除 pick：把它之前的项整体后移一格，再收缩队首。
+     *
+     * ⚠️ 不能用"拿队首填补空位"的省事写法 —— 那会把队首元素挪到队列中间，
+     * **破坏剩余项与提交顺序的对应关系**，后续找最小 POC 时就会选错
+     * （实测表现为部分帧对、部分帧错）。 */
+    for (int k = pick; k != c->pending_head;) {
+        int prev = (k - 1 + DMD_MAX_SURFACES) % DMD_MAX_SURFACES;
+        c->pending[k] = c->pending[prev];
+        c->pending_poc[k] = c->pending_poc[prev];
+        c->pending_seq[k] = c->pending_seq[prev];
+        k = prev;
+    }
+    c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
+    c->pending_count--;
+    return head;
+}
+
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
@@ -1467,53 +1595,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         }
 
         if (rc == DMD_OK) {
-            /* 配对。选谁取决于两侧顺序是否一致（见 driver.h 的说明）：
-             *
-             * - VP9/VP8：无帧重排，提交序 == 出帧序，取队首
-             * - H.264/HEVC：ffmpeg 按解码序提交、MediaCodec 按显示序出帧，
-             *   必须取队列中 POC 最小的那个，否则从第 2 帧起全部错位
-             *
-             * 用线性扫描找最小 POC：队列最多 64 项且实测重排深度只有 2-3，
-             * 每帧一次 O(n) 扫描的代价可以忽略，换来的是不需要维护堆。 */
-            VASurfaceID head = VA_INVALID_ID;
-            if (c->pending_count > 0) {
-                int pick = c->pending_head;
-                if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
-                    unsigned int bseq = c->pending_seq[pick];
-                    int32_t best = c->pending_poc[pick];
-                    for (int k = 1; k < c->pending_count; k++) {
-                        int idx2 = (c->pending_head + k) % DMD_MAX_SURFACES;
-                        /* 先比序列号：旧序列必须先配完，否则新序列（IDR 后
-                         * POC 重置回小值）会抢占旧序列未配对的帧。 */
-                        if (c->pending_seq[idx2] < bseq ||
-                            (c->pending_seq[idx2] == bseq &&
-                             c->pending_poc[idx2] < best)) {
-                            bseq = c->pending_seq[idx2];
-                            best = c->pending_poc[idx2];
-                            pick = idx2;
-                        }
-                    }
-                }
-                head = c->pending[pick];
-                dmd_log("配对: 帧 -> surface %u (seq %u POC %d, 队列剩 %d)\n",
-                        (unsigned)head, c->pending_seq[pick],
-                        (int)c->pending_poc[pick], c->pending_count - 1);
-                /* 摘除 pick：把它之后的项整体前移一格。
-                 *
-                 * ⚠️ 不能用"拿队首填补空位"的省事写法 —— 那会把队首元素挪到
-                 * 队列中间，**破坏剩余项与提交顺序的对应关系**，后续找最小
-                 * POC 时就会选错（实测表现为部分帧对、部分帧错）。
-                 * 队列最多 64 项、重排深度实测 2-3，这次搬移代价可忽略。 */
-                for (int k = pick; k != c->pending_head;) {
-                    int prev = (k - 1 + DMD_MAX_SURFACES) % DMD_MAX_SURFACES;
-                    c->pending[k] = c->pending[prev];
-                    c->pending_poc[k] = c->pending_poc[prev];
-                    c->pending_seq[k] = c->pending_seq[prev];
-                    k = prev;
-                }
-                c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
-                c->pending_count--;
-            }
+            VASurfaceID head = dmd_pending_take_locked(c);
             struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
             if (hs) {
                 surface_store_frame_locked(hs, &frame);
