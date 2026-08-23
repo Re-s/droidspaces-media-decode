@@ -241,10 +241,41 @@ VAStatus dmd_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
     if (cfg) {
         *profile = cfg->profile;
         *entrypoint = cfg->entrypoint;
-        *num_attribs = cfg->num_attribs;
-        if (cfg->num_attribs > 0)
-            memcpy(attrib_list, cfg->attribs,
-                   (size_t)cfg->num_attribs * sizeof(VAConfigAttrib));
+
+        /* 回报**驱动支持的属性**，不是回显 CreateConfig 的入参。
+         *
+         * 这里曾直接把 cfg->attribs 抄回去 —— 对 ffmpeg 与 Firefox 有效，
+         * 因为它们建 config 时自己就传了 RTFormat，回显恰好等于真值。
+         *
+         * 但 Chrome **不传任何属性**建 config，然后调本函数查询驱动
+         * 支持什么。回显模式下它拿到 num_attribs=0，读不到 RTFormat，
+         * 于是 FillProfileInfo_Locked 判定该 profile 不可用 ——
+         * 六个 profile 全部枚举失败，硬解完全不可用。
+         *
+         * VA-API 的语义是"驱动声明能力"，回显是错的。现在无论
+         * CreateConfig 传了什么，RTFormat 一定出现在返回集里。 */
+        int n = 0;
+        int have_rtformat = 0;
+
+        for (int i = 0; i < cfg->num_attribs && n < DMD_MAX_CONFIG_ATTRIBUTES; i++) {
+            if (cfg->attribs[i].type == VAConfigAttribRTFormat) {
+                /* 用驱动真实支持的值覆盖调用方传入的值 */
+                attrib_list[n].type = VAConfigAttribRTFormat;
+                attrib_list[n].value = VA_RT_FORMAT_YUV420;
+                have_rtformat = 1;
+            } else {
+                attrib_list[n] = cfg->attribs[i];
+            }
+            n++;
+        }
+
+        if (!have_rtformat && n < DMD_MAX_CONFIG_ATTRIBUTES) {
+            attrib_list[n].type = VAConfigAttribRTFormat;
+            attrib_list[n].value = VA_RT_FORMAT_YUV420;
+            n++;
+        }
+
+        *num_attribs = n;
         status = VA_STATUS_SUCCESS;
     } else {
         status = VA_STATUS_ERROR_INVALID_CONFIG;

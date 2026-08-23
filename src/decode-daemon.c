@@ -272,7 +272,17 @@ static int send_all(int fd, const void *b, size_t l)
     while (l > 0) {
         ssize_t n = write(fd, p, l);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return -1;
+        if (n < 0) {
+            /* 带上 errno —— 区分"对端关了"(EPIPE/ECONNRESET) 与其他原因。
+             * socket 是阻塞的且没设 SO_SNDTIMEO，所以缓冲满只会让 write
+             * 阻塞，不会返回错误；真返回错误就是对端出了问题。 */
+            dlog(1, "send_all: write 失败: %s", strerror(errno));
+            return -1;
+        }
+        if (n == 0) {
+            dlog(1, "send_all: write 返回 0（对端已关闭）");
+            return -1;
+        }
         p += n; l -= n;
     }
     return 0;
@@ -599,11 +609,41 @@ static void *input_thread(void *arg)
             csd_len = 0;
         }
 
-        ssize_t bi = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
-        if (bi < 0) {
-            dlog(1, "[%d] 取输入缓冲失败: %zd", s->id, bi);
-            continue;
+        /* 取输入缓冲：拿不到必须**重试**，绝不能丢这个 NALU。
+         *
+         * ⚠️ 这里曾经只 dlog + continue —— 那等于静默丢弃一个 NALU，
+         * 而丢任何一个 VCL 都会毁掉后续的参考帧链，画面必然坏掉。
+         *
+         * 什么时候会拿不到？输入缓冲被占满，而这只在**消费者猛灌**时发生：
+         * ffmpeg 与 Firefox 只保持少量在途帧，从不触发；Chrome 会一次性
+         * 投出数百个解码请求，实测 259 个单元进来后输入缓冲耗尽，
+         * 于是 "取输入缓冲失败: -1" → 上层判定发送失败 → 会话直接结束，
+         * Chrome 侧表现为硬解完全不可用。
+         *
+         * 输入缓冲耗尽是**背压**而非错误：output 线程取走帧后缓冲就会
+         * 回收。所以这里要一直等，只有真正的错误码才放弃。 */
+        ssize_t bi;
+        int bi_tries = 0;
+        for (;;) {
+            bi = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
+            if (bi >= 0)
+                break;
+            if (bi != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+                dlog(1, "[%d] 取输入缓冲错误: %zd", s->id, bi);
+                break;
+            }
+            if (s->stop)
+                break;
+            bi_tries++;
+            dlog(1, "[%d] 输入缓冲暂满，重试 #%d（等 %d ms）",
+                 s->id, bi_tries, INPUT_TIMEOUT_US / 1000);
+            if (bi_tries >= 12) {   /* 12 × 5s = 60s，足够任何正常背压 */
+                dlog(1, "[%d] 输入缓冲持续不可用，放弃", s->id);
+                break;
+            }
         }
+        if (bi < 0)
+            goto done;   /* 拿不到就结束会话，但不静默丢帧 */
         size_t cap;
         uint8_t *ib = AMediaCodec_getInputBuffer(s->codec, bi, &cap);
         if (!ib || cap < sz) {
