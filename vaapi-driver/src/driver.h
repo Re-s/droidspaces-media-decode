@@ -24,7 +24,7 @@
 /* 驱动版本，随 vendor 串一起被消费者看到。
  * 注意 ffmpeg 按 vendor 串匹配 vaapi_driver_quirks 名单；我们不在名单内，
  * 走 standard behaviour，即要求语义标准。 */
-#define DMD_DRIVER_VERSION "0.2.0"
+#define DMD_DRIVER_VERSION "0.3.0"
 #define DMD_VENDOR_STRING "DroidSpaces MediaCodec VA-API driver " DMD_DRIVER_VERSION
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。

@@ -1,5 +1,134 @@
 # 更新日志
 
+## v0.3.0
+
+新增第三条传输通道：路径式 Unix socket。协议未变，向后兼容 v0.2.0 ——
+不配置就仍走 TCP，行为与上一版一致。
+
+### 新增：路径式 Unix socket 通道
+
+原先驱动只能连 TCP `127.0.0.1:20003`，这依赖容器与 Android **共享 net
+namespace**。实测 DroidSpaces 有两类容器，归属并不相同：
+
+| | host 型 | NAT 型 |
+|---|---|---|
+| net namespace | 共享 `4026531937` | **独立** `4026535650` |
+| IP | 直接持有 `wlan0` 真实地址 | `eth0` 172.28.x.x/16 |
+| `127.0.0.1:20003` | 可达 | **不可达** |
+| abstract socket 可见数 | 31（与宿主一致） | **0** |
+
+所以 TCP loopback 与 abstract socket **都只在 host 型容器可用**。这里有个
+容易搞错的地方：abstract socket 虽然不落文件系统，但它属于 net namespace，
+**并不是 TCP 的替代品** —— NAT 型容器下两者一起失效。
+
+路径式 Unix socket 不属于 net namespace，平台 bind mount 进容器即可，
+两类容器都通，且鉴权直接靠文件权限，不必把服务暴露到网络。
+DroidSpaces 自己的显示通道就是这个模式（宿主
+`/data/local/tmp/anland-<hash>.sock` → 容器 `/run/display.sock`，
+实测两侧 inode 相同，确认是同一文件）。
+
+**用法**：
+
+```bash
+# daemon 侧（注意 SELinux domain，见下）
+runcon u:r:droidspacesd:s0 decode-daemon --sock /data/local/tmp/dmd
+
+# 驱动侧：显式指定
+DMD_ENDPOINT=unix:/run/dmd/decode.sock
+DMD_ENDPOINT=tcp:20003
+# 不设则探测 /run/dmd/decode.sock，存在则用，否则退回 TCP
+```
+
+### 为什么 `--sock` 要支持传目录
+
+`bind()` 只能创建**新 inode**，而 bind mount 绑定的是 **inode 而非路径**。
+挂单个 socket 文件时，daemon 每次重启都换 inode，容器侧立刻
+`ECONNREFUSED` —— 更麻烦的是此时两侧 `stat` 看到的 inode 可能一致
+（都是那个孤立 inode），很容易误判成别的问题。
+
+传目录就没这个问题：目录 inode 稳定，daemon 随便重启都不影响。
+平台只需挂一次 `宿主 /data/local/tmp/dmd/ → 容器 /run/dmd/`。
+
+### 验证
+
+十二条流走 Unix socket 通道**逐字节比对 12/12 一致**，含 4.1GB
+`long3000.h264`（3000 帧）与 2.0GB `long1500.h265`（1500 帧），
+长流无累积错位。并发 4 路 4/4 一致。自动探测首次即命中 Unix socket。
+异常关键词（可逆排空 / 会话已重建 / 队列已满 / 等帧超时 5000 /
+退回 TCP / 收帧后仍无空位）全部为 0，且这是在十二条流全部成功解码
+前提下取得的**有效阴性**。
+
+### 修复：判活从 connect 探测改为 flock
+
+daemon 启动时要判断是否已有实例在跑。原实现是"connect 一下，连得上就
+认为有活实例"，有两个问题：
+
+1. 用的是**阻塞** socket 且 connect **没有上界** —— 旧实例 backlog 打满时
+   新进程会挂死在启动路径上；而若内核返回 `EAGAIN`，还会被误判成
+   "无监听者"，进而 `unlink` 掉**活实例正在用的** socket 文件。
+2. 对活实例有副作用：每次被拒的启动都让旧实例白跑一次 `accept` +
+   建线程再销毁，并短暂占用一个并发配额。
+
+`flock` 没有这些问题：不碰对方进程、无需超时，且进程无论怎么死
+（含 `SIGKILL`）内核都会释放锁。
+
+### 修复：SHM 路径未累加 `frames_recv`
+
+`dmd_client.c` 的 SHM 收帧路径只读 `s->frames_recv` 当序号、从不递增，
+于是该计数在 SHM 模式下恒为 0。这不只是统计瑕疵 —— `decode.c` 的排空
+判据拿它当护栏（`frames_received() > 0`，即"至少收到过一帧才允许判定
+等待徒劳"，那是当初修黑帧加的）。恒 0 会让整个条件恒假，方向上偏保守
+（只靠超时、不会误排空），但护栏语义已经失真。
+
+### ⚠️ 已知阻塞项：SELinux domain 权限
+
+Unix socket 通道在 Enforcing 下**尚不能用**，因为现有两个身份各只有
+一半权限：
+
+| 启动身份 | 能 `bind()` socket | 能用 MediaCodec |
+|---|---|---|
+| `su`（`u:r:ksu:s0`） | ✗ 各处 `EACCES` | ✓ |
+| `runcon u:r:droidspacesd:s0` | ✓ | ✗ SIGABRT |
+
+`droidspacesd` 下崩在 `CCodec::allocate`，tombstone 栈顶
+`Codec2Client::GetServiceNames`，报
+`Hardware service manager is not running`。
+
+三组对照实验确认这与传输方式无关：`ksu`+TCP 正常、`droidspacesd`+TCP
+**同样 SIGABRT**、`droidspacesd`+Unix socket+**SELinux permissive**
+正常解码。也就是说通道本身是正确的，缺的只是一条 allow 规则。
+
+已排除的替代方案：root 无效（两个 domain 本来都是 uid 0，SELinux 是
+MAC 不看 uid）；DroidSpaces `enable_hw_access=1` 无效（只透传 `/dev`
+节点、不改 domain）；`untrusted_app` 走不通（无法执行 `shell_data_file`
+标签的二进制，`chcon` 被拒）；另外 11 个 domain 均无法同时满足
+"可切入"与"可 bind"；`selinux_permissive=1` 有效但那是把宿主 SELinux
+整体切成 permissive，不可作为交付形态。
+
+**规则到位前驱动会自动退回 TCP，行为与 v0.2.0 一致，无退化。**
+平台侧需要什么见 `doc/platform-integration-contract.md`。
+
+### 勘误（上一版及开发过程中的三处错误结论）
+
+1. ~~"SHM 帧交付路径有 bug，根因未定位"~~ —— 那些 0 帧现象的真实原因就是
+   上述 SELinux domain 问题，与 SHM 无关（当时日志里传输模式其实是 TCP）。
+2. ~~"不需要新增 SELinux 策略"~~ —— 方向相反。建 socket 不需要，
+   但在该 domain 下**解码**需要。
+3. ~~"能连上 Unix socket 即 `SCM_RIGHTS` 可用，零拷贝两类容器都能用"~~ ——
+   SHM 的 memfd 交接**不走**这条控制通道，而是 daemon 另开一个
+   **abstract** socket，它属 net namespace。所以零拷贝只在 host 型容器
+   可能可用，NAT 型必然降级。教训：控制通道能跨 netns，
+   不等于交接通道也跨得过去。
+
+### memfd 零拷贝仍默认关闭
+
+需 `DMD_WANT_SHM=1` 显式开启。实测该路径会让**单个连接**断掉
+（118 单元只取回 25 帧），但不会打死 daemon（无新 tombstone、socket 继续
+`accept`、事后非 SHM 路径复测一致）→ 属该连接的错误处理问题。
+另外浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测。
+
+---
+
 ## v0.2.0
 
 新增 Chrome / Chromium 硬解支持，修复三个缺陷。向后兼容，协议与 v0.1.0 一致。
