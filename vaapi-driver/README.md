@@ -7,22 +7,27 @@
 
 ## 当前能力边界
 
-**已实现：能力查询 + H.264 / VP9 / VP8 解码数据路径。** `vainfo` 能列出 profiles
-与配置属性；三者都已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
-
-**未实现：HEVC 的解码数据路径。** 因此 **profile 也不再声明** ——
-声明了但解不出来比不声明更糟：消费者会选中我们然后失败，而它本来可以直接
-走软解。撤销前 Firefox 的探针会把 HEVC 读成"可硬解"（位图含 `1<<8`）。
-现在 HEVC 在能力协商阶段就干净失败并回退软解。
+**已实现：能力查询 + H.264 / HEVC / VP9 / VP8 解码数据路径。** `vainfo` 能列出
+profiles 与配置属性；四者都已真机端到端出画面，硬解输出与软解**逐字节完全一致**。
 
 各 codec 实际状态：
 
 | Profile | daemon codec | 能力查询 | 解码出画面 | 验证结果 |
 |---------|-------------|---------|-----------|---------|
-| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | **通过** | 1080p 150 帧 + 4K 90 帧，`cmp` 与软解逐字节一致 |
+| `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | **通过** | 1080p 150 帧 + 4K 90 帧 + 长流 3000 帧，`cmp` 与软解逐字节一致 |
+| `VAProfileHEVCMain` | 1（HEVC） | 正常 | **通过** | 1080p / 4K / 720p / 无参考帧 / 长流 1500 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP9Profile0` | 2（VP9） | 正常 | **通过** | 720p 120 帧 + 1080p 60 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP8Version0_3` | 3（VP8） | 正常 | **通过** | 720p 120 帧，`cmp` 与软解逐字节一致 |
-| ~~`VAProfileHEVCMain`~~ | 1（HEVC） | **不声明** | 未实现 | 见上：不虚报未实现的能力 |
+
+HEVC 有一类码流不支持：SPS 里 `num_short_term_ref_pic_sets > 0` 时无法重建
+参数集（VA-API 只给数量、不给内容），`dmd_hevc_can_build` 返回 0，驱动回
+`VA_STATUS_ERROR_UNIMPLEMENTED` 让上层干净回落软解。x265 默认不产生这类码流。
+
+> **历史**：HEVC 的 profile 声明曾被撤销过一段时间 —— 那时码流转发还没实现，
+> 声明了反而更糟（消费者会选中我们然后失败，而它本可以直接走软解），
+> 撤销前 Firefox 探针会把 HEVC 读成"可硬解"（位图含 `1<<8`）。
+> 现在实现已完成并逐字节验证，声明是**如实**的。
+> 但那条原则仍然有效：**不要声明没有端到端验证过的能力**。
 
 各 codec 的难度差异只有一个来源 —— **VA-API 传给 driver 的码流完整度不同**：
 
@@ -105,12 +110,21 @@ ffmpeg 就会收到 `VA_STATUS_ERROR_OPERATION_FAILED`，整条流解不下去
 **不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10）：硬件可能支持，
 但未验证。谎报能力会让消费者选中我们然后失败，比不报更糟。
 
-### 出口只有 CPU 路径（VAImage）
+### 出口：CPU 路径（VAImage）+ dmabuf 导出（非零拷贝）
 
-`vaExportSurfaceHandle` 保持 UNIMPLEMENTED，surface 数据放普通 heap 内存。
-这不是偷懒，是容器环境的硬限制：ION 完全不可用（legacy `EINVAL` / modern
-`ENODEV`），`/dev/dma_heap` 不存在（内核 4.14），MediaCodec 的 NDK 公开 API
-也拿不到输出缓冲的 dmabuf fd。零拷贝这条路是死的。
+surface 数据放普通 heap 内存，回读主要走 `vaDeriveImage` / `vaCreateImage`。
+
+**零拷贝这条路是死的** —— 容器环境的硬限制：ION 完全不可用
+（legacy `EINVAL` / modern `ENODEV`），`/dev/dma_heap` 不存在（内核 4.14），
+MediaCodec 的 NDK 公开 API 也拿不到输出缓冲的 dmabuf fd。
+
+但 `vaExportSurfaceHandle` **已实现**（`src/export.c`，159 行，
+`vtable.inc:60` 已注册）：它把 heap 里的帧内容拷进一块新分配的 dmabuf
+再导出 fd。**这是"能导出"而不是"零拷贝"** —— 多了一次 CPU 拷贝。
+
+实现它的原因是 **Firefox 硬解必须走这个入口**（它不接受纯 VAImage 路径）。
+ffmpeg 则用 `vaDeriveImage`，不碰这条路 —— 所以只测 ffmpeg 时
+导出路径的问题完全不可见，需要单独用浏览器验证。
 
 回读走 `vaDeriveImage` 与 `vaCreateImage` + `vaGetImage` 两条路，**都要实现**：
 ffmpeg 探测时用 derive，但 `hwdownload` 是读访问（`MAP_READ`），

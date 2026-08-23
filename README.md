@@ -12,7 +12,8 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 - **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox）无需改动即可用
 - **TCP 跨 namespace 通信**：容器与 Android 宿主共享 net namespace，TCP loopback 直接互通。
   路径型 Unix socket 因 mount namespace 独立而不可用，但 **abstract socket 可行**
-  （属 net namespace，双向可见；共享内存通道已在用，实测可跨边界传 memfd）
+  （属 net namespace，双向可见；共享内存通道用它传 memfd，ffmpeg 下实测可行。
+  注意该通道**默认关闭**，浏览器路径未走过它，故沙箱下的表现尚未验证）
 - **最小化实现**：基于 anland 项目的 libdisplay_daemon 库简化而来，代码简洁易懂
 - **进程托管**：daemon 设计为被平台托管的前台进程（DroidSpace 负责启动与守护）
 
@@ -58,6 +59,13 @@ abstract socket 是可行路径，无需依赖任何共享挂载点。
 延迟 p50 4.46 ms、p95 9.77 ms。原先的瓶颈是 daemon 的单线程串行结构
 （不是 TCP 传输也不是硬件解码器），已通过收发分离拆除：
 单客户端吞吐提升 20–30%，并支持多客户端并发（4 路合计约 253 fps）。
+
+> **这些是墙钟测量的吞吐上界**（`tools/probe_cost.c` 用 `CLOCK_MONOTONIC`
+> 逐帧计时），指"尽快连续解码能跑多快"，**不是实时播放帧率**。
+> 浏览器实时播放约 30 fps —— 那受播放节奏限制，不是解码能力上限。
+>
+> ⚠️ 引用帧率必须说明是墙钟还是内容时长。本项目曾把
+> "143 帧 ÷ 5 秒内容时长"当成实时播放帧率，真实只有 6.4 fps。
 详见 [性能实测与优化路线](doc/performance-and-roadmap.md)。
 
 ### 通信协议
