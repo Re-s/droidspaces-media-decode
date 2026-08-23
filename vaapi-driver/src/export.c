@@ -17,6 +17,7 @@
  * 但多了"能被 GL/合成器导入"这个关键能力。
  */
 
+#include <stdlib.h>
 #include <fcntl.h> /* O_CLOEXEC —— drm.h 的 DRM_CLOEXEC 是它的别名 */
 #include <string.h>
 #include <sys/ioctl.h>
@@ -127,6 +128,26 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[1].object_index[0] = 0;
         desc->layers[1].offset[0] = (uint32_t)stride * slice_h;
         desc->layers[1].pitch[0] = stride;
+    }
+
+    /* 诊断黑帧：DMD_VA_LUMA=1 时抽样算 Y 平面亮度均值并打进日志。
+     *
+     * 为什么需要在这里量：黑帧只在浏览器路径上出现，而 ffmpeg 路径
+     * （六条流回归）永远看不到 —— 它不会像浏览器那样中途重启解码器。
+     * 导出这一刻是驱动能看到最终像素的最后位置。
+     * 纯诊断，默认关闭，不影响正常路径。 */
+    if (getenv("DMD_VA_LUMA")) {
+        const unsigned char *y = s->data;
+        if (y && s->data_size >= (size_t)stride * 16) {
+            double sum = 0; int cnt = 0;
+            size_t lim = (size_t)stride * slice_h;
+            if (lim > s->data_size) lim = s->data_size;
+            for (size_t k = 0; k < lim; k += 1499) { sum += y[k]; cnt++; }
+            double mean = cnt ? sum / cnt : 0;
+            dmd_log("亮度: surface=%u 均值 %.1f%s\n",
+                    (unsigned)surface_id, mean,
+                    mean < 20.0 ? "  ← 黑帧!" : "");
+        }
     }
 
     dmd_log("ExportSurfaceHandle: surface=%u -> fd=%d %ux%u stride=%u "

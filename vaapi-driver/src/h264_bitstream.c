@@ -328,7 +328,25 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
      *      l0_m1 = 0,1 → 错；2,3,4,15 → 对（l0 可偏大）
      *      l1_m1 = 0 → 对；1,2,3 → 全错（l1 不可偏大）
      *    因为 l1_default_active 决定非 override B slice 里 ref_idx_l1 的
-     *    **熵解码码长**，改了它就是语法解析层错位，不是预测质量问题。 */
+     *    **熵解码码长**，改了它就是语法解析层错位，不是预测质量问题。
+     *
+     * ── 实测修正（浏览器黑屏的真正原因）─────────────────────
+     * 上面"照抄当前帧生效值"的推理漏了一种情况：**带 override 的 slice**。
+     * 对它们 VA-API 给的是 override 后的值，与 PPS 默认值无关，
+     * 于是我们会写出一个错的默认值，而**其他**非 override slice 会用它。
+     *
+     * 实测证据：test1080.h264 的真实 PPS 恒为 l0=2 l1=0（原码流只有一份
+     * PPS），而驱动送出了 5 种变体：l0 取 0/1/2/3、l1 取 0/1。
+     * 其中只有 l0=2 l1=0 那份是对的。会话开头送的恰好是 l0=0 那份，
+     * 于是从第 4 帧起（前 3 帧是流水线里已解好的）画面全黑到下一个 IDR ——
+     * 每轮循环黑 25 帧左右，就是用户看到的"每隔一段黑屏一次"。
+     *
+     * 修正办法：**取见过的最大 l0、最小 l1**。
+     * - l0 可以偏大（已实测：l0_m1=2,3,4,15 都对），所以取最大值安全，
+     *   且能覆盖真实默认值（真实值必 <= 某个 slice 的生效值）。
+     * - l1 一位都不能偏大，所以取最小值 —— 非 override slice 报的就是
+     *   真实默认值，而 override slice 只会报得更大。
+     * 这样多轮之后收敛到唯一一份 PPS，也顺带消除了无意义的反复重送。 */
     unsigned int def_l0 = have_sp ? sp_l0_minus1 : 0;
     unsigned int def_l1 = have_sp ? sp_l1_minus1 : 0;
     (void)pp;
@@ -427,12 +445,16 @@ size_t dmd_h264_build_sps_nalu(const VAPictureParameterBufferH264 *pp,
 size_t dmd_h264_build_pps_nalu(const VAPictureParameterBufferH264 *pp,
                                const VAIQMatrixBufferH264 *iq, int have_iq,
                                const VASliceParameterBufferH264 *sp,
+                               unsigned int def_l0_minus1,
+                               unsigned int def_l1_minus1,
                                unsigned char *out, size_t out_cap)
 {
     unsigned char rbsp[256];
+    /* l0/l1 由调用方推导后传入，**不能**直接取 sp 里的生效值 ——
+     * 带 override_flag 的 slice 其生效值与 PPS 默认值无关。
+     * 见 decode.c 里的推导说明。 */
     size_t n = build_pps_rbsp(pp, iq, have_iq, sp != NULL,
-                              sp ? sp->num_ref_idx_l0_active_minus1 : 0,
-                              sp ? sp->num_ref_idx_l1_active_minus1 : 0, rbsp,
+                              def_l0_minus1, def_l1_minus1, rbsp,
                               sizeof(rbsp));
     if (n == 0)
         return 0;

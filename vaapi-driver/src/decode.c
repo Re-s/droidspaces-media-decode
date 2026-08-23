@@ -1336,6 +1336,7 @@ static int h264_send_param_sets(struct dmd_session *sess,
                                 const VAPictureParameterBufferH264 *pp,
                                 const VAIQMatrixBufferH264 *iq, int have_iq,
                                 const VASliceParameterBufferH264 *sp,
+                                unsigned int def_l0, unsigned int def_l1,
                                 VAProfile profile, unsigned int disp_width,
                                 unsigned int disp_height)
 {
@@ -1353,7 +1354,8 @@ static int h264_send_param_sets(struct dmd_session *sess,
     }
     dmd_log("H.264: 已送 SPS %zu 字节\n", n);
 
-    n = dmd_h264_build_pps_nalu(pp, iq, have_iq, sp, nalu, sizeof(nalu));
+    n = dmd_h264_build_pps_nalu(pp, iq, have_iq, sp, def_l0, def_l1,
+                                nalu, sizeof(nalu));
     if (n == 0) {
         dmd_log("H.264: PPS 合成失败\n");
         return -1;
@@ -1565,26 +1567,68 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     unsigned int mbs_wide = 0, mbs_high = 0;
     VAPictureParameterBufferHEVC hevc_snap;
     int need_hevc_params = 0;
+    /* 锁内快照：下面发送时已解锁，不能再读 c->pending_l0/l1。 */
+    unsigned int l0_snap = 0, l1_snap = 0;
 
     if (codec == DMD_CODEC_H264 && c->have_h264_pic_param) {
         mbs_wide = (unsigned int)c->h264_pic_param.picture_width_in_mbs_minus1 + 1;
         mbs_high = (unsigned int)c->h264_pic_param.picture_height_in_mbs_minus1 + 1;
+        unsigned int pp_num_ref = c->h264_pic_param.num_ref_frames;
         /* 重发条件：首次、流内几何变化、或 PPS 的 num_ref_idx 默认值变化。
          *
          * 最后一条是必需的：PPS 默认值必须照抄**当前帧**的生效值
          * （详见 h264_bitstream.c 的说明），而不同帧的生效值会变。
          * MediaCodec 接受流中反复出现的 PPS，每次只多几字节。 */
-        unsigned int l0 = c->have_h264_slice_param
+        /* l0 取见过的**最大**、l1 取见过的**最小**。
+         *
+         * VA-API 给的是每个 slice 的生效值，而带 override_flag 的 slice
+         * 其生效值与 PPS 默认值无关 —— 直接照抄会写出错误的默认值，
+         * 被其他非 override slice 用上就解出黑屏（详见 h264_bitstream.c
+         * 的实测记录：真实 PPS 恒为 l0=2 l1=0，而照抄会产生 5 种变体）。
+         *
+         * l0 可以偏大、l1 一位都不能偏大（单变量实测），所以分别取
+         * 最大与最小，几帧之内就收敛到唯一一份正确的 PPS。 */
+        unsigned int l0_now = c->have_h264_slice_param
                               ? c->h264_slice_param.num_ref_idx_l0_active_minus1
                               : 0;
-        unsigned int l1 = c->have_h264_slice_param
+        unsigned int l1_now = c->have_h264_slice_param
                               ? c->h264_slice_param.num_ref_idx_l1_active_minus1
                               : 0;
-        if (!c->param_sets_sent || c->sent_mbs_wide != mbs_wide ||
-            c->sent_mbs_high != mbs_high || c->sent_l0 != l0 ||
-            c->sent_l1 != l1) {
+        /* l0：不能靠"逐帧取最大"收敛 —— 参数集必须在**首个 slice 之前**
+         * 送出，那时只见过 IDR 的 slice param（I slice 的 num_ref_idx 恒为 0），
+         * 后面见到更大值时前面的帧已经用错的 PPS 解过了。
+         * 实测每个会话只送 3 种变体（l0=0/1/3），真值 2 从未被送出。
+         *
+         * 改用 SPS 的 num_ref_frames 作上界：它是码流自带的参考帧数上限，
+         * 必然 >= 任何 slice 的真实 l0_active，而 l0 偏大是安全的
+         * （单变量实测 l0_m1=2,3,4,15 全对）。这样第一份 PPS 就是可用的，
+         * 不依赖"多看几帧"。 */
+        unsigned int l0 = pp_num_ref > 0 ? pp_num_ref - 1 : 15;
+        if (l0 > 31)
+            l0 = 31;
+        /* pp_num_ref 为 0 时用 15：VA-API 在首帧的 pic param 里可能还没填
+         * num_ref_frames（实测 SPS 写的是 4，而送 PPS 那一刻读到 0，
+         * 于是写出 l0=0 的错误 PPS）。15 是"够大且已实测可用"的上界
+         * （单变量实测 l0_m1=15 解码正确），比读到 0 安全。 */
+        /* l1 一位都不能偏大，只能取观测到的最小值。
+         * 非 override 的 slice 报的就是真实默认值，override 的只会更大，
+         * 所以最小值即真值；IDR 的 I slice 报 0，正好是常见真值。 */
+        if (!c->refidx_seen) {
+            c->refidx_l1_min = l1_now;
+            c->refidx_seen = 1;
+        } else if (l1_now < c->refidx_l1_min) {
+            c->refidx_l1_min = l1_now;
+        }
+        unsigned int l1 = c->refidx_l1_min;
+        (void)l0_now;
+        int why_first = !c->param_sets_sent;
+        int why_geom  = (c->sent_mbs_wide != mbs_wide || c->sent_mbs_high != mbs_high);
+        int why_refidx = (c->sent_l0 != l0 || c->sent_l1 != l1);
+        if (why_first || why_geom || why_refidx) {
             c->pending_l0 = l0;
             c->pending_l1 = l1;
+            l0_snap = l0;
+            l1_snap = l1;
             need_param_sets = 1;
             pp_snap = c->h264_pic_param;
             iq_snap = c->h264_iq_matrix;
@@ -1630,7 +1674,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             rc = DMD_ERR_PROTOCOL;
     } else if (need_param_sets) {
         if (h264_send_param_sets(sess, &pp_snap, &iq_snap, have_iq_snap,
-                                 have_sp_snap ? &sp_snap : NULL, profile_snap,
+                                 have_sp_snap ? &sp_snap : NULL,
+                                 l0_snap, l1_snap, profile_snap,
                                  pw, ph) != 0)
             rc = DMD_ERR_PROTOCOL;
     }
@@ -1794,6 +1839,20 @@ found:
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
+    /* 诊断：daemon 送来的帧本身是不是黑的？
+     * 与 export.c 里的同名探测配对使用，用来区分
+     * "解码器就输出了黑帧" 和 "拷进 surface 后才变黑"。
+     * DMD_VA_LUMA=1 才启用。 */
+    if (getenv("DMD_VA_LUMA") && f->data && f->size > 100000) {
+        double sum = 0; int cnt = 0;
+        for (size_t k = 0; k < f->size && k < 2000000; k += 1499) {
+            sum += f->data[k]; cnt++;
+        }
+        double m = cnt ? sum / cnt : 0;
+        dmd_log("入帧亮度: unit=%u 均值 %.1f%s\n",
+                f->unit_seq, m, m < 20.0 ? "  ← daemon 送来就是黑的!" : "");
+    }
+
     unsigned int src_stride = f->stride > 0 ? (unsigned int)f->stride
                                             : (unsigned int)f->width;
     unsigned int src_slice = f->slice_height > 0
@@ -1921,8 +1980,24 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          *
          * daemon 支持 unit_seq 时同时也开了跟随输入序输出，滞后只有 1，
          * 帧几乎立刻就来，永远不该判定徒劳（否则会 0 ms 就排空，
-         * 实测误触发 383 次）。旧 daemon 才有滞后 4 与消费者在飞 3 帧的互等。 */
-        int wait_is_futile = !c->daemon_has_unit_seq &&
+         * 实测误触发 383 次）。旧 daemon 才有滞后 4 与消费者在飞 3 帧的互等。
+         *
+         * ⚠️ `daemon_has_unit_seq` 是**收到第一帧才置位**的运行时观测，
+         * 所以会话刚建立、首帧还没回来时它必然为 0。若此时只看它，
+         * 就会在 0 ms 判定徒劳并立刻排空 —— 而排空 = EOS + flush，
+         * 参考帧链被毁，之后的 P/B 帧全黑到下一个 IDR。
+         *
+         * 实测（浏览器循环播放 5 轮）：每轮会话开头各触发 1 次 0 ms 排空，
+         * 共 5 次，与 5 段黑帧簇一一对应；每段黑 25~27 帧（unit 4..30，
+         * 恰好是首个 IDR 之后到下一个 IDR 之前），总计 135/708 帧纯黑。
+         * 日志原文是"等了 0 ms 仍无帧，可逆排空（队列 3）"—— 队列明明是满的
+         * （在飞 3 帧），帧就在路上，等一下就有，根本不该排空。
+         *
+         * 所以再加一个条件：**至少收到过一帧**才允许判定徒劳。
+         * 一帧都还没收到时，无法区分"互等"与"首帧还在路上"，
+         * 此时应当耐心等到 flush_after_ms 阈值，而不是立刻毁掉会话状态。 */
+        int wait_is_futile = dmd_session_frames_received(c->session) > 0 &&
+                             !c->daemon_has_unit_seq &&
                              (c->pending_count < DMD_PIPELINE_DEPTH);
 
         if (!c->input_finished && !drained_once &&

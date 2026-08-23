@@ -233,6 +233,12 @@ struct dmd_context {
     int have_h264_pic_param;
     VAPictureParameterBufferH264 h264_pic_param;
     /* HEVC 图像参数：合成 VPS/SPS/PPS 用。与 h264 那份互斥使用。 */
+    /* PPS 的 num_ref_idx 默认值推导：l0 取见过的最大、l1 取见过的最小。
+     * 见 decode.c 的说明 —— 直接照抄每帧生效值会写出错误的 PPS 默认值。 */
+    unsigned int refidx_l0_max;
+    unsigned int refidx_l1_min;
+    int refidx_seen;
+
     VAPictureParameterBufferHEVC hevc_pic_param;
     int hevc_pic_param_valid;
     int have_h264_slice_param;
@@ -505,6 +511,8 @@ size_t dmd_h264_build_sps_nalu(const VAPictureParameterBufferH264 *pp,
 size_t dmd_h264_build_pps_nalu(const VAPictureParameterBufferH264 *pp,
                                const VAIQMatrixBufferH264 *iq, int have_iq,
                                const VASliceParameterBufferH264 *sp,
+                               unsigned int def_l0_minus1,
+                               unsigned int def_l1_minus1,
                                unsigned char *out, size_t out_cap);
 
 #endif /* DMD_DRIVER_H */
