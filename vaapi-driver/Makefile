@@ -27,7 +27,7 @@ CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
-SOURCES := $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
+SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
            $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
            $(SRCDIR)/h264_bitstream.c $(SRCDIR)/export.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
