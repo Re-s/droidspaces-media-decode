@@ -295,6 +295,18 @@ typedef struct {
     size_t           shm_slot;         /* 单槽字节数 */
     size_t           shm_total;        /* 池总字节数（含控制区） */
     int              shm_next;         /* 下一个要写的槽位 */
+
+    /* 可逆排空（长度 0 的带内请求）
+     *
+     * drain_req 由 input 线程自增，drain_done 由 output 线程在完成
+     * EOS 处理 + AMediaCodec_flush 后自增。input 线程等两者相等才继续送料，
+     * 否则新数据会被 flush 一起丢掉，表现为吞帧。 */
+    volatile sig_atomic_t drain_req;
+    volatile sig_atomic_t drain_done;
+    /* CSD 副本：flush 清掉解码器里的参数集，排空后必须原样重送。
+     * SPS+PPS 量级很小，256 字节足够（实测 1080p 为 31+9）。 */
+    uint8_t          csd_keep[256];
+    size_t           csd_keep_len;
 } Session;
 
 /*
@@ -448,7 +460,80 @@ static void *input_thread(void *arg)
         uint32_t sz;
         if (recv_all(s->fd, &sz, 4) < 0) break;      /* 客户端关闭写端，正常结束 */
         sz = ntohl(sz);
-        if (sz == 0 || sz > MAX_FRAME) {
+
+        /* 长度 0 = 排空请求（可逆），不是数据单元。
+         *
+         * 为什么需要它：消费者只保持 3 帧在飞，而本机解码器有 B 帧时要收到
+         * 第 4 个输入单元才吐首帧 —— 双方互等。原先驱动只能靠
+         * shutdown(SHUT_WR) 逼出帧，但那是**不可逆**的：会话作废、必须重建，
+         * 实测每帧 155 ms、播放慢 4.7 倍。
+         *
+         * 而 EOS + AMediaCodec_flush 是可逆的（tools/probe_drain.c 实测：
+         * 排空 3 帧后 flush 重送 CSD 能继续解出 6 帧）。所以把"催出帧"做成
+         * 带内信号：送 EOS 让解码器吐出在手的帧，收到 EOS 标志后 flush 复位，
+         * 重送 CSD，会话继续可用。
+         *
+         * 选 sz==0 承载：它原本被判为非法长度，老客户端不会发，
+         * 因此无需协议版本协商。 */
+        if (sz == 0) {
+            s->drain_req++;
+            dlog(2, "[%d] 收到排空请求 #%u", s->id, s->drain_req);
+
+            ssize_t di = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
+            if (di < 0) {
+                dlog(1, "[%d] 排空取输入缓冲失败: %zd", s->id, di);
+                continue;
+            }
+            /* 送 EOS：解码器会把已排队但因流水线深度压着的帧全部吐出。 */
+            AMediaCodec_queueInputBuffer(s->codec, di, 0, 0, 0, FLAG_END_OF_STREAM);
+
+            /* 等 output 线程见到 EOS 并完成 flush，再继续收下一个单元。
+             * 必须等：flush 会丢弃解码器里的一切，若此时已经把新数据塞进去
+             * 就会被一起丢掉，表现为吞帧。
+             *
+             * ⚠️ 必须有上界。output 线程可能因为解码错误提前退出，
+             * 那时 drain_done 永远追不上 drain_req —— 无界等待会让 input 线程
+             * 永久卡住、会话泄漏、解码器不释放。实测后果是 8 个会话全部泄漏、
+             * daemon 空转 200% CPU 并开始拒绝新连接（"并发会话已达上限 8"），
+             * 表现却是"浏览器一帧也解不出来"，极易误判成别处的问题。 */
+            int waited_us = 0;
+            const int drain_wait_max_us = 2000000;   /* 2s：远大于正常排空耗时 */
+            while (running && !s->stop &&
+                   s->drain_done < s->drain_req &&
+                   waited_us < drain_wait_max_us) {
+                usleep(1000);
+                waited_us += 1000;
+            }
+            if (s->drain_done < s->drain_req) {
+                dlog(1, "[%d] 排空等待超时（%d ms），放弃会话",
+                     s->id, waited_us / 1000);
+                s->stop = 1;
+                break;
+            }
+
+            /* flush 清掉了 CSD，必须重送，否则后续 VCL 无参考参数集。
+             * 这里用累积的 csd（首次送入时保留了副本）。 */
+            if (s->csd_keep_len > 0) {
+                ssize_t ci = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
+                if (ci >= 0) {
+                    size_t cap;
+                    uint8_t *ib = AMediaCodec_getInputBuffer(s->codec, ci, &cap);
+                    if (ib && cap >= s->csd_keep_len) {
+                        memcpy(ib, s->csd_keep, s->csd_keep_len);
+                        AMediaCodec_queueInputBuffer(s->codec, ci, 0,
+                                                     s->csd_keep_len, 0,
+                                                     FLAG_CODEC_CONFIG);
+                        dlog(2, "[%d] 排空后已重送 CSD (%zu 字节)",
+                             s->id, s->csd_keep_len);
+                    } else {
+                        AMediaCodec_queueInputBuffer(s->codec, ci, 0, 0, 0, 0);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (sz > MAX_FRAME) {
             dlog(1, "[%d] NALU 长度非法: %u", s->id, sz);
             break;
         }
@@ -478,6 +563,12 @@ static void *input_thread(void *arg)
                     AMediaCodec_queueInputBuffer(s->codec, ci, 0, csd_len, 0,
                                                  FLAG_CODEC_CONFIG);
                     dlog(2, "[%d] CSD 已送入 (%zu 字节)", s->id, csd_len);
+                    /* 留一份副本：排空后的 flush 会清掉解码器里的 CSD，
+                     * 那时要原样重送，否则后续 VCL 无参数集可参考。 */
+                    if (csd_len <= sizeof(s->csd_keep)) {
+                        memcpy(s->csd_keep, csd, csd_len);
+                        s->csd_keep_len = csd_len;
+                    }
                 } else {
                     dlog(1, "[%d] CSD 超出输入缓冲容量", s->id);
                     AMediaCodec_queueInputBuffer(s->codec, ci, 0, 0, 0, 0);
@@ -801,6 +892,25 @@ static void *output_thread(void *arg)
             }
             AMediaCodec_releaseOutputBuffer(s->codec, oi, 0);
             if (eos) {
+                /* EOS 有两种来源，处理完全不同：
+                 *   1) 排空请求（drain_req > drain_done）—— 会话还要继续用，
+                 *      flush 复位解码器后接着服务，由 input 线程重送 CSD
+                 *   2) 客户端真的关了写端 —— 流结束，退出线程
+                 * 区分依据就是有没有未完成的排空请求。 */
+                if (s->drain_req > s->drain_done) {
+                    media_status_t fs = AMediaCodec_flush(s->codec);
+                    if (fs != AMEDIA_OK) {
+                        dlog(1, "[%d] 排空后 flush 失败: %d", s->id, fs);
+                        s->stop = 1;
+                        break;
+                    }
+                    /* flush 会丢弃未取走的输出，格式描述也要重新下发：
+                     * 客户端靠它确定 stride/crop，漏发会让后续帧解析错位。 */
+                    s->fmt_sent = 0;
+                    s->drain_done++;
+                    dlog(2, "[%d] 排空 #%u 完成，会话继续", s->id, s->drain_done);
+                    continue;
+                }
                 dlog(2, "[%d] 收到 EOS，输出结束", s->id);
                 break;
             }

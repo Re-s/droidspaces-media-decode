@@ -81,6 +81,7 @@ struct dmd_session {
 
     uint64_t units_sent;
     uint64_t frames_recv;
+    uint64_t drains_sent;   /* 发出的可逆排空请求数（诊断用） */
 };
 
 /* ------------------------------------------------------------ 日志 */
@@ -660,6 +661,34 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
     }
 
     s->units_sent++;
+    return DMD_OK;
+}
+
+int dmd_session_drain(struct dmd_session *s)
+{
+    if (!s)
+        return DMD_ERR_INVAL;
+    if (s->input_finished)
+        return sess_err(s, DMD_ERR_STATE, "已 finish_input，无需排空", 0);
+    if (s->fd < 0)
+        return sess_err(s, DMD_ERR_STATE, "会话已无有效连接", 0);
+    if (s->tx_broken)
+        return sess_err(s, DMD_ERR_STATE,
+                        "上行流已损坏（此前发送中断），需重建会话", 0);
+
+    /* 长度 0 = 排空请求。daemon 会送 EOS 逼解码器吐出在手的帧，
+     * 收齐后 flush 复位并重送 CSD —— 与 finish_input 不同，**会话仍可用**。
+     *
+     * 为什么需要：消费者只保持 3 帧在飞，而解码器有 B 帧时要第 4 个单元
+     * 才吐首帧，双方互等。原先只能用 finish_input 打破，但那不可逆，
+     * 每次都要重建会话（实测每帧 155 ms、播放慢 4.7 倍）。 */
+    uint32_t be = htonl(0);
+    int r = send_exact(s, &be, 4, s->io_timeout_ms);
+    if (r != DMD_OK) {
+        s->tx_broken = 1;
+        return r;
+    }
+    s->drains_sent++;
     return DMD_OK;
 }
 

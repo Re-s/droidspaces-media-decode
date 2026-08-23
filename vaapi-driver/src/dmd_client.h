@@ -180,6 +180,20 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len);
 int dmd_session_finish_input(struct dmd_session *s);
 
 /*
+ * 可逆排空：让 daemon 送 EOS 逼解码器吐出在手的帧，收齐后 flush 复位
+ * 并重送 CSD —— 与 finish_input 的区别是**会话之后仍然可用**。
+ *
+ * 用途：消费者只保持少量帧在飞（浏览器是 3 帧），而解码器有 B 帧时要收到
+ * 第 4 个输入单元才吐首帧，双方互等。此时调用本函数即可拿到帧且不作废会话。
+ * 原先只能用 finish_input 打破互等，代价是每次都要重建会话
+ * （实测每帧 155 ms，播放慢 4.7 倍）。
+ *
+ * 排空后 daemon 会重新下发格式描述块，next_frame 内部自动消费，调用方无感。
+ * 返回 DMD_OK / DMD_ERR_*。
+ */
+int dmd_session_drain(struct dmd_session *s);
+
+/*
  * 取下一帧。timeout_ms <0 表示用配置里的 io_timeout_ms。
  * 返回 DMD_OK 拿到帧、DMD_EOS 流结束、DMD_ERR_TIMEOUT 暂时无帧（会话仍可用）、
  * 其他负值为错误。内部自动消费格式描述块并更新 dmd_session_format()。

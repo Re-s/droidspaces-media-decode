@@ -1670,6 +1670,9 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
     idx = (int)(c - drv->contexts);
 
     int spent = 0;
+    /* 本次等待是否已经排空过一次。可逆排空不会改变队列深度，
+     * 不加这个闸就会在同一次等待里反复排空（忙循环）。 */
+    int drained_once = 0;
     /* 单次等待用较小的片，这样能周期性回到锁内检查状态。 */
     const int slice_ms = 100;
     /* 等这么久还没帧就认为解码器在攥尾部帧，主动 flush。
@@ -1736,22 +1739,41 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * （tools/probe_rebuild.c 验证过）。
          *
          * 队列够深时仍按耐心阈值等 —— 那种情况下帧确实在路上，
-         * 提前 flush 会白白打断一个正常会话。 */
+         * 提前 flush 会白白打断一个正常会话。
+         *
+         * ⚠️ 可逆排空必须"每次等待只做一次"。它不像 finish_input 会置
+         * input_finished 把自己挡住 —— 排空后队列深度不变，条件依旧成立，
+         * 不加闸就会变成忙循环（实测触发 133 万次、只出 1 帧）。 */
         int wait_is_futile = (c->pending_count < DMD_PIPELINE_DEPTH);
 
-        if (!c->input_finished &&
+        if (!c->input_finished && !drained_once &&
             (wait_is_futile || spent >= flush_after_ms)) {
             struct dmd_session *fs = c->session;
-            c->input_finished = 1;
+            /* 优先用可逆排空：daemon 送 EOS 催出帧后 flush 复位并重送 CSD，
+             * 会话仍可用 —— 于是不必重建，省掉 connect+握手+configure。
+             * 只有排空失败（老 daemon 不认长度 0）才退回不可逆的 finish_input。 */
             drv->io_busy[idx] = 1;
             pthread_mutex_unlock(&drv->lock);
-            int frc = dmd_session_finish_input(fs);
+            int frc = dmd_session_drain(fs);
+            int reversible = (frc == DMD_OK);
+            if (!reversible)
+                frc = dmd_session_finish_input(fs);
             pthread_mutex_lock(&drv->lock);
             drv->io_busy[idx] = 0;
             pthread_cond_broadcast(&drv->io_done);
-            dmd_log("SyncSurface: 等了 %d ms 仍无帧，flush 输入（rc=%d，"
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+            if (reversible)
+                drained_once = 1;
+            else
+                c->input_finished = 1;
+            dmd_log("SyncSurface: 等了 %d ms 仍无帧，%s（rc=%d，"
                     "阈值 %d ms，队列 %d）\n",
-                    spent, frc, flush_after_ms, c->pending_count);
+                    spent, reversible ? "可逆排空" : "flush 输入",
+                    frc, flush_after_ms, c->pending_count);
             /* 重新查找：放锁期间对象可能被销毁。 */
             continue;
         }
