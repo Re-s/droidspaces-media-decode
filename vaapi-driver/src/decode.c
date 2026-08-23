@@ -400,10 +400,21 @@ static struct dmd_session *session_open(int codec, unsigned int width,
 
 /* flush 过的会话已不能再送数据，透明换一条新的。
  *
- * 为什么可以这么做（已实测，probe_rebuild）：
- * 新建会话 + 重送 SPS/PPS 后，**从非 IDR 帧续传也能立刻出帧**
- * （实测续传 12 个 VCL 出 9 帧，首个续传单元 nal_unit_type=1）。
- * 所以不必等下一个 IDR，不会有可见花屏。
+ * ⚠️ **重建会摧毁参考帧链，代价不是"慢"而是"画面坏"。**
+ *
+ * 曾有一份探针（tools/probe_rebuild.c）报告"从非 IDR 帧续传也能立刻出帧
+ * （续传 12 个 VCL 出 9 帧），所以不会有可见花屏"—— 那个结论**是错的**：
+ * 它只数了帧数，没看画面，那些帧全是纯黑（Y=16）。探针文件开头已标注
+ * 自身不可信，不要再引用它的结论。
+ *
+ * 真相：任何丢弃解码器状态的操作（flush 或重建）都会摧毁参考帧链，
+ * 而 P/B 帧必须依赖它。从非 IDR 位置重新开始，要一直黑到下一个 IDR
+ * （本测试流每 30 帧一个，故最多连黑 29 帧）。这正是"浏览器播放时
+ * 画面一闪一闪"的根因 —— 实测 135/708 帧纯黑。
+ *
+ * 所以重建**必须尽量避免**，而不是"可以放心用"。真要重建，
+ * 正确做法是从最近的 IDR 重放并丢弃重放出的帧（见 tools/probe_replay.c）。
+ * 当前实现的策略是把触发条件收紧到几乎不发生（见 wait_is_futile 的判据）。
  *
  * 调用方必须持锁；本函数内部会临时放锁做阻塞 IO（connect + 握手）。
  * 返回 0 成功，-1 失败（失败时 c->session 置空，由调用方走失败路径）。
@@ -1414,8 +1425,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      *
      * 这条路径覆盖的是 **seek**：daemon 没有连接内 reset，flush 又是不可逆的
      * shutdown(SHUT_WR)，所以播放器跳转后要继续解码只能重建会话。
-     * 可行性已实测（probe_rebuild）：新会话重送 SPS/PPS 后，
-     * 从非 IDR 帧续传也能立刻出帧，不必等下一个 IDR，因此不会有可见花屏。
+     * ⚠️ 曾据 tools/probe_rebuild.c 认为"从非 IDR 帧续传也能立刻出帧，
+     * 不会有可见花屏"—— 那个结论**是错的**（探针只数帧数没看画面，
+     * 那些帧全是纯黑 Y=16，探针开头已自我标注不可信）。
+     * 实际上重建摧毁参考帧链，续传后要黑到下一个 IDR。
+     * seek 场景下这个代价通常可接受（播放器跳转后本就期待画面刷新），
+     * 但**不要**把它当成"重建无害"的依据。
      *
      * 注意：Firefox 的正常播放**不会**走到这里 —— 实测它一旦在
      * vaSyncSurface 上卡住就直接 DestroyContext，不再调 EndPicture。
@@ -1953,9 +1968,13 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * 若按耐心阈值等满 2000ms 再 flush，每帧就要 2 秒，播放等于卡死；
          * 立刻 flush 则马上出帧。
          *
-         * flush 的代价（会话作废）已由 EndPicture 的透明重建消掉：
-         * 重送 SPS/PPS 后可从非 IDR 帧续传，上层察觉不到
-         * （tools/probe_rebuild.c 验证过）。
+         * ⚠️ 这里曾写着"flush 的代价已由透明重建消掉，上层察觉不到
+         * （probe_rebuild.c 验证过）"—— **那是错的**。那份探针只数帧数
+         * 没看画面（帧全是纯黑 Y=16），它自己开头已标注结论不可信。
+         *
+         * flush 的真实代价是**参考帧链被摧毁**，续传后要黑到下一个 IDR。
+         * 上层不但察觉得到，用户会直接看到"画面一闪一闪"
+         * （实测 135/708 帧纯黑）。所以 flush 绝不是廉价操作。
          *
          * 队列够深时仍按耐心阈值等 —— 那种情况下帧确实在路上，
          * 提前 flush 会白白打断一个正常会话。
