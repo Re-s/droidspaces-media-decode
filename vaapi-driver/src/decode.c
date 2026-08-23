@@ -1506,11 +1506,71 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     /* 入队：**在放锁发送之前**入队，保证队列顺序严格等于提交顺序。
      * 若发送失败再出队回滚。 */
+    /* 队列满时收**一帧**腾出空位，而不是直接失败。
+     *
+     * ⚠️ 这里曾直接返回 OPERATION_FAILED，那是 Chrome 硬解不可用的根因：
+     *
+     * Chrome 不像 ffmpeg / Firefox 那样调 vaSyncSurface 逐帧同步，而是
+     * 大批提交后靠 vaExportSurfaceHandle 拿 dmabuf。于是队列很快填满，
+     * EndPicture 报错 → Chrome 收到 "operation failed" → 判定硬解不可用
+     * → 断开连接（daemon 侧看到的 Broken pipe / Connection reset 是结果）。
+     *
+     * 实测时间线可以确证：队列满那一刻 Chrome 立刻报 vaEndPicture failed，
+     * 而全部 50 次配对都发生在**失败之后的 DestroyContext 排空阶段** ——
+     * 也就是说帧在播放期间从没被及时消费，形成死锁：
+     * Chrome 等 surface 就绪 → 就绪需要收帧 → 收帧被队列满堵住。
+     *
+     * 队列满是**背压**不是错误：帧还在路上，收回来就有空间。
+     *
+     * ⚠️ 只收一帧，收够就走。曾试过在这里循环收光，那会替消费者把帧全
+     * 收走（实测配对 1651 次而 Chrome 只导出 24 帧，帧率反跌到 1 fps）。
+     * 也试过把队列放大到 256，只是把症状推后（送入 67 → 259）而未解决。 */
     if (c->pending_count >= DMD_MAX_SURFACES) {
-        pthread_mutex_unlock(&drv->lock);
-        free(scratch);
-        dmd_log("EndPicture: 待解码队列已满（%d）\n", DMD_MAX_SURFACES);
-        return VA_STATUS_ERROR_OPERATION_FAILED;
+        struct dmd_session *bp_sess = c->session;
+        int bp_idx = (int)(c - drv->contexts);
+
+        if (bp_sess && !drv->io_busy[bp_idx]) {
+            drv->io_busy[bp_idx] = 1;
+            pthread_mutex_unlock(&drv->lock);
+
+            struct dmd_frame bp_frame;
+            memset(&bp_frame, 0, sizeof(bp_frame));
+            int bp_rc = dmd_session_next_frame(bp_sess, &bp_frame,
+                                               DMD_BACKPRESSURE_MS);
+
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[bp_idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                if (bp_rc == DMD_OK)
+                    dmd_session_release_frame(bp_sess, &bp_frame);
+                pthread_mutex_unlock(&drv->lock);
+                free(scratch);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+
+            if (bp_rc == DMD_OK) {
+                VASurfaceID bp_head = dmd_pending_take_locked(c,
+                                                             bp_frame.unit_seq);
+                struct dmd_surface *bp_hs = dmd_find_surface_locked(drv,
+                                                                    bp_head);
+                if (bp_hs) {
+                    surface_store_frame_locked(bp_hs, &bp_frame);
+                    bp_hs->state = DMD_SURFACE_READY;
+                }
+                dmd_session_release_frame(bp_sess, &bp_frame);
+            }
+        }
+
+        if (c->pending_count >= DMD_MAX_SURFACES) {
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            dmd_log("EndPicture: 待解码队列已满（%d），收帧后仍无空位\n",
+                    DMD_MAX_SURFACES);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     c->pending[qpos] = target;

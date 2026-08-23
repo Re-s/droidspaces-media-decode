@@ -208,12 +208,20 @@ MOZ_DISABLE_RDD_SANDBOX=1         # 否则 RDD 沙箱禁止本驱动连 daemon �
 更干净的长期做法是驱动改用 Unix socket，或由沙箱策略放行这一个连接。
 只在信任本机环境时使用。
 
-profile 里还需要两个 pref：
+profile 里还需要一个 pref：
 
 ```
-media.ffmpeg.vaapi.enabled = true
 media.hardware-video-decoding.force-enabled = true
 ```
+
+> ⚠️ 这里曾写着还需要 `media.ffmpeg.vaapi.enabled = true`。
+> **该 pref 在 Firefox 137 前后已被移除**，140 ESR 的 libxul 里根本
+> 不存在这个名字（`strings libxul.so | grep -x` 查不到），设了也没有作用。
+>
+> 单变量实测：把它从 profile 删掉后硬解照常工作（872 帧导出、
+> 零软解回落）。真正起作用的是上面那条 `force-enabled`。
+>
+> 现在硬解开关统一在 `media.hardware-video-decoding.*` 之下。
 
 `tools/firefox-hwdec` 把上述环境固化了，并带自检：
 

@@ -110,11 +110,15 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
 fi
 
-# 这两个 pref 也是必需的，但 pref 属于 profile。若用户 profile 里没设，
+# 这个 pref 也是必需的，但 pref 属于 profile。若用户 profile 里没设，
 # 这里通过环境变量兜不住 —— 所以提示一次，只提示不强制。
+#
+# ⚠️ 这里曾同时提示 media.ffmpeg.vaapi.enabled=true。该 pref 在
+# Firefox 137 前后已被移除，140 ESR 的 libxul 里根本不存在这个名字，
+# 设了没有任何作用。单变量实测：删掉它硬解照常工作（872 帧导出、
+# 零软解回落）。硬解开关现在统一在 media.hardware-video-decoding.* 之下。
 if [ "${DMD_QUIET:-0}" != "1" ]; then
-    log "提示：profile 里需要 media.ffmpeg.vaapi.enabled=true"
-    log "      与 media.hardware-video-decoding.force-enabled=true"
+    log "提示：profile 里需要 media.hardware-video-decoding.force-enabled=true"
     log "      诊断硬解是否生效：DMD_VA_LOG=1 firefox-hwdec 然后看 stderr"
 fi
 
