@@ -364,6 +364,27 @@ driver:  pending_unit[] 精确匹配 dmd_frame.unit_seq
 | 显示序输出（去掉 vendor 键，模拟非高通平台） | 全部一致 | 0 |
 | 跟随输入序（带 vendor 键） | 全部一致 | 0 |
 
+### 排空的触发条件（黑屏根因）
+
+排空（EOS + flush）会**摧毁解码器的参考帧链**，之后的 P/B 帧全黑到
+下一个 IDR。所以判据必须严格：
+
+```c
+int wait_is_futile = dmd_session_frames_received(c->session) > 0 &&
+                     !c->daemon_has_unit_seq &&
+                     (c->pending_count < DMD_PIPELINE_DEPTH);
+```
+
+⚠️ 三个条件都是必需的，尤其**第一个**：`daemon_has_unit_seq` 是
+"收到第一帧才置位"的运行时观测，会话刚建立时必然为 0。
+只看它就会在 0 ms 判定徒劳并立刻排空 —— 实测浏览器循环播放
+708 帧里 135 帧纯黑（每轮 1 次误排空，各毁掉 25~27 帧）。
+日志会写"等了 0 ms 仍无帧，可逆排空（队列 3）"：队列明明是满的。
+
+一帧都没收到时无法区分"互等死锁"与"首帧还在路上"，
+此时应等到 `flush_after_ms` 阈值。详见
+`../dmd-vaapi/research/M-9-black-frames.md` 第八节。
+
 ### 长流与 seek
 
 配对改成按单元序号后补做了这两项验证，同样对上两种 daemon 配置。
