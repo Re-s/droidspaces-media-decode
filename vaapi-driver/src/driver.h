@@ -12,6 +12,7 @@
 
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_dec_hevc.h>
 #include <va/va_dec_vp8.h>
 #include <va/va_dec_vp9.h>
 /* struct drm_state 定义在这里，va_backend.h 只做前向声明。 */
@@ -231,6 +232,9 @@ struct dmd_context {
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
     int have_h264_pic_param;
     VAPictureParameterBufferH264 h264_pic_param;
+    /* HEVC 图像参数：合成 VPS/SPS/PPS 用。与 h264 那份互斥使用。 */
+    VAPictureParameterBufferHEVC hevc_pic_param;
+    int hevc_pic_param_valid;
     int have_h264_slice_param;
     VASliceParameterBufferH264 h264_slice_param;
     int have_h264_iq_matrix;
@@ -480,6 +484,20 @@ int dmd_profile_to_codec(VAProfile profile);
  * VA-API 从不传递参数集原始比特流，而 daemon 靠起始码识别 NAL 类型把它们
  * 累积成 codec-specific data，所以必须自己写出来。
  * 返回写入 out 的字节数，0 表示失败（含 out_cap 不足）。 */
+/* HEVC 参数集合成（hevc_bitstream.c）。
+ *
+ * dmd_hevc_can_build 返回 0 表示这个码流无法合成（VA-API 缺少必要信息），
+ * 调用方应让上层回落软解，而不是产出坏画面。 */
+int    dmd_hevc_can_build(const VAPictureParameterBufferHEVC *pp);
+size_t dmd_hevc_build_vps_nalu(const VAPictureParameterBufferHEVC *pp,
+                               VAProfile profile,
+                               unsigned char *out, size_t cap);
+size_t dmd_hevc_build_sps_nalu(const VAPictureParameterBufferHEVC *pp,
+                               VAProfile profile,
+                               unsigned char *out, size_t cap);
+size_t dmd_hevc_build_pps_nalu(const VAPictureParameterBufferHEVC *pp,
+                               unsigned char *out, size_t cap);
+
 size_t dmd_h264_build_sps_nalu(const VAPictureParameterBufferH264 *pp,
                                VAProfile profile, unsigned int disp_width,
                                unsigned int disp_height, unsigned char *out,

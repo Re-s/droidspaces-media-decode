@@ -15,16 +15,22 @@
  * ⚠️ 只列**解码路径真的通了**的 profile。声明了但解不出来比不声明更糟 ——
  * 消费者会选中我们然后失败，而它本来可以直接走软解。
  *
- * HEVC（VAProfileHEVCMain）曾经列在这里，现已移除：码流转发未实现，
- * `vaEndPicture` 返回 UNIMPLEMENTED。这个虚报是有实际后果的 ——
- * Firefox 的 vaapitest 探针会把它读成 CODEC_HW_HEVC（GfxInfo.h:63 的 1<<8），
- * 实测探针输出 368 = H264|VP8|VP9|HEVC，于是 Firefox 认为我们能解 HEVC。
- * 等 HEVC 真正实现后再加回来。
+ * HEVC（VAProfileHEVCMain）曾因"码流转发未实现"被移除过一段时间 ——
+ * 那时声明它属于虚报，Firefox 的 vaapitest 探针会读成 CODEC_HW_HEVC
+ * （GfxInfo.h:63 的 1<<8）。现在 hevc_bitstream.c 已实现 VPS/SPS/PPS 合成
+ * 并真机验证（1080p/4K/720p 逐字节一致、长流 1500 帧、seek 全通），
+ * 所以重新声明；探针输出 368 = H264|VP8|VP9|HEVC 这次名实相符。
+ *
+ * ⚠️ HEVC 有一类码流无法支持：SPS 里带 st_ref_pic_set 的
+ * （num_short_term_ref_pic_sets > 0）。VA-API 只给个数不给内容，
+ * 无法复现。那种情况 vaEndPicture 返回 UNIMPLEMENTED 让上层回落软解 ——
+ * 见 dmd_hevc_can_build。实测 x265 默认输出 0，常见码流不受影响。
  */
 static const VAProfile dmd_profiles[] = {
     VAProfileH264ConstrainedBaseline,
     VAProfileH264Main,
     VAProfileH264High,
+    VAProfileHEVCMain,
     VAProfileVP9Profile0,
     VAProfileVP8Version0_3,
 };

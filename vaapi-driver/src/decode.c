@@ -1084,6 +1084,19 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->vp8_pic_param, b->data,
                        sizeof(VAPictureParameterBufferVP8));
                 c->have_vp8_pic_param = 1;
+            } else if (c->codec == DMD_CODEC_HEVC &&
+                       b->size >= sizeof(VAPictureParameterBufferHEVC)) {
+                /* 用途同 H.264：合成 VPS/SPS/PPS，并取 POC 供配对回退路径用。
+                 * CurrPic.pic_order_cnt 是已解包的完整 POC，可直接比大小。 */
+                memcpy(&c->hevc_pic_param, b->data,
+                       sizeof(VAPictureParameterBufferHEVC));
+                c->hevc_pic_param_valid = 1;
+                c->current_poc = c->hevc_pic_param.CurrPic.pic_order_cnt;
+                /* HEVC 没有 frame_num；用 IRAP 判定新序列：
+                 * IDR 会把 POC 重置，配对时必须按 seq 分段。 */
+                c->current_frame_num =
+                    c->hevc_pic_param.slice_parsing_fields.bits.IdrPicFlag ? 0 : 1;
+                c->have_current_poc = 1;
             } else if (c->codec == DMD_CODEC_H264 &&
                        b->size >= sizeof(VAPictureParameterBufferH264)) {
                 /* 两个用途：
@@ -1241,16 +1254,74 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return buf;
     }
 
-    case DMD_CODEC_HEVC:
-        /* HEVC 同样只缺起始码（同一个 h2645 解析器），但参数集是三个
-         * （VPS/SPS/PPS）且 profile_tier_level 里 VA-API 提供的字段更少，
-         * 另需处理 conf_win 与 EPB 计数。先把 H.264 验通再做，
-         * 避免同时引入两处不确定性。 */
-        return NULL;
+    case DMD_CODEC_HEVC: {
+        /* 与 H.264 完全同构：VASliceParameterBufferHEVC 里有
+         * slice_data_byte_offset，说明 slice header 原样在 buffer 里，
+         * 所以只需前置 4 字节起始码转发，不必重建 slice header
+         * （那要反推参考列表重排序，是欠定问题）。 */
+        size_t cap = 4 + c->slice_len;
+        unsigned char *buf = malloc(cap);
+        if (!buf)
+            return NULL;
+        buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 1;
+        memcpy(buf + 4, c->slice_data, c->slice_len);
+        *scratch = buf;
+        *out_len = cap;
+        return buf;
+    }
 
     default:
         return NULL;
     }
+}
+
+/* HEVC：在首个 slice 之前把合成的 VPS/SPS/PPS 送给 daemon。
+ *
+ * 与 H.264 的区别是三个参数集而非两个，且必须按 VPS→SPS→PPS 顺序 ——
+ * SPS 引用 VPS 的 id，PPS 引用 SPS 的 id。
+ * 每个都作为独立数据单元发送（daemon 靠 nal_unit_header 识别并累积为 CSD）。
+ *
+ * 调用方不得持锁（这里会做阻塞发送）。返回 0 成功。 */
+static int hevc_send_param_sets(struct dmd_session *sess,
+                                const VAPictureParameterBufferHEVC *pp,
+                                VAProfile profile)
+{
+    unsigned char nalu[600];
+
+    size_t n = dmd_hevc_build_vps_nalu(pp, profile, nalu, sizeof(nalu));
+    if (n == 0) {
+        dmd_log("HEVC: VPS 合成失败\n");
+        return -1;
+    }
+    if (dmd_session_send_unit(sess, nalu, n) != DMD_OK) {
+        dmd_log("HEVC: VPS 发送失败: %s\n", dmd_session_last_error(sess));
+        return -1;
+    }
+    dmd_log("HEVC: 已送 VPS %zu 字节\n", n);
+
+    n = dmd_hevc_build_sps_nalu(pp, profile, nalu, sizeof(nalu));
+    if (n == 0) {
+        dmd_log("HEVC: SPS 合成失败\n");
+        return -1;
+    }
+    if (dmd_session_send_unit(sess, nalu, n) != DMD_OK) {
+        dmd_log("HEVC: SPS 发送失败: %s\n", dmd_session_last_error(sess));
+        return -1;
+    }
+    dmd_log("HEVC: 已送 SPS %zu 字节\n", n);
+
+    n = dmd_hevc_build_pps_nalu(pp, nalu, sizeof(nalu));
+    if (n == 0) {
+        dmd_log("HEVC: PPS 合成失败\n");
+        return -1;
+    }
+    if (dmd_session_send_unit(sess, nalu, n) != DMD_OK) {
+        dmd_log("HEVC: PPS 发送失败: %s\n", dmd_session_last_error(sess));
+        return -1;
+    }
+    dmd_log("HEVC: 已送 PPS %zu 字节\n", n);
+
+    return 0;
 }
 
 /* H.264：在首个 slice 之前把合成的 SPS/PPS 送给 daemon。
@@ -1492,6 +1563,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     int have_sp_snap = 0;
     VAProfile profile_snap = c->profile;
     unsigned int mbs_wide = 0, mbs_high = 0;
+    VAPictureParameterBufferHEVC hevc_snap;
+    int need_hevc_params = 0;
 
     if (codec == DMD_CODEC_H264 && c->have_h264_pic_param) {
         mbs_wide = (unsigned int)c->h264_pic_param.picture_width_in_mbs_minus1 + 1;
@@ -1521,11 +1594,41 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         }
     }
 
+    if (codec == DMD_CODEC_HEVC && c->hevc_pic_param_valid) {
+        /* 重发条件比 H.264 简单：HEVC 的 PPS 不含随帧变化的字段
+         * （num_ref_idx 默认值在 PPS 里是真正的默认值，slice header 会覆盖），
+         * 所以只在首次与分辨率变化时重发。 */
+        unsigned int w = c->hevc_pic_param.pic_width_in_luma_samples;
+        unsigned int h = c->hevc_pic_param.pic_height_in_luma_samples;
+        /* VA-API 缺少复现某些码流所需的信息（见 dmd_hevc_can_build）。
+         * 这种情况必须失败，让上层回落软解 —— 合成一个不匹配的 SPS
+         * 会解出坏画面，比直接失败糟得多。 */
+        if (!dmd_hevc_can_build(&c->hevc_pic_param)) {
+            dmd_log("HEVC: 该码流无法合成参数集"
+                    "（num_short_term_ref_pic_sets=%u），拒绝\n",
+                    c->hevc_pic_param.num_short_term_ref_pic_sets);
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_UNIMPLEMENTED;
+        }
+        if (!c->param_sets_sent || c->sent_mbs_wide != w ||
+            c->sent_mbs_high != h) {
+            need_param_sets = 1;
+            need_hevc_params = 1;
+            hevc_snap = c->hevc_pic_param;
+            /* 借用这两个字段记分辨率（HEVC 无宏块概念，存的是像素） */
+            mbs_wide = w;
+            mbs_high = h;
+        }
+    }
+
     drv->io_busy[idx] = 1;
     pthread_mutex_unlock(&drv->lock);
 
     int rc = DMD_OK;
-    if (need_param_sets) {
+    if (need_hevc_params) {
+        if (hevc_send_param_sets(sess, &hevc_snap, profile_snap) != 0)
+            rc = DMD_ERR_PROTOCOL;
+    } else if (need_param_sets) {
         if (h264_send_param_sets(sess, &pp_snap, &iq_snap, have_iq_snap,
                                  have_sp_snap ? &sp_snap : NULL, profile_snap,
                                  pw, ph) != 0)

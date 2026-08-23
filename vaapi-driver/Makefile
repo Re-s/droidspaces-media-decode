@@ -29,7 +29,7 @@ LDLIBS  += -lpthread
 
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
            $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
-           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/export.c
+           $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
 # 客户端库的自测程序：独立目标，make all 不依赖它。
