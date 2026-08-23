@@ -323,7 +323,7 @@ H.264 的 P/B 帧必须依赖参考帧，从非 IDR 位置重新开始解码要�
 54 帧纯黑（`tools/probe_black.c`，亮度均值恰为 16 即 BT.601 black level），
 表现为播放时画面一闪一闪。`flush` 与重建会话在这点上**没有区别**。
 
-**根治办法：让解码器按解码顺序输出，滞后从 4 降到 1，互等消失。**
+**根治办法：让解码器跟随输入顺序输出，滞后从 4 降到 1，互等消失。**
 `tools/probe_keys.c` 逐键实测（目标滞后 <= 3）：
 
 | 配置 | 滞后 |
@@ -332,19 +332,42 @@ H.264 的 P/B 帧必须依赖参考帧，从非 IDR 位置重新开始解码要�
 | `vendor.qti-ext-dec-low-latency.enable=1` | 4+ |
 | **`vendor.qti-ext-dec-picture-order.enable=1`** | **1** |
 
-只有最后一个有效。但它必须**与驱动的配对逻辑配套改**：
+只有最后一个有效。
+
+早期版本用编译期常量 `DMD_DECODE_ORDER_OUTPUT` 告诉驱动"解码器按什么顺序
+出帧"，两侧不一致就画面错位且不报错（实测 105/150 帧）。**该常量已删除** ——
+现在驱动根本不需要知道输出顺序，见下节。
+
+### 配对：按输入单元序号精确匹配（与输出顺序解耦）
+
+daemon 把每个输入单元的序号写进 `queueInputBuffer` 的
+`presentationTimeUs`，MediaCodec 原样带到对应的输出帧上，再经帧头回传。
+于是"这一帧属于哪次提交"是**已知事实**，不需要推断：
 
 ```
-daemon: vendor.qti-ext-dec-picture-order.enable = 1
-driver: DMD_DECODE_ORDER_OUTPUT              = 1   ← 两者必须一致
+daemon:  vcl_in * 1000  →  presentationTimeUs   （乘 1000 见下）
+         帧头第 4 字段  ←  presentationTimeUs / 1000
+driver:  pending_unit[] 精确匹配 dmd_frame.unit_seq
 ```
 
-`DMD_DECODE_ORDER_OUTPUT=1` 时配对退化为取队首：ffmpeg 按解码序提交、
-解码器按解码序输出，提交序 == 出帧序，不需要 POC 重排。
+能力用格式描述块头部第 2 个字（原保留的 0）声明 `CAP_FRAME_PTS`；
+旧 daemon 恒为 0，客户端按 3 字段帧头解析，向后兼容，
+此时驱动回退到 `(seq, POC)` 推断。
 
-⚠️ **只改一侧的后果是画面错位而不是报错**：只改 daemon 时
-`test1080.h264` 帧数正确（150）但 105 帧错位（每 4 帧错 3 帧），
-因为 POC 配对假设的是显示序输出。
+**为什么乘 1000**：解码器按毫秒量化 PTS，直接用序号（步长 1us）会被
+全部压成 0 —— 实测 9 个单元回传的 PTS 全为 0，配对退化成"一个号对应多帧"。
+
+验证方式是**同一份驱动分别对上两种 daemon**：
+
+| daemon 配置 | 六条流 | 配对回退 |
+|---|---|---|
+| 显示序输出（去掉 vendor 键，模拟非高通平台） | 全部一致 | 0 |
+| 跟随输入序（带 vendor 键） | 全部一致 | 0 |
+
+⚠️ 维护 `pending` 队列时，`pending_unit` 必须与 `pending`/`pending_poc`/
+`pending_seq` **一起搬移**。漏搬会让序号与 surface 错位、同一个号被重复匹配
+（实测 `unit 5` 与 `unit 9` 各出现两次、序号 2 和 6 消失、70/150 帧错位），
+而 daemon 侧日志一切正常 —— 很难查。
 
 另一条已验证可行但未采用的路（`tools/probe_replay.c`）：保留排空，
 但重建后从最近的 IDR 重放并丢弃重放帧，黑帧与重复帧同样是 0。
