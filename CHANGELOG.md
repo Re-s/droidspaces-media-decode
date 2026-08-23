@@ -127,6 +127,23 @@ MAC 不看 uid）；DroidSpaces `enable_hw_access=1` 无效（只透传 `/dev`
    可能可用，NAT 型必然降级。教训：控制通道能跨 netns，
    不等于交接通道也跨得过去。
 
+### 发布前修订（审查与翻译阶段发现）
+
+这些改动发生在 v0.3.0 tag 打出之后、Release 发布之前，属于同一版本的收尾：
+
+- **`--sock` 两个坑修复**：尾斜杠（`/path/dmd/` 会拼出 `dmd//decode.sock`，
+  日志与验证清单匹配串对不上）；目录不存在时**静默降级**成单文件 socket
+  （单文件挂载在 daemon 重启后必然失效）。现在剥除尾斜杠、自动建目录，
+  以 `.sock` 结尾的路径才视为文件模式并打印告警。
+- **日志措辞**：`传输=TCP` 改为 `帧回传=SHM|内联`。原字段描述的是帧回传方式，
+  与控制通道无关——走 `--sock` 时它照样印 TCP。这个歧义曾导致把 SELinux
+  domain 失败误判成 SHM 帧交付 bug。
+- **文档全局审查修订**：四个单元核对全部 11 份文档共报 95 条问题；
+  研究文档里"Mesa 存在 src/va/venus/ 等五个 VA-API driver 目录"的关键论据
+  被证伪（那些路径不存在），已标作废；事实清单三条基础前提订正。
+- **新增英文版**：`README.en.md`、`vaapi-driver/README.en.md`、
+  `doc/platform-integration-contract.en.md`。以中文版为准。
+
 ### memfd 零拷贝仍默认关闭
 
 需 `DMD_WANT_SHM=1` 显式开启。实测该路径会让**单个连接**断掉
