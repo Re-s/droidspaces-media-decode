@@ -364,6 +364,26 @@ driver:  pending_unit[] 精确匹配 dmd_frame.unit_seq
 | 显示序输出（去掉 vendor 键，模拟非高通平台） | 全部一致 | 0 |
 | 跟随输入序（带 vendor 键） | 全部一致 | 0 |
 
+### 长流与 seek
+
+配对改成按单元序号后补做了这两项验证，同样对上两种 daemon 配置。
+素材用 3000 帧 / 100 个 IDR 的流（`-g 30 -bf 2`，带 B 帧）：
+
+```
+ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=100" \
+       -c:v libx264 -g 30 -bf 2 -pix_fmt yuv420p long3000.h264
+```
+
+| 场景 | 结果 |
+|---|---|
+| 长流 3000 帧（跟随输入序 daemon） | 逐字节一致，回退/重建/排空 全 0，序号连续到 3000 |
+| 长流 3000 帧（显示序 daemon） | 逐字节一致，回退/重建 0 |
+| seek 10/30/55/80 秒 | 全部一致，回退/重建 0 |
+| 分辨率切换流 seek（`switch.h264`/`grow.h264`） | 全部一致 |
+
+日志里偶发一条 `SyncSurface: 等帧超时 30 ms` 属正常非阻塞轮询，
+上层随后重试，不影响结果。
+
 ⚠️ 维护 `pending` 队列时，`pending_unit` 必须与 `pending`/`pending_poc`/
 `pending_seq` **一起搬移**。漏搬会让序号与 surface 错位、同一个号被重复匹配
 （实测 `unit 5` 与 `unit 9` 各出现两次、序号 2 和 6 消失、70/150 帧错位），
