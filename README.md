@@ -4,16 +4,26 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 
 ## 项目简介
 
-本项目提供了一个运行在 Android 设备上的 MediaCodec 硬件解码守护进程，通过 TCP socket 将硬件解码能力暴露给 Linux 容器（如 DroidSpaces 中的 Debian 容器）。这使得容器内的应用程序能够利用 Android 设备的 GPU 硬件解码能力，实现高效的视频播放。
+本项目提供了一个运行在 Android 设备上的 MediaCodec 硬件解码守护进程，把硬件解码能力暴露给 Linux 容器（如 DroidSpaces 中的 Debian 容器）。容器内的应用无需任何改动即可通过标准 VA-API 用上 Android 的硬件解码。
 
 ### 核心特性
 
 - **硬件加速解码**：利用 Android MediaCodec API 硬件解码 H.264 / HEVC / VP8 / VP9
-- **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox）无需改动即可用
-- **TCP 跨 namespace 通信**：容器与 Android 宿主共享 net namespace，TCP loopback 直接互通。
-  路径型 Unix socket 因 mount namespace 独立而不可用，但 **abstract socket 可行**
-  （属 net namespace，双向可见；共享内存通道用它传 memfd，ffmpeg 下实测可行。
-  注意该通道**默认关闭**，浏览器路径未走过它，故沙箱下的表现尚未验证）
+- **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox、Chrome）无需改动即可用
+- **两种传输通道，自动选择**：
+  - **路径式 Unix socket**（推荐）：不属于 net namespace，靠 bind mount 跨界，
+    **host 型与 NAT 型容器都能用**；鉴权靠文件权限，服务不上网络。
+    走这条路时自动启用 memfd 零拷贝。
+  - **TCP 127.0.0.1**（兜底）：仅在容器与宿主**共享 net namespace** 时可用
+    （host 型容器满足，NAT 型不满足）。
+  
+  驱动通过 `DMD_ENDPOINT` 显式指定，或自动探测默认路径后退回 TCP。
+  
+  ⚠️ **memfd 零拷贝默认关闭**，需 `DMD_WANT_SHM=1` 显式开启。
+  这条路驱动侧从未真正启用过（`want_shm` 长期硬编码为 0），只有单元测试走过
+  （150 帧、与 TCP 前 20 帧逐字节一致、无 fd 泄漏），真实消费者环境下未验证。
+  另一个未实测的风险是浏览器沙箱能否收 `SCM_RIGHTS`
+  （Firefox RDD / Chrome GPU 进程都有 seccomp 过滤）。
 - **最小化实现**：基于 anland 项目的 libdisplay_daemon 库简化而来，代码简洁易懂
 - **进程托管**：daemon 设计为被平台托管的前台进程（DroidSpace 负责启动与守护）
 
@@ -24,14 +34,16 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 │                Android 设备 (Root)                  │
 │                                                     │
 │  ┌───────────────────────────────────────────────┐ │
-│  │         decode-daemon (TCP 服务端)            │ │
+│  │              decode-daemon                    │ │
 │  │                                               │ │
-│  │  • 监听 TCP 端口 (默认 20003)                │ │
-│  │  • 接收 H.264 NALU 数据                      │ │
+│  │  • 监听 Unix socket（--sock，推荐）           │ │
+│  │    或 TCP 127.0.0.1:20003（兜底）             │ │
+│  │  • 接收 H.264 / HEVC / VP8 / VP9 码流         │ │
 │  │  • 使用 MediaCodec 硬件解码                   │ │
-│  │  • 返回解码后的 NV12 帧数据                  │ │
+│  │  • 返回 NV12 帧（TCP 传输或 memfd 零拷贝）    │ │
 │  └───────────────────────┬───────────────────────┘ │
-│                          │ TCP (127.0.0.1:20003)    │
+│                          │ Unix socket（bind mount）│
+│                          │ 或 TCP 127.0.0.1:20003   │
 │                          │                          │
 │  ┌───────────────────────┴───────────────────────┐ │
 │  │          Linux 容器 (Debian aarch64)          │ │
@@ -44,14 +56,67 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 └─────────────────────────────────────────────────────┘
 ```
 
-容器与 Android 宿主**共享 net namespace**（实测 inode 均为 `4026531937`），
-所以 TCP loopback 直接互通；而 mount namespace 独立，**路径型** Unix socket
-（`/tmp/xxx.sock` 这种）在对侧不存在，不可用。
+DroidSpaces 有**两类容器**，namespace 归属不同，这直接决定可用的传输方式：
 
-但 **abstract socket 可用** —— 它属于 net namespace 而不落文件系统，双向可见。
-共享内存通道（`DMD_XFER_SHM`）已经在用它传递 memfd，实测跨边界成功且
-解码结果与软解逐字节一致。所以后续若要把控制通道也从 TCP 换成 Unix socket，
-abstract socket 是可行路径，无需依赖任何共享挂载点。
+| | host 型 | NAT 型 |
+|---|---|---|
+| net namespace | 与宿主**共享**（`4026531937`） | **独立**（如 `4026535650`） |
+| IP | 直接持有 `wlan0` 真实地址 | `eth0` 172.28.x.x/16，网关 172.28.0.1 |
+| `127.0.0.1:20003` | 可达 | **不可达** |
+| abstract socket 可见数 | 31（与宿主一致） | **0** |
+| mnt / pid / uts / ipc / cgroup ns | 均隔离 | 均隔离 |
+
+所以 **TCP loopback 与 abstract socket 都依赖共享 net namespace**，只在 host 型
+容器可用。NAT 型容器两者皆不通 —— abstract socket 属于 net namespace，
+并不是 TCP 的替代品。
+
+**路径式 Unix socket 才是通用解**：它不属于 net namespace，平台把宿主上的
+socket 文件 bind mount 进容器即可，两类容器都能用，且鉴权直接靠文件权限，
+不必把服务暴露到网络。实测跑通了完整链路 —— 容器 `connect` 成功、
+通过 `SCM_RIGHTS` 收到 memfd、`mmap` 读到宿主写入的内容，
+一次同时证明三件事：路径式 Unix socket 跨 mount namespace 可用、
+`SCM_RIGHTS` 能跨界传 fd、memfd 跨 namespace 可映射。
+
+DroidSpaces 自己的显示通道就是这个模式：宿主
+`/data/local/tmp/anland-<hash>.sock` → 容器 `/run/display.sock`
+（实测两侧 inode 相同，确认是同一文件）。
+
+⚠️ **两个部署约束**（都是实测踩出来的）：
+
+1. **必须挂目录，不能挂单个 socket 文件。** `bind()` 只能创建新 inode，
+   而 bind mount 绑的是 **inode 而非路径** —— 挂单文件时 daemon 一重启就换
+   inode，容器侧立刻变成 `ECONNREFUSED`，且此时两侧 `stat` 看到的 inode
+   可能一致（都是那个孤立 inode），极易误判。挂目录则 inode 稳定：
+   宿主 `/data/local/tmp/dmd/` → 容器 `/run/dmd/`，daemon 随便重启都不影响。
+
+2. **daemon 需要合适的 SELinux domain，而现有 domain 都只有一半权限。**
+   这是当前**阻塞 Unix socket 通道交付**的唯一问题：
+
+   | 启动身份 | 能 bind socket | 能用 MediaCodec |
+   |---|---|---|
+   | `su`（`u:r:ksu:s0`） | ✗ 各处 `EACCES` | ✓ |
+   | `runcon u:r:droidspacesd:s0` | ✓ | ✗ SIGABRT |
+
+   `droidspacesd` 下崩在 `CCodec::allocate`，tombstone 栈顶
+   `Codec2Client::GetServiceNames`，报 `Hardware service manager is not running`
+   —— 该 domain 无权访问 hwservicemanager / Codec2 HAL。
+
+   三组对照实验确认这与传输方式无关：`ksu`+TCP 正常、`droidspacesd`+TCP
+   同样 SIGABRT、`droidspacesd`+Unix socket+**SELinux permissive** 正常解码。
+   也就是说 **Unix socket 通道本身是正确的**，缺的只是一条 allow 规则。
+
+   已排除的替代方案：root 无效（两个 domain 本来都是 uid 0，SELinux 是 MAC
+   不看 uid）；DroidSpaces 的 `enable_hw_access=1` 无效（只透传 `/dev` 节点、
+   不改 domain，且作用于容器而非宿主侧的 daemon）；`untrusted_app` domain
+   走不通（无法执行 `shell_data_file` 标签的二进制，改标签被拒）；
+   `selinux_permissive=1` 有效但等于全系统关防护，不可作为交付形态。
+
+   **需要平台补一条规则**：允许 `droidspacesd` 访问 hwservicemanager 与
+   Codec2 HAL。DroidSpaces 已为该 domain 配过 `/dev/dri`、`/dev/ashmem`
+   的访问权，这属同类工作。
+
+3. **在规则到位前，默认路径仍是 TCP。** 驱动探测不到可用 socket 会自动退回
+   TCP（`u:r:ksu:s0` 下正常），行为与 v0.2.0 一致，无退化。
 
 ### 性能
 

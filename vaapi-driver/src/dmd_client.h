@@ -68,9 +68,28 @@ enum {
  * 4K NV12 单帧就是 12441600 字节，daemon 的 8MB 只约束输入侧。 */
 #define DMD_MAX_FRAME_BYTES (64u * 1024u * 1024u)
 
+/* 默认 Unix socket 路径。存在且是 socket 时优先于 TCP。
+ *
+ * 平台应把宿主上的 socket 文件 bind mount 到这里 —— 仿 DroidSpaces 自己的
+ * 显示通道做法：宿主 /data/local/tmp/anland-<hash>.sock → 容器
+ * /run/display.sock（实测两侧 inode 相同，确认是同一文件）。
+ *
+ * 这条路不依赖 net namespace，所以 host 型与 NAT 型容器都能用。 */
+#define DMD_DEFAULT_SOCK "/run/dmd/decode.sock"
+
 /* ------------------------------------------------------------ 配置 */
 struct dmd_session_config {
     uint16_t port;              /* daemon TCP 端口，0 表示用 20003 */
+    /* 非 NULL = 连这个路径的 Unix socket，此时忽略 port。
+     * 默认路径见 DMD_DEFAULT_SOCK。
+     *
+     * 路径式 Unix socket **不属于 net namespace**：平台把宿主上的 socket
+     * 文件 bind mount 进容器即可，host 型与 NAT 型容器都能用。
+     * 而 TCP 127.0.0.1 只在共享 net namespace 时可达（实测 NAT 型容器
+     * netns 独立，TCP loopback 与 abstract socket 都不通）。
+     *
+     * 字符串只在 dmd_session_create 期间被读取，调用方保证那段时间内有效。 */
+    const char *sock_path;
     int      codec;             /* DMD_CODEC_* */
     int      width;             /* 96..8192 */
     int      height;            /* 96..4320 */

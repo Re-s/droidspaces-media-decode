@@ -19,10 +19,12 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 /* surface 分配在 msm_drm 的 dumb buffer 里，为的是能导出 dmabuf
  * （Firefox 取帧的唯一途径，见 export.c）。 */
@@ -383,17 +385,103 @@ static struct dmd_session *session_open(int codec, unsigned int width,
     cfg.codec = codec;
     cfg.width = (int)width;
     cfg.height = (int)height;
-    /* 阶段 1 固定 TCP：SHM 是后续优化，先把正确性做对。 */
-    cfg.want_shm = 0;
     cfg.io_timeout_ms = DMD_FRAME_TIMEOUT_MS;
+
+    /* 端点选择：Unix socket 优先，TCP 兜底。
+     *
+     * DMD_ENDPOINT 可显式指定：
+     *   unix:/run/dmd.sock   连该路径的 Unix socket
+     *   tcp:20003            连 127.0.0.1 的该端口
+     * 不设时按 DMD_DEFAULT_SOCK → TCP 的顺序自动探测。
+     *
+     * 为什么 Unix socket 优先：它**不属于 net namespace**，平台把宿主上的
+     * socket 文件 bind mount 进容器即可，两类容器都通；而 TCP 127.0.0.1
+     * 只在共享 net namespace 时可达 —— 实测 DroidSpaces 的 NAT 型容器
+     * netns 独立（4026535650 vs 宿主 4026531937），TCP loopback 与
+     * abstract socket 都不通，只有路径式 Unix socket 这条路。
+     *
+     * ⚠️ 勘误：这里一度写着"能连上 Unix socket 就意味着 SCM_RIGHTS 可用，
+     * 于是可以请求 SHM 传输"。**那个推论是错的。**
+     *
+     * SHM 的 memfd 交接并不走这条控制通道，而是 daemon 另开一个
+     * **abstract** socket（decode-daemon.c 里 sun_path[0] = 0 那处），
+     * 驱动再去连它。abstract socket 属于 net namespace ——
+     * 于是 NAT 型容器（netns 独立）根本连不上那个交接通道，
+     * DMD_WANT_SHM=1 在那里必然交接失败再降级，每建一次会话白等一次超时。
+     *
+     * 换句话说：**控制通道跨 netns 的能力，不等于 SHM 交接通道也跨得过去。**
+     * 要让零拷贝在 NAT 容器可用，得把 memfd 交接也改走这条路径式
+     * Unix socket（同一个连接上传 SCM_RIGHTS 即可，不必另开 socket），
+     * 那是一项独立改动，尚未做。 */
+    const char *ep = getenv("DMD_ENDPOINT");
+    char sockbuf[256];
+    const char *use_sock = NULL;
+
+    if (ep && strncmp(ep, "unix:", 5) == 0) {
+        snprintf(sockbuf, sizeof(sockbuf), "%s", ep + 5);
+        use_sock = sockbuf;
+    } else if (ep && strncmp(ep, "tcp:", 4) == 0) {
+        int p = atoi(ep + 4);
+        if (p > 0 && p < 65536)
+            cfg.port = (uint16_t)p;
+    } else if (!ep) {
+        /* 未显式指定：默认路径存在且是 socket 就用它 */
+        struct stat st;
+        if (stat(DMD_DEFAULT_SOCK, &st) == 0 && S_ISSOCK(st.st_mode))
+            use_sock = DMD_DEFAULT_SOCK;
+    }
+
+    cfg.sock_path = use_sock;
+    /* SHM（memfd 零拷贝）默认**关闭**，需 DMD_WANT_SHM=1 显式开启。
+     *
+     * 之所以保守：这条路**驱动侧从未真正启用过**（cfg.want_shm 长期硬编码
+     * 为 0），只有 tests/test_dmd_client.c 走过 —— 那里实测 150 帧、与 TCP
+     * 前 20 帧逐字节一致、无 fd 泄漏，但那是独立测试程序，不是驱动被
+     * dlopen 进消费者进程的真实环境。
+     *
+     * 尚未实测的风险：浏览器沙箱能否收 SCM_RIGHTS（Firefox RDD /
+     * Chrome GPU 进程都有 seccomp 过滤）。本项目有先例 —— 一份源码级结论说
+     * RDD 沙箱对 SYS_SOCKET 一律返回 EACCES，实测却跑通了 713 帧。
+     * 这类判断只能靠实测。
+     *
+     * ⚠️ 勘误：此处一度写着"SHM 帧交付路径有 bug、daemon 在 memfd 交接后
+     * 不再服务、根因未定位"。**那个归因是错的**，已订正。那些 0 帧现象的真实
+     * 原因是 SELinux domain 权限 —— daemon 以 runcon u:r:droidspacesd:s0
+     * 启动时能建 socket，但无权访问 hwservicemanager/Codec2，于是在
+     * CCodec::allocate 处 SIGABRT（tombstone 栈顶 Codec2Client::GetServiceNames，
+     * "Hardware service manager is not running"）。与 SHM 无关 ——
+     * 当时日志里的传输模式其实是 TCP。三组对照实验：
+     *   u:r:ksu:s0          + TCP         → 正常解码（但该 domain 无权 bind）
+     *   u:r:droidspacesd:s0 + TCP         → 同样 SIGABRT（与传输方式无关）
+     *   u:r:droidspacesd:s0 + Unix socket + SELinux permissive → 正常解码
+     * 结论：Unix socket 通道本身是正确的，缺的只是一条 allow 规则。
+     *
+     * 另注：SHM 交接走的是 abstract socket（见上方端点选择处的勘误），
+     * 属 net namespace，所以零拷贝**只在 host 型容器可能可用**，
+     * NAT 型容器下必然降级。这也是它默认关闭的又一个理由。 */
+    const char *wantshm = getenv("DMD_WANT_SHM");
+    cfg.want_shm = (use_sock && wantshm && *wantshm == '1') ? 1 : 0;
 
     memset(&err, 0, sizeof(err));
     struct dmd_session *s = dmd_session_create(&cfg, &err);
+
+    /* Unix socket 连不上就退回 TCP —— 平台没挂载时仍能工作。 */
+    if (!s && use_sock) {
+        dmd_log("Unix socket %s 连接失败（%s），退回 TCP\n",
+                use_sock, err.msg);
+        cfg.sock_path = NULL;
+        cfg.want_shm = 0;
+        memset(&err, 0, sizeof(err));
+        s = dmd_session_create(&cfg, &err);
+    }
+
     if (!s)
         dmd_log("会话建立失败: code=%d handshake=%d %s\n", err.code,
                 err.handshake_status, err.msg);
     else
-        dmd_log("会话已建立: codec=%d %ux%u xfer=%d\n", codec, width, height,
+        dmd_log("会话已建立: codec=%d %ux%u 端点=%s xfer=%d\n", codec,
+                width, height,
+                cfg.sock_path ? cfg.sock_path : "tcp/127.0.0.1",
                 dmd_session_xfer_mode(s));
     return s;
 }

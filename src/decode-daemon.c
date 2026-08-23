@@ -33,6 +33,8 @@
 #include <pthread.h>
 #include <sys/select.h>
 #include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/file.h>   /* flock：判活，见 main 里的锁逻辑 */
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <stddef.h>
@@ -41,6 +43,8 @@
 #include <media/NdkMediaFormat.h>
 
 #define MAX_FRAME          (8*1024*1024)
+/* 目录模式下的 socket 文件名。驱动侧的 DMD_DEFAULT_SOCK 必须与此一致。 */
+#define DAEMON_SOCK_NAME "decode.sock"
 #define INPUT_TIMEOUT_US   5000000
 #define OUTPUT_TIMEOUT_US  20000
 #define SEND_CHUNK         262144
@@ -1179,16 +1183,36 @@ out_fd:
 int main(int argc, char **argv)
 {
     int port = DEFAULT_PORT;
+    const char *sock_path = NULL;   /* 非 NULL = 监听 Unix socket 而非 TCP */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0)      log_level = 2;
         else if (strcmp(argv[i], "-q") == 0) log_level = 0;
-        else if (strcmp(argv[i], "-h") == 0) {
-            printf("用法: %s [端口] [-v|-q]\n"
-                   "  端口   监听的 TCP 端口（默认 %d，仅绑定 127.0.0.1）\n"
-                   "  -v     逐帧调试日志\n"
-                   "  -q     只输出错误\n",
-                   argv[0], DEFAULT_PORT);
+        else if (strcmp(argv[i], "--sock") == 0 && i + 1 < argc) {
+            sock_path = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printf("用法: %s [端口] [--sock 路径] [-v|-q]\n"
+                   "  端口          监听的 TCP 端口（默认 %d，仅绑定 127.0.0.1）\n"
+                   "  --sock 路径   改为监听该路径的 Unix socket（推荐）\n"
+                   "  -v            逐帧调试日志\n"
+                   "  -q            只输出错误\n"
+                   "\n"
+                   "两种监听方式的区别：\n"
+                   "  TCP 127.0.0.1 依赖容器与 Android **共享 net namespace**。\n"
+                   "  DroidSpaces 的 host 型容器满足，NAT 型容器不满足\n"
+                   "  （实测 NAT 容器 netns 独立，127.0.0.1 不可达）。\n"
+                   "\n"
+                   "  --sock 建的是路径式 Unix socket，不属于 net namespace，\n"
+                   "  由平台把它 bind mount 进容器即可用 —— 两类容器都通，\n"
+                   "  且鉴权直接靠文件权限，不必把服务暴露到网络。\n"
+                   "  DroidSpaces 自己的显示通道就是这个模式\n"
+                   "  （/data/local/tmp/anland-*.sock → 容器 /run/display.sock）。\n"
+                   "\n"
+                   "⚠️ 在 Android 上建 socket 文件需要合适的 SELinux domain。\n"
+                   "  用 su 直接启动会跑在 u:r:ksu:s0 下，bind 得到 EACCES。\n"
+                   "  实测可行的启动方式：\n"
+                   "    runcon u:r:droidspacesd:s0 %s --sock /data/local/tmp/dmd.sock\n",
+                   argv[0], DEFAULT_PORT, argv[0]);
             return 0;
         } else {
             int p = atoi(argv[i]);
@@ -1203,27 +1227,146 @@ int main(int argc, char **argv)
 
     if (pipe(wakefd) < 0) { perror("pipe"); return 1; }
 
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { perror("socket"); return 1; }
-
+    int srv;
     int opt = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in a = { AF_INET, htons(port), { htonl(INADDR_LOOPBACK) }, {0} };
-
-    /* bind/listen 必须检查：失败时若继续打印 "listening" 会让外部管理脚本
-     * 误判启动成功（例如另一个实例已占用端口）。 */
-    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0) {
-        fprintf(stderr, "bind %d failed: %s\n", port, strerror(errno));
-        close(srv); return 1;
+    /* --sock 指向**目录**时，在其中建固定名 socket。
+     *
+     * 这是为了解决 bind mount 的 inode 语义问题：bind() 只能创建新 inode，
+     * 所以 daemon 每次重启都会换 inode，而 bind mount 绑的是 inode ——
+     * 挂单个 socket 文件时，daemon 一重启容器侧就变成 ECONNREFUSED，
+     * 必须重新挂载。
+     *
+     * 改挂**目录**就没这个问题：目录 inode 稳定，里面的 socket 换 inode
+     * 不影响挂载。平台只需挂一次：
+     *   宿主 /data/local/tmp/dmd/  →  容器 /run/dmd/
+     * 之后 daemon 随便重启，容器一直能连 /run/dmd/decode.sock。 */
+    char sock_in_dir[256];
+    if (sock_path) {
+        struct stat dst;
+        if (stat(sock_path, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+            snprintf(sock_in_dir, sizeof(sock_in_dir), "%s/%s",
+                     sock_path, DAEMON_SOCK_NAME);
+            dlog(1, "--sock 是目录，实际监听 %s", sock_in_dir);
+            sock_path = sock_in_dir;
+        }
     }
-    if (listen(srv, MAX_CLIENTS) < 0) {
-        fprintf(stderr, "listen failed: %s\n", strerror(errno));
-        close(srv); return 1;
-    }
 
-    /* 这行是外部脚本判断启动成功的标志，保持文本不变 */
-    fprintf(stderr, "listening on %d\n", port);
+    if (sock_path) {
+        /* Unix socket 监听：路径式，不属于 net namespace，
+         * 由平台 bind mount 进容器 —— host 型与 NAT 型容器都能用。 */
+        srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (srv < 0) { perror("socket"); return 1; }
+
+        struct sockaddr_un ua;
+        memset(&ua, 0, sizeof(ua));
+        ua.sun_family = AF_UNIX;
+        if (strlen(sock_path) >= sizeof(ua.sun_path)) {
+            fprintf(stderr, "sock 路径过长（上限 %zu）: %s\n",
+                    sizeof(ua.sun_path) - 1, sock_path);
+            close(srv); return 1;
+        }
+        strncpy(ua.sun_path, sock_path, sizeof(ua.sun_path) - 1);
+
+        /* 残留 socket 文件的处理 —— 这里有个**部署顺序约束**，务必看完。
+         *
+         * bind() 只能创建**新 inode**，无法绑到已存在的文件。而 bind mount
+         * 绑定的是 inode 而非路径：一旦 unlink 重建，容器侧的挂载点就指向
+         * 孤立 inode，表现为 connect 得到 ECONNREFUSED —— 宿主两侧 stat
+         * 看到的 inode 甚至会一致（都是那个孤立 inode），很容易误判。
+         *
+         * 所以正确的部署顺序是：
+         *   1. daemon 先启动、建好 socket 文件
+         *   2. 平台**再** bind mount 进容器
+         *   3. daemon 重启后必须**重新挂载**（inode 变了）
+         *
+         * 这里只在"确认没有活的监听者"时才删残留：先 connect 探一下，
+         * 连得上说明另一个实例正在服务，直接报错退出而不是抢它的路径。 */
+        /* 判活用 flock 而**不是** connect 探测。
+         *
+         * 早前版本是"connect 一下，连得上就认为有活实例"。那样有两个问题：
+         *   1. 用的是阻塞 socket 且 connect 没有上界 —— 旧实例 backlog 打满时
+         *      新进程会挂死在启动路径上；而如果内核返回 EAGAIN，还会被误判成
+         *      "无监听者"，进而 unlink 掉**活实例正在用的** socket 文件。
+         *   2. 对活实例有副作用：每次被拒的启动都让旧实例白跑一次 accept +
+         *      建线程再销毁，并短暂占用一个并发配额。
+         *
+         * flock 没有这些问题：不碰对方进程、无需超时、且进程无论怎么死
+         * （含 SIGKILL）内核都会释放锁，所以不会留下假的"已占用"状态。
+         * 锁文件与 socket 同目录、独立命名，句柄故意**不关闭** ——
+         * 靠它在整个进程生命周期内持有锁。 */
+        char lockpath[300];
+        snprintf(lockpath, sizeof(lockpath), "%s.lock", sock_path);
+        int lockfd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (lockfd < 0) {
+            fprintf(stderr, "打开锁文件 %s 失败: %s\n",
+                    lockpath, strerror(errno));
+            close(srv);
+            return 1;
+        }
+        if (flock(lockfd, LOCK_EX | LOCK_NB) < 0) {
+            if (errno == EWOULDBLOCK)
+                fprintf(stderr, "%s 上已有实例在运行，拒绝启动\n", sock_path);
+            else
+                fprintf(stderr, "flock %s 失败: %s\n",
+                        lockpath, strerror(errno));
+            close(lockfd);
+            close(srv);
+            return 1;
+        }
+        /* 锁已拿到，说明没有活实例 —— lockfd 故意不关，保持持有。 */
+
+        struct stat st;
+        if (stat(sock_path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            /* 拿到锁还看到 socket 文件，就是上次退出留下的死文件，可以删。
+             * ⚠️ 但这会换掉 inode，已有的 bind mount 会失效，需重新挂载。 */
+            fprintf(stderr, "清理残留 socket 文件 %s"
+                            "（注意：inode 将改变，已有的 bind mount 需重挂）\n",
+                    sock_path);
+            unlink(sock_path);
+        }
+
+        if (bind(srv, (struct sockaddr *)&ua, sizeof(ua)) < 0) {
+            fprintf(stderr, "bind %s failed: %s\n", sock_path, strerror(errno));
+            /* Android 上最常见的原因是 SELinux domain 不对：
+             * su 启动会跑在 u:r:ksu:s0，bind 得到 EACCES。 */
+            if (errno == EACCES)
+                fprintf(stderr, "  提示: 试试 runcon u:r:droidspacesd:s0 启动\n");
+            close(srv); return 1;
+        }
+        /* 0660 + 由平台决定属组。这里放宽到 0666 是为了先跑通；
+         * 真实部署应收紧到特定 gid（参考 /dev/dri 用的 droidspaces-gpu）。 */
+        if (chmod(sock_path, 0666) < 0)
+            dlog(1, "chmod %s 警告: %s", sock_path, strerror(errno));
+
+        if (listen(srv, MAX_CLIENTS) < 0) {
+            fprintf(stderr, "listen failed: %s\n", strerror(errno));
+            close(srv); unlink(sock_path); return 1;
+        }
+        /* 与 TCP 分支保持同样的"启动成功"标志格式，外部脚本可统一匹配 */
+        fprintf(stderr, "listening on %s\n", sock_path);
+    } else {
+        srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { perror("socket"); return 1; }
+
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in a = { AF_INET, htons(port), { htonl(INADDR_LOOPBACK) }, {0} };
+
+        /* bind/listen 必须检查：失败时若继续打印 "listening" 会让外部管理脚本
+         * 误判启动成功（例如另一个实例已占用端口）。 */
+        if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0) {
+            fprintf(stderr, "bind %d failed: %s\n", port, strerror(errno));
+            close(srv); return 1;
+        }
+        if (listen(srv, MAX_CLIENTS) < 0) {
+            fprintf(stderr, "listen failed: %s\n", strerror(errno));
+            close(srv); return 1;
+        }
+
+        /* 这行是外部脚本判断启动成功的标志，保持文本不变 */
+        fprintf(stderr, "listening on %d\n", port);
+    }
     fflush(stderr);
 
     int next_id = 1;
@@ -1293,6 +1436,10 @@ int main(int argc, char **argv)
     }
 
     close(srv);
+    /* Unix socket 要删掉文件，否则下次启动 bind 会拿到 EADDRINUSE。
+     * （启动时也会删一次残留，双保险 —— 被信号杀死时走不到这里。） */
+    if (sock_path)
+        unlink(sock_path);
 
     /* 等待仍在运行的会话收尾，避免解码器资源被强行回收 */
     for (int i = 0; i < 50; i++) {

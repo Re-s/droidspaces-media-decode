@@ -378,24 +378,17 @@ static int shm_attach(struct dmd_session *s, const char *name)
 }
 
 /* ------------------------------------------------------------ 连接与握手 */
-static int tcp_connect(struct dmd_session *s, uint16_t port, int timeout_ms,
-                       struct dmd_error *err)
+/* 非阻塞 connect + 带上界的等待。TCP 与 Unix socket 两条路共用，
+ * 差别只在地址结构 —— 超时、SO_ERROR 检查、错误分类都是同一套。 */
+static int sock_connect_wait(int fd, const struct sockaddr *sa, socklen_t slen,
+                             const char *what, int timeout_ms,
+                             struct dmd_error *err)
 {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) {
-        err_set(err, DMD_ERR_CONNECT, 0, "创建 TCP socket 失败", 1);
-        return -1;
-    }
-
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons(port);
-
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    if (connect(fd, sa, slen) < 0) {
         if (errno != EINPROGRESS) {
-            err_set(err, DMD_ERR_CONNECT, 0, "connect 127.0.0.1 失败", 1);
+            char m[96];
+            snprintf(m, sizeof(m), "connect %s 失败", what);
+            err_set(err, DMD_ERR_CONNECT, 0, m, 1);
             close(fd);
             return -1;
         }
@@ -424,10 +417,73 @@ static int tcp_connect(struct dmd_session *s, uint16_t port, int timeout_ms,
             return -1;
         }
     }
+    return 0;
+}
+
+/* 连 TCP 127.0.0.1:port。依赖容器与 Android 共享 net namespace —— 
+ * DroidSpaces 的 host 型容器满足，NAT 型容器不满足。 */
+static int tcp_connect(struct dmd_session *s, uint16_t port, int timeout_ms,
+                       struct dmd_error *err)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        err_set(err, DMD_ERR_CONNECT, 0, "创建 TCP socket 失败", 1);
+        return -1;
+    }
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(port);
+
+    if (sock_connect_wait(fd, (struct sockaddr *)&a, sizeof(a),
+                          "127.0.0.1", timeout_ms, err) < 0)
+        return -1;
 
     /* 帧交付要低延迟；失败不致命，忽略返回值 */
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    s->fd = fd;
+    return 0;
+}
+
+/* 连路径式 Unix socket。
+ *
+ * 相比 TCP 与 abstract socket，这条路的关键优势是**不依赖 net namespace**：
+ * 平台把宿主上的 socket 文件 bind mount 进容器即可，
+ * 所以 host 型与 NAT 型容器都能用（实测 NAT 容器 netns 独立，
+ * 127.0.0.1 与 abstract socket 都不可达，只有这条通）。
+ *
+ * DroidSpaces 自己的显示通道就是这个模式：
+ * 宿主 /data/local/tmp/anland-<hash>.sock → 容器 /run/display.sock
+ * （实测两侧 inode 相同，确认是同一文件）。
+ *
+ * 鉴权直接靠文件权限 + SELinux，不必把服务暴露到网络。
+ * TCP_NODELAY 不适用于 AF_UNIX，故此处不设。 */
+static int unix_connect(struct dmd_session *s, const char *path,
+                        int timeout_ms, struct dmd_error *err)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        err_set(err, DMD_ERR_CONNECT, 0, "创建 Unix socket 失败", 1);
+        return -1;
+    }
+
+    struct sockaddr_un ua;
+    memset(&ua, 0, sizeof(ua));
+    ua.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(ua.sun_path)) {
+        err_set(err, DMD_ERR_CONNECT, 0, "socket 路径过长", 0);
+        close(fd);
+        return -1;
+    }
+    memcpy(ua.sun_path, path, strlen(path));
+
+    if (sock_connect_wait(fd, (struct sockaddr *)&ua, sizeof(ua),
+                          path, timeout_ms, err) < 0)
+        return -1;
+
     s->fd = fd;
     return 0;
 }
@@ -583,7 +639,10 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
     int cto = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms
                                           : DMD_DEF_CONNECT_MS;
 
-    if (tcp_connect(s, port, cto, err) < 0) {
+    /* sock_path 优先：它不依赖 net namespace，适用面比 TCP 广。 */
+    int crc = cfg->sock_path ? unix_connect(s, cfg->sock_path, cto, err)
+                             : tcp_connect(s, port, cto, err);
+    if (crc < 0) {
         if (err)
             s->err = *err;
         dmd_session_destroy(s);
