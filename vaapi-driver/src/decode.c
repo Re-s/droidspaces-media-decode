@@ -32,7 +32,8 @@
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
-static VASurfaceID dmd_pending_take_locked(struct dmd_context *c);
+static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
+                                           uint32_t unit_seq);
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f);
 
@@ -435,6 +436,17 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
 
     c->session = ns;
     c->input_finished = 0;
+    /* 新会话的 daemon 侧 vcl_in 从 1 重新开始，这里必须同步归零，
+     * 否则提交序号与回传的 PTS 错位，配对会持续走"无匹配"回退路径。
+     * ⚠️ 队列里残留的旧序号必须一并作废，否则新会话发出的号会与它们撞车：
+     * 实测 test1080 出现两次 unit 5、35 次"无匹配"回退、70/150 帧错位。
+     * 置 0 表示"该项无有效序号"，不会匹配任何回传的 PTS，
+     * 只能由回退推断按顺序配掉 —— 这正是需要的语义。 */
+    c->units_submitted = 0;
+    for (int k = 0; k < c->pending_count; k++) {
+        int idx = (c->pending_head + k) % DMD_MAX_SURFACES;
+        c->pending_unit[idx] = 0;
+    }
     /* 参数集属于旧会话的状态，新会话必须重送 —— 清掉"已送"标记，
      * 下一次 EndPicture 的既有逻辑就会重新合成并发送 SPS/PPS。 */
     c->param_sets_sent = 0;
@@ -650,7 +662,7 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
             if (frc != DMD_OK)
                 break; /* EOS 或真错误：剩下的确实取不到了 */
 
-            VASurfaceID id = dmd_pending_take_locked(c);
+            VASurfaceID id = dmd_pending_take_locked(c, frame.unit_seq);
             struct dmd_surface *ds = dmd_find_surface_locked(drv, id);
             if (ds) {
                 surface_store_frame_locked(ds, &frame);
@@ -1440,6 +1452,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
     c->pending_seq[qpos] = c->last_seq;
     c->pending_poc[qpos] = c->have_current_poc ? c->current_poc : INT32_MAX;
+    /* 发提交序号：daemon 会把它当 PTS 原样回传，配对时据此精确匹配。
+     * 与 daemon 的 vcl_in 对齐 —— 两侧都从 1 开始、每个数据单元加 1。
+     * 注意只有真正送出数据单元的提交才占号，参数集不占（daemon 侧同理：
+     * is_param_set 的单元走 CSD 路径，不递增 vcl_in）。 */
+    c->pending_unit[qpos] = ++c->units_submitted;
     c->pending_count++;
     c->have_current_poc = 0;
     c->current_target = VA_INVALID_ID;
@@ -1574,12 +1591,45 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
  * 用线性扫描而非堆：队列最多 64 项且实测重排深度只有 2-3，
  * 每帧一次 O(n) 扫描的代价可以忽略。
  */
-static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
+static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
+                                           uint32_t unit_seq)
 {
     if (c->pending_count <= 0)
         return VA_INVALID_ID;
 
     int pick = c->pending_head;
+
+    /* 首选：按提交序号精确配对。
+     *
+     * daemon 把每个输入单元的序号当 PTS 送给 MediaCodec，解码器原样回传到
+     * 对应的输出帧上（tools/probe_negotiate.c 实测未被改写），于是这一帧
+     * 究竟属于哪次提交是**已知事实**，不需要推断。
+     *
+     * 这样配对就与解码器的出帧顺序完全解耦：显示序、跟随输入序、
+     * 甚至将来换个平台换个顺序，都不影响正确性。此前靠 (seq,POC) 排序
+     * 隐含假设了"输出是显示序"，一旦假设不成立就画面错位而且不报错
+     * （实测 105/150 帧错位）。
+     *
+     * unit_seq == 0 表示 daemon 不支持该能力（旧版本），回退到下面的推断。 */
+    if (unit_seq != 0) {
+        /* 观测到一次就记住：daemon 支持精确配对。这同时意味着它开了
+         * 跟随输入序输出（两者在 daemon 里同一版本引入），滞后为 1，
+         * 于是不需要排空 —— wait_is_futile 用这个标志做判断。 */
+        c->daemon_has_unit_seq = 1;
+        for (int k = 0; k < c->pending_count; k++) {
+            int idx = (c->pending_head + k) % DMD_MAX_SURFACES;
+            /* 序号 0 = 已作废（会话重建前的残留项），不参与精确匹配 */
+            if (c->pending_unit[idx] != 0 &&
+                c->pending_unit[idx] == (uint64_t)unit_seq) {
+                pick = idx;
+                goto found;
+            }
+        }
+        /* 没匹配上：多半是排空/重建导致 daemon 侧序号重新计数，
+         * 或收到了上一个会话的残留帧。退回顺序推断，不要丢帧。 */
+        dmd_log("配对: unit_seq=%u 无匹配项，回退顺序推断（队列 %d）\n",
+                unit_seq, c->pending_count);
+    }
     /* daemon 开了 vendor.qti-ext-dec-picture-order.enable 时解码器按**解码序**
      * 输出，而 ffmpeg 也是按解码序提交的 —— 于是提交序 == 出帧序，
      * 所有 codec 都退化成取队首，不需要 POC 重排。
@@ -1589,8 +1639,12 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
      * 只能靠 EOS 逼出帧 —— 而那会摧毁参考帧链，导致约 9 成帧纯黑
      * （tools/probe_black.c）。解码序输出把滞后降到 1，互等消失，
      * 排空/重建/重放统统不再需要（tools/probe_keys.c 实测）。 */
-    if (!DMD_DECODE_ORDER_OUTPUT &&
-        (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC)) {
+    /* 回退路径：daemon 未提供 unit_seq（旧版本）时只能按 (seq, POC) 推断。
+     *
+     * 这条路依赖"输出是显示序"这个假设，而假设是否成立取决于 daemon 的
+     * 解码器配置 —— 驱动无法自行知道。这正是要用 unit_seq 精确配对的原因：
+     * 有它就不必猜。VP8/VP9 无帧重排，提交序 == 出帧序，取队首即可。 */
+    if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
         unsigned int bseq = c->pending_seq[pick];
         int32_t best = c->pending_poc[pick];
         for (int k = 1; k < c->pending_count; k++) {
@@ -1606,9 +1660,11 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
         }
     }
 
+found:
     VASurfaceID head = c->pending[pick];
-    dmd_log("配对: 帧 -> surface %u (seq %u POC %d, 队列剩 %d)\n",
-            (unsigned)head, c->pending_seq[pick], (int)c->pending_poc[pick],
+    dmd_log("配对: 帧 -> surface %u (unit %llu seq %u POC %d, 队列剩 %d)\n",
+            (unsigned)head, (unsigned long long)c->pending_unit[pick],
+            c->pending_seq[pick], (int)c->pending_poc[pick],
             c->pending_count - 1);
 
     /* 摘除 pick：把它之前的项整体后移一格，再收缩队首。
@@ -1621,6 +1677,10 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
         c->pending[k] = c->pending[prev];
         c->pending_poc[k] = c->pending_poc[prev];
         c->pending_seq[k] = c->pending_seq[prev];
+        /* pending_unit 必须一起搬。漏了它会让序号与 surface 错位，
+         * 同一个号被重复匹配 —— 实测 unit 5 与 unit 9 各出现两次、
+         * 序号 2 和 6 凭空消失、70/150 帧错位。 */
+        c->pending_unit[k] = c->pending_unit[prev];
         k = prev;
     }
     c->pending_head = (c->pending_head + 1) % DMD_MAX_SURFACES;
@@ -1754,10 +1814,12 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * ⚠️ 可逆排空必须"每次等待只做一次"。它不像 finish_input 会置
          * input_finished 把自己挡住 —— 排空后队列深度不变，条件依旧成立，
          * 不加闸就会变成忙循环（实测触发 133 万次、只出 1 帧）。 */
-        /* 解码序输出时滞后只有 1，帧几乎立刻就来，永远不该判定"徒劳"——
-         * 否则会 0 ms 就排空，白白付出摧毁参考帧链的代价（黑帧根因）。
-         * 只有显示序输出（滞后 4 > 消费者在飞的 3 帧）才存在真正的互等。 */
-        int wait_is_futile = !DMD_DECODE_ORDER_OUTPUT &&
+        /* 只有"再等也不可能出帧"时才排空 —— 排空会摧毁参考帧链，是黑帧根因。
+         *
+         * daemon 支持 unit_seq 时同时也开了跟随输入序输出，滞后只有 1，
+         * 帧几乎立刻就来，永远不该判定徒劳（否则会 0 ms 就排空，
+         * 实测误触发 383 次）。旧 daemon 才有滞后 4 与消费者在飞 3 帧的互等。 */
+        int wait_is_futile = !c->daemon_has_unit_seq &&
                              (c->pending_count < DMD_PIPELINE_DEPTH);
 
         if (!c->input_finished && !drained_once &&
@@ -1840,7 +1902,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         }
 
         if (rc == DMD_OK) {
-            VASurfaceID head = dmd_pending_take_locked(c);
+            VASurfaceID head = dmd_pending_take_locked(c, frame.unit_seq);
             struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
             if (hs) {
                 surface_store_frame_locked(hs, &frame);

@@ -135,6 +135,14 @@ struct dmd_frame {
     uint32_t width;
     uint32_t height;
 
+    /* 该帧对应的**输入单元序号**（1 起），0 = daemon 未提供。
+     *
+     * 由 daemon 在 queueInputBuffer 时写入 presentationTimeUs，
+     * MediaCodec 原样带到输出帧上。用途是精确配对：调用方据此就知道
+     * 这一帧属于第几次提交，**无需知道解码器按什么顺序出帧**。
+     * 旧 daemon 不带此字段时为 0，调用方需回退到按顺序推断。 */
+    uint32_t unit_seq;
+
     /* 该帧生效的几何信息，从最近一次格式描述块复制而来，随帧自洽 */
     int stride;
     int slice_height;

@@ -57,19 +57,6 @@
  * 让它继续送料把流水线填满；达到之后才真正阻塞等帧。
  * 取 6（滞后 4 再留 2 的余量）—— 太小会退回死锁，太大会让队列变长、
  * 增加延迟且浪费 surface。 */
-/* daemon 是否让解码器按解码顺序输出
- * （对应 decode-daemon.c 里的 vendor.qti-ext-dec-picture-order.enable）。
- *
- * 1 = 解码序：提交序 == 出帧序，配对退化为取队首，无需 POC 重排。
- *     滞后从 4 降到 1，消除与消费者的互等，因此不再需要排空/会话重建 ——
- *     那两者会摧毁参考帧链，是画面黑屏闪烁的根因。
- * 0 = 显示序（解码器默认）：必须按 (seq, POC) 排序配对。
- *
- * ⚠️ 这个开关必须与 daemon 的配置**严格一致**。不一致的后果是画面错位而
- * 不是报错：实测只改 daemon 不改配对时，test1080 帧数正确（150）
- * 但 105 帧错位（每 4 帧错 3 帧）。 */
-#define DMD_DECODE_ORDER_OUTPUT 1
-
 #define DMD_PIPELINE_DEPTH 6
 
 /* 等这么久（毫秒）仍取不到帧，才认定上游不再送料、执行不可逆的 flush。
@@ -205,8 +192,17 @@ struct dmd_context {
     /* 所属 coded video sequence 序号：POC 每逢 IDR 会重置，跨序列比 POC
      * 大小没有意义，所以排序时先比 seq 再比 POC。 */
     unsigned int pending_seq[DMD_MAX_SURFACES];
+    /* 该 surface 对应的**提交序号**（第几次向 daemon 送数据单元，1 起）。
+     * daemon 把它作为 PTS 原样回传到帧上（dmd_frame.unit_seq），
+     * 于是配对可以精确匹配，而不必假设解码器的出帧顺序。 */
+    uint64_t pending_unit[DMD_MAX_SURFACES];
     int pending_head;
     int pending_count;
+    /* 已提交的数据单元计数，给 pending_unit 发号。 */
+    uint64_t units_submitted;
+    /* daemon 是否回传 unit_seq（运行时从帧里观测，非编译期假设）。
+     * 有它就能精确配对，且说明 daemon 已开跟随输入序输出（滞后 1）。 */
+    int daemon_has_unit_seq;
     /* 本帧的 POC，RenderPicture 从 pic param 取、EndPicture 随 surface 入队。
      * 仅 H.264/HEVC 有意义。 */
     int32_t current_poc;

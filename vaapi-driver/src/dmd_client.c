@@ -41,6 +41,10 @@
 #define DMD_HELLO_MAGIC       0x444D4400u
 #define DMD_HELLO_VERSION     2u
 #define DMD_FMTDESC_SENTINEL  0xFFFFFFFFu
+/* 格式描述块头部第 2 个字的能力标志（旧 daemon 恒为 0）。
+ * CAP_FRAME_PTS：帧头带额外的 PTS 字段 = 该帧对应的输入单元序号，
+ * 驱动用它精确配对 surface，无需知道解码器的出帧顺序。 */
+#define DMD_CAP_FRAME_PTS     0x00000001u
 #define DMD_SHMFRAME_SENTINEL 0xFFFFFFFEu
 #define DMD_FMTDESC_WORDS     8
 #define DMD_SHM_CTRL_BYTES    4096
@@ -82,6 +86,8 @@ struct dmd_session {
     uint64_t units_sent;
     uint64_t frames_recv;
     uint64_t drains_sent;   /* 发出的可逆排空请求数（诊断用） */
+    uint32_t caps;          /* daemon 能力位（来自格式描述块，0 = 旧 daemon） */
+    uint32_t last_pts;      /* 最近一帧的输入单元序号，0 = 不可用 */
 };
 
 /* ------------------------------------------------------------ 日志 */
@@ -728,6 +734,7 @@ static int ensure_rbuf(struct dmd_session *s, size_t need)
 /* 把当前格式快照写进帧，让每帧自带自洽的几何信息 */
 static void frame_apply_format(const struct dmd_session *s, struct dmd_frame *f)
 {
+    f->unit_seq     = s->last_pts;
     f->stride       = s->fmt.stride;
     f->slice_height = s->fmt.slice_height;
     f->crop_left    = s->fmt.crop_left;
@@ -770,6 +777,8 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
         uint32_t w = ntohl(w_be), h = ntohl(h_be), sz = ntohl(sz_be);
 
         if (sz == DMD_FMTDESC_SENTINEL) {
+            /* 第 2 个字是能力标志（旧 daemon 为 0） */
+            s->caps = h;
             /* [0][0][0xFFFFFFFF] 之后是 8 个 32 位字的格式描述块 */
             uint32_t fw[DMD_FMTDESC_WORDS];
             r = recv_exact(s, fw, sizeof(fw), rest_to, rest_to);
@@ -809,6 +818,21 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
             int slot = (int)ntohl(si[0]);
             uint32_t dlen = ntohl(si[1]);
 
+            /* 支持 PTS 的 daemon 在槽位/长度之后再跟一个字：输入单元序号。
+             * 与 TCP 路径的帧头第 4 字段同义，保证两种传输模式一致。 */
+            if (s->caps & DMD_CAP_FRAME_PTS) {
+                uint32_t p_be;
+                r = recv_exact(s, &p_be, 4, rest_to, rest_to);
+                if (r == DMD_EOS)
+                    return sess_err(s, DMD_ERR_PROTOCOL,
+                                    "SHM 消息 PTS 字段被截断", 0);
+                if (r != DMD_OK)
+                    return r;
+                s->last_pts = ntohl(p_be);
+            } else {
+                s->last_pts = 0;
+            }
+
             if (!s->shm_base)
                 return sess_err(s, DMD_ERR_PROTOCOL,
                                 "收到 SHM 帧但共享内存未挂载", 0);
@@ -823,15 +847,30 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
             out->size = dlen;
             out->width = w;
             out->height = h;
+            out->unit_seq = s->last_pts;
             out->shm_slot = slot;
             out->seq = s->frames_recv;
             frame_apply_format(s, out);
-            s->frames_recv++;
-            s->shm_held++;
+                s->shm_held++;
             return DMD_OK;
         }
 
-        /* 普通 TCP 帧 */
+        /* 普通 TCP 帧。
+         * 支持 CAP_FRAME_PTS 的 daemon 在 12 字节帧头后再跟一个字：
+         * 该帧对应的输入单元序号。必须在读帧体**之前**取走，
+         * 否则字节流错位（实测表现为六条流全部差异，含无重排的 VP8/VP9）。 */
+        if (s->caps & DMD_CAP_FRAME_PTS) {
+            uint32_t p_be;
+            r = recv_exact(s, &p_be, 4, first_to, rest_to);
+            if (r == DMD_EOS)
+                return sess_err(s, DMD_ERR_PROTOCOL, "帧头 PTS 字段被截断", 0);
+            if (r != DMD_OK)
+                return r;
+            s->last_pts = ntohl(p_be);
+        } else {
+            s->last_pts = 0;   /* 0 = 无 PTS 信息（旧 daemon） */
+        }
+
         if (sz == 0)
             return sess_err(s, DMD_ERR_PROTOCOL, "帧长度为 0", 0);
         if (sz > DMD_MAX_FRAME_BYTES || w > 16384 || h > 16384)

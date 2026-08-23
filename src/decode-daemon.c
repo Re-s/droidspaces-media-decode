@@ -133,6 +133,21 @@ static void on_signal(int s)
 #define FMTDESC_WORDS   8
 /* 帧头 frame_size 取这些值时表示不是帧数据，而是控制消息 */
 #define FMTDESC_SENTINEL 0xFFFFFFFFu   /* 随后 32 字节格式描述块 */
+
+/* 格式描述块头部第 2 个字的能力标志（原为保留的 0）。
+ * CAP_FRAME_PTS：每个帧头额外带第 4 个字段 —— 该帧对应的输入单元序号
+ * （由 MediaCodec 通过 presentationTimeUs 原样回传）。
+ * 驱动用它精确配对 surface，无需知道解码器按什么顺序出帧。 */
+#define CAP_FRAME_PTS   0x00000001u
+
+/* 输入单元序号 → presentationTimeUs 的放大倍数。
+ *
+ * ⚠️ 解码器按**毫秒**量化 PTS，直接用序号（步长 1us）会被全部压成 0 ——
+ * 实测送 9 个单元回传的 PTS 全为 0，配对退化成"一个号对应多帧"
+ * （表现为 unit 5 重复出现、35 次无匹配回退、70/150 帧错位）。
+ * 乘 1000 后每个单元相差 1ms，量化后仍然唯一。
+ * 客户端收到后除回去，还原成序号。 */
+#define PTS_UNIT_SCALE  1000
 #define SHMFRAME_SENTINEL 0xFFFFFFFEu  /* 随后 8 字节：槽位号 + 数据长度 */
 
 /*
@@ -303,6 +318,11 @@ typedef struct {
      * 否则新数据会被 flush 一起丢掉，表现为吞帧。 */
     volatile sig_atomic_t drain_req;
     volatile sig_atomic_t drain_done;
+
+    /* 输入单元序号，用作 PTS 标签（1 起）。仅 input 线程写。
+     * 让每个输出帧能被追溯到"第几次提交"，驱动据此精确配对 surface，
+     * 无需知道解码器的输出顺序。 */
+    uint64_t         vcl_in;
     /* CSD 副本：flush 清掉解码器里的参数集，排空后必须原样重送。
      * SPS+PPS 量级很小，256 字节足够（实测 1080p 为 31+9）。 */
     uint8_t          csd_keep[256];
@@ -592,7 +612,22 @@ static void *input_thread(void *arg)
             continue;
         }
         memcpy(ib, buf, sz);
-        AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
+        /* PTS 用"第几个数据单元"的序号（1 起，步长 1us）。
+         *
+         * 这不是为了计时，而是给每个输入单元一个**可回传的身份标签**：
+         * MediaCodec 会把 presentationTimeUs 原样带到对应的输出帧上
+         * （tools/probe_negotiate.c 实测：值域与步长都能对上，未被改写）。
+         * output 线程把它放进下行帧头，驱动就能精确知道"这一帧对应第几次提交"，
+         * 从而按提交序号配对 surface —— 与解码器按什么顺序出帧完全无关。
+         *
+         * 这样就不需要让驱动去猜/协商输出顺序：显示序也好、跟随输入序也好，
+         * 配对都正确。此前依赖输出顺序的做法很脆弱：一旦两侧假设不一致，
+         * 后果是画面错位而不报错（实测 105/150 帧错位）。
+         *
+         * 从 1 开始：0 留作"无 PTS 信息"的哨兵，便于兼容旧 daemon。 */
+        AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz,
+                                     (int64_t)s->vcl_in * PTS_UNIT_SCALE, 0);
+        s->vcl_in++;
     }
 
     /* 送出 end-of-stream，让 output 线程能确定性地收完剩余帧。
@@ -759,7 +794,8 @@ static void shm_teardown(Session *s)
  *
  * 返回 0 成功，-1 失败。
  */
-static int send_frame_shm(Session *s, const uint8_t *data, size_t len)
+static int send_frame_shm(Session *s, const uint8_t *data, size_t len,
+                          uint32_t pts)
 {
     if (len > s->shm_slot) {
         dlog(1, "[%d] 帧 %zu 字节超出槽位 %zu，需重建池", s->id, len, s->shm_slot);
@@ -790,10 +826,13 @@ static int send_frame_shm(Session *s, const uint8_t *data, size_t len)
     __atomic_store_n(shm_slot_state(s, slot), 1u, __ATOMIC_RELEASE);
     s->shm_next = (slot + 1) % SHM_SLOTS;
 
-    uint32_t msg[5] = {
+    /* 第 6 字段 = 输入单元序号，与 TCP 路径的第 4 字段同义，
+     * 让两种传输模式对驱动呈现一致的配对信息。 */
+    uint32_t msg[6] = {
         htonl((uint32_t)s->w), htonl((uint32_t)s->h),
         htonl(SHMFRAME_SENTINEL),
-        htonl((uint32_t)slot), htonl((uint32_t)len)
+        htonl((uint32_t)slot), htonl((uint32_t)len),
+        htonl(pts)
     };
     if (send_all(s->fd, msg, sizeof(msg)) < 0) {
         /* 通知失败则立即释放槽位，否则池会漏 */
@@ -816,7 +855,11 @@ static int send_format_desc(Session *s)
     if (s->crop_r <= 0)       s->crop_r = s->w - 1;
     if (s->crop_b <= 0)       s->crop_b = s->h - 1;
 
-    uint32_t hdr[3] = { htonl(0), htonl(0), htonl(FMTDESC_SENTINEL) };
+    /* 第 2 个字原为保留的 0，现用作能力标志：置 CAP_FRAME_PTS 表示
+     * 后续每个帧头都带第 4 个字段（PTS，即输入单元序号）。
+     * 旧 daemon 这里恒为 0，客户端据此按 3 字段帧头解析 —— 向后兼容。 */
+    uint32_t hdr[3] = { htonl(0), htonl(CAP_FRAME_PTS),
+                        htonl(FMTDESC_SENTINEL) };
     uint32_t body[FMTDESC_WORDS] = {
         htonl((uint32_t)s->w),      htonl((uint32_t)s->h),
         htonl((uint32_t)s->stride), htonl((uint32_t)s->slice_height),
@@ -865,12 +908,18 @@ static void *output_thread(void *arg)
                     int fail;
                     if (s->xfer == XFER_SHM) {
                         fail = (send_frame_shm(s, ob + info.offset,
-                                               (size_t)info.size) < 0);
+                                               (size_t)info.size,
+                                               (uint32_t)(info.presentationTimeUs / PTS_UNIT_SCALE)) < 0);
                     } else {
-                        uint32_t hdr[3] = {
+                        /* 第 4 字段 = 该帧对应的输入单元序号。
+                         * MediaCodec 把 queueInputBuffer 时给的
+                         * presentationTimeUs 原样带到输出帧上，
+                         * 于是驱动能精确知道这一帧对应第几次提交。 */
+                        uint32_t hdr[4] = {
                             htonl((uint32_t)s->w),
                             htonl((uint32_t)s->h),
-                            htonl((uint32_t)info.size)
+                            htonl((uint32_t)info.size),
+                            htonl((uint32_t)(info.presentationTimeUs / PTS_UNIT_SCALE))
                         };
                         fail = (send_all(s->fd, hdr, sizeof(hdr)) < 0);
                         size_t off = (size_t)info.offset;
@@ -1172,6 +1221,7 @@ int main(int argc, char **argv)
         s->fd       = cli;
         s->w        = 1920;   /* 握手前的占位值，真实尺寸由握手与 FORMAT_CHANGED 决定 */
         s->h        = 1080;
+        s->vcl_in   = 1;      /* PTS 标签从 1 起：0 留作"无 PTS 信息"哨兵 */
         s->id       = next_id++;
         s->codec_id = CODEC_H264;
         s->mime     = codec_mime(CODEC_H264);
