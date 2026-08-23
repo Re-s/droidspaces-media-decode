@@ -1082,9 +1082,11 @@ static void *session_thread(void *arg)
      * max-output-reorder-frames、output-delay、vendor.qti-ext-dec-low-latency
      * 全都无效，只有这个键有用），互等消失，排空/重建/重放统统不再需要。
      *
-     * ⚠️ 必须与驱动的 DMD_DECODE_ORDER_OUTPUT 严格一致。驱动默认按
-     * (seq, POC) 重排配对，那假设的是显示序输出；只改这里不改驱动，
-     * 画面会错位而不报错（实测 test1080 帧数对但 105 帧错位）。
+     * 历史注意事项（已消除）：早期驱动用编译期常量 DMD_DECODE_ORDER_OUTPUT
+     * 声明"解码器按什么顺序出帧"，必须与这里严格一致，否则画面错位且不报错
+     * （实测 test1080 帧数对但 105/150 帧错位）。该常量已删除 —— 现在每帧
+     * 回传自己的输入单元序号（CAP_FRAME_PTS），驱动按序号精确配对，
+     * 与输出顺序完全解耦，改这个键不再需要驱动配合。
      *
      * 用字面量：这是高通 vendor 扩展，NDK 头文件里没有定义。
      * 非高通平台会忽略未知键，退化为原有行为，不会失败。 */

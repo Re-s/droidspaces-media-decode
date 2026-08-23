@@ -1573,7 +1573,6 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (codec == DMD_CODEC_H264 && c->have_h264_pic_param) {
         mbs_wide = (unsigned int)c->h264_pic_param.picture_width_in_mbs_minus1 + 1;
         mbs_high = (unsigned int)c->h264_pic_param.picture_height_in_mbs_minus1 + 1;
-        unsigned int pp_num_ref = c->h264_pic_param.num_ref_frames;
         /* 重发条件：首次、流内几何变化、或 PPS 的 num_ref_idx 默认值变化。
          *
          * 最后一条是必需的：PPS 默认值必须照抄**当前帧**的生效值
@@ -1594,37 +1593,25 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         unsigned int l1_now = c->have_h264_slice_param
                               ? c->h264_slice_param.num_ref_idx_l1_active_minus1
                               : 0;
-        /* l0：不能靠"逐帧取最大"收敛 —— 参数集必须在**首个 slice 之前**
-         * 送出，那时只见过 IDR 的 slice param（I slice 的 num_ref_idx 恒为 0），
-         * 后面见到更大值时前面的帧已经用错的 PPS 解过了。
-         * 实测每个会话只送 3 种变体（l0=0/1/3），真值 2 从未被送出。
+        /* l0/l1 直接用 slice param 报的生效值。
          *
-         * 改用 SPS 的 num_ref_frames 作上界：它是码流自带的参考帧数上限，
-         * 必然 >= 任何 slice 的真实 l0_active，而 l0 偏大是安全的
-         * （单变量实测 l0_m1=2,3,4,15 全对）。这样第一份 PPS 就是可用的，
-         * 不依赖"多看几帧"。 */
-        unsigned int l0 = pp_num_ref > 0 ? pp_num_ref - 1 : 15;
-        if (l0 > 31)
-            l0 = 31;
-        /* pp_num_ref 为 0 时用 15：VA-API 在首帧的 pic param 里可能还没填
-         * num_ref_frames（实测 SPS 写的是 4，而送 PPS 那一刻读到 0，
-         * 于是写出 l0=0 的错误 PPS）。15 是"够大且已实测可用"的上界
-         * （单变量实测 l0_m1=15 解码正确），比读到 0 安全。 */
-        /* l1 一位都不能偏大，只能取观测到的最小值。
-         * 非 override 的 slice 报的就是真实默认值，override 的只会更大，
-         * 所以最小值即真值；IDR 的 I slice 报 0，正好是常见真值。 */
-        if (!c->refidx_seen) {
-            c->refidx_l1_min = l1_now;
-            c->refidx_seen = 1;
-        } else if (l1_now < c->refidx_l1_min) {
-            c->refidx_l1_min = l1_now;
-        }
-        unsigned int l1 = c->refidx_l1_min;
-        (void)l0_now;
-        int why_first = !c->param_sets_sent;
-        int why_geom  = (c->sent_mbs_wide != mbs_wide || c->sent_mbs_high != mbs_high);
-        int why_refidx = (c->sent_l0 != l0 || c->sent_l1 != l1);
-        if (why_first || why_geom || why_refidx) {
+         * ⚠️ 曾尝试"消除 PPS 振荡"：改用 SPS 的 num_ref_frames-1 推导 l0、
+         * 用观测最小值收敛 l1，让每个会话只送 1 份 PPS（685 次 → 1 次）。
+         * 那是一次**回归**：long3000.h264 只解出 15/1323 帧后卡死在等帧超时。
+         *
+         * 原因是重送次数本身在承担纠错作用 —— 正常版本对该流发出 4 种变体
+         * 共 2735 次，其中包含真值 68ebe3cb22c0；收敛成单一份之后送出的是
+         * 68e938f2c8b0，解码器再没有机会收到正确的那份。
+         *
+         * 换句话说：振荡看着丑，但它覆盖了真值；固定成一份就赌错了。
+         * 要真正消除振荡，得先能在**首个 slice 之前**确定真实的默认值，
+         * 而 VA-API 只给每个 slice 的生效值（override 的与默认值无关），
+         * 目前没有可靠推导途径。保持现状。 */
+        unsigned int l0 = l0_now;
+        unsigned int l1 = l1_now;
+        if (!c->param_sets_sent || c->sent_mbs_wide != mbs_wide ||
+            c->sent_mbs_high != mbs_high || c->sent_l0 != l0 ||
+            c->sent_l1 != l1) {
             c->pending_l0 = l0;
             c->pending_l1 = l1;
             l0_snap = l0;

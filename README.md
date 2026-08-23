@@ -8,10 +8,13 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 
 ### 核心特性
 
-- **硬件加速解码**：利用 Android MediaCodec API 进行 H.264 硬件解码
-- **TCP 跨 namespace 通信**：容器与 Android 宿主共享 net namespace 但 mount namespace 独立，因此基于路径的 Unix socket 不可用，TCP loopback 可直接互通
+- **硬件加速解码**：利用 Android MediaCodec API 硬件解码 H.264 / HEVC / VP8 / VP9
+- **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox）无需改动即可用
+- **TCP 跨 namespace 通信**：容器与 Android 宿主共享 net namespace，TCP loopback 直接互通。
+  路径型 Unix socket 因 mount namespace 独立而不可用，但 **abstract socket 可行**
+  （属 net namespace，双向可见；共享内存通道已在用，实测可跨边界传 memfd）
 - **最小化实现**：基于 anland 项目的 libdisplay_daemon 库简化而来，代码简洁易懂
-- **KSU/Magisk 模块**：提供发布用的 Magisk 模块以支持开机自启（开发测试阶段无需安装，直接推送二进制运行即可）
+- **进程托管**：daemon 设计为被平台托管的前台进程（DroidSpace 负责启动与守护）
 
 ## 架构图
 
@@ -41,7 +44,13 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 ```
 
 容器与 Android 宿主**共享 net namespace**（实测 inode 均为 `4026531937`），
-所以 TCP loopback 直接互通；而 mount namespace 独立，基于路径的 Unix socket 不可用。
+所以 TCP loopback 直接互通；而 mount namespace 独立，**路径型** Unix socket
+（`/tmp/xxx.sock` 这种）在对侧不存在，不可用。
+
+但 **abstract socket 可用** —— 它属于 net namespace 而不落文件系统，双向可见。
+共享内存通道（`DMD_XFER_SHM`）已经在用它传递 memfd，实测跨边界成功且
+解码结果与软解逐字节一致。所以后续若要把控制通道也从 TCP 换成 Unix socket，
+abstract socket 是可行路径，无需依赖任何共享挂载点。
 
 ### 性能
 
@@ -261,57 +270,52 @@ API=29 ./build.sh                    # 覆盖目标 API level
 
 产物为 `build/decode-daemon`（aarch64 PIE 可执行文件）。
 
-## KSU/Magisk 模块安装方法
+## 部署：由 DroidSpace 平台托管
 
-### 安装要求
+> **变更说明**：早期计划用 KSU/Magisk 模块实现开机自启，`magisk-module/` 目录是
+> 那个方案的产物。**该方案已放弃** —— daemon 的启动、重启、守护与日志收集
+> 统一交由 DroidSpace 平台托管，本项目不再自带进程管理。
+> `magisk-module/` 保留供参考，不再维护，也不作为发布形态。
 
-- 已安装 Magisk 20.0+ 或 KernelSU
-- Android 10.0+ (API 29+)
-- 支持 MediaCodec 硬件解码的设备
-- ARM64 架构
+### daemon 的定位
 
-### 安装步骤
+`decode-daemon` 被设计成一个适合被托管的**前台进程**：
 
-1. **准备模块包**
-   ```bash
-   # 进入 magisk-module 目录
-   cd magisk-module
-   
-   # 确保 decode-daemon 二进制文件已编译并放置在此目录
-   # 可以从 src/ 目录复制编译好的文件
-   cp ../src/decode-daemon .
-   
-   # 打包为 ZIP 文件
-   zip -r ../decode-daemon-module.zip . -x "*.git*"
-   ```
+- 前台运行，不自我 daemonize（托管方需要能直接监督子进程）
+- 日志走 stderr，由托管方收集
+- `SIGTERM` 优雅退出
+- 判活**用监听端点而不是 PID**（PID 会反复变化，这是踩过的坑）
 
-2. **安装模块**
-   - 打开 Magisk Manager 应用
-   - 点击"模块" → "从本地安装"
-   - 选择生成的 `decode-daemon-module.zip` 文件
-   - 等待安装完成，重启设备
+### 部署步骤（开发与测试）
 
-3. **验证安装**
-   ```bash
-   # 检查模块是否激活
-   magisk --list
-   
-   # 检查服务是否运行
-   ps -ef | grep decode-daemon
-   ```
+```bash
+# 1) 构建
+./build.sh                     # 产物 build/decode-daemon
 
-### 模块配置
+# 2) 推送到设备
+adb push build/decode-daemon /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/decode-daemon
 
-- **监听端口**：默认 TCP `127.0.0.1:20003`，可在 `service.sh` 中修改 `PORT`
-- **日志文件**：`/data/local/tmp/decode-daemon.log`
-- **PID 文件**：`/data/local/tmp/decode-daemon.pid`
-- **SELinux**：daemon 以 KernelSU root（`u:r:ksu:s0`）运行，实测无需额外策略；`sepolicy.rule` 中多数规则是早期 Unix socket 方案的遗留，待清理
+# 3) 启动（监听 127.0.0.1:20003）
+adb shell su -c 'nohup /data/local/tmp/decode-daemon 20003 >/data/local/tmp/dd.log 2>&1 &'
 
-模块设计细节与防 bootloop 要求见 [模块文档](magisk-module/README.md)。
+# 4) 确认在听 —— 用端口判活，不要看 PID
+adb shell 'timeout 3 sh -c "echo > /dev/tcp/127.0.0.1/20003" && echo 在听'
+```
+
+⚠️ **adb 端口会变化**。设备重连后端口号可能不同，编译与推送要放在同一条命令里
+完成，否则容易出现"改了代码但设备上还是旧二进制"—— 新旧协议不匹配会表现为
+`帧头数值不合理`，很容易误判成协议缺陷。
+
+### 生产部署
+
+由 DroidSpace 负责：二进制放置位置、启动时机（需 media 服务就绪）、
+崩溃重启、日志收集、健康检查。接入契约详见规划文档
+`dmd-vaapi/research/plan-droidspace-hosting.md`。
 
 ## 测试方法
 
-开发与测试阶段**不需要安装 KSU/Magisk 模块**，直接推送二进制手动启动即可。模块只是最终发布形态。
+开发与测试阶段直接推送二进制手动启动即可（见上文"部署"一节）。生产部署由 DroidSpace 平台托管。
 
 ### 1. 构建并推送 daemon
 
@@ -368,7 +372,7 @@ RESULT: 20 frames decoded from /root/decode-test/test1080.h264
 ### 5. 手动测试
 
 ```bash
-# 在 Android 设备上启动 daemon（如果未使用 Magisk 模块）
+# 在 Android 设备上启动 daemon（开发测试用；生产由 DroidSpace 托管）
 adb shell
 su
 ./decode-daemon 20003
@@ -468,7 +472,7 @@ SHM 模式已省掉 TCP 的两次内核拷贝（吞吐 +17%，daemon CPU −28.6
 - [性能实测与优化路线](doc/performance-and-roadmap.md) - 压测数据、瓶颈归因、零拷贝可行性与硬约束
 - [为什么不直接用 V4L2](doc/why-not-v4l2.md) - 容器内 `/dev/video32` 实测不可用的取证结论
 - [VAAPI Proxy 架构调研报告](doc/vaapi-mediacodec-proxy-research.md) - 详细的 VA-API 代理驱动实现方案
-- [Magisk 模块详细文档](magisk-module/README.md) - 模块安装和配置说明
+- [Magisk 模块文档](magisk-module/README.md) - ⚠️ 已废弃方案，保留供参考
 
 ## 许可证
 
