@@ -1022,6 +1022,25 @@ static void *session_thread(void *arg)
      * 不会失败。 */
     AMediaFormat_setInt32(fmt, "low-latency", 1);
 
+    /* 让解码器按**解码顺序**输出，而不是攒够重排缓冲再按显示顺序吐。
+     *
+     * 这是根治画面黑屏闪烁的手段。默认（显示序）下有 B 帧时要收到第 4 个
+     * 输入单元才吐首帧，而浏览器稳态只保持 3 帧在飞 —— 差一帧，双方死等。
+     * 此前只能靠 EOS 逼出帧，但 EOS/flush/重建会话都会摧毁参考帧链，
+     * 导致约 9 成帧纯黑（tools/probe_black.c：60 帧里 54 帧亮度为 16）。
+     *
+     * 开这个键后滞后从 4 降到 1（tools/probe_keys.c 逐键实测：low-latency、
+     * max-output-reorder-frames、output-delay、vendor.qti-ext-dec-low-latency
+     * 全都无效，只有这个键有用），互等消失，排空/重建/重放统统不再需要。
+     *
+     * ⚠️ 必须与驱动的 DMD_DECODE_ORDER_OUTPUT 严格一致。驱动默认按
+     * (seq, POC) 重排配对，那假设的是显示序输出；只改这里不改驱动，
+     * 画面会错位而不报错（实测 test1080 帧数对但 105 帧错位）。
+     *
+     * 用字面量：这是高通 vendor 扩展，NDK 头文件里没有定义。
+     * 非高通平台会忽略未知键，退化为原有行为，不会失败。 */
+    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
+
     s->codec = AMediaCodec_createDecoderByType(s->mime);
     if (!s->codec) { dlog(0, "[%d] 无可用解码器: %s", s->id, s->mime); goto out_fmt; }
 

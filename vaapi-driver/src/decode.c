@@ -1580,7 +1580,17 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c)
         return VA_INVALID_ID;
 
     int pick = c->pending_head;
-    if (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC) {
+    /* daemon 开了 vendor.qti-ext-dec-picture-order.enable 时解码器按**解码序**
+     * 输出，而 ffmpeg 也是按解码序提交的 —— 于是提交序 == 出帧序，
+     * 所有 codec 都退化成取队首，不需要 POC 重排。
+     *
+     * 这么做的目的是根治黑帧：默认（显示序输出）下解码器有 B 帧时要收到
+     * 第 4 个输入单元才吐首帧，而浏览器稳态只在飞 3 帧，双方互等，
+     * 只能靠 EOS 逼出帧 —— 而那会摧毁参考帧链，导致约 9 成帧纯黑
+     * （tools/probe_black.c）。解码序输出把滞后降到 1，互等消失，
+     * 排空/重建/重放统统不再需要（tools/probe_keys.c 实测）。 */
+    if (!DMD_DECODE_ORDER_OUTPUT &&
+        (c->codec == DMD_CODEC_H264 || c->codec == DMD_CODEC_HEVC)) {
         unsigned int bseq = c->pending_seq[pick];
         int32_t best = c->pending_poc[pick];
         for (int k = 1; k < c->pending_count; k++) {
@@ -1744,7 +1754,11 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * ⚠️ 可逆排空必须"每次等待只做一次"。它不像 finish_input 会置
          * input_finished 把自己挡住 —— 排空后队列深度不变，条件依旧成立，
          * 不加闸就会变成忙循环（实测触发 133 万次、只出 1 帧）。 */
-        int wait_is_futile = (c->pending_count < DMD_PIPELINE_DEPTH);
+        /* 解码序输出时滞后只有 1，帧几乎立刻就来，永远不该判定"徒劳"——
+         * 否则会 0 ms 就排空，白白付出摧毁参考帧链的代价（黑帧根因）。
+         * 只有显示序输出（滞后 4 > 消费者在飞的 3 帧）才存在真正的互等。 */
+        int wait_is_futile = !DMD_DECODE_ORDER_OUTPUT &&
+                             (c->pending_count < DMD_PIPELINE_DEPTH);
 
         if (!c->input_finished && !drained_once &&
             (wait_is_futile || spent >= flush_after_ms)) {
