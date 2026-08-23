@@ -1713,6 +1713,14 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             dmd_log("HEVC: 该码流无法合成参数集"
                     "（num_short_term_ref_pic_sets=%u），拒绝\n",
                     c->hevc_pic_param.num_short_term_ref_pic_sets);
+            /* tx 在上面已分配（scratch 为空时 malloc），这条早退路径必须
+             * 释放它 —— 否则每帧泄漏 unit_len 字节。函数正常路径在下面
+             * 统一 free(tx)，走不到这里。
+             *
+             * 注意 tx 可能就是 scratch（所有权已转移给 tx），所以只 free
+             * 一次、不要另外 free(scratch)。 */
+            free(tx);
+            c->pending_count--;
             pthread_mutex_unlock(&drv->lock);
             return VA_STATUS_ERROR_UNIMPLEMENTED;
         }

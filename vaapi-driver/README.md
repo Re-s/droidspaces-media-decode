@@ -154,6 +154,41 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 失败），但 `offsets[1] = stride * slice_height` 要用 **1088**。按 1080 算会让
 色度平面偏移 `stride*8` 字节，症状是绿边、花屏、色度错位。
 
+## 消费者契约差异：同一个驱动，三种用法
+
+三个消费者对驱动的期望不一样，只测一个会漏掉另外两个的坑。已实测跑通的差异：
+
+| 行为 | ffmpeg | Firefox | Chrome |
+|---|---|---|---|
+| 建 config 传 `RTFormat` | 传 | 传 | **不传**（期望驱动主动声明） |
+| 逐帧 `vaSyncSurface` | 调 | 调 | **从不调** |
+| 取帧方式 | `vaDeriveImage` | `vaExportSurfaceHandle` | `vaExportSurfaceHandle`（大批提交后取） |
+| dmabuf layout | 不用 | `SEPARATE_LAYERS` | `SEPARATE_LAYERS` |
+
+两条 Chrome 特有要求各自造成过一次"硬解完全不可用"：
+
+1. **`vaQueryConfigAttributes` 必须声明驱动能力，不能回显入参。** Chrome 建
+   config 不传属性，然后查询驱动支持什么。回显模式下它拿到 0 个属性、
+   读不到 `RTFormat`，`FillProfileInfo_Locked` 判定六个 profile 全部不可用。
+2. **收帧不能只发生在 `vaSyncSurface` 里。** Chrome 从不调它，于是待解码队列
+   填满 → `vaEndPicture` 报错 → Chrome 放弃硬解。现在队列满时会在
+   `EndPicture` 内收一帧腾空位。
+
+还有一条硬契约（Chromium `vaapi_wrapper.cc` 的 `FillProfileInfo_Locked`）：
+**`vaQuerySurfaceAttributes` 必须返回 `num_attribs > 0` 且包含
+`VASurfaceAttribMaxWidth` / `MaxHeight`**，否则整个 profile 被拒。
+我们在 `profiles.c` 里有报（`MinWidth`/`MinHeight` 可选，Chromium 自己兜 16）。
+
+> ⚠️ 这张表是**实测**得出的（每条都对应一次真机验证），不是读 Chromium
+> 源码推断的。相关的源码级调研见
+> `dmd-vaapi/research/A-1-chrome-vaapi-contract.md`，但那份报告基于本地
+> 已有的 Chromium 源码（约 120+），**不是**实际测试用的 151，
+> 其中的 feature flag 状态与新增契约未经验证。
+>
+> 本项目有过一次教训：一份源码级结论（"RDD 沙箱对 `SYS_SOCKET` 一律返回
+> `EACCES`"）被实测推翻，因为那段代码路径在实际环境里没按预期执行。
+> **源码结论要靠单变量实验确认才算成立。**
+
 ## 浏览器（Firefox）：能力没问题，门槛在环境
 
 `vainfo` / ffmpeg 能硬解**不代表** Firefox 也会硬解。Firefox 判定"能否硬解"要
