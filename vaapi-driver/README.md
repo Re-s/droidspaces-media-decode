@@ -213,6 +213,10 @@ Xvfb 不行：它不提供 DRI3，GLX 走不到 freedreno，`MESA_ACCELERATED` �
 | 平均解码耗时 | 7.4 ms（帧间隔 33.3 ms） |
 | 驱动侧 / 浏览器侧错误 | 无 |
 
+该结果已独立复现：容器内经 socks5 代理 `git clone` 本分支、从克隆代码
+`make` + `make install`（零警告）、只靠 `firefox-hwdec` 设置环境，
+得到硬解 144 帧 / 软解 0 帧 / 导出 148 次全成功，六条流回归同时保持逐字节一致。
+
 ### 必须以桌面会话的所属用户运行
 
 Firefox 拒绝以 root 身份使用普通用户的会话，直接退出并只留一句
@@ -336,7 +340,19 @@ libva 会报 `has no function __vaDriverInit_1_0`。
 
 **必须在容器内编译**（aarch64）。开发机若是 x86_64，缺 aarch64 glibc 交叉工具链。
 
-依赖：`libva-dev`（只取头文件）、`gcc`、`make`、`pkg-config`。容器实测已全部具备。
+容器里 `git clone` GitHub 直连会挂在 TLS 上
+（`GnuTLS recv error (-110): TLS 链接非正常地终止了`），走本机 socks5 代理即可：
+
+```bash
+git -c http.proxy=socks5h://127.0.0.1:1080 clone \
+    --branch feat/vaapi-driver https://github.com/Re-s/droidspaces-media-decode.git
+```
+
+注意 `socks5h`（让代理做 DNS）而不是 `socks5`，且该端口不吃 `http://` 协议前缀。
+
+依赖：`libva-dev`（只取头文件）、`libdrm-dev`（dumb buffer 的 ioctl 定义与
+`drm_fourcc.h`，同样只取头文件）、`gcc`、`make`、`pkg-config`。
+容器实测已全部具备。
 
 ```bash
 make            # 产物 build/msm_drm_drv_video.so
