@@ -28,6 +28,20 @@
 
 - **mount namespace 独立** → 容器默认看不到 Android 的 `/data`（实测容器内 `/data` 只有 `local/` 一个空壳，`nsenter -t 1 -m -- ls /data/adb` 报"没有那个文件或目录"）。因此**基于文件系统路径的 Unix domain socket 不可用** —— 两侧的挂载表不一致，同一路径在对侧不指向同一个 socket 节点。
 
+  ⚠️ **但这不等于"Unix socket 一律不可用"**：**abstract namespace socket**
+  （Linux 的 `@` 前缀，不落文件系统）属于 **net namespace** 而不是 mount
+  namespace，而 net namespace 是**共享**的（见上表），所以 abstract socket
+  两侧可见。本项目的共享内存通道（`DMD_XFER_SHM`）就是用它传递 memfd
+  的 —— 实测跨边界成功，且解码结果与软解逐字节一致。
+
+  所以"不可用"只针对**路径型**。做架构决策时不要把这条读成
+  "只能用 TCP"。
+
+  同时注意反向的坑：`vaapi-driver/src/decode.c` 里 `cfg.want_shm = 0`，
+  SHM 通道目前**默认关闭**，浏览器路径从未走过它。因此
+  "abstract socket 在 Firefox 沙箱下可用"这一点**尚未验证**，
+  已验证的只是"在 ffmpeg（无沙箱）下可用"。
+
 #### 例外：存在一个双向共享目录
 
 mount namespace 隔离**不等于完全不共享**。实测容器 `/proc/self/mountinfo` 里有一条
@@ -63,7 +77,9 @@ Android 写的文件容器立即可读，反之亦然。
 
 ## 2. 端到端解码链路已验证可用
 
-测试方式：`build.sh` 交叉编译后 `adb push` 到 `/data/local/tmp/`，用 `su -c` 手动启动（测试阶段不安装 KSU/Magisk 模块），容器内运行 `src/test_decode.py`。
+测试方式：`build.sh` 交叉编译后 `adb push` 到 `/data/local/tmp/`，用 `su -c` 手动启动，容器内运行 `src/test_decode.py`。
+
+（早期计划用 KSU/Magisk 模块做开机自启，该方案**已放弃** —— daemon 改由 DroidSpace 平台托管。手动启动现在是开发测试的标准方式，不再是"临时替代"。）
 
 ```
 Connected to port 20003
