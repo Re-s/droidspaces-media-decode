@@ -1,7 +1,9 @@
 # VA-API Proxy Driver（容器侧）
 
+> 🌐 **English version: [README.en.md](README.en.md)**
+
 把 Android 宿主的 MediaCodec 硬件解码能力，通过标准 VA-API 暴露给 DroidSpaces
-容器内的消费者（`vainfo` / ffmpeg / Firefox），**不需要任何环境变量**。
+容器内的消费者（`vainfo` / ffmpeg / Firefox / Chrome），**不需要任何环境变量**。
 
 产物：`msm_drm_drv_video.so`，安装到 `/usr/lib/aarch64-linux-gnu/dri/`。
 
@@ -275,12 +277,21 @@ Xvfb 不行：它不提供 DRI3，GLX 走不到 freedreno，`MESA_ACCELERATED` �
 |---|---|
 | VA-API 硬解帧 | 143（视频共 147 帧） |
 | 软解帧 | **0** |
-| `vaExportSurfaceHandle` | 148 次全部成功 |
+| `vaExportSurfaceHandle` | 148 次全部成功 ⚠️ 见下注 |
 | 平均解码耗时 | 7.4 ms（帧间隔 33.3 ms） |
 | 驱动侧 / 浏览器侧错误 | 无 |
 | 实际帧率 | **28.9 fps**（视频标称 30fps）—— 墙钟：导出帧数 ÷ 首末帧日志时间戳差 |
 | 画面正确性 | **黑帧 0**（按亮度均值判定），与软解基线逐字节一致 |
 | 排空 / 会话重建 | **各 0 次** |
+
+> ⚠️ **本表三个计数互不自洽，原始日志已不可复得，故不作解释、只如实标注。**
+> 导出次数（148）既大于硬解帧数（143）也大于视频总帧数（147）。
+> 可能的原因有若干（同一 surface 被导出多次、含非解码用途的导出、
+> 统计口径把重试算了两次），但**都是推测，没有证据**。
+>
+> 这个不一致不影响该轮测试的核心结论 —— 软解帧 0、黑帧 0、
+> 与软解基线逐字节一致，这三项各自独立取证。但表内计数不应被引用为精确值。
+> 后续复测时应先统一口径：明确"导出次数"是否含重复导出同一 surface。
 
 > 帧率算法：`导出帧数 ÷ (末帧时间戳 - 首帧时间戳)`，用驱动日志的墙钟
 > 时间戳，**不是**"帧数 ÷ 视频内容时长"。后者会把卡顿的播放算成正常
@@ -342,7 +353,7 @@ UV 的 offset 是 `stride × slice_height`（**缓冲高 1088**，不是显示�
 
 ### 观测教训：不要让未实现入口静默失败
 
-上面这个根因之所以难找，是因为 25 个未实现桩**静默**返回
+上面这个根因之所以难找，是因为 24 个未实现桩**静默**返回
 `VA_STATUS_ERROR_UNIMPLEMENTED`。消费者踩到未实现入口的典型症状是
 "悄悄回落软解"而不是报错，静默桩让这种情况完全不可观测 —— 为此绕了两轮弯路
 （先后误判为流水线深度死锁、flush 阈值误判）。
@@ -374,7 +385,7 @@ daemon 侧的 `low-latency` 降不下来 —— 那是解码器固有的流水�
 |---|---|---|
 | 语义 | 送 EOS 催出帧后 `flush` 复位并重送 CSD | `shutdown(SHUT_WR)` |
 | 会话 | **仍可用** | 作废，必须重建 |
-| 每帧成本 | 33.6 ms（满速） | 155 ms（慢 4.7 倍） |
+| 每帧成本 | 33.6 ms（满速） | 155 ms（慢约 4.6 倍） |
 | 协议 | 长度 0 的带内请求 | 关闭写端 |
 
 ### 已解决：曾导致黑屏闪烁的互等
@@ -384,9 +395,14 @@ daemon 侧的 `low-latency` 降不下来 —— 那是解码器固有的流水�
 
 之所以要消除而不是优化它们：**排空和重建都会摧毁参考帧链**。
 H.264 的 P/B 帧必须依赖参考帧，从非 IDR 位置重新开始解码要一直黑到
-下一个 IDR（本测试流每 30 帧一个，故最多连黑 29 帧），实测 60 帧样本里
-54 帧纯黑（`tools/probe_black.c`，亮度均值恰为 16 即 BT.601 black level），
-表现为播放时画面一闪一闪。`flush` 与重建会话在这点上**没有区别**。
+下一个 IDR（本测试流每 30 帧一个，故**单次**排空最多连黑 29 帧）。
+实测 60 帧样本里 54 帧纯黑（`tools/probe_black.c`，亮度均值恰为 16
+即 BT.601 black level），表现为播放时画面一闪一闪。
+`flush` 与重建会话在这点上**没有区别**。
+
+> 60 帧里黑 54 帧超过了单次排空的上限（29），说明该样本区间内
+> **发生了多次排空** —— 每次都重新摧毁参考帧链，黑帧区间首尾相接。
+> 这正是问题的严重性所在：不是"偶尔黑一段"，而是排空频繁到几乎连成一片。
 
 **根治办法：让解码器跟随输入顺序输出，滞后从 4 降到 1，互等消失。**
 `tools/probe_keys.c` 逐键实测（目标滞后 <= 3）：
@@ -482,6 +498,7 @@ ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=100" \
 
 `tools/probe_cost.c` 拆开了那 155 ms：建会话只要 2.1 ms，
 真正的成本是 `flush → 首帧` 的 149.8 ms（MediaCodec 处理 EOS 的固有延迟）。
+（两项相加 151.9 ms，与端到端 155 ms 的差额是每帧其余固定开销，未单独拆分。）
 所以问题从来不是"重建会话贵"，而是"为了拿一帧就得走一遍 EOS"。
 
 旧 daemon 不认长度 0，此时 `drain` 失败，驱动自动退回 `finish_input` +
@@ -518,6 +535,10 @@ ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=100" \
 
 改用可逆排空后，浏览器场景下的会话重建次数降为 **0**，
 帧率从 6.4 fps 提到 29.8 fps（满速）。
+
+> 这里的 29.8 fps 与上文 Firefox 结果表里的 28.9 fps 是**不同轮次**的测量 ——
+> 前者是可逆排空改造完成时的即时验证，后者是之后一次完整回归。
+> 两者都是墙钟测法、都属"满速"区间，差异来自不同的视频与运行环境，不是矛盾。
 
 ## 无感发现机制（改名即失效）
 
@@ -564,7 +585,7 @@ libva 会报 `has no function __vaDriverInit_1_0`。
 
 ```bash
 git -c http.proxy=socks5h://127.0.0.1:1080 clone \
-    --branch feat/vaapi-driver https://github.com/Re-s/droidspaces-media-decode.git
+    https://github.com/Re-s/droidspaces-media-decode.git
 ```
 
 注意 `socks5h`（让代理做 DNS）而不是 `socks5`，且该端口不吃 `http://` 协议前缀。
@@ -634,7 +655,7 @@ vaapi-driver/
 │   ├── driver.c      # 入口 __vaDriverInit_*、vtable 装配、日志
 │   ├── driver.h      # 内部结构、能力常量、已实现入口声明
 │   ├── profiles.c    # profile/entrypoint/config 查询与 config 对象管理
-│   ├── stubs.c       # 自动生成：47 个 UNIMPLEMENTED 桩
+│   ├── stubs.c       # 自动生成：24 个 UNIMPLEMENTED 桩
 │   ├── stubs.h       # 自动生成
 │   └── vtable.inc    # 自动生成：60 个槽位的装配列表
 └── tools/

@@ -237,9 +237,19 @@ slice param —— I slice 的 `num_ref_idx` 恒为 0。运行时实测：
 第一轮离线自测显示"PPS 逐字节一致"是**假阳性**：测试用例手填了 l0=2。
 教训：自测输入必须取自真实运行时快照。
 
-**推荐修法（比我试的暂存方案简单）**：PPS 默认值改用 SPS 的
+> 🚫 **下面这条"推荐修法"已被单变量实测证伪，不要照此施工。**
+>
+> 原推荐：PPS 默认值改用 SPS 的 `num_ref_frames`，理由是"任何合法 slice 的
+> `num_ref_idx_active` 都 ≤ 它，不会造成参考帧不足"。
+>
+> 实测结论相反：**`l1` 一位都不能偏大**。见
+> `vaapi-driver/src/h264_bitstream.c` 里 `num_ref_idx_l1_default_active_minus1`
+> 的处理与其上方注释 —— 那里记录了单变量实验的结果。
+> 所以不能用一个"足够大"的值兜底，必须写准。
+
+~~**推荐修法（比我试的暂存方案简单）**：PPS 默认值改用 SPS 的
 `num_ref_frames`。任何合法 slice 的 `num_ref_idx_active` 都 ≤ 它，不会造成
-参考帧不足（不足才解错）。逐字节一致不是目标，解码正确才是。
+参考帧不足（不足才解错）。~~逐字节一致不是目标，解码正确才是。
 
 ## 第三轮：num_ref_idx 假设被推翻，真根因是 daemon 不传 PTS
 
@@ -346,17 +356,26 @@ AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
   （`h264dec.c:674` 的 `decode_slice` 只在 `case H264_NAL_SLICE` 内，
   SPS/PPS/SEI 分别在 `:699`/`:717`/`:687` 被 ffmpeg 自己消费）。
 
-  **修法：按 POC 配对，不按提交顺序。**
+  > ✅ **本条已解决，下面的方案未被采用 —— 保留仅作记录，不要照此施工。**
+  >
+  > 实际采用的是**按输入单元序号精确配对**：daemon 把输入单元序号写进
+  > `queueInputBuffer` 的 `presentationTimeUs`，驱动按该序号配对 surface，
+  > 与输出顺序完全解耦（协议能力位 `CAP_FRAME_PTS`）。
+  > 这比按 POC 配对更可靠 —— 不依赖 B 帧重排深度的经验值，
+  > 也不需要"已提交未填充"的排序窗口。
+  >
+  > POC 路径现在只作为**回退**存在（daemon 不支持 `CAP_FRAME_PTS` 时），
+  > 见 `vaapi-driver/src/decode.c` 里 `daemon_has_unit_seq` 相关分支。
+
+  ~~**修法：按 POC 配对，不按提交顺序。**~~
   VA-API 本来就提供显示序 —— `VAPictureParameterBufferH264.CurrPic` 的
   `TopFieldOrderCnt` 就是 POC（`va.h:3546` 的 `VAPictureH264`）。
-  当前 `decode.c` 里 grep `CurrPic`/`TopFieldOrderCnt`/`poc` **零命中**，
-  完全没用这个信息。所以**不需要 daemon 传 PTS**：
   在 `EndPicture` 记录 `POC → render_target` 映射，
   `SyncSurface` 收到第 n 个帧时投递给 POC 第 n 小的待填充 surface。
 
-  实现要点与风险：B 帧重排深度实测 5-6，需要一个"已提交未填充"的窗口来排序；
-  ffmpeg 可能在某帧到达前就 `vaSyncSurface` 该 surface，
-  此时需缓存先到的其他帧。复杂度中等，但**全部在 driver 内，不动 daemon**。
+  当初评估的风险（现已不适用）：B 帧重排深度实测 5-6，需要一个
+  "已提交未填充"的窗口来排序；ffmpeg 可能在某帧到达前就 `vaSyncSurface`
+  该 surface，此时需缓存先到的其他帧。
 
 ### 给后续单元的建议
 

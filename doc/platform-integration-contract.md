@@ -9,9 +9,24 @@
 
 ## 1. 一句话概述
 
+> 🌐 **English version: [platform-integration-contract.en.md](platform-integration-contract.en.md)**
+
 本组件让 DroidSpaces 容器内的标准 Linux 应用（ffmpeg / Firefox / Chrome）通过 **VA-API** 使用 Android 宿主的 **MediaCodec 硬件解码**，应用无需改动；它由两部分组成 —— 宿主侧的 `decode-daemon` 与容器侧被 libva `dlopen` 的驱动 `msm_drm_drv_video.so`。
 
-**平台需要做三件事**：把一个宿主目录 bind mount 进容器、以正确的 SELinux domain 启动 daemon、把 `/dev/dri/renderD128` 透传进容器。除此之外不需要任何网络、端口或策略配置。
+**平台需要做四件事**：
+
+1. 把一个宿主目录 bind mount 进容器（§2.1）
+2. 以正确的 SELinux domain 启动 daemon（§2.2）
+3. 把 `/dev/dri/renderD128` 透传进容器（§2.3）
+4. **补一条 SELinux allow 规则**：允许 daemon 所在 domain 访问
+   hwservicemanager 与 Codec2 HAL（§2.2）
+
+不需要任何网络或端口配置 —— 通道是 Unix socket，不上网络栈。
+
+> ⚠️ **第 4 项是当前唯一的阻塞项，请勿漏排。** 前三项做完后，
+> §6 验证清单的第 1–7 步会**全部通过**，只有第 8 步（真实解码）失败 ——
+> 因为 daemon 要到创建 codec 时才触及 Codec2，握手阶段不碰。
+> 也就是说"看起来都装好了"并不代表能解码。详见 §2.2。
 
 ---
 
@@ -29,7 +44,7 @@
 | 容器内实际端点 | `/run/dmd/decode.sock` |
 | 读写 | 需可读写（客户端要 `connect`） |
 
-容器侧路径是驱动的编译期默认值 `DMD_DEFAULT_SOCK`（`vaapi-driver/src/dmd_client.h:78`），文件名 `decode.sock` 是 daemon 目录模式下的固定名 `DAEMON_SOCK_NAME`（`src/decode-daemon.c:46`）。两侧必须一致，改一边就连不上。
+容器侧路径是驱动的编译期默认值 `DMD_DEFAULT_SOCK`（`vaapi-driver/src/dmd_client.h` 的 `DMD_DEFAULT_SOCK`），文件名 `decode.sock` 是 daemon 目录模式下的固定名 `DAEMON_SOCK_NAME`（`src/decode-daemon.c` 的 `DAEMON_SOCK_NAME`）。两侧必须一致，改一边就连不上。
 
 **为什么必需**
 
@@ -48,7 +63,7 @@
 - bind mount 绑定的是 **inode 而非路径**。
 - 结果：若平台挂载的是单个 socket 文件，daemon 一重启，容器侧挂载点仍指向那个已经孤立的旧 inode，`connect` 立刻变成 `ECONNREFUSED`，**必须重新挂载**。更麻烦的是此时宿主两侧 `stat` 看到的 inode 会一致（都是孤立 inode），很容易误判为"挂载还好着"。
 
-挂目录没有这个问题：目录 inode 稳定，里面的 socket 换 inode 不影响挂载。平台只挂一次，daemon 随便重启，容器一直连 `/run/dmd/decode.sock`。这一约束与对策在 `src/decode-daemon.c:1232-1252` 与 `:1270-1307` 的注释里有对应说明。
+挂目录没有这个问题：目录 inode 稳定，里面的 socket 换 inode 不影响挂载。平台只挂一次，daemon 随便重启，容器一直连 `/run/dmd/decode.sock`。这一约束与对策在 `src/decode-daemon.c` 的 `--sock` 目录模式分支（搜 `S_ISDIR`）与 flock 判活段（搜 `LOCK_EX`）的注释里有对应说明。
 
 **验证方法**
 
@@ -81,10 +96,26 @@ python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('/run/dmd/de
 **要求**
 
 ```bash
-runcon u:r:droidspacesd:s0 /path/to/decode-daemon --sock /data/local/tmp/dmd/
+mkdir -p /data/local/tmp/dmd
+runcon u:r:droidspacesd:s0 /path/to/decode-daemon --sock /data/local/tmp/dmd
 ```
 
-`--sock` 传**目录**：daemon `stat` 到它是目录时，会在其中建固定名 `decode.sock`（`src/decode-daemon.c:1244-1252`）。
+`--sock` 传**目录**：daemon `stat` 到它是目录时，会在其中建固定名
+`decode.sock`。目录不存在时 daemon 会**自动创建**（0755），
+并在日志里写明 `--sock 目录不存在，已创建`。
+
+上面仍显式写了 `mkdir -p`，因为平台通常要先建好目录才能配置 bind mount ——
+挂载点必须在容器启动时就存在。
+
+> **两个已修的坑，供参考**（v0.3.0 发布前修掉）：
+> - **尾斜杠**：早前传 `/data/local/tmp/dmd/` 会拼出
+>   `/data/local/tmp/dmd//decode.sock`。功能正常，但日志里的双斜杠与本文
+>   §6 第 2 步要匹配的字符串对不上，容易误判成没生效。现已剥除尾斜杠。
+> - **目录不存在时静默降级**：早前会把该路径直接当成 socket **文件名** bind，
+>   静默造出一个单文件 socket。单文件挂载在 daemon 重启后必然失效
+>   （inode 变了），而平台当时拿不到任何警告。现在会自动建目录；
+>   若路径以 `.sock` 结尾则视为确实想要文件模式，此时会打印告警说明
+>   重启后挂载会断。
 
 daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行、不自我 daemonize、日志走 stderr、`SIGTERM` 优雅退出。**判活请用监听端点而不是 PID** —— PID 会反复变化。
 
@@ -96,7 +127,7 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 - 以 `runcon u:r:droidspacesd:s0` 启动则 `bind()` 成功。
 - 容器进程自身的上下文也是 `u:r:droidspacesd:s0`。
 
-建 socket 这一步**不需要新增 SELinux 规则** —— 策略已允许，只是要用 DroidSpaces 自己的 domain。daemon 在 `bind()` 拿到 `EACCES` 时会直接打印这条提示（`src/decode-daemon.c:1311-1315`）。
+建 socket 这一步**不需要新增 SELinux 规则** —— 策略已允许，只是要用 DroidSpaces 自己的 domain。daemon 在 `bind()` 拿到 `EACCES` 时会直接打印这条提示（`src/decode-daemon.c` 的 `bind()` 失败提示（搜 `runcon u:r:droidspacesd`））。
 
 ### ⚠️ 但仅切 domain 还不够：需要平台补一条 allow 规则
 
@@ -129,7 +160,9 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 | 其余 domain（`magisk`/`init`/`shell`/`system_server`/`mediaserver`/`media_codec`/`hal_codec2_default` 等 11 个） | 均无法同时满足"可切入"与"可 bind" |
 | DroidSpaces `selinux_permissive=1` | 有效，但那是**把宿主 SELinux 整体切成 permissive**（帮助原文：`Set host SELinux to permissive mode`），全系统关防护，不可作为交付形态 |
 
-**所需规则**：允许 `droidspacesd` 访问 hwservicemanager 与 Codec2 HAL。DroidSpaces 已为该 domain 配过 `/dev/dri`、`/dev/ashmem` 的访问权，这属同类工作。
+**所需规则**：允许 `droidspacesd` 访问 hwservicemanager 与 Codec2 HAL。
+
+这类配置平台已经做过 —— `/dev/dri` 与 `/dev/ashmem` 的 `droidspaces-gpu` 属组授权就是先例，说明平台有能力也有惯例做这种 domain 级授权。（本项目**不使用** `/dev/ashmem`，这里只是引用它作为"平台做过同类工作"的证据，不是要求配置它 —— 见 §5。）
 
 > **待平台确认**：这条规则加在哪里、是否愿意为 daemon 单独定义一个兼具两种权限的 domain。在规则到位前，驱动会自动退回 TCP（`ksu` domain 下正常），功能不退化，但 NAT 型容器用不了硬解。
 
@@ -180,7 +213,7 @@ host 型容器已有该节点；NAT 型容器最初没有，**平台配置后才
 两条都是硬依赖：
 
 1. **libva 靠它发现驱动**：libva 用 `DRM_IOCTL_VERSION` 从 `/dev/dri/renderD128` 取内核驱动名，实测为 `msm_drm`；映射表里没有 msm 条目，于是走 fallback 原样使用该名字，只尝试唯一一个文件名 `/usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so`。没有这个节点，驱动根本不会被加载（`vaapi-driver/README.md`"无感发现机制"）。
-2. **可导出 surface 依赖它**：驱动把 surface 分配在 msm_drm 的 dumb buffer 里（`DRM_IOCTL_MODE_CREATE_DUMB` + `MAP_DUMB`，`vaapi-driver/src/decode.c:140-195`），`vaExportSurfaceHandle` 由此导出 dmabuf fd（`vaapi-driver/src/export.c`）。**Firefox 与 Chrome 硬解只走这个入口**，拿不到 fd 就静默回落软解。fd 不可用时驱动会退回普通 heap（`decode.c:209-218`），ffmpeg 的 `vaDeriveImage` 路径仍能工作，但浏览器路径会失效。
+2. **可导出 surface 依赖它**：驱动把 surface 分配在 msm_drm 的 dumb buffer 里（`DRM_IOCTL_MODE_CREATE_DUMB` + `MAP_DUMB`，`vaapi-driver/src/decode.c` 的 dumb buffer 分配），`vaExportSurfaceHandle` 由此导出 dmabuf fd（`vaapi-driver/src/export.c`）。**Firefox 与 Chrome 硬解只走这个入口**，拿不到 fd 就静默回落软解。fd 不可用时驱动会退回普通 heap（同文件的导出路径），ffmpeg 的 `vaDeriveImage` 路径仍能工作，但浏览器路径会失效。
 
 **验证方法**
 
@@ -210,11 +243,22 @@ ls -l /dev/dri/renderD128 && id
 
 | 传输 | 依赖的 namespace | host 型 | NAT 型 | 说明 |
 |---|---|---|---|---|
-| **路径式 Unix socket**（`--sock`） | 仅 mount ns（靠 bind mount 跨界） | ✅ | ✅ | **唯一对两类容器都成立的通道，推荐** |
+| **路径式 Unix socket**（`--sock`） | 仅 mount ns（靠 bind mount 跨界） | ⚠️ 见下 | ⚠️ 见下 | **唯一对两类容器都成立的通道，推荐** |
 | TCP `127.0.0.1:20003` | 共享 net ns | ✅ | ❌ | NAT 型 netns 独立，loopback 不通 |
 | abstract socket（`@` 前缀） | 共享 net ns | ✅ | ❌ | NAT 型可见数为 0 |
 
-驱动侧的端点选择逻辑（`vaapi-driver/src/decode.c:390-452`）：
+> ⚠️ **Unix socket 那行的两个 ⚠️ 是指：通道机制本身已验证可用，但当前
+> 在 SELinux Enforcing 下起不了作用** —— 缺 §2.2 第 4 项那条 allow 规则。
+>
+> 实测状态：
+> - **Permissive 下**：两类容器都通，十二条流逐字节比对 12/12 一致
+> - **Enforcing 下**：daemon 能建 socket、能握手，但创建 codec 时 SIGABRT，
+>   解码返回 0 帧（`internal decoding error`）
+>
+> 规则补上后这两格才是真正的 ✅。在那之前，实际可用的通道是 TCP
+> （仅 host 型容器），驱动会自动退回。
+
+驱动侧的端点选择逻辑（`vaapi-driver/src/decode.c` 的 `session_open`）：
 
 - `DMD_ENDPOINT=unix:<路径>` 或 `DMD_ENDPOINT=tcp:<端口>` 可显式指定；
 - 不设时自动探测：`/run/dmd/decode.sock` 存在且是 socket 就用它，否则走 TCP；
@@ -226,11 +270,17 @@ ls -l /dev/dri/renderD128 && id
 
 ## 4. 可选优化：memfd 零拷贝（SHM 传输）
 
-TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息。实测 1080p 收益：稳态窗口吞吐 +12.9%、daemon CPU **−28.6%**，两种模式解出的帧逐字节完全一致。
+TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息。
+
+**取证环境为 `tests/test_dmd_client.c`（独立测试程序）**，实测 1080p 收益：稳态窗口吞吐 +12.9%、daemon CPU **−28.6%**，两种模式解出的帧逐字节完全一致。
+
+> ⚠️ **不要把这组数字当作驱动侧的预期收益。** 它出自独立测试程序，
+> 而驱动被 `dlopen` 进真实消费者（ffmpeg / 浏览器）后的 SHM 路径
+> **至今没有端到端跑通**（见下方说明）。真实收益未知，可能更低。
 
 ⚠️ **它只在 host 型容器可能可用，NAT 型容器不可用。**
 
-> **勘误**：本文档早前版本称"它在两类容器都可用，因为不依赖 net namespace"。**那个结论是错的**。SHM 的 memfd 交接并不走 §2.1 那条路径式 Unix socket，而是 daemon 另开一个 **abstract** socket（`src/decode-daemon.c:755`，`sun_path[0] = 0`），驱动再去连它。abstract socket **属于 net namespace** —— NAT 型容器 netns 独立，连不上那个交接通道，`DMD_WANT_SHM=1` 在那里必然交接失败再降级，每建一次会话白等一次超时。
+> **勘误**：本文档早前版本称"它在两类容器都可用，因为不依赖 net namespace"。**那个结论是错的**。SHM 的 memfd 交接并不走 §2.1 那条路径式 Unix socket，而是 daemon 另开一个 **abstract** socket（`src/decode-daemon.c`，搜 `sun_path[0] = 0`），驱动再去连它。abstract socket **属于 net namespace** —— NAT 型容器 netns 独立，连不上那个交接通道，`DMD_WANT_SHM=1` 在那里必然交接失败再降级，每建一次会话白等一次超时。
 >
 > 教训：**控制通道能跨 netns，不等于 SHM 交接通道也跨得过去。** 要让零拷贝在 NAT 容器可用，需把 memfd 交接改走同一条路径式 Unix socket（在已有连接上传 `SCM_RIGHTS` 即可，不必另开 socket）。那是一项独立改动，尚未实施。
 
@@ -238,7 +288,7 @@ TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`�
 
 **平台侧无需为此做任何配置** —— 这一项是后续优化，不是接入要求。
 
-⚠️ **当前默认关闭。** 驱动侧需 `DMD_WANT_SHM=1` 且已走 Unix socket 才请求 SHM（`vaapi-driver/src/decode.c:438-439`）。
+⚠️ **当前默认关闭。** 驱动侧需 `DMD_WANT_SHM=1` 且已走 Unix socket 才请求 SHM（`vaapi-driver/src/decode.c` 的 `want_shm` 判定（搜 `DMD_WANT_SHM`））。
 
 这条路**驱动侧从未真正启用过**（`want_shm` 长期硬编码为 0），只有 `tests/test_dmd_client.c` 走过：实测 150 帧、与 TCP 前 20 帧逐字节一致、无 fd 泄漏。但那是独立测试程序，不是驱动被 `dlopen` 进消费者进程的真实环境。
 
@@ -266,7 +316,7 @@ TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`�
 | 进程管理模块（KSU / Magisk） | **不需要** | 该方案已放弃；daemon 设计为被平台托管的前台进程 |
 | 抬高 daemon 权限或让它常驻 root shell | **不需要** | 只需正确的 domain，见 2.2 |
 
-> **待平台确认**：socket 文件权限的收紧目标。daemon 目前 `chmod 0666`（`src/decode-daemon.c:1317-1320`），注释里已标注这是"先跑通"的放宽值，真实部署应收紧到特定 gid（参考 `/dev/dri` 用的 `droidspaces-gpu`）。**平台希望用哪个 gid、由谁设置属组**需要确认后再改代码。
+> **待平台确认**：socket 文件权限的收紧目标。daemon 目前 `chmod 0666`（`src/decode-daemon.c` 的 `listen()` 与权限设置（搜 `chmod`）），注释里已标注这是"先跑通"的放宽值，真实部署应收紧到特定 gid（参考 `/dev/dri` 用的 `droidspaces-gpu`）。**平台希望用哪个 gid、由谁设置属组**需要确认后再改代码。
 >
 > **待平台确认**：容器内 `/run/dmd/` 挂载点目录由谁创建（`/run` 在容器内是 tmpfs），以及挂载在容器启动流程的哪个阶段发生。
 
@@ -280,7 +330,7 @@ TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`�
 |---|---|---|---|
 | 1 | 宿主 | `ps -AZ \| grep decode-daemon` | 进程存在，标签 `u:r:droidspacesd:s0` |
 | 2 | 宿主 | 查 daemon stderr 日志 | 含 `listening on /data/local/tmp/dmd/decode.sock` |
-| 3 | 宿主 | `stat -c '%i %F' /data/local/tmp/dmd/decode.sock` | `<inode> socket` |
+| 3 | 宿主 | `stat -c '%i %F' /data/local/tmp/dmd/decode.sock` | `<inode> socket`（⚠️ 经 `adb` 传递时见下方注意事项） |
 | 4 | 容器 | `stat -c '%i %F' /run/dmd/decode.sock` | inode 与第 3 步**完全相同**，类型 `socket` |
 | 5 | 容器 | `python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('/run/dmd/decode.sock');print('connect ok')"` | `connect ok` |
 | 6 | 容器 | `ls -l /dev/dri/renderD128 && id` | `crw-rw---- 1 root droidspaces-gpu`，`id` 含 `droidspaces-gpu` |
@@ -306,6 +356,35 @@ DMD_ENDPOINT=unix:/run/dmd/decode.sock <消费者>   # 显式指定端点，绕�
 >
 > ⚠️ 第 7、8 步通过**不代表浏览器也能硬解** —— ffmpeg 走 `vaDeriveImage`，浏览器走 `vaExportSurfaceHandle`，是两条不同的出口。浏览器验证还需要容器内的桌面会话与额外环境（见 `vaapi-driver/README.md`"浏览器（Firefox）"一节），那部分属于容器镜像与桌面环境配置，不在本契约范围内。
 
+### 在 Android 侧执行这些命令时的注意事项
+
+上表的命令按"在目标侧的 shell 里直接执行"书写。经 `adb` 从外部传入时有两个坑，
+都实测踩过：
+
+**一、内层引号会被拆开。** 第 3 步经 `adb shell su -c` 传递时：
+
+```bash
+# ✗ 坏：外层双引号先被本机 shell 处理，'%i %F' 的空格把参数拆成两个
+adb shell su -c "stat -c '%i %F' /data/local/tmp/dmd/decode.sock"
+#   → stat: '%F': No such file or directory
+#     1270438
+
+# ✓ 好：转义内层引号
+adb shell "su -c \"stat -c '%i %F' /data/local/tmp/dmd/decode.sock\""
+#   → 1270438 socket
+
+# ✓ 也好：避开空格，分两次取
+adb shell su -c "stat -c %i /data/local/tmp/dmd/decode.sock"
+```
+
+Android 的 `stat` **支持** `%i` 与 `%F`，报错纯粹是引号层级问题，
+不要误判成"Android stat 不支持该格式符"。
+判类型也可以直接用 `ls -l`（socket 显示为 `s` 开头，如 `srw-rw-rw-`）。
+
+**二、Android 自带 shell 不支持部分 POSIX 语法。** `for x in a b; do ...; done`
+会报 syntax error，`/dev/tcp/...` 也不存在。需要循环或测端口时，
+从容器侧执行，或改用 `adb shell` 多次调用。
+
 ---
 
 ## 7. 已知限制
@@ -314,14 +393,14 @@ DMD_ENDPOINT=unix:/run/dmd/decode.sock <消费者>   # 显式指定端点，绕�
 
 | 项 | 状态 |
 |---|---|
-| SHM（memfd）零拷贝 | 驱动侧**默认关闭**，需 `DMD_WANT_SHM=1`。这条路驱动侧从未真正启用过（只有单元测试走过：150 帧、逐字节一致、无 fd 泄漏），真实消费者环境下未验证；浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测（`vaapi-driver/src/decode.c:424-448`） |
+| SHM（memfd）零拷贝 | 驱动侧**默认关闭**，需 `DMD_WANT_SHM=1`。这条路驱动侧从未真正启用过（只有单元测试走过：150 帧、逐字节一致、无 fd 泄漏），真实消费者环境下未验证；浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测（`vaapi-driver/src/decode.c` 的 SHM 默认关闭说明（搜 `DMD_WANT_SHM`）） |
 | **SELinux allow 规则缺失** | **当前唯一阻塞项**。`droidspacesd` domain 无权访问 hwservicemanager/Codec2，daemon 在 `CCodec::allocate` 处 SIGABRT。permissive 下同条件正常解码，证明通道本身正确 —— 详见 §2.2 |
 | 浏览器沙箱收 `SCM_RIGHTS` | **未验证**（Firefox RDD / Chrome GPU 进程有 seccomp 过滤） |
 | Firefox 的 `MOZ_DISABLE_RDD_SANDBOX=1` | 该环境变量的原始理由是"RDD 沙箱禁止驱动创建 **TCP** socket"。**改用 Unix socket 后是否仍需要它，尚未实测**。它降低 RDD 进程隔离强度，属安全权衡 |
 | socket 文件权限 | 当前 `chmod 0666`，任何容器内进程可连；应收紧到特定 gid，等平台确认目标 gid |
 | 鉴权 | Unix socket 路径靠文件权限，但在 0666 下不构成隔离；TCP 路径完全无鉴权且 loopback 在 host 型容器不构成边界。**不要在多租户或不可信 App 环境下使用当前版本** |
 | 单文件挂载场景 | 若平台挂的是单个 socket 文件而非目录，daemon 每次重启后**必须重新挂载**（inode 变了） |
-| 残留 socket 清理 | daemon 启动时若发现无人监听的残留 socket 文件会 `unlink` 重建，这会**换掉 inode**，已有 bind mount 失效（`src/decode-daemon.c:1301-1307`） |
+| 残留 socket 清理 | daemon 启动时若发现无人监听的残留 socket 文件会 `unlink` 重建，这会**换掉 inode**，已有 bind mount 失效（`src/decode-daemon.c` 的 flock 判活（搜 `LOCK_EX`）） |
 | 并发上限 | `MAX_CLIENTS = 8`，硬件支持 16，**尚未测到上限行为**；超限时直接关闭新连接，客户端只看到连接被断，没有明确拒绝原因 |
 | 编解码覆盖 | H.264 / HEVC / VP9 / VP8 已真机端到端逐字节验证。**未验证**：高位深与非 4:2:0（HEVC Main10、VP9 Profile2、H.264 High 10 / 4:2:2）——驱动不声明这些能力 |
 | HEVC 例外 | SPS 里 `num_short_term_ref_pic_sets > 0` 的码流无法重建参数集，驱动回 `VA_STATUS_ERROR_UNIMPLEMENTED` 让上层干净回落软解 |

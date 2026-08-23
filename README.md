@@ -1,5 +1,7 @@
 # DroidSpaces Media Decode Daemon
 
+> 🌐 **English version: [README.en.md](README.en.md)**
+
 Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解能力。
 
 ## 项目简介
@@ -12,8 +14,9 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 - **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox、Chrome）无需改动即可用
 - **两种传输通道，自动选择**：
   - **路径式 Unix socket**（推荐）：不属于 net namespace，靠 bind mount 跨界，
-    **host 型与 NAT 型容器都能用**；鉴权靠文件权限，服务不上网络。
-    走这条路时自动启用 memfd 零拷贝。
+    **host 型与 NAT 型容器都能用**；鉴权靠文件权限与 SELinux，服务不上网络。
+    ⚠️ 当前 daemon 建 socket 后 `chmod 0666`（`src/decode-daemon.c` 里标注为
+    "先跑通"的放宽值），真实部署应收紧到特定 gid。
   - **TCP 127.0.0.1**（兜底）：仅在容器与宿主**共享 net namespace** 时可用
     （host 型容器满足，NAT 型不满足）。
   
@@ -81,7 +84,7 @@ DroidSpaces 自己的显示通道就是这个模式：宿主
 `/data/local/tmp/anland-<hash>.sock` → 容器 `/run/display.sock`
 （实测两侧 inode 相同，确认是同一文件）。
 
-⚠️ **两个部署约束**（都是实测踩出来的）：
+⚠️ **两个部署约束 + 一条当前状态**（约束都是实测踩出来的）：
 
 1. **必须挂目录，不能挂单个 socket 文件。** `bind()` 只能创建新 inode，
    而 bind mount 绑的是 **inode 而非路径** —— 挂单文件时 daemon 一重启就换
@@ -121,7 +124,11 @@ DroidSpaces 自己的显示通道就是这个模式：宿主
 ### 性能
 
 1080p 峰值 **194 fps**、4K 峰值 **82 fps**，两者均满足 60fps（富余 3.24× / 1.37×）。
-延迟 p50 4.46 ms、p95 9.77 ms。原先的瓶颈是 daemon 的单线程串行结构
+延迟 p50 4.46 ms、p95 9.77 ms。
+
+> 这两个峰值是**端到端单客户端**测得（TCP 通道）。文档别处出现的
+> 275.5 / 244.0 fps 是 SHM 与 TCP 的**稳态窗口**对比，口径不同，
+> 不能与这里横向比较，也不意味着 194 fps 是硬件上限。原先的瓶颈是 daemon 的单线程串行结构
 （不是 TCP 传输也不是硬件解码器），已通过收发分离拆除：
 单客户端吞吐提升 20–30%，并支持多客户端并发（4 路合计约 253 fps）。
 
@@ -145,7 +152,7 @@ DroidSpaces 自己的显示通道就是这个模式：宿主
     旧 daemon 不发，客户端按 3 字段解析。
   - 共享内存模式对应地在 `[槽位][长度]` 之后多一个同义字段。
 - **最大单元大小 8MB 只约束上行**：`MAX_FRAME` 仅用于校验客户端送来的数据单元
-  （`src/decode-daemon.c:451`），**下行帧大小没有任何上限检查**。
+  （`src/decode-daemon.c:579` 的 `sz > MAX_FRAME`），**下行帧大小没有任何上限检查**。
   客户端不要拿 8MB 去校验下行 —— 4K NV12 单帧 12441600 字节就已超过它，
   照 8MB 判定会把正常的 4K 流误判成协议错误。
 - **格式描述块的能力位**：块头第 2 个字（原为保留的 0）声明 daemon 能力，
@@ -174,7 +181,8 @@ daemon 与客户端配套发布，不保留无握手的兼容路径：
 `codec` 取值：`0`=H.264 `1`=HEVC `2`=VP9 `3`=VP8。
 传输模式：`0`=TCP，`1`=共享内存（见下节）。
 
-**版本必须精确等于 2**：daemon 按严格相等判定（`src/decode-daemon.c:363`），
+**版本必须精确等于 2**：daemon 按严格相等判定（`src/decode-daemon.c:409` 的
+`ver != HELLO_VERSION`），
 不接受更低的版本号，不匹配直接回 `status=1` 并断开。
 
 不同编码的数据单元切分方式不同，客户端必须按对应规则送数据：
@@ -237,9 +245,6 @@ SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
 
 两个超时不要混淆：**槽位等待约 1 秒**（客户端不归还），
 **memfd 交接等待 3 秒**（客户端拿到名字后不来 connect，实测降级发生在 3.0~3.5 s）。
-
-槽位大小按握手声明的分辨率算（宽对齐 128、高对齐 32，再乘 1.5），
-1080p 为 3133440 字节、720p 为 1413120 字节。
 
 槽位按 **adaptive-playback 上限**（`max(声明宽,1920) × max(声明高,1088)`）计算，
 而不是按握手声明的实际分辨率。原因：只按当前分辨率开槽时，
@@ -383,8 +388,11 @@ adb shell 'timeout 3 sh -c "echo > /dev/tcp/127.0.0.1/20003" && echo 在听'
 ### 生产部署
 
 由 DroidSpace 负责：二进制放置位置、启动时机（需 media 服务就绪）、
-崩溃重启、日志收集、健康检查。接入契约详见规划文档
-`dmd-vaapi/research/plan-droidspace-hosting.md`。
+崩溃重启、日志收集、健康检查。**接入契约详见
+[`doc/platform-integration-contract.md`](doc/platform-integration-contract.md)**
+—— 那份文档列出平台必须提供的三件事（bind mount 目录、正确的 SELinux domain
+启动、`/dev/dri/renderD128` 透传）、各自的实测依据与验证命令，
+以及当前唯一的阻塞项（`droidspacesd` 缺一条访问 Codec2 的 allow 规则）。
 
 ## 测试方法
 
@@ -457,16 +465,98 @@ nc -zv 127.0.0.1 20003
 daemon 的命令行选项：
 
 ```
-用法: decode-daemon [端口] [-v|-q]
-  端口   监听的 TCP 端口（默认 20003，仅绑定 127.0.0.1）
-  -v     逐帧调试日志
-  -q     只输出错误
+用法: decode-daemon [端口] [--sock 路径] [-v|-q]
+  端口          监听的 TCP 端口（默认 20003，仅绑定 127.0.0.1）
+  --sock 路径   改为监听该路径的 Unix socket（推荐）
+                传目录时在其中建 decode.sock
+  -v            逐帧调试日志
+  -q            只输出错误
+```
+
+**推荐用法（Unix socket，两类容器都支持）**：
+
+```bash
+# 宿主侧：注意必须用 droidspacesd domain，否则 bind() 得到 EACCES
+adb shell su -c 'runcon u:r:droidspacesd:s0 \
+  /data/local/tmp/decode-daemon --sock /data/local/tmp/dmd'
+# 成功时输出：
+#   --sock 是目录，实际监听 /data/local/tmp/dmd/decode.sock
+#   listening on /data/local/tmp/dmd/decode.sock
+
+# 平台把该目录 bind mount 进容器（宿主 /data/local/tmp/dmd → 容器 /run/dmd）
+# 容器侧：
+DMD_ENDPOINT=unix:/run/dmd/decode.sock ffmpeg -hwaccel vaapi ...
+# 或不设 DMD_ENDPOINT，驱动会自动探测 /run/dmd/decode.sock
+```
+
+⚠️ **传目录而非单个 socket 文件**：`bind()` 只能创建新 inode，而 bind mount
+绑的是 **inode 而非路径** —— 挂单文件时 daemon 一重启容器侧就 `ECONNREFUSED`。
+挂目录则目录 inode 稳定，daemon 随便重启都不影响。
+
+⚠️ **Enforcing 下这条路当前走不通**：`droidspacesd` domain 能 bind 但无权访问
+Codec2，会在 `CCodec::allocate` 处 SIGABRT。详见"已知问题"。
+
+**兜底用法（TCP，仅 host 型容器）**：
+
+```bash
+adb shell su -c '/data/local/tmp/decode-daemon 20003'
 ```
 
 默认级别只输出连接与会话统计。排查解码问题时用 `-v` 看逐帧信息
 （逐帧日志会带来可观的 sys 开销，压测时务必保持默认或 `-q`）。
 
 ## 已知问题
+
+### 0. Unix socket 通道在 SELinux Enforcing 下不可用（当前最大阻塞项）
+
+现有两个启动身份**各只有一半权限**：
+
+| 启动身份 | 能 `bind()` socket | 能用 MediaCodec |
+|---|---|---|
+| `su`（`u:r:ksu:s0`） | ✗ 各处 `EACCES` | ✓ |
+| `runcon u:r:droidspacesd:s0` | ✓ | ✗ SIGABRT |
+
+`droidspacesd` 下崩在 `CCodec::allocate`，tombstone 栈顶
+`Codec2Client::GetServiceNames`，报 `Hardware service manager is not running`。
+
+三组对照实验确认这与传输方式**无关**：
+
+| 身份 + 传输 | 结果 |
+|---|---|
+| `ksu` + TCP | 正常解码（但该 domain 无权 bind） |
+| `droidspacesd` + TCP | **同样 SIGABRT** ← 证明与 Unix socket 无关 |
+| `droidspacesd` + Unix socket + **SELinux permissive** | **正常解码** |
+
+所以**通道本身是正确的**（permissive 下十二条流逐字节比对 12/12 一致），
+缺的只是一条 allow 规则：允许 `droidspacesd` 访问 hwservicemanager 与
+Codec2 HAL。
+
+已排除的替代方案：root 无效（两个 domain 本来都是 uid 0，SELinux 是 MAC
+不看 uid）；DroidSpaces `enable_hw_access=1` 无效（只透传 `/dev` 节点、
+不改 domain）；`untrusted_app` 走不通（无法执行 `shell_data_file` 标签的
+二进制，`chcon` 被拒）；另外 11 个 domain 均无法同时满足"可切入"与
+"可 bind"；`selinux_permissive=1` 有效但那是把宿主 SELinux 整体切成
+permissive，不可作为交付形态。
+
+**规则到位前驱动会自动退回 TCP，行为与 v0.2.0 一致，无退化。**
+详见 [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) §2.2。
+
+### 0b. memfd 零拷贝开启后单连接会断
+
+`DMD_WANT_SHM=1` 时实测：`xfer=1`、4 槽 memfd 挂载与 `帧回传=SHM` 握手都成功，
+随后该连接断开（`Broken pipe` / `Connection reset by peer`），
+118 个输入单元只取回 25 帧。
+
+但**不会打死 daemon** —— 无新 tombstone、socket 继续 `accept`、
+事后非 SHM 路径复测逐字节一致。所以属该连接的错误处理问题，
+不是进程级崩溃 —— 排查方向应放在该连接的错误返回与提前 `close`，
+而不是"daemon 崩了"。具体根因未定位，故默认关闭。
+
+> 与"已知问题 0"区分：那条是 SELinux domain 导致**任何**解码都不成，
+> 与传输方式无关；这条是 SHM 帧交付路径特有的。两者曾被我误当成同一件事。
+
+另外零拷贝的 memfd 交接走的是**另开的 abstract socket**，属 net namespace，
+所以它**只在 host 型容器可能可用，NAT 型必然降级**。
 
 ### 1. 共享内存池不支持超出上限的分辨率
 槽位已按 adaptive-playback 上限（≥1920×1088）预留，覆盖了常见的
@@ -486,14 +576,21 @@ daemon 的命令行选项：
 - 帧率、色彩空间、位深的变化未处理（只跟踪尺寸与 crop）
 
 ### 3. 编解码器支持范围
-- **H.264 / HEVC / VP9 / VP8 四种均已真机端到端验证**，帧数与源流精确匹配：
+- **H.264 / HEVC / VP9 / VP8 四种均已真机端到端验证。**
+  VP9 / VP8 的解码帧数与源流帧数**精确匹配**；H.264 / HEVC 那轮当时
+  没有记录源流帧数，所以严格说只有"解码出 150 帧、无错误"，
+  **不能声称帧数匹配**：
 
-  | 编码 | 分辨率 | 源流帧数 | 解码帧数 |
-  |------|--------|----------|----------|
-  | H.264 | 1080p | — | 150 |
-  | HEVC | 720p | — | 150 |
-  | VP9 | 720p | 120 | 120 |
-  | VP8 | 720p | 120 | 120 |
+  | 编码 | 分辨率 | 源流帧数 | 解码帧数 | 是否可判定匹配 |
+  |------|--------|----------|----------|---------------|
+  | H.264 | 1080p | 未记录 | 150 | ✗ 缺基准 |
+  | HEVC | 720p | 未记录 | 150 | ✗ 缺基准 |
+  | VP9 | 720p | 120 | 120 | ✓ |
+  | VP8 | 720p | 120 | 120 | ✓ |
+
+  > H.264 / HEVC 的正确性由另一条更强的证据支撑：**十二条流与软解基线
+  > 逐字节一致**（含 3000 帧与 1500 帧长流）。逐字节比对比帧数计数严格得多，
+  > 所以这里缺的只是这张表的完整性，不是能力上的疑点。
 
 - MPEG2 硬件支持但协议未列入（无实际需求）
 - 未覆盖：VP9 10-bit、HEVC Main10、H.264 High 10/4:2:2 等高位深与非 4:2:0 采样
@@ -516,6 +613,7 @@ SHM 模式已省掉 TCP 的两次内核拷贝（吞吐 +17%，daemon CPU −28.6
 
 收益不到一成、代价是版本脆弱性，因此**暂不实施**。
 详细核算与 UBWC 结论修正见 `doc/performance-and-roadmap.md`。
+
 ### 6. TCP 通信无鉴权
 - 明文 TCP，无认证、无加密
 - 仅绑定 loopback (`INADDR_LOOPBACK`)，但**同设备上任何进程（含普通 App）都能连接并使用该解码服务**
@@ -535,7 +633,7 @@ SHM 模式已省掉 TCP 的两次内核拷贝（吞吐 +17%，daemon CPU −28.6
 
 - **源码基于**：anland 项目的 libdisplay_daemon 库
 - **技术栈**：Android NDK (C), Python 测试脚本
-- **通信方式**：TCP socket (IPv4 loopback)
+- **通信方式**：路径式 Unix socket（推荐，两类容器都支持）或 TCP socket（IPv4 loopback，仅 host 型容器）
 - **目标平台**：Android ARM64 设备
 
 ## 相关文档

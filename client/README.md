@@ -1,5 +1,17 @@
 # decode-client — 容器侧解码客户端
 
+> ℹ️ **定位：参考实现与协议验证工具，不是交付主路径。**
+>
+> 项目的交付主路径是 **VA-API 驱动**（`vaapi-driver/`）—— 它被 libva
+> `dlopen` 进 ffmpeg / Firefox / Chrome，应用无需任何改动就能用上硬解。
+>
+> 本目录这个 CLI 客户端自己解复用、自己送 NALU、自己渲染，
+> 用途是：验证 daemon 协议、排查问题时绕开 VA-API 层做对照、
+> 以及作为协议的可读参考实现。**日常使用请走 VA-API 驱动。**
+>
+> 它包含一份完整的 abstract socket + `SCM_RIGHTS` + memfd 实现，
+> 早于驱动侧启用零拷贝，可作为该机制的参考。
+
 运行在 Linux 容器内：解复用视频文件 → 把 NALU 送到 Android 侧的 `decode-daemon`
 → 取回解码后的 NV12 帧 → 用 EGL/GLESv2 渲染到 X11 窗口，或导出为 PPM。
 

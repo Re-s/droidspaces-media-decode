@@ -15,10 +15,22 @@ CPU 占用从 83%（卡在单核上限）升到 102%（跨出单核），
 并且支持了多客户端并发（4 路同时解码合计约 253 fps）。
 详见下文"优化路线"第 1 节。
 
-后续优化优先级：少拷贝（memfd）**已完成**（吞吐 +17%，daemon CPU −28.6%）；
-零拷贝（dmabuf）**已否决**——上限收益仅 4.4% 单核 CPU，却需依赖私有符号，
-理由见下文「成本核算」。
-两者都不再是性能急需，而是为了降低 CPU 与内存带宽占用。
+后续优化优先级：
+
+- **少拷贝（memfd / SHM）：实现完成但当前不可用，默认关闭。**
+  早前此处标为"已完成（吞吐 +17%，daemon CPU −28.6%）"，那组数字来自
+  `tests/test_dmd_client.c`（独立测试程序）下的测量，**不是驱动被 dlopen
+  进真实消费者进程的结果**。v0.3.0 首次在驱动侧启用该路径后实测：
+  `DMD_WANT_SHM=1` 时握手与 4 槽 memfd 交接都成功，但该连接随即断开
+  （118 个输入单元只取回 25 帧）。所以**目前没有可信的端到端 SHM 性能数字**。
+  另外它的 memfd 交接走另开的 **abstract** socket（属 net namespace），
+  因此**只在 host 型容器可能可用，NAT 型必然降级** —— 详见
+  [`verified-platform-facts.md`](verified-platform-facts.md) §1.4。
+
+- **零拷贝（dmabuf）：已否决** —— 上限收益仅 4.4% 单核 CPU，
+  却需依赖私有符号，理由见下文「成本核算」。
+
+两者都不是性能急需，而是为了降低 CPU 与内存带宽占用。
 
 ## 实测数据
 
@@ -122,7 +134,7 @@ recv NALU → memcpy → dequeueOutputBuffer(1ms) → 同步 fprintf+fflush → 
 省掉 TCP 的两次拷贝，仍需一次 CPU 拷贝。
 
 **当前状态**：已实现为 `DMD_XFER_SHM` 传输模式，握手时协商。
-用 ffmpeg 实测走通（`xfer=1`，daemon 侧确认 `传输=SHM`），
+用 ffmpeg 实测走通（`xfer=1`，daemon 侧确认 `帧回传=SHM`），
 且解码结果与软解**逐字节一致**。
 
 但它**默认关闭** —— `vaapi-driver/src/decode.c` 里写着
@@ -149,6 +161,11 @@ Android ION/gralloc dmabuf → abstract socket + SCM_RIGHTS → 容器
 
 - 容器与 Android 的 **net namespace inode 完全相同**（`4026531937`），
   abstract socket 双向可见且互连成功（含阴性对照）
+
+  ⚠️ **该前提只对 host 型容器成立。** DroidSpaces 的 NAT 型容器 netns
+  独立（实测 `4026535650`），abstract socket 可见数为 **0**，这条链路
+  在那里不成立。本节结论的适用范围限于 host 型容器 —— 详见
+  [`verified-platform-facts.md`](verified-platform-facts.md) §1.1。
 - ION 分配的 dmabuf fd 传入容器后可 `mmap` 读到 Android 写入的内容
 - `DRM_IOCTL_PRIME_FD_TO_HANDLE` 在 `renderD128` 上成功返回 GEM handle
   （memfd 走同路径返回 `EINVAL`，证明非假阳性）
@@ -204,8 +221,17 @@ ION/gralloc 分配的 buffer**，不是 MediaCodec 的输出缓冲。链路本�
 单次 0.227 ms，等效带宽 13137 MB/s
 ```
 
-按 SHM 模式实测的 194 fps 折算，这次拷贝占约 **4.4% 的单核 CPU**；
+按约 194 fps 折算，这次拷贝占约 **4.4% 的单核 CPU**；
 对比 daemon 每帧总开销约 3.03 ms（545 ticks / 1800 帧），占比约 7.5%。
+
+> ⚠️ **折算基数需注意**：这里的 194 fps 早前被表述为"SHM 模式实测"，
+> 但它与本文 §性能对照表里的 **TCP 峰值 194.47 fps** 数值相同，
+> 且 v0.3.0 实测表明驱动侧 SHM 路径当前无法端到端跑通
+> （连接会断，118 单元只取回 25 帧）。所以这个基数应理解为
+> **TCP 路径的峰值帧率**，而非 SHM 实测值。
+>
+> 这不影响"不做 dmabuf"的结论 —— 用更高的基数折算只会让拷贝占比
+> 更小，收益上限更低。
 
 **结论：不做。** 上限收益不到一成，代价是私有符号依赖与版本脆弱性，
 而当前吞吐对 60 fps 需求已有 3.2× 余量。TCP → SHM 那一步省掉两次内核拷贝

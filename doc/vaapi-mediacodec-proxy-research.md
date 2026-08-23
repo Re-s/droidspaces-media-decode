@@ -11,9 +11,22 @@
 > - 驱动实现细节与踩坑记录 → `vaapi-driver/README.md`
 > - 平台事实 → `doc/verified-platform-facts.md`
 >
-> 已知与本文不符的几点（举例，非穷举）：代码量估算远低于实际规模；
-> 配对机制最终改为"按输入单元序号精确匹配"，与输出顺序解耦；
-> 控制通道至今仍是 TCP，未迁到 Unix socket。
+> 已知与本文不符之处（非穷举，按严重程度排列）：
+>
+> 1. **§1.4 与 §4.2 的 Mesa 目录结构完全是虚构的**，两节已标注作废。
+>    原文声称存在 `src/va/venus/`、`src/va/freedreno/` 等目录并据此
+>    "建议放弃自研"。那些路径都不存在（Mesa 的 VA-API 只有
+>    `src/gallium/frontends/va` 一个前端，freedreno 没有 VA-API 后端），
+>    且把 Mesa 的 "Venus"（virtio-gpu Vulkan 透传）与高通的 "Venus"
+>    （视频解码 IP）当成了一回事。**这是本文最危险的错误** —— 若当初采信，
+>    项目根本不会开始。
+> 2. **控制通道已不只有 TCP**：v0.3.0 起新增路径式 Unix socket 通道，
+>    并且它是**推荐通道**（TCP 只在容器与宿主共享 net namespace 时可用，
+>    DroidSpaces 的 NAT 型容器不满足）。本文所有"只能用 TCP"的表述均已过时。
+> 3. **配对机制**最终改为"按输入单元序号精确匹配"，与输出顺序解耦；
+>    本文设想的按 POC 配对只保留为回退路径。
+> 4. **代码量估算**远低于实际规模。
+> 5. 本文多处把 net namespace 共享当作无条件前提，那**只对 host 型容器成立**。
 
 ## 环境摘要
 
@@ -103,19 +116,31 @@ libva 通过 `va_openDriver()` 加载驱动，流程如下：
 
 ### 1.4 Mesa 中的 VA-API Driver 示例
 
-Mesa 中 VA-API driver 位于 `src/va/` 目录：
-
-| Driver | 路径 | 说明 |
-|--------|------|------|
-| **Venus** | `src/va/venus/` | Qualcomm Vulkan Video → VA-API（最相关！） |
-| **Nouveau** | `src/va/nouveau/` | NVIDIA 开源驱动的 VA-API |
-| **Radeonsi** | `src/va/radeonsi/` | AMD Radeon 的 VA-API |
-| **Intel** | `src/va/intel/` | Intel i965 VA-API |
-| **Freedreno** | `src/va/freedreno/` | Qualcomm Adreno（Turnip 后端）|
-
-> **关键发现**：Mesa 的 `src/va/freedreno/` 目录实现了 Adreno GPU 的 VA-API，但它是通过 Turnip Vulkan 驱动做硬件解码的，不是 MediaCodec。Venus driver 是通过 Vulkan Video 扩展做解码的另一个参考。
-
-> 来源：[Mesa 源码 src/va/](https://gitlab.freedesktop.org/mesa/mesa/-/tree/main/src/va)
+> 🚫 **本节原内容已被证伪，整节作废。** 保留在此仅为记录当初的错误判断。
+>
+> 原文列了一张表，声称 Mesa 的 VA-API driver 位于 `src/va/` 下，
+> 且存在 `src/va/venus/`、`src/va/freedreno/`、`src/va/nouveau/`、
+> `src/va/radeonsi/`、`src/va/intel/` 五个目录，并据此得出
+> "Adreno 已有 VA-API 实现、可以参考甚至不必自研"的结论。
+>
+> **那些路径全部不存在。** 实际情况：
+>
+> | 声称 | 事实 |
+> |---|---|
+> | VA-API driver 在 `src/va/` 下分目录 | Mesa 的 VA-API **只有一个** gallium 前端：`src/gallium/frontends/va` |
+> | 有 `src/va/freedreno/` | **不存在**；freedreno 没有 VA-API 后端 |
+> | 有 `src/va/venus/` 做"Qualcomm Vulkan Video → VA-API" | **不存在** |
+>
+> 还有一处**同名混淆**：Mesa 的 "Venus" 是 **virtio-gpu 的 Vulkan 透传驱动**
+> （给虚拟机用），与本仓其余文档里 "Venus" 指**高通的视频解码 IP**
+> （`/dev/video32`、HFI 会话那些）是同名不同物。原文把两者当成一回事。
+>
+> **这条错误的危害最大** —— 它是全文唯一"建议放弃自研"的依据。
+> 如果当初采信，项目就不会开始。实际结论正好相反：
+> Adreno 平台上**没有**现成的 VA-API 后端可参考，自研是必要的。
+>
+> 教训：引用外部代码库的目录结构时必须实际拉取核对，
+> 不能凭对项目布局的印象推断。
 
 ### 1.5 Driver 安装路径
 
@@ -312,17 +337,23 @@ src/
 └── list.c / stats.c     # 工具代码
 ```
 
-### 4.2 Venus VA-API Driver（Mesa 内置）
+### 4.2 ~~Venus VA-API Driver（Mesa 内置）~~ —— 已证伪
 
-| 项目 | 说明 |
-|------|------|
-| **路径** | Mesa `src/va/venus/` |
-| **架构** | Vulkan Video → VA-API |
-| **相关性** | **高** — Qualcomm 平台的参考实现 |
-
-Venus 是 Mesa 中为 Qualcomm GPU 实现的 VA-API driver，它通过 Vulkan Video 扩展进行硬件解码。对于你的场景，如果 Adreno 640 支持 Vulkan Video 扩展，可以考虑直接使用 Venus driver。
-
-> 来源：[Mesa venus driver](https://gitlab.freedesktop.org/mesa/mesa/-/tree/main/src/va/venus)
+> 🚫 **本节作废，与 §1.4 是同一个错误。**
+>
+> 原文称 Mesa 有一个位于 `src/va/venus/` 的 VA-API driver、
+> 是"Qualcomm 平台的参考实现"，并建议"如果 Adreno 640 支持
+> Vulkan Video 扩展，可以考虑直接使用 Venus driver"。
+>
+> 事实：
+> - `src/va/venus/` **不存在**。Mesa 的 VA-API 只有 `src/gallium/frontends/va`
+> - Mesa 的 "Venus" 是 **virtio-gpu 的 Vulkan 透传驱动**（给虚拟机用），
+>   不是 VA-API driver，也与高通无关
+> - 与本仓其余文档里指高通视频解码 IP 的 "Venus"（`/dev/video32`、HFI）
+>   **同名不同物**
+>
+> 所以"直接用现成 driver"这条路不存在。实际采用的方案是自研 VA-API
+> 驱动 + MediaCodec 后端，也就是本仓库当前的实现。
 
 ### 4.3 libvdpau-va-gl
 

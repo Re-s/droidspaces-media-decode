@@ -11,36 +11,84 @@
 
 ---
 
-## 1. 跨边界通信：为什么用 TCP
+## 1. 跨边界通信：三条通道与各自的适用范围
 
-容器与 Android 宿主的 namespace 关系（实测 `/proc/self/ns/`）：
+> ⚠️ **本节在 v0.3.0 大幅订正。** 早前版本把"net namespace 共享"当作
+> DroidSpaces 容器的普遍事实，并据此断言"abstract socket 两侧可见、
+> 路径式 Unix socket 不可用"。实测证明**那只对 host 型容器成立**，
+> 而且结论正好相反 —— 路径式 Unix socket 才是唯一通用的通道。
 
-| namespace | 容器内值 | 与宿主关系 |
-|-----------|---------|-----------|
-| net | `4026531937` | **共享宿主初始 namespace** |
-| mnt | `4026535443` | 独立 |
-| pid | `4026535442` | 独立 |
-| ipc | `4026535440` | 独立 |
-| uts | `4026535439` | 独立 |
-| cgroup | `4026535441` | 独立 |
+### 1.1 DroidSpaces 有两类容器，namespace 归属不同
 
-结论：
+容器类型由 `/data/local/Droidspaces/Containers/<name>/container.config`
+里的 `net_mode` 决定（`host` 或 `nat`）。两者实测差异：
 
-- **mount namespace 独立** → 容器默认看不到 Android 的 `/data`（实测容器内 `/data` 只有 `local/` 一个空壳，`nsenter -t 1 -m -- ls /data/adb` 报"没有那个文件或目录"）。因此**基于文件系统路径的 Unix domain socket 不可用** —— 两侧的挂载表不一致，同一路径在对侧不指向同一个 socket 节点。
+| | host 型 | NAT 型 |
+|---|---|---|
+| net namespace | **共享** 宿主初始 ns `4026531937` | **独立**（实测过 `4026535650`、`4026535651`） |
+| IP | 直接持有 `wlan0` 真实地址（如 `192.168.17.96`） | `eth0` `172.28.x.x/16`，网关 `172.28.0.1` |
+| `127.0.0.1:20003` 连宿主 | 可达 | **不可达** |
+| abstract socket 可见数 | 31（与宿主一致） | **0** |
+| mnt / pid / uts / ipc / cgroup | 均独立 | 均独立 |
+| `/dev/dri/renderD128` | 有 | 需平台透传（可配置） |
 
-  ⚠️ **但这不等于"Unix socket 一律不可用"**：**abstract namespace socket**
-  （Linux 的 `@` 前缀，不落文件系统）属于 **net namespace** 而不是 mount
-  namespace，而 net namespace 是**共享**的（见上表），所以 abstract socket
-  两侧可见。本项目的共享内存通道（`DMD_XFER_SHM`）就是用它传递 memfd
-  的 —— 实测跨边界成功，且解码结果与软解逐字节一致。
+宿主侧 `ds-br0`（`172.28.0.1/16`）加 veth 对承载 NAT 型容器的网络，
+桥本身在宿主 netns 上，所以 NAT 容器能经网关访问宿主服务 ——
+但那是**转发**，不是共享网络栈。
 
-  所以"不可用"只针对**路径型**。做架构决策时不要把这条读成
-  "只能用 TCP"。
+> **易错点 1**：NAT 型容器"能访问宿主路由"与"共享 net namespace"是两回事。
+> 前者靠 NAT 转发，后者是同一个网络栈。判据看 `readlink /proc/self/ns/net`
+> 的 inode 与 `grep -c @ /proc/net/unix` 的可见数（NAT 型为 0）。
+>
+> **易错点 2**：NAT 型容器的 netns inode **不是固定值** —— 容器每次重启都会
+> 变（本项目先后实测到 `4026535651` 与 `4026535650`）。文档各处引用的具体
+> 数字只是取证快照，**判断依据应当是"与宿主的 `4026531937` 是否相同"**，
+> 而不是去比对某个记下来的值。宿主侧那个是内核初始 namespace，才是稳定的。
 
-  同时注意反向的坑：`vaapi-driver/src/decode.c` 里 `cfg.want_shm = 0`，
-  SHM 通道目前**默认关闭**，浏览器路径从未走过它。因此
-  "abstract socket 在 Firefox 沙箱下可用"这一点**尚未验证**，
-  已验证的只是"在 ffmpeg（无沙箱）下可用"。
+### 1.2 三条通道的适用范围
+
+| 通道 | 依赖 | host 型 | NAT 型 |
+|---|---|---|---|
+| TCP `127.0.0.1:20003` | **net namespace 共享** | 可用 | **不可用** |
+| abstract socket（`@` 前缀） | **net namespace 共享** | 可用 | **不可用** |
+| **路径式 Unix socket** | 一个 bind mount | **可用** | **可用** |
+
+⚠️ **abstract socket 不是 TCP 的替代品。** 它虽然不落文件系统、绕开了
+mount namespace，但它属于 **net namespace** —— 所以在 NAT 型容器里
+和 TCP 一起失效（实测可见数 0）。早前文档把它当作"跨界通用方案"是错的。
+
+**路径式 Unix socket 才是通用解**：它不属于任何 namespace 边界内的抽象名字空间，
+靠 bind mount 让两侧看到同一个 inode 即可。v0.3.0 起这是**首选通道**
+（`--sock` / `DMD_ENDPOINT=unix:...`，见 §1.4）。
+
+DroidSpaces 自己的显示通道就是这个模式：宿主
+`/data/local/tmp/anland-<hash>.sock` → 容器 `/run/display.sock`，
+实测两侧 inode 相同（`1279492` / `1298133`，每容器一个）。
+
+### 1.3 mount namespace 独立的后果
+
+容器默认看不到 Android 的 `/data`（实测容器内 `/data` 只有 `local/` 一个空壳，
+`nsenter -t 1 -m -- ls /data/adb` 报"没有那个文件或目录"）。所以路径式
+Unix socket **必须靠 bind mount** 才能跨界 —— 同一路径在对侧默认不指向
+同一个 socket 节点。这条限制依然成立，只是解法从"改用 abstract socket"
+变成了"让平台挂一个 bind mount"。
+
+### 1.4 memfd 零拷贝的通道归属（易错）
+
+SHM（`DMD_XFER_SHM`）的 memfd 交接**不走**控制通道，而是 daemon
+另开一个 **abstract** socket（`src/decode-daemon.c` 里 `sun_path[0] = 0` 处），
+驱动再去连它。
+
+所以**零拷贝只在 host 型容器可能可用，NAT 型必然降级** —— 即使控制通道
+已经是路径式 Unix socket 也一样。
+
+> **教训**：控制通道能跨 netns，**不等于** memfd 交接通道也跨得过去。
+> 要让零拷贝在 NAT 容器可用，需把交接改走同一条路径式 Unix socket
+> （在已有连接上传 `SCM_RIGHTS`，不必另开 socket）。那是独立改动，尚未实施。
+
+SHM 目前**默认关闭**（需 `DMD_WANT_SHM=1`）。实测开启后单个连接会断
+（118 单元只取回 25 帧），但不会打死 daemon。浏览器沙箱能否收
+`SCM_RIGHTS` 亦**未验证** —— 已验证的只是 ffmpeg（无沙箱）下可用。
 
 #### 例外：存在一个双向共享目录
 
@@ -71,9 +119,18 @@ Android 写的文件容器立即可读，反之亦然。
 
 因此帧传输仍须走 memfd + `SCM_RIGHTS`：传递的是 fd 而非路径，
 天然绕开文件系统命名空间的不一致。
-- **net namespace 共享** → TCP `127.0.0.1` 在两侧直接互通，无需端口转发。这是当前方案的基础。
+- **net namespace（仅 host 型容器）共享** → TCP `127.0.0.1` 两侧直接互通，
+  无需端口转发。这是 v0.2.0 及更早版本的唯一通道，现在是**兜底通道**。
+  NAT 型容器下不可达（见 §1.1），那里必须走路径式 Unix socket。
 
-> 文档中"Socket 路径 `/tmp/anland/decode.sock`"的描述属于早期 Unix socket 方案的遗留，与当前 TCP 实现不符。
+> ⚠️ **订正**：早前此处写着"文档中『Socket 路径 `/tmp/anland/decode.sock`』
+> 属于早期 Unix socket 方案的遗留，与当前 TCP 实现不符"。
+>
+> 那个判断已被 v0.3.0 推翻 —— 路径式 Unix socket 不是遗留方案，而是
+> **当前首选通道**（`--sock` / `DMD_ENDPOINT=unix:...`）。它是唯一对
+> host 型与 NAT 型容器都成立的通道，且鉴权靠文件权限而非把服务暴露到网络。
+> 当年那条记录的真正问题只是**路径写错了**（实际由平台 bind mount 决定，
+> 默认 `/run/dmd/decode.sock`），不是方案方向错。
 
 ## 2. 端到端解码链路已验证可用
 

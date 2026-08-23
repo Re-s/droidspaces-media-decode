@@ -76,11 +76,27 @@ adb shell "su -c 'ps -A | grep decode-daemon'"
 ## SELinux
 
 daemon 由 KernelSU 以 root 启动，运行在 `u:r:ksu:s0` 域下，实测可正常访问
-MediaCodec 与网络，**不需要额外策略**。
+MediaCodec 与网络。**走 TCP 通道时不需要额外策略。**
 
-`sepolicy.rule` 中的规则大部分是早期 Unix socket + dmabuf 方案的遗留
-（如 `sock_file`、`hal_graphics_allocator_default`、`surfaceflinger` 相关项），
-对当前 TCP 实现无用。保留待清理，请勿以其为准理解实现。
+> ⚠️ **但这个结论只对 TCP 成立，v0.3.0 之后不再是全貌。**
+>
+> 早前此处写着"不需要额外策略"且称 `sepolicy.rule` 里的 `sock_file`
+> 等规则"对当前 TCP 实现无用、保留待清理"。这两句现在都要修正 ——
+> v0.3.0 新增的路径式 Unix socket 通道恰恰**需要**那类权限，而且
+> 当前正卡在 SELinux 上：
+>
+> | 启动身份 | 能 `bind()` Unix socket | 能用 MediaCodec |
+> |---|---|---|
+> | `u:r:ksu:s0`（本模块用的） | ✗ 各处 `EACCES` | ✓ |
+> | `u:r:droidspacesd:s0` | ✓ | ✗ `CCodec::allocate` 处 SIGABRT |
+>
+> 也就是说 **`ksu` 域能解码但建不了 socket 文件** —— 本模块这条启动路径
+> 无法支持 Unix socket 通道。需要一个兼具两种权限的 domain，
+> 详见仓库根 `CHANGELOG.md` 的 v0.3.0 条目与
+> [`../doc/platform-integration-contract.md`](../doc/platform-integration-contract.md) §2.2。
+>
+> 所以 `sepolicy.rule` 里那些 `sock_file` 规则**方向是对的**，
+> 不该当作"遗留待清理" —— 只是本模块的 `ksu` 域用不上它们。
 
 ## 故障排除
 

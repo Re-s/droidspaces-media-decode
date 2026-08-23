@@ -464,8 +464,16 @@ static int do_handshake(Session *s)
         s->xfer = XFER_TCP;
     }
 
-    dlog(1, "[%d] 握手成功: %s %ux%u 传输=%s",
-         s->id, mime, w, h, s->xfer == XFER_SHM ? "SHM" : "TCP");
+    /* 帧回传方式只有两种：SHM（memfd 零拷贝）或走控制连接内联。
+     *
+     * ⚠️ 这里**故意不叫 "TCP"**。老版本印的是 `传输=TCP`，但那个字段描述的是
+     * "帧不走 SHM、而是内联在控制连接里回传"，与控制通道究竟是 TCP 还是
+     * Unix socket 无关 —— 走 --sock 时它照样印 TCP。这个歧义害我误判过一次
+     * 根因（把 SELinux domain 导致的解码失败当成 SHM 帧交付的 bug，
+     * 因为日志显示 TCP 就以为 SHM 没参与）。
+     * 控制通道类型请看启动时的 `listening on ...` 那行。 */
+    dlog(1, "[%d] 握手成功: %s %ux%u 帧回传=%s",
+         s->id, mime, w, h, s->xfer == XFER_SHM ? "SHM" : "内联");
     return 0;
 
 reply_fail:
@@ -1242,13 +1250,61 @@ int main(int argc, char **argv)
      *   宿主 /data/local/tmp/dmd/  →  容器 /run/dmd/
      * 之后 daemon 随便重启，容器一直能连 /run/dmd/decode.sock。 */
     char sock_in_dir[256];
+    char sock_trimmed[256];
     if (sock_path) {
+        /* 先剥掉尾部斜杠，否则拼出来是 dir//decode.sock ——
+         * 能用，但日志里的双斜杠会和文档里要匹配的字符串对不上，
+         * 平台照抄验证清单时会以为没生效。 */
+        size_t sl = strlen(sock_path);
+        while (sl > 1 && sock_path[sl - 1] == '/') sl--;
+        if (sl < sizeof(sock_trimmed)) {
+            memcpy(sock_trimmed, sock_path, sl);
+            sock_trimmed[sl] = '\0';
+            sock_path = sock_trimmed;
+        }
+
+        /* 只 stat 一次并把结果记下来 —— 不要在 else 分支里重复 stat 或去读
+         * errno：stat 成功时 errno 未定义，靠它判分支是脆的。 */
         struct stat dst;
-        if (stat(sock_path, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+        int st_ok = (stat(sock_path, &dst) == 0);
+
+        if (st_ok && S_ISDIR(dst.st_mode)) {
             snprintf(sock_in_dir, sizeof(sock_in_dir), "%s/%s",
                      sock_path, DAEMON_SOCK_NAME);
             dlog(1, "--sock 是目录，实际监听 %s", sock_in_dir);
             sock_path = sock_in_dir;
+        } else if (!st_ok) {
+            /* 路径不存在。老行为是直接把它当 socket 文件名 bind ——
+             * 那会**静默**造出一个单文件 socket，而单文件挂载在 daemon
+             * 重启后必然失效（inode 变了）。平台拼错路径或忘了建目录时
+             * 拿不到任何警告，几天后才在"容器突然 ECONNREFUSED"里暴露。
+             *
+             * 现在的处理：以斜杠结尾、或看起来就是目录名（不含 .sock）时，
+             * 认为用户想要目录模式，直接建出来；否则保留文件模式并告警。 */
+            int wants_dir = (strstr(sock_path, ".sock") == NULL);
+            if (wants_dir) {
+                if (mkdir(sock_path, 0755) == 0 || errno == EEXIST) {
+                    snprintf(sock_in_dir, sizeof(sock_in_dir), "%s/%s",
+                             sock_path, DAEMON_SOCK_NAME);
+                    dlog(1, "--sock 目录不存在，已创建；实际监听 %s",
+                         sock_in_dir);
+                    sock_path = sock_in_dir;
+                } else {
+                    /* 注意：此处 srv 尚未创建（它在下面的分支里才 socket()），
+                     * 所以不要 close 它 —— 早前版本在这里 close(srv) 用的是
+                     * 未初始化值，编译器已警告。 */
+                    fprintf(stderr,
+                            "创建目录 %s 失败: %s\n"
+                            "（若本意是直接指定 socket 文件，请让文件名以 .sock 结尾）\n",
+                            sock_path, strerror(errno));
+                    return 1;
+                }
+            } else {
+                dlog(1, "⚠ --sock 指向单个 socket 文件 %s —— "
+                        "该文件的 inode 每次重启都会变，若平台按文件做 bind mount，"
+                        "重启后容器侧会 ECONNREFUSED。建议改传目录。",
+                     sock_path);
+            }
         }
     }
 
