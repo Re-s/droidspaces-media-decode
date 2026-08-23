@@ -133,6 +133,21 @@ static void on_signal(int s)
 #define FMTDESC_WORDS   8
 /* 帧头 frame_size 取这些值时表示不是帧数据，而是控制消息 */
 #define FMTDESC_SENTINEL 0xFFFFFFFFu   /* 随后 32 字节格式描述块 */
+
+/* 格式描述块头部第 2 个字的能力标志（原为保留的 0）。
+ * CAP_FRAME_PTS：每个帧头额外带第 4 个字段 —— 该帧对应的输入单元序号
+ * （由 MediaCodec 通过 presentationTimeUs 原样回传）。
+ * 驱动用它精确配对 surface，无需知道解码器按什么顺序出帧。 */
+#define CAP_FRAME_PTS   0x00000001u
+
+/* 输入单元序号 → presentationTimeUs 的放大倍数。
+ *
+ * ⚠️ 解码器按**毫秒**量化 PTS，直接用序号（步长 1us）会被全部压成 0 ——
+ * 实测送 9 个单元回传的 PTS 全为 0，配对退化成"一个号对应多帧"
+ * （表现为 unit 5 重复出现、35 次无匹配回退、70/150 帧错位）。
+ * 乘 1000 后每个单元相差 1ms，量化后仍然唯一。
+ * 客户端收到后除回去，还原成序号。 */
+#define PTS_UNIT_SCALE  1000
 #define SHMFRAME_SENTINEL 0xFFFFFFFEu  /* 随后 8 字节：槽位号 + 数据长度 */
 
 /*
@@ -295,6 +310,23 @@ typedef struct {
     size_t           shm_slot;         /* 单槽字节数 */
     size_t           shm_total;        /* 池总字节数（含控制区） */
     int              shm_next;         /* 下一个要写的槽位 */
+
+    /* 可逆排空（长度 0 的带内请求）
+     *
+     * drain_req 由 input 线程自增，drain_done 由 output 线程在完成
+     * EOS 处理 + AMediaCodec_flush 后自增。input 线程等两者相等才继续送料，
+     * 否则新数据会被 flush 一起丢掉，表现为吞帧。 */
+    volatile sig_atomic_t drain_req;
+    volatile sig_atomic_t drain_done;
+
+    /* 输入单元序号，用作 PTS 标签（1 起）。仅 input 线程写。
+     * 让每个输出帧能被追溯到"第几次提交"，驱动据此精确配对 surface，
+     * 无需知道解码器的输出顺序。 */
+    uint64_t         vcl_in;
+    /* CSD 副本：flush 清掉解码器里的参数集，排空后必须原样重送。
+     * SPS+PPS 量级很小，256 字节足够（实测 1080p 为 31+9）。 */
+    uint8_t          csd_keep[256];
+    size_t           csd_keep_len;
 } Session;
 
 /*
@@ -448,7 +480,80 @@ static void *input_thread(void *arg)
         uint32_t sz;
         if (recv_all(s->fd, &sz, 4) < 0) break;      /* 客户端关闭写端，正常结束 */
         sz = ntohl(sz);
-        if (sz == 0 || sz > MAX_FRAME) {
+
+        /* 长度 0 = 排空请求（可逆），不是数据单元。
+         *
+         * 为什么需要它：消费者只保持 3 帧在飞，而本机解码器有 B 帧时要收到
+         * 第 4 个输入单元才吐首帧 —— 双方互等。原先驱动只能靠
+         * shutdown(SHUT_WR) 逼出帧，但那是**不可逆**的：会话作废、必须重建，
+         * 实测每帧 155 ms、播放慢 4.7 倍。
+         *
+         * 而 EOS + AMediaCodec_flush 是可逆的（tools/probe_drain.c 实测：
+         * 排空 3 帧后 flush 重送 CSD 能继续解出 6 帧）。所以把"催出帧"做成
+         * 带内信号：送 EOS 让解码器吐出在手的帧，收到 EOS 标志后 flush 复位，
+         * 重送 CSD，会话继续可用。
+         *
+         * 选 sz==0 承载：它原本被判为非法长度，老客户端不会发，
+         * 因此无需协议版本协商。 */
+        if (sz == 0) {
+            s->drain_req++;
+            dlog(2, "[%d] 收到排空请求 #%u", s->id, s->drain_req);
+
+            ssize_t di = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
+            if (di < 0) {
+                dlog(1, "[%d] 排空取输入缓冲失败: %zd", s->id, di);
+                continue;
+            }
+            /* 送 EOS：解码器会把已排队但因流水线深度压着的帧全部吐出。 */
+            AMediaCodec_queueInputBuffer(s->codec, di, 0, 0, 0, FLAG_END_OF_STREAM);
+
+            /* 等 output 线程见到 EOS 并完成 flush，再继续收下一个单元。
+             * 必须等：flush 会丢弃解码器里的一切，若此时已经把新数据塞进去
+             * 就会被一起丢掉，表现为吞帧。
+             *
+             * ⚠️ 必须有上界。output 线程可能因为解码错误提前退出，
+             * 那时 drain_done 永远追不上 drain_req —— 无界等待会让 input 线程
+             * 永久卡住、会话泄漏、解码器不释放。实测后果是 8 个会话全部泄漏、
+             * daemon 空转 200% CPU 并开始拒绝新连接（"并发会话已达上限 8"），
+             * 表现却是"浏览器一帧也解不出来"，极易误判成别处的问题。 */
+            int waited_us = 0;
+            const int drain_wait_max_us = 2000000;   /* 2s：远大于正常排空耗时 */
+            while (running && !s->stop &&
+                   s->drain_done < s->drain_req &&
+                   waited_us < drain_wait_max_us) {
+                usleep(1000);
+                waited_us += 1000;
+            }
+            if (s->drain_done < s->drain_req) {
+                dlog(1, "[%d] 排空等待超时（%d ms），放弃会话",
+                     s->id, waited_us / 1000);
+                s->stop = 1;
+                break;
+            }
+
+            /* flush 清掉了 CSD，必须重送，否则后续 VCL 无参考参数集。
+             * 这里用累积的 csd（首次送入时保留了副本）。 */
+            if (s->csd_keep_len > 0) {
+                ssize_t ci = AMediaCodec_dequeueInputBuffer(s->codec, INPUT_TIMEOUT_US);
+                if (ci >= 0) {
+                    size_t cap;
+                    uint8_t *ib = AMediaCodec_getInputBuffer(s->codec, ci, &cap);
+                    if (ib && cap >= s->csd_keep_len) {
+                        memcpy(ib, s->csd_keep, s->csd_keep_len);
+                        AMediaCodec_queueInputBuffer(s->codec, ci, 0,
+                                                     s->csd_keep_len, 0,
+                                                     FLAG_CODEC_CONFIG);
+                        dlog(2, "[%d] 排空后已重送 CSD (%zu 字节)",
+                             s->id, s->csd_keep_len);
+                    } else {
+                        AMediaCodec_queueInputBuffer(s->codec, ci, 0, 0, 0, 0);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (sz > MAX_FRAME) {
             dlog(1, "[%d] NALU 长度非法: %u", s->id, sz);
             break;
         }
@@ -478,6 +583,12 @@ static void *input_thread(void *arg)
                     AMediaCodec_queueInputBuffer(s->codec, ci, 0, csd_len, 0,
                                                  FLAG_CODEC_CONFIG);
                     dlog(2, "[%d] CSD 已送入 (%zu 字节)", s->id, csd_len);
+                    /* 留一份副本：排空后的 flush 会清掉解码器里的 CSD，
+                     * 那时要原样重送，否则后续 VCL 无参数集可参考。 */
+                    if (csd_len <= sizeof(s->csd_keep)) {
+                        memcpy(s->csd_keep, csd, csd_len);
+                        s->csd_keep_len = csd_len;
+                    }
                 } else {
                     dlog(1, "[%d] CSD 超出输入缓冲容量", s->id);
                     AMediaCodec_queueInputBuffer(s->codec, ci, 0, 0, 0, 0);
@@ -501,7 +612,22 @@ static void *input_thread(void *arg)
             continue;
         }
         memcpy(ib, buf, sz);
-        AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz, 0, 0);
+        /* PTS 用"第几个数据单元"的序号（1 起，步长 1us）。
+         *
+         * 这不是为了计时，而是给每个输入单元一个**可回传的身份标签**：
+         * MediaCodec 会把 presentationTimeUs 原样带到对应的输出帧上
+         * （tools/probe_negotiate.c 实测：值域与步长都能对上，未被改写）。
+         * output 线程把它放进下行帧头，驱动就能精确知道"这一帧对应第几次提交"，
+         * 从而按提交序号配对 surface —— 与解码器按什么顺序出帧完全无关。
+         *
+         * 这样就不需要让驱动去猜/协商输出顺序：显示序也好、跟随输入序也好，
+         * 配对都正确。此前依赖输出顺序的做法很脆弱：一旦两侧假设不一致，
+         * 后果是画面错位而不报错（实测 105/150 帧错位）。
+         *
+         * 从 1 开始：0 留作"无 PTS 信息"的哨兵，便于兼容旧 daemon。 */
+        AMediaCodec_queueInputBuffer(s->codec, bi, 0, sz,
+                                     (int64_t)s->vcl_in * PTS_UNIT_SCALE, 0);
+        s->vcl_in++;
     }
 
     /* 送出 end-of-stream，让 output 线程能确定性地收完剩余帧。
@@ -668,7 +794,8 @@ static void shm_teardown(Session *s)
  *
  * 返回 0 成功，-1 失败。
  */
-static int send_frame_shm(Session *s, const uint8_t *data, size_t len)
+static int send_frame_shm(Session *s, const uint8_t *data, size_t len,
+                          uint32_t pts)
 {
     if (len > s->shm_slot) {
         dlog(1, "[%d] 帧 %zu 字节超出槽位 %zu，需重建池", s->id, len, s->shm_slot);
@@ -699,10 +826,13 @@ static int send_frame_shm(Session *s, const uint8_t *data, size_t len)
     __atomic_store_n(shm_slot_state(s, slot), 1u, __ATOMIC_RELEASE);
     s->shm_next = (slot + 1) % SHM_SLOTS;
 
-    uint32_t msg[5] = {
+    /* 第 6 字段 = 输入单元序号，与 TCP 路径的第 4 字段同义，
+     * 让两种传输模式对驱动呈现一致的配对信息。 */
+    uint32_t msg[6] = {
         htonl((uint32_t)s->w), htonl((uint32_t)s->h),
         htonl(SHMFRAME_SENTINEL),
-        htonl((uint32_t)slot), htonl((uint32_t)len)
+        htonl((uint32_t)slot), htonl((uint32_t)len),
+        htonl(pts)
     };
     if (send_all(s->fd, msg, sizeof(msg)) < 0) {
         /* 通知失败则立即释放槽位，否则池会漏 */
@@ -725,7 +855,11 @@ static int send_format_desc(Session *s)
     if (s->crop_r <= 0)       s->crop_r = s->w - 1;
     if (s->crop_b <= 0)       s->crop_b = s->h - 1;
 
-    uint32_t hdr[3] = { htonl(0), htonl(0), htonl(FMTDESC_SENTINEL) };
+    /* 第 2 个字原为保留的 0，现用作能力标志：置 CAP_FRAME_PTS 表示
+     * 后续每个帧头都带第 4 个字段（PTS，即输入单元序号）。
+     * 旧 daemon 这里恒为 0，客户端据此按 3 字段帧头解析 —— 向后兼容。 */
+    uint32_t hdr[3] = { htonl(0), htonl(CAP_FRAME_PTS),
+                        htonl(FMTDESC_SENTINEL) };
     uint32_t body[FMTDESC_WORDS] = {
         htonl((uint32_t)s->w),      htonl((uint32_t)s->h),
         htonl((uint32_t)s->stride), htonl((uint32_t)s->slice_height),
@@ -774,12 +908,18 @@ static void *output_thread(void *arg)
                     int fail;
                     if (s->xfer == XFER_SHM) {
                         fail = (send_frame_shm(s, ob + info.offset,
-                                               (size_t)info.size) < 0);
+                                               (size_t)info.size,
+                                               (uint32_t)(info.presentationTimeUs / PTS_UNIT_SCALE)) < 0);
                     } else {
-                        uint32_t hdr[3] = {
+                        /* 第 4 字段 = 该帧对应的输入单元序号。
+                         * MediaCodec 把 queueInputBuffer 时给的
+                         * presentationTimeUs 原样带到输出帧上，
+                         * 于是驱动能精确知道这一帧对应第几次提交。 */
+                        uint32_t hdr[4] = {
                             htonl((uint32_t)s->w),
                             htonl((uint32_t)s->h),
-                            htonl((uint32_t)info.size)
+                            htonl((uint32_t)info.size),
+                            htonl((uint32_t)(info.presentationTimeUs / PTS_UNIT_SCALE))
                         };
                         fail = (send_all(s->fd, hdr, sizeof(hdr)) < 0);
                         size_t off = (size_t)info.offset;
@@ -801,6 +941,25 @@ static void *output_thread(void *arg)
             }
             AMediaCodec_releaseOutputBuffer(s->codec, oi, 0);
             if (eos) {
+                /* EOS 有两种来源，处理完全不同：
+                 *   1) 排空请求（drain_req > drain_done）—— 会话还要继续用，
+                 *      flush 复位解码器后接着服务，由 input 线程重送 CSD
+                 *   2) 客户端真的关了写端 —— 流结束，退出线程
+                 * 区分依据就是有没有未完成的排空请求。 */
+                if (s->drain_req > s->drain_done) {
+                    media_status_t fs = AMediaCodec_flush(s->codec);
+                    if (fs != AMEDIA_OK) {
+                        dlog(1, "[%d] 排空后 flush 失败: %d", s->id, fs);
+                        s->stop = 1;
+                        break;
+                    }
+                    /* flush 会丢弃未取走的输出，格式描述也要重新下发：
+                     * 客户端靠它确定 stride/crop，漏发会让后续帧解析错位。 */
+                    s->fmt_sent = 0;
+                    s->drain_done++;
+                    dlog(2, "[%d] 排空 #%u 完成，会话继续", s->id, s->drain_done);
+                    continue;
+                }
                 dlog(2, "[%d] 收到 EOS，输出结束", s->id);
                 break;
             }
@@ -894,6 +1053,44 @@ static void *session_thread(void *arg)
     int max_h = s->h > 1088 ? s->h : 1088;
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_WIDTH,  max_w);
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_MAX_HEIGHT, max_h);
+
+    /* 低延迟模式：让解码器尽快吐帧，而不是攥着几帧等流水线填满。
+     *
+     * 为什么必须开：MediaCodec 稳态滞后 2-3 个输入单元，而浏览器里的
+     * ffmpeg 稳态只保持 3 帧在飞（H.264 重排深度 has_b_frames=2 决定），
+     * 送完第 3 帧就 vaSyncSurface 阻塞等第 1 帧。双方差正好一帧 →
+     * 互等 → 驱动侧兜底 flush（不可逆 shutdown(SHUT_WR)）→ 会话作废 →
+     * 浏览器永久回落软解。实测 Firefox 140 只硬解出 1 帧就掉回软解。
+     * 命令行 ffmpeg 不受影响，因为它送料远远超前，盖住了这个滞后。
+     *
+     * 为什么用字面量而不用 AMEDIAFORMAT_KEY_LOW_LATENCY：
+     * 该符号是 __INTRODUCED_IN(30)（NdkMediaFormat.h:321），而本 daemon
+     * 按 API 29 构建。key 本身只是字符串常量，直接写字面值即可，
+     * 既不用抬高构建 API，也不引入弱符号判空。
+     * 低于 API 30 的设备上 MediaCodec 会忽略未知 key —— 退化为原有行为，
+     * 不会失败。 */
+    AMediaFormat_setInt32(fmt, "low-latency", 1);
+
+    /* 让解码器按**解码顺序**输出，而不是攒够重排缓冲再按显示顺序吐。
+     *
+     * 这是根治画面黑屏闪烁的手段。默认（显示序）下有 B 帧时要收到第 4 个
+     * 输入单元才吐首帧，而浏览器稳态只保持 3 帧在飞 —— 差一帧，双方死等。
+     * 此前只能靠 EOS 逼出帧，但 EOS/flush/重建会话都会摧毁参考帧链，
+     * 导致约 9 成帧纯黑（tools/probe_black.c：60 帧里 54 帧亮度为 16）。
+     *
+     * 开这个键后滞后从 4 降到 1（tools/probe_keys.c 逐键实测：low-latency、
+     * max-output-reorder-frames、output-delay、vendor.qti-ext-dec-low-latency
+     * 全都无效，只有这个键有用），互等消失，排空/重建/重放统统不再需要。
+     *
+     * 历史注意事项（已消除）：早期驱动用编译期常量 DMD_DECODE_ORDER_OUTPUT
+     * 声明"解码器按什么顺序出帧"，必须与这里严格一致，否则画面错位且不报错
+     * （实测 test1080 帧数对但 105/150 帧错位）。该常量已删除 —— 现在每帧
+     * 回传自己的输入单元序号（CAP_FRAME_PTS），驱动按序号精确配对，
+     * 与输出顺序完全解耦，改这个键不再需要驱动配合。
+     *
+     * 用字面量：这是高通 vendor 扩展，NDK 头文件里没有定义。
+     * 非高通平台会忽略未知键，退化为原有行为，不会失败。 */
+    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
 
     s->codec = AMediaCodec_createDecoderByType(s->mime);
     if (!s->codec) { dlog(0, "[%d] 无可用解码器: %s", s->id, s->mime); goto out_fmt; }
@@ -1026,6 +1223,7 @@ int main(int argc, char **argv)
         s->fd       = cli;
         s->w        = 1920;   /* 握手前的占位值，真实尺寸由握手与 FORMAT_CHANGED 决定 */
         s->h        = 1080;
+        s->vcl_in   = 1;      /* PTS 标签从 1 起：0 留作"无 PTS 信息"哨兵 */
         s->id       = next_id++;
         s->codec_id = CODEC_H264;
         s->mime     = codec_mime(CODEC_H264);

@@ -1,4 +1,12 @@
-# MediaCodec Decode Daemon — KSU/Magisk 模块
+# MediaCodec Decode Daemon — KSU/Magisk 模块（已废弃）
+
+> ⚠️ **此方案已放弃，不再维护。**
+>
+> daemon 的启动、重启、守护与日志收集统一交由 **DroidSpace 平台托管**，
+> 本项目不再自带进程管理。本目录保留仅供参考（例如 SELinux 规则与
+> 启动时机的历史经验），**不作为发布形态**。
+>
+> 当前部署方式见仓库根 `README.md` 的"部署"一节。
 
 模块的唯一职责：**开机自动启动 `decode-daemon`**。
 

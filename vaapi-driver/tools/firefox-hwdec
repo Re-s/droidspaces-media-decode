@@ -1,0 +1,121 @@
+#!/bin/bash
+# 用硬件解码启动 Firefox（DroidSpaces MediaCodec VA-API 驱动）
+#
+# 为什么需要这个包装：Firefox 判定"能否硬解"要过三重门，其中两重靠环境变量
+# 才能过。裸跑 firefox 会静默回落软解，日志里只有一句
+# "Codec h264 is not accelerated"，很难看出原因。
+#
+#   1) MESA_LOADER_DRIVER_OVERRIDE=msm
+#      容器里 Mesa 默认走 zink（Vulkan 转译），挑不到设备后回落 llvmpipe。
+#      glxtest 于是报 MESA_ACCELERATED FALSE → Firefox 认为无硬件 GL →
+#      连 vaapitest 探针都不跑 → 每个 codec 的硬解开关全是关。
+#      注意 media.hardware-video-decoding.force-enabled 绕不过这条：
+#      它和 mIsAccelerated 是并列的与条件（widget/gtk/GfxInfo.cpp）。
+#      加上覆盖后拿到真硬件 FD640（Adreno 640 / freedreno）。
+#
+#   2) MOZ_DISABLE_RDD_SANDBOX=1
+#      ⚠️ 这是安全权衡，不是最佳解。
+#      解码跑在 RDD 进程里，其沙箱禁止创建网络 socket，而本驱动要连
+#      daemon 的 127.0.0.1:20003 —— 会拿到 "Permission denied"。
+#      关掉 RDD 沙箱会降低该进程的隔离强度。更干净的长期做法是让驱动
+#      改用 Unix socket，或由沙箱策略放行这一个连接。
+#      只在你信任本机环境时使用。
+#
+# 用法： firefox-hwdec [firefox 的任意参数]
+# 自检： firefox-hwdec --dmd-check   （只检查环境，不启动浏览器）
+
+set -u
+
+DRM_DEVICE="${DMD_DRM_DEVICE:-/dev/dri/renderD128}"
+DAEMON_PORT="${DMD_DAEMON_PORT:-20003}"
+FIREFOX_BIN="${DMD_FIREFOX_BIN:-firefox}"
+
+log() { printf '%s\n' "$*" >&2; }
+
+check_env() {
+    local ok=0
+
+    if [ -e "$DRM_DEVICE" ]; then
+        log "✓ DRM 设备: $DRM_DEVICE"
+    else
+        log "✗ DRM 设备不存在: $DRM_DEVICE"
+        ok=1
+    fi
+
+    # daemon 用端口判存活，不要用 PID —— 它会变。
+    if timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$DAEMON_PORT" 2>/dev/null; then
+        log "✓ 解码 daemon 在听 127.0.0.1:$DAEMON_PORT"
+    else
+        log "✗ 解码 daemon 未运行（端口 $DAEMON_PORT 不通）"
+        ok=1
+    fi
+
+    local drv=/usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so
+    if [ -f "$drv" ]; then
+        log "✓ VA-API 驱动已安装"
+    else
+        log "✗ 找不到驱动: $drv"
+        ok=1
+    fi
+
+    # Firefox 自己的探针，输出的位图决定各 codec 的硬解开关。
+    local probe=/usr/lib/firefox-esr/vaapitest
+    [ -x "$probe" ] || probe=/usr/lib/firefox/vaapitest
+    if [ -x "$probe" ]; then
+        local codecs
+        codecs=$("$probe" --drm "$DRM_DEVICE" 2>/dev/null | \
+                 awk '/VAAPI_HWCODECS/{getline; print}')
+        if [ -n "${codecs:-}" ]; then
+            local list=""
+            [ $((codecs & 16))  -ne 0 ] && list="$list H264"
+            [ $((codecs & 32))  -ne 0 ] && list="$list VP8"
+            [ $((codecs & 64))  -ne 0 ] && list="$list VP9"
+            [ $((codecs & 128)) -ne 0 ] && list="$list AV1"
+            [ $((codecs & 256)) -ne 0 ] && list="$list HEVC"
+            log "✓ Firefox 探针认可的硬解 codec:${list:- 无}（位图 $codecs）"
+        else
+            log "✗ Firefox 探针未返回 codec 位图"
+            ok=1
+        fi
+    fi
+
+    return $ok
+}
+
+if [ "${1:-}" = "--dmd-check" ]; then
+    check_env
+    exit $?
+fi
+
+export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-msm}"
+export MOZ_DISABLE_RDD_SANDBOX="${MOZ_DISABLE_RDD_SANDBOX:-1}"
+
+# Firefox 拒绝以 root 身份使用别人的会话，报
+# "Running Firefox as root in a regular user's session is not supported."
+# 然后直接退出。容器里桌面通常跑在普通用户下（XDG_RUNTIME_DIR=/run/user/1000），
+# 而人习惯用 root 操作，于是撞上这条 —— 提前说清楚，别让人对着空日志猜。
+if [ "$(id -u)" = "0" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    rt_owner=$(stat -c %u "$XDG_RUNTIME_DIR" 2>/dev/null || echo 0)
+    if [ "$rt_owner" != "0" ]; then
+        rt_user=$(stat -c %U "$XDG_RUNTIME_DIR" 2>/dev/null || echo "?")
+        log "✗ 你是 root，但 $XDG_RUNTIME_DIR 属于 $rt_user —— Firefox 会拒绝启动。"
+        log "  改用该用户运行： su $rt_user -s /bin/bash -c '$0 $*'"
+        exit 1
+    fi
+fi
+
+# Wayland 下 Firefox 才能拿到硬件 WebRender（VA-API 的第二重门要求
+# 合成器不是软件 WebRender）。有 WAYLAND_DISPLAY 就顺手打开开关。
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
+fi
+
+# 这两个 pref 也是必需的，但 pref 属于 profile。若用户 profile 里没设，
+# 这里通过环境变量兜不住 —— 所以提示一次，只提示不强制。
+if [ "${DMD_QUIET:-0}" != "1" ]; then
+    log "提示：profile 里需要 media.ffmpeg.vaapi.enabled=true"
+    log "      与 media.hardware-video-decoding.force-enabled=true"
+    log "      诊断硬解是否生效：DMD_VA_LOG=1 firefox-hwdec 然后看 stderr"
+fi
+
+exec "$FIREFOX_BIN" "$@"
