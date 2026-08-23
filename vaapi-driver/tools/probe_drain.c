@@ -64,7 +64,20 @@ static int drain(AMediaCodec *c)
         AMediaCodecBufferInfo info;
         ssize_t oi = AMediaCodec_dequeueOutputBuffer(c, &info, 20000);
         if (oi >= 0) {
-            if (info.size > 0) got++;
+            if (info.size > 0) {
+                got++;
+                /* 只数帧不够 —— 上一版就是因此误判 flush 可用。
+                 * 检查亮度：flush 丢掉参考帧后解出来的是纯黑（Y=16）。 */
+                size_t osz; uint8_t *ob = AMediaCodec_getOutputBuffer(c, oi, &osz);
+                if (ob && osz > 200000) {
+                    double sum = 0; int nsamp = 0;
+                    for (size_t k = 0; k < 100000; k += 97) { sum += ob[k]; nsamp++; }
+                    double mean = sum / nsamp;
+                    if (got <= 8)
+                        printf("    帧%d 亮度均值 %.1f%s\n", got, mean,
+                               mean < 20.0 ? "  ← 黑帧!" : "");
+                }
+            }
             int eos = (info.flags & FLAG_EOS) != 0;
             AMediaCodec_releaseOutputBuffer(c, oi, false);
             if (eos) break;
@@ -124,6 +137,23 @@ int main(int argc, char **argv)
     printf("  排空取到 %d 帧\n", g1);
 
     /* 关键一步：flush 能否让它复活 */
+    printf("--- 对照A：EOS 后**不** flush，直接继续送料 ---\n");
+    {
+        ssize_t t = AMediaCodec_dequeueInputBuffer(c, 200000);
+        printf("  dequeueInputBuffer -> %zd %s\n", t,
+               t >= 0 ? "(还能收输入)" : "(拒绝输入，EOS 后必须 flush)");
+        if (t >= 0) {
+            /* 真送一个 VCL 看出不出帧 */
+            size_t cp; uint8_t *p2 = AMediaCodec_getInputBuffer(c, t, &cp);
+            memcpy(p2, data + vo[3], vl[3]);
+            AMediaCodec_queueInputBuffer(c, t, 0, vl[3], 3 * 33333, 0);
+            AMediaCodecBufferInfo bi2;
+            ssize_t o2 = AMediaCodec_dequeueOutputBuffer(c, &bi2, 500000);
+            printf("  送一个 VCL 后 dequeueOutput -> %zd\n", o2);
+            if (o2 >= 0) AMediaCodec_releaseOutputBuffer(c, o2, false);
+        }
+    }
+
     printf("--- flush 后重送 CSD，继续送第 4..9 个 VCL ---\n");
     media_status_t fs = AMediaCodec_flush(c);
     printf("  AMediaCodec_flush -> %d (0=OK)\n", fs);
