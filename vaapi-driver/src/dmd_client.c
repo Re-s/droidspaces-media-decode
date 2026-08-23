@@ -851,6 +851,20 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
             out->shm_slot = slot;
             out->seq = s->frames_recv;
             frame_apply_format(s, out);
+            /* SHM 路径也必须累加 frames_recv —— 它不只是统计。
+             *
+             * ⚠️ 这里原先只读不写，于是 SHM 模式下该计数恒为 0，
+             * 造成两个后果：
+             *
+             * 1. dmd_session_frames_received() 恒 0，而 decode.c 的排空判据
+             *    用 `frames_received() > 0` 当护栏（"至少收到过一帧才允许
+             *    判定等待徒劳"，那是黑帧根因的修复）。恒 0 会让整个
+             *    wait_is_futile 恒假 —— 方向上偏保守（只靠超时、不会误排空），
+             *    但护栏语义已经失真，一旦将来有人改动那个表达式就会踩坑。
+             * 2. out->seq 恒为 0，帧序号信息丢失。
+             *
+             * TCP 路径在下面 s->frames_recv++ 处累加，两条路径必须一致。 */
+            s->frames_recv++;
                 s->shm_held++;
             return DMD_OK;
         }
