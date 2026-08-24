@@ -45,3 +45,6 @@ Thumbs.db
 *.avi
 # VA-API driver 构建产物
 vaapi-driver/build/
+
+# 发布产物：只作为 GitHub Release 资产上传，不进仓库
+rel/

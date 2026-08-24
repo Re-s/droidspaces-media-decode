@@ -18,15 +18,20 @@
 1. 把一个宿主目录 bind mount 进容器（§2.1）
 2. 以正确的 SELinux domain 启动 daemon（§2.2）
 3. 把 `/dev/dri/renderD128` 透传进容器（§2.3）
-4. **补一条 SELinux allow 规则**：允许 daemon 所在 domain 访问
-   hwservicemanager 与 Codec2 HAL（§2.2）
+4. **补 SELinux allow 规则**：让媒体**服务端域**能把 binder 句柄
+   transfer 给 daemon 所在的 domain（§2.2）
 
 不需要任何网络或端口配置 —— 通道是 Unix socket，不上网络栈。
 
-> ⚠️ **第 4 项是当前唯一的阻塞项，请勿漏排。** 前三项做完后，
+> ⚠️ **第 4 项既容易漏排，也容易搞反方向。** 前三项做完后，
 > §6 验证清单的第 1–7 步会**全部通过**，只有第 8 步（真实解码）失败 ——
-> 因为 daemon 要到创建 codec 时才触及 Codec2，握手阶段不碰。
-> 也就是说"看起来都装好了"并不代表能解码。详见 §2.2。
+> 因为 daemon 要到创建 codec 时才去取解码器，握手阶段不碰。
+> 也就是说"看起来都装好了"并不代表能解码。
+>
+> 关于搞反：规则的 subject 是**服务端域**
+> （`allow mediacodec droidspacesd binder { call transfer }`），
+> 不是 daemon 自己的 domain。`binder { transfer }` 按 sender 判定，
+> receiver 是 permissive 也盖不住。完整推理与已验证的规则集见 §2.2。
 
 ---
 
@@ -150,6 +155,22 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 
 第三行是关键：把 SELinux 切成 permissive、其他条件完全不变就能正常工作，说明 **Unix socket 通道本身是正确的**，缺的只是一条 allow 规则。
 
+> ⚠️ **v0.3.1 修正：规则的方向此前搞错了。** 下文一度把所需规则写成"允许
+> `droidspacesd` 访问 hwservicemanager / Codec2"，即以 `droidspacesd` 为
+> subject。**那样加不会有任何效果** —— `droidspacesd` 是永久 permissive 域，
+> 以它为 subject 的检查本来就不阻断。
+>
+> 真正缺的是反方向：服务端域要把 binder 句柄 **transfer 给** `droidspacesd`，
+> 而 `binder { transfer }` 按 **sender**（服务端域，enforcing）判定。denial
+> 被 `dontaudit` 静默，所以全程看不到 avc 行，这正是误判的来源。
+>
+> 一锤定音的对照：`dumpsys -l`（纯枚举）两域都成功，`dumpsys media.player`
+> （需回传句柄）在 `droidspacesd` 下 `FAILED_TRANSACTION`、`ksu` 下正常，
+> 同一模式在 system binder 与 hwbinder 两条总线一致复现。失败链的第一因是
+> `getService ... EX_TRANSACTION_FAILED for android.hardware.media.omx@1.0::IOmx`
+> → `Cannot obtain IOmx service` → ACodec `-19`，SIGABRT 是 Codec2 回退时的
+> 二次现象，不是根因。
+
 **已排除的替代方案**（都实测过）：
 
 | 方案 | 结论 |
@@ -160,11 +181,39 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 | 其余 domain（`magisk`/`init`/`shell`/`system_server`/`mediaserver`/`media_codec`/`hal_codec2_default` 等 11 个） | 均无法同时满足"可切入"与"可 bind" |
 | DroidSpaces `selinux_permissive=1` | 有效，但那是**把宿主 SELinux 整体切成 permissive**（帮助原文：`Set host SELinux to permissive mode`），全系统关防护，不可作为交付形态 |
 
-**所需规则**：允许 `droidspacesd` 访问 hwservicemanager 与 Codec2 HAL。
+**所需规则**（subject 是服务端域，不是 `droidspacesd`）：
 
-这类配置平台已经做过 —— `/dev/dri` 与 `/dev/ashmem` 的 `droidspaces-gpu` 属组授权就是先例，说明平台有能力也有惯例做这种 domain 级授权。（本项目**不使用** `/dev/ashmem`，这里只是引用它作为"平台做过同类工作"的证据，不是要求配置它 —— 见 §5。）
+```
+allow mediacodec   droidspacesd binder { call transfer }
+allow mediacodec   droidspacesd fd use
+allow mediametrics droidspacesd binder { call transfer }
+allow mediametrics droidspacesd fd use
+```
 
-> **待平台确认**：这条规则加在哪里、是否愿意为 daemon 单独定义一个兼具两种权限的 domain。在规则到位前，驱动会自动退回 TCP（`ksu` domain 下正常），功能不退化，但 NAT 型容器用不了硬解。
+`mediacodec` 域即 `media.hwcodec`，IOmx 的提供者。注意 `hal_codec2_default`
+类型在测试设备的策略里**不存在**（Codec2 由 `mediacodec` 域提供），CIL 里
+引用不存在的类型会导致整个策略编译失败，不要照抄进去。
+
+这类配置平台已经做过，而且是**完全同一形状**的规则 —— PulseAudio 能出声就
+靠 `sepolicy.rule` 里这两条：
+
+```
+allow audioserver droidspacesd binder { call transfer }
+allow mediaserver droidspacesd binder { call transfer }
+```
+
+所以硬解要的只是补上 OMX 对应的服务端域，属于既有惯例的自然延伸，不是新机制。
+
+> **状态（v0.3.1）**：平台侧已实现并验证通过。规则加在
+> `Android/app/src/main/assets/boot-module/sepolicy.rule` 与
+> `init/android-service/binary-configuration/droidspaces_binary.cil` 两个载体
+> （平台双轨惯例）。补规则后端到端逐字节验证：150 帧 1080p，`vainfo` 报出驱动
+> 版本与 6 个 VLD profile，输出与软解 `md5` 相同。
+>
+> 补规则后 `hwservice_manager { find }` 的 denial **依然存在**且标
+> `permissive=1`（IOmx / IAllocator / IMapper 各一条），但不再阻断 —— 因为
+> `find` 的 subject 是 `droidspacesd` 自己，permissive 能放行。这条现象容易
+> 让人以为规则没生效，实际是正常的。
 
 **验证方法**
 
@@ -306,7 +355,7 @@ TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`�
 
 | 项 | 结论 | 依据 |
 |---|---|---|
-| ~~新增 SELinux 策略~~ | **⚠️ 需要，见 §2.2** | 早前版本误列为"不需要"。建 socket 确实不需要新规则，但 `droidspacesd` domain **无权访问 hwservicemanager / Codec2**，daemon 会在 `CCodec::allocate` 处 SIGABRT。这是当前唯一阻塞项 |
+| ~~新增 SELinux 策略~~ | **⚠️ 需要，见 §2.2**（v0.3.1 已由平台实现） | 建 socket 确实不需要新规则。需要的是让**服务端域**能把 binder 句柄 transfer 给 `droidspacesd`（`allow mediacodec droidspacesd binder { call transfer }` 等）。早前两版都写错过：先误列为"不需要"，后又把 subject 写成 `droidspacesd` 自己 |
 | 端口转发 / iptables / NAT 规则 | **不需要** | Unix socket 通道不经过网络；NAT 型容器不再需要 TCP 可达性 |
 | 任何网络配置（DNS、路由、防火墙放行） | **不需要** | 传输不走网络栈 |
 | 透传 `/dev/ashmem` | **不需要** | 该节点已透传（`root:droidspaces-gpu`），但本项目**不使用**它 —— Android 11+ 已被 memfd 取代，且 memfd 方案更优 |
@@ -394,7 +443,7 @@ Android 的 `stat` **支持** `%i` 与 `%F`，报错纯粹是引号层级问题�
 | 项 | 状态 |
 |---|---|
 | SHM（memfd）零拷贝 | 驱动侧**默认关闭**，需 `DMD_WANT_SHM=1`。这条路驱动侧从未真正启用过（只有单元测试走过：150 帧、逐字节一致、无 fd 泄漏），真实消费者环境下未验证；浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测（`vaapi-driver/src/decode.c` 的 SHM 默认关闭说明（搜 `DMD_WANT_SHM`）） |
-| **SELinux allow 规则缺失** | **当前唯一阻塞项**。`droidspacesd` domain 无权访问 hwservicemanager/Codec2，daemon 在 `CCodec::allocate` 处 SIGABRT。permissive 下同条件正常解码，证明通道本身正确 —— 详见 §2.2 |
+| ~~**SELinux allow 规则缺失**~~ | **v0.3.1 已解决**。缺的是给**服务端域**的 `binder transfer`（判定按 sender，`droidspacesd` 自身 permissive 救不了），不是给 `droidspacesd` 的规则。平台已在两个策略载体加上并端到端逐字节验证通过 —— 详见 §2.2 |
 | 浏览器沙箱收 `SCM_RIGHTS` | **未验证**（Firefox RDD / Chrome GPU 进程有 seccomp 过滤） |
 | Firefox 的 `MOZ_DISABLE_RDD_SANDBOX=1` | 该环境变量的原始理由是"RDD 沙箱禁止驱动创建 **TCP** socket"。**改用 Unix socket 后是否仍需要它，尚未实测**。它降低 RDD 进程隔离强度，属安全权衡 |
 | socket 文件权限 | 当前 `chmod 0666`，任何容器内进程可连；应收紧到特定 gid，等平台确认目标 gid |

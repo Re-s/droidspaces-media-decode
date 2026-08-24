@@ -18,15 +18,21 @@ This component lets standard Linux applications inside a DroidSpaces container (
 1. bind mount one host directory into the container (§2.1)
 2. start the daemon in the correct SELinux domain (§2.2)
 3. pass `/dev/dri/renderD128` through into the container (§2.3)
-4. **add one SELinux allow rule**: allow the daemon's domain to access
-   hwservicemanager and the Codec2 HAL (§2.2)
+4. **add SELinux allow rules** so the media **service domains** can transfer
+   binder handles to the daemon's domain (§2.2)
 
 No network or port configuration is needed — the channel is a Unix socket and does not touch the network stack.
 
-> ⚠️ **Item 4 is the only current blocker; do not overlook it.** Once the first three items are done,
-> steps 1–7 of the §6 verification checklist **all pass**, and only step 8 (real decoding) fails —
-> because the daemon only touches Codec2 when a codec is created, never during the handshake.
-> In other words, "everything looks installed" does not mean decoding works. See §2.2.
+> ⚠️ **Item 4 is easy to overlook and easy to get backwards.** Once the first three items
+> are done, steps 1–7 of the §6 verification checklist **all pass**, and only step 8 (real
+> decoding) fails, because the daemon only reaches for a codec when one is created, never
+> during the handshake. In other words, "everything looks installed" does not mean decoding
+> works.
+>
+> Getting it backwards: the rules go on the **service domains** as the subject
+> (`allow mediacodec droidspacesd binder { call transfer }`), not on the daemon's own
+> domain. `binder { transfer }` is checked against the sender, so a permissive receiver
+> cannot cover it. See §2.2 for the full reasoning and the verified rule set.
 
 ---
 
@@ -150,6 +156,26 @@ Three control experiments confirm this has **nothing to do with the transport**:
 
 The third row is the key one: switching SELinux to permissive with everything else unchanged makes it work, which shows that **the Unix socket channel itself is correct** and all that is missing is one allow rule.
 
+> ⚠️ **Corrected in v0.3.1: the rule was pointed the wrong way.** The text below
+> once asked to "allow `droidspacesd` to access hwservicemanager / Codec2", with
+> `droidspacesd` as the subject. **Adding it that way does nothing** —
+> `droidspacesd` is a permanently permissive domain, so checks with it as the
+> subject never block in the first place.
+>
+> What is actually missing is the other direction: the service domains have to
+> hand a binder handle **to** `droidspacesd`, and `binder { transfer }` is checked
+> against the **sender**, which is enforcing. The denial is `dontaudit`'d, so no
+> avc line ever appears, and that is exactly what led to the wrong reading.
+>
+> The decisive comparison: `dumpsys -l` (pure enumeration, no handle returned)
+> succeeds in both domains, while `dumpsys media.player` (needs a handle back)
+> returns `FAILED_TRANSACTION` under `droidspacesd` and works under `ksu`. The
+> same pattern reproduces on both the system binder and hwbinder. The first cause
+> in the failure chain is
+> `getService ... EX_TRANSACTION_FAILED for android.hardware.media.omx@1.0::IOmx`
+> → `Cannot obtain IOmx service` → ACodec `-19`. The SIGABRT is a secondary
+> effect of the Codec2 fallback, not the root cause.
+
 **Alternatives already ruled out** (all tested on device):
 
 | Approach | Conclusion |
@@ -160,11 +186,44 @@ The third row is the key one: switching SELinux to permissive with everything el
 | The remaining domains (`magisk`/`init`/`shell`/`system_server`/`mediaserver`/`media_codec`/`hal_codec2_default`, 11 in total) | None can satisfy "can be entered" and "can bind" at the same time |
 | DroidSpaces `selinux_permissive=1` | Works, but it **switches the whole host SELinux to permissive** (help text verbatim: `Set host SELinux to permissive mode`), disabling protection system-wide; not acceptable as a delivered configuration |
 
-**Rule required**: allow `droidspacesd` to access hwservicemanager and the Codec2 HAL.
+**Rules required** (the subject is the service domain, not `droidspacesd`):
 
-The platform has done this kind of configuration before — the `droidspaces-gpu` group authorization on `/dev/dri` and `/dev/ashmem` is the precedent, showing the platform both can and routinely does grant domain-level access. (This project does **not** use `/dev/ashmem`; it is cited here only as evidence that the platform has done work of the same kind, not as something to configure — see §5.)
+```
+allow mediacodec   droidspacesd binder { call transfer }
+allow mediacodec   droidspacesd fd use
+allow mediametrics droidspacesd binder { call transfer }
+allow mediametrics droidspacesd fd use
+```
 
-> **Pending platform confirmation**: where this rule should be added, and whether you would rather define a dedicated domain for the daemon that holds both sets of permissions. Until the rule is in place, the driver automatically falls back to TCP (which works in the `ksu` domain); functionality does not regress, but NAT-mode containers cannot use hardware decoding.
+The `mediacodec` domain is `media.hwcodec`, the provider of IOmx. Note that the
+`hal_codec2_default` type does **not** exist in the policy on the test device
+(Codec2 is served from the `mediacodec` domain), and naming a missing type breaks
+the whole CIL compile, so do not copy it in.
+
+The platform has done this kind of configuration before, and in **exactly the same
+shape** — PulseAudio produces sound thanks to these two lines in `sepolicy.rule`:
+
+```
+allow audioserver droidspacesd binder { call transfer }
+allow mediaserver droidspacesd binder { call transfer }
+```
+
+So hardware decode only needs the OMX-side service domains added. It is a natural
+extension of an existing convention, not a new mechanism.
+
+> **Status (v0.3.1)**: implemented and verified on the platform side. The rules
+> live in both policy carriers, per platform convention:
+> `Android/app/src/main/assets/boot-module/sepolicy.rule` and
+> `init/android-service/binary-configuration/droidspaces_binary.cil`. With them in
+> place, end-to-end verification is byte exact: 150 frames of 1080p, `vainfo`
+> reporting the driver version and 6 VLD profiles, output matching the software
+> decode `md5`.
+>
+> After adding the rules, the `hwservice_manager { find }` denials **are still
+> there** and still marked `permissive=1` (one each for IOmx, IAllocator and
+> IMapper), but they no longer block, because `find` has `droidspacesd` itself as
+> the subject and permissive covers it. This is easy to misread as the rules not
+> having taken effect; it is expected.
 
 **How to verify**
 
@@ -307,7 +366,7 @@ Listed explicitly to avoid over-configuration:
 
 | Item | Conclusion | Basis |
 |---|---|---|
-| ~~Add SELinux policy~~ | **⚠️ Required, see §2.2** | An earlier version wrongly listed this as "not needed". Creating the socket indeed needs no new rule, but the `droidspacesd` domain **has no permission to access hwservicemanager / Codec2**, and the daemon SIGABRTs at `CCodec::allocate`. This is the only current blocker |
+| ~~Add SELinux policy~~ | **⚠️ Required, see §2.2** (done by the platform in v0.3.1) | Creating the socket indeed needs no new rule. What is needed is letting the **service domains** transfer a binder handle to `droidspacesd` (`allow mediacodec droidspacesd binder { call transfer }` and friends). Both earlier versions got this wrong: first listed as "not needed", then written with `droidspacesd` itself as the subject |
 | Port forwarding / iptables / NAT rules | **Not needed** | The Unix socket channel does not go through the network; NAT-mode containers no longer need TCP reachability |
 | Any network configuration (DNS, routing, firewall allow rules) | **Not needed** | The transport does not use the network stack |
 | Passing `/dev/ashmem` through | **Not needed** | This node is already passed through (`root:droidspaces-gpu`), but this project **does not use** it — it was replaced by memfd in Android 11+, and the memfd approach is better |
@@ -395,7 +454,7 @@ An honest list of items that are currently unresolved or unverified, so the plat
 | Item | Status |
 |---|---|
 | SHM (memfd) zero-copy | **Disabled by default** on the driver side, requires `DMD_WANT_SHM=1`. This path has never actually been enabled on the driver side (only unit tests exercised it: 150 frames, byte-for-byte identical, no fd leaks); not verified in a real consumer environment; whether browser sandboxes can receive `SCM_RIGHTS` has not been measured either (the SHM-disabled-by-default note in `vaapi-driver/src/decode.c`; search for `DMD_WANT_SHM`) |
-| **Missing SELinux allow rule** | **The only current blocker.** The `droidspacesd` domain has no permission to access hwservicemanager/Codec2, and the daemon SIGABRTs at `CCodec::allocate`. Under permissive, decoding works under otherwise identical conditions, which proves the channel itself is correct — see §2.2 |
+| ~~**Missing SELinux allow rule**~~ | **Resolved in v0.3.1.** What was missing is `binder transfer` for the **service domains** (checked against the sender, so `droidspacesd` being permissive cannot help), not a rule for `droidspacesd`. The platform added it to both policy carriers and verified end to end, byte exact — see §2.2 |
 | Browser sandboxes receiving `SCM_RIGHTS` | **Not verified** (the Firefox RDD / Chrome GPU processes have seccomp filters) |
 | Firefox's `MOZ_DISABLE_RDD_SANDBOX=1` | The original reason for this environment variable was "the RDD sandbox forbids the driver from creating a **TCP** socket". **Whether it is still needed after switching to a Unix socket has not been measured.** It weakens RDD process isolation, so it is a security tradeoff |
 | Socket file permissions | Currently `chmod 0666`, so any process inside the container can connect; it should be tightened to a specific gid, pending the platform's confirmation of the target gid |

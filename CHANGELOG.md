@@ -1,5 +1,63 @@
 # 更新日志
 
+## v0.3.1
+
+守护进程稳定性修复。协议未变，驱动逻辑无改动，与 v0.3.0 完全兼容。
+
+### 修复：accept 出错时整个 daemon 退出，所有会话一起断
+
+原实现只把 `EINTR` 与 `ECONNABORTED` 当可恢复，其余 errno 一律 `break`
+主循环。真机踩到过：容器跨 netns 连宿主 TCP 时 `accept` 返回 `EMSGSIZE`，
+日志只留下 `accept: Message too long` 和 `daemon 退出`，正在解码的会话被
+一并带走。叠加平台侧没有崩溃自动重启（`ds_spawn_daemon` 只在容器启动与
+monitor 的 reboot_cycle 里拉起），daemon 一死要等容器重启。
+
+`accept` 的错误几乎都只影响那一个连接。Linux 还会把新连接上待处理的网络
+错误从 `accept` 抛出来，man 手册明确要求把它们当 `EAGAIN` 一样重试。现在
+这些一律跳过该连接继续服务，只有 fd 耗尽这类真正的进程级故障才退出，交给
+上层重启。
+
+真机验证：`droidspacesd` 域下连续三个会话全部握手成功，daemon 进程始终
+存活；客户端因协议不同步先退出导致 `send_all: write 失败: Broken pipe`
+时，daemon 只结束该会话。修复前这两种情况都会让进程整体退出。
+
+### 修复：Unix 模式下白调一次 TCP_NODELAY
+
+`TCP_NODELAY` 在 `AF_UNIX` 上返回 `EOPNOTSUPP`。原先无条件调用，返回值没
+检查所以无害，但没有意义。现在只在 TCP 模式下设置。
+
+### 重要结论修正：SELinux 阻塞项的方向搞错了
+
+本仓库文档此前把唯一阻塞项写成「`droidspacesd` 缺 hwservicemanager /
+Codec2 的 allow 规则」。**这个方向是错的**，据此加规则不会有任何效果。
+
+真正的原因：`binder { transfer }` 的 SELinux 判定按 **sender**（服务端域，
+enforcing），不按 receiver。`droidspacesd` 自身是永久 permissive 域，救不
+了这一步；而 denial 被 `dontaudit` 静默，所以全程看不到 avc 行 —— 这正是
+先前误判的来源。
+
+一锤定音的对照实验：`dumpsys -l`（纯枚举，不回传句柄）两域都成功，
+`dumpsys media.player`（需回传句柄）在 `droidspacesd` 下
+`FAILED_TRANSACTION`、在 `ksu` 下正常，同一模式在 system binder 与
+hwbinder 两条总线一致复现。
+
+正确的规则加在服务端域侧：
+
+```
+allow mediacodec   droidspacesd binder { call transfer }
+allow mediacodec   droidspacesd fd use
+allow mediametrics droidspacesd binder { call transfer }
+allow mediametrics droidspacesd fd use
+```
+
+DroidSpaces 平台其实早就为 PulseAudio 做过同形状的事
+（`allow audioserver droidspacesd binder { call transfer }`），硬解只是补
+上 OMX 对应的服务端域。补规则后端到端逐字节验证通过：150 帧 1080p，
+`msm_drm_drv_video.so` 经 `DMD_ENDPOINT` 自动接入，输出与软解 `md5` 相同。
+
+另外注意 `hal_codec2_default` 类型在测试设备的策略里**不存在**（Codec2 由
+`mediacodec` 域提供），CIL 里引用不存在的类型会导致整个策略编译失败。
+
 ## v0.3.0
 
 新增第三条传输通道：路径式 Unix socket。协议未变，向后兼容 v0.2.0。
