@@ -1444,8 +1444,36 @@ int main(int argc, char **argv)
 
         int cli = accept(srv, NULL, NULL);
         if (cli < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            perror("accept"); break;
+            /* accept 的错误几乎都只影响这一个连接，不该拖垮整个 daemon。
+             * Linux 会把新连接上待处理的网络错误从 accept 抛出来，man 手册
+             * 明确要求把它们当 EAGAIN 一样重试；EMSGSIZE 实测也出现过
+             * （容器跨 netns 连宿主 TCP 时），当时 daemon 直接退出，
+             * 所有会话一起断。只有 fd 耗尽这类真正的进程级故障才值得退出。 */
+            switch (errno) {
+            case EINTR:
+            case ECONNABORTED:
+            case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+            case EWOULDBLOCK:
+#endif
+            case EMSGSIZE:
+            case EPROTO:
+            case ENOPROTOOPT:
+            case EHOSTDOWN:
+            case EHOSTUNREACH:
+            case ENETDOWN:
+            case ENETUNREACH:
+            case ENONET:
+            case EOPNOTSUPP:
+            case ETIMEDOUT:
+                dlog(1, "accept 跳过一个连接: %s", strerror(errno));
+                continue;
+            default:
+                /* EMFILE/ENFILE/ENOBUFS/ENOMEM 也可能是暂时的，但反复重试
+                 * 会变忙等，交给上层重启更干净。 */
+                perror("accept");
+                goto accept_loop_done;
+            }
         }
 
         pthread_mutex_lock(&count_lock);
@@ -1459,7 +1487,9 @@ int main(int argc, char **argv)
             continue;
         }
 
-        setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        /* TCP_NODELAY 在 AF_UNIX 上返回 EOPNOTSUPP，Unix 模式下没必要调。 */
+        if (!sock_path)
+            setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
         Session *s = calloc(1, sizeof(Session));
         if (!s) {
@@ -1490,6 +1520,7 @@ int main(int argc, char **argv)
         pthread_detach(th);
         dlog(1, "[%d] 客户端接入", s->id);
     }
+accept_loop_done:
 
     close(srv);
     /* Unix socket 要删掉文件，否则下次启动 bind 会拿到 EADDRINUSE。
