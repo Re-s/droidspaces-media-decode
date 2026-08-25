@@ -89,7 +89,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # Full history and tags: the per-component diff below needs the previous
+      # tag, which a shallow clone does not have.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -120,6 +124,55 @@ jobs:
             exit 1
           fi
           wc -l notes.md
+
+      # Every release ships all three assets, so a reader cannot tell from the
+      # file list which component actually changed. Worse, a rebuild on a
+      # different toolchain changes a binary's checksum with no source change at
+      # all, which looks like a silent code change. Say which source trees moved
+      # and pin the compiler, so a changed checksum is always explainable.
+      - name: Describe what changed per component
+        run: |
+          prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          {
+            echo
+            echo '### 本次各组件的改动范围'
+            echo
+            if [ -n "$prev" ]; then
+              echo "与 \`${prev}\` 相比："
+              echo
+              daemon_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- src/ | wc -l)
+              driver_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | wc -l)
+
+              if [ "$daemon_changed" -gt 0 ]; then
+                echo "- **\`decode-daemon\`**：源码有改动（\`src/\` 下 ${daemon_changed} 个文件）"
+                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- src/ | sed 's/^/      /'
+              else
+                echo "- **\`decode-daemon\`**：**源码无改动**（\`src/\` 零变更）。"
+                echo "  二进制的 checksum 仍可能与上一版不同，因为它是在 CI 上用固定版本的 NDK"
+                echo "  重新编译的，而上一版可能来自不同工具链。行为未变，协议未变。"
+              fi
+
+              if [ "$driver_changed" -gt 0 ]; then
+                echo "- **\`msm_drm_drv_video.so\`**：源码有改动（\`vaapi-driver/src/\` 下 ${driver_changed} 个文件）"
+                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | sed 's/^/      /'
+              else
+                echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更），同上。"
+              fi
+            else
+              echo "首个带此说明的版本，无法与上一 tag 比较。"
+            fi
+            echo
+            echo '### 构建环境'
+            echo
+            echo '| 产物 | 工具链 |'
+            echo '|---|---|'
+            echo "| \`decode-daemon\` | Android NDK r26d，target API 29 |"
+            echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64，系统 gcc |"
+            echo
+            echo '> 换工具链会改变二进制的 checksum，即使源码一字未动。要判断是否真有'
+            echo '> 代码改动，看上面的「改动范围」而不是 checksum。'
+          } >> notes.md
+          cat notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
