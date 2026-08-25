@@ -1,0 +1,6 @@
+id=dmd_watchdog
+name=DMD Watchdog: decode-daemon keeper
+version=v0.1.0
+versionCode=100
+author=Re-s
+description=看护 Droidspaces 的 decode-daemon：端点探活失败即重启。尚未启动。

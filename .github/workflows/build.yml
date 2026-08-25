@@ -83,9 +83,55 @@ jobs:
           path: vaapi-driver/build/msm_drm_drv_video.so
           if-no-files-found: error
 
+  watchdog:
+    name: dmd_watchdog module zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable aarch64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # dmd-probe 是唯一需要编译的部件；静态链接，容器里不挑 libc。
+      # 与驱动同用 arm64 debian：编出来的二进制能在 qemu 下直接跑，
+      # 顺手当架构冒烟测试。
+      - name: Build dmd-probe (static aarch64)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/src" -w /src/ksu-module \
+            debian:trixie-slim bash -euxc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends gcc libc6-dev file
+              gcc -O2 -static -Wall -Wextra -o dmd-probe src/dmd-probe.c
+              file dmd-probe | grep -q "ARM aarch64" || {
+                echo "not an aarch64 binary" >&2; exit 1; }
+              ./dmd-probe 2>/dev/null; rc=$?
+              [ "$rc" = "3" ] || { echo "probe usage rc=$rc, want 3" >&2; exit 1; }
+            '
+
+      - name: Package module zip
+        run: |
+          mkdir -p pkg
+          cp ksu-module/module.prop ksu-module/service.sh \
+             ksu-module/dmd-watchdog.sh ksu-module/action.sh \
+             ksu-module/sepolicy.rule ksu-module/README.md pkg/
+          cp ksu-module/dmd-probe pkg/
+          chmod 755 pkg/service.sh pkg/dmd-watchdog.sh pkg/action.sh pkg/dmd-probe
+          chmod 644 pkg/module.prop pkg/sepolicy.rule pkg/README.md
+          ( cd pkg && zip -r "../dmd_watchdog-${GITHUB_REF_NAME}.zip" . )
+          unzip -l "dmd_watchdog-${GITHUB_REF_NAME}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmd_watchdog-zip
+          path: dmd_watchdog-*.zip
+          if-no-files-found: error
+
   release:
     name: Release
-    needs: [ daemon, driver ]
+    needs: [ daemon, driver, watchdog ]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -100,13 +146,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Same three assets every release has shipped since v0.3.0, so the
+      # Same four assets every release has shipped since v0.3.3, so the
       # download URLs stay predictable.
       - name: Checksums
         run: |
           cd dist
           ls -la
-          sha256sum decode-daemon msm_drm_drv_video.so > SHA256SUMS
+          sha256sum decode-daemon msm_drm_drv_video.so dmd_watchdog-*.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Extract release notes for this tag
@@ -158,6 +204,15 @@ jobs:
               else
                 echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更），同上。"
               fi
+
+              wd_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- ksu-module/ | wc -l)
+              if [ "$wd_changed" -gt 0 ]; then
+                echo "- **\`dmd_watchdog-*.zip\`**（KSU 看护模块）：源码有改动（\`ksu-module/\` 下 ${wd_changed} 个文件）"
+                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- ksu-module/ | sed 's/^/      /'
+              else
+                echo "- **\`dmd_watchdog-*.zip\`**（KSU 看护模块）：**源码无改动**（\`ksu-module/\` 零变更）。"
+                echo "  zip 的 checksum 仍可能因打包顺序/时间戳不同而变化，内容未变。"
+              fi
             else
               echo "首个带此说明的版本，无法与上一 tag 比较。"
             fi
@@ -168,6 +223,7 @@ jobs:
             echo '|---|---|'
             echo "| \`decode-daemon\` | Android NDK r26d，target API 29 |"
             echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64，系统 gcc |"
+            echo "| \`dmd_watchdog-*.zip\` | Debian trixie aarch64，静态 gcc（仅 dmd-probe 需编译） |"
             echo
             echo '> 换工具链会改变二进制的 checksum，即使源码一字未动。要判断是否真有'
             echo '> 代码改动，看上面的「改动范围」而不是 checksum。'
@@ -179,6 +235,7 @@ jobs:
           files: |
             dist/decode-daemon
             dist/msm_drm_drv_video.so
+            dist/dmd_watchdog-*.zip
             dist/SHA256SUMS
           body_path: notes.md
           fail_on_unmatched_files: true

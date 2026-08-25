@@ -1,0 +1,21 @@
+# dmd_watchdog SELinux 规则
+#
+# 实测前提（真机，Android 13 Enforcing）：本看护从 KSU service.sh 启动，
+# 进程落在 u:r:ksu:s0；由它拉起的 decode-daemon 继承该域，**已验证能真硬解**
+# （容器 ffmpeg -hwaccel vaapi 出帧，daemon 日志 41/32 帧回传，MediaCodec
+# 建 codec 成功）。这是因为 droidspaces 模块的 sepolicy 已给出 mediacodec /
+# mediametrics 到 droidspacesd 的 binder 规则，而 ksu 域本身对 media 服务的
+# 访问在该设备上已足够。
+#
+# 因此这里**不重复声明** droidspacesd / droidspacesd_exec 等类型 ——
+# 那些由 droidspaces 模块的 sepolicy.rule 负责，重复声明会让 magiskpolicy
+# 报错甚至中断策略加载（历史上平台就因为改宽 hwservicemanager 的授权
+# 导致设备起不来）。本模块只补自己需要的那一点。
+
+# 看护要 stat/connect daemon 的 unix socket（在 /data/local/Droidspaces 下）
+allow ksu system_data_file sock_file { getattr write };
+allow ksu system_data_file file { getattr open read write };
+allow ksu system_data_file dir { search read open getattr add_name write };
+
+# 探活即 connect + 握手
+allow ksu ksu unix_stream_socket { create connect write read shutdown getopt setopt };
