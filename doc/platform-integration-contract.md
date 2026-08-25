@@ -155,14 +155,23 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 
 第三行是关键：把 SELinux 切成 permissive、其他条件完全不变就能正常工作，说明 **Unix socket 通道本身是正确的**，缺的只是一条 allow 规则。
 
-> ⚠️ **v0.3.1 修正：规则的方向此前搞错了。** 下文一度把所需规则写成"允许
-> `droidspacesd` 访问 hwservicemanager / Codec2"，即以 `droidspacesd` 为
-> subject。**那样加不会有任何效果** —— `droidspacesd` 是永久 permissive 域，
-> 以它为 subject 的检查本来就不阻断。
+> ⚠️ **v0.3.2 再修正：v0.3.1 这段把结论下过头了。** 它的诊断骨架是对的
+> —— `binder { transfer }` 确实按 **sender**（服务端域，enforcing）判定，
+> denial 确实被 `dontaudit` 静默，这也确实是最初误判的来源。
 >
-> 真正缺的是反方向：服务端域要把 binder 句柄 **transfer 给** `droidspacesd`，
-> 而 `binder { transfer }` 按 **sender**（服务端域，enforcing）判定。denial
-> 被 `dontaudit` 静默，所以全程看不到 avc 行，这正是误判的来源。
+> 但它进一步断言"以 `droidspacesd` 为 subject 加规则**不会有任何效果**"，
+> **这一步是错的**。v0.3.2 实测：只补下面五条以 `hwservicemanager` 为
+> subject、`droidspacesd` 为 target 的规则，硬解即从"每次必崩"变为
+> 逐字节正确，且连续 117 个会话无新 tombstone。
+>
+> 两者不矛盾，因为它们是链条上**先后两环**：codec 客户端要先向
+> `android.hidl.manager@1.2::IServiceManager` 解析服务，拿不到
+> hwservicemanager 就根本走不到 IOmx 那一步。v0.3.1 看到的
+> `EX_TRANSACTION_FAILED for ...::IOmx` 是**已经越过**第一环之后的现象。
+>
+> 教训：`droidspacesd` 是 permissive 域这一点，只说明"以它为 subject 的
+> **访问检查**不阻断"，不等于"任何写法里出现它都无效"。这两条规则里它是
+> **target**，判定按 sender（`hwservicemanager`，enforcing），照样生效。
 >
 > 一锤定音的对照：`dumpsys -l`（纯枚举）两域都成功，`dumpsys media.player`
 > （需回传句柄）在 `droidspacesd` 下 `FAILED_TRANSACTION`、`ksu` 下正常，
@@ -181,14 +190,29 @@ daemon 的进程形态（`README.md`"daemon 的定位"一节）：前台运行�
 | 其余 domain（`magisk`/`init`/`shell`/`system_server`/`mediaserver`/`media_codec`/`hal_codec2_default` 等 11 个） | 均无法同时满足"可切入"与"可 bind" |
 | DroidSpaces `selinux_permissive=1` | 有效，但那是**把宿主 SELinux 整体切成 permissive**（帮助原文：`Set host SELinux to permissive mode`），全系统关防护，不可作为交付形态 |
 
-**所需规则**（subject 是服务端域，不是 `droidspacesd`）：
+**所需规则**（subject 一律是服务端域，`droidspacesd` 是 target）：
 
 ```
+allow hwservicemanager droidspacesd binder { call transfer }
+allow hwservicemanager droidspacesd fd use
+allow hwservicemanager droidspacesd dir search
+allow hwservicemanager droidspacesd file { getattr open read }
+allow hwservicemanager droidspacesd process getattr
+
 allow mediacodec   droidspacesd binder { call transfer }
 allow mediacodec   droidspacesd fd use
 allow mediametrics droidspacesd binder { call transfer }
 allow mediametrics droidspacesd fd use
 ```
+
+`hwservicemanager` 这五条排在最前面，因为它是**总闸**：codec 客户端必须先
+解析 `android.hidl.manager@1.2::IServiceManager` 才能查任何 HAL，这一步失败
+就直接 `Check failed: serviceManager Hardware service manager is not running`
+并 SIGABRT。这条报错读起来像缺 IOmx，实际缺的是服务管理器本身。
+
+媒体编解码走 **hwbinder**，而策略里既有的 `servicemanager` 相关规则只覆盖
+**system binder** —— 这个不对称正是「PulseAudio 一直能出声、硬解却必崩」的
+原因，音频走的是 system binder。
 
 `mediacodec` 域即 `media.hwcodec`，IOmx 的提供者。注意 `hal_codec2_default`
 类型在测试设备的策略里**不存在**（Codec2 由 `mediacodec` 域提供），CIL 里

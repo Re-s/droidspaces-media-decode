@@ -41,6 +41,57 @@ unlink+重建 socket 换 inode，容器侧持死引用 —— 此前症状是连
 - 降级路径（REPLY_LEGACY）：一次性 WARN 后照常工作，v2 裸 12 字节兼容
 - 目录模式重启重连：inode 变更后新连接自动对上，无误报
 - 真机（文件级 bind mount 死 inode 场景）验证待设备恢复后进行
+## v0.3.2
+
+日志修正与结论订正。协议未变，解码路径无改动，与 v0.3.1 完全兼容。
+
+> **`decode-daemon` 源码本版无改动**（`src/` 零变更），改的只有驱动侧的
+> `vaapi-driver/src/dmd_client.c` 与文档。
+>
+> 但 release 里的 `decode-daemon` 二进制 checksum 与 v0.3.1 **不同**
+> （31672 → 31776 字节）：v0.3.1 是本地 NDK（clang 18.0.3）编的，v0.3.2 由
+> CI 用 NDK r26d（clang 17.0.2）重编。已核对两者的日志与协议字符串**逐条
+> 相同**、握手版本同为 2，差异纯属编译器代码生成，行为未变。
+>
+> 已有部署**不需要**因本版更换 daemon，只换驱动 `.so` 即可。
+> 从 v0.3.3 起 release 说明会自动交代每个资产的源码改动范围。
+
+### 修复：会话建立日志把 Unix socket 谎报成 TCP
+
+`dmd_client.c` 里那条 `会话建立` 日志无条件打印 `port=%u` 与 `传输=TCP`，
+即使连接实际走的是 `sock_path`。连接分派本身一直是对的（`sock_path` 优先），
+错的只有日志。
+
+代价不小：排查时看到 `port=20003 传输=TCP` 会认定驱动忽略了 `DMD_ENDPOINT`、
+硬走 TCP 兜底，据此一路查错方向。实际上 Unix socket 早已连通。
+
+根子是把两个概念挤进了一个字段：`s->xfer` 描述的是**帧传输方式**
+（内联 / SHM），**控制通道类型**（Unix socket / TCP）是另一件事。现在分开报，
+走 Unix socket 时打印路径而不是那个没用上的端口号。
+
+### 结论订正：v0.3.1 对 SELinux 规则的判断下过头了
+
+v0.3.1 的诊断骨架是对的 —— `binder { transfer }` 确实按 **sender** 判定、
+denial 确实被 `dontaudit` 静默。但它进一步断言「以 `droidspacesd` 为 subject
+加规则不会有任何效果」，**这一步是错的**。
+
+实测：补上五条以 `hwservicemanager` 为 subject、`droidspacesd` 为 target 的
+规则后，硬解从「每次必崩」变为逐字节正确，连续 117 个会话无新 tombstone。
+
+两者不矛盾，是链条上先后两环：codec 客户端要先解析
+`android.hidl.manager@1.2::IServiceManager`，拿不到 hwservicemanager 就根本
+走不到 IOmx 那一步。v0.3.1 看到的 `EX_TRANSACTION_FAILED for ...::IOmx` 是
+**已经越过**第一环之后的现象。
+
+另一半原因是总线不对称：媒体编解码走 **hwbinder**，而策略里既有的
+`servicemanager` 规则只覆盖 **system binder**。这正是「PulseAudio 一直能
+出声、硬解却必崩」的原因 —— 音频走的是 system binder。
+
+完整规则与推导见 [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) §2.2。
+
+教训：`droidspacesd` 是 permissive 域，只说明「以它为 subject 的**访问检查**
+不阻断」，不等于「任何写法里出现它都无效」。它作为 **target** 时判定按 sender
+走，照样生效。
 
 ## v0.3.1
 

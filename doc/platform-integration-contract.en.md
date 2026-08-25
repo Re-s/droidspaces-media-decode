@@ -156,16 +156,27 @@ Three control experiments confirm this has **nothing to do with the transport**:
 
 The third row is the key one: switching SELinux to permissive with everything else unchanged makes it work, which shows that **the Unix socket channel itself is correct** and all that is missing is one allow rule.
 
-> ⚠️ **Corrected in v0.3.1: the rule was pointed the wrong way.** The text below
-> once asked to "allow `droidspacesd` to access hwservicemanager / Codec2", with
-> `droidspacesd` as the subject. **Adding it that way does nothing** —
-> `droidspacesd` is a permanently permissive domain, so checks with it as the
-> subject never block in the first place.
+> ⚠️ **Re-corrected in v0.3.2: v0.3.1 overstated this.** Its diagnostic frame was
+> right. `binder { transfer }` really is checked against the **sender** (the
+> service domain, enforcing), the denial really is `dontaudit`'d, and that really
+> was the source of the original misreading.
 >
-> What is actually missing is the other direction: the service domains have to
-> hand a binder handle **to** `droidspacesd`, and `binder { transfer }` is checked
-> against the **sender**, which is enforcing. The denial is `dontaudit`'d, so no
-> avc line ever appears, and that is exactly what led to the wrong reading.
+> But it went on to claim that adding rules with `droidspacesd` as the subject
+> **does nothing**, and that step is wrong. Measured in v0.3.2: adding only the
+> five rules below, with `hwservicemanager` as the subject and `droidspacesd` as
+> the target, turns hardware decode from "aborts every time" into byte exact
+> output, with 117 consecutive sessions and no new tombstone.
+>
+> The two findings do not conflict, they are consecutive links in one chain. The
+> codec client must first resolve `android.hidl.manager@1.2::IServiceManager`;
+> without hwservicemanager it never reaches the IOmx step at all. The
+> `EX_TRANSACTION_FAILED for ...::IOmx` that v0.3.1 observed is what happens
+> **after** that first link already succeeded.
+>
+> The lesson: `droidspacesd` being a permissive domain only means access checks
+> **with it as the subject** do not block. It does not mean any rule mentioning
+> it is inert. In these five rules it is the **target**, the check runs against
+> the sender (`hwservicemanager`, enforcing), and it takes effect.
 >
 > The decisive comparison: `dumpsys -l` (pure enumeration, no handle returned)
 > succeeds in both domains, while `dumpsys media.player` (needs a handle back)
@@ -186,14 +197,30 @@ The third row is the key one: switching SELinux to permissive with everything el
 | The remaining domains (`magisk`/`init`/`shell`/`system_server`/`mediaserver`/`media_codec`/`hal_codec2_default`, 11 in total) | None can satisfy "can be entered" and "can bind" at the same time |
 | DroidSpaces `selinux_permissive=1` | Works, but it **switches the whole host SELinux to permissive** (help text verbatim: `Set host SELinux to permissive mode`), disabling protection system-wide; not acceptable as a delivered configuration |
 
-**Rules required** (the subject is the service domain, not `droidspacesd`):
+**Rules required** (the subject is always the service domain, `droidspacesd` is the target):
 
 ```
+allow hwservicemanager droidspacesd binder { call transfer }
+allow hwservicemanager droidspacesd fd use
+allow hwservicemanager droidspacesd dir search
+allow hwservicemanager droidspacesd file { getattr open read }
+allow hwservicemanager droidspacesd process getattr
+
 allow mediacodec   droidspacesd binder { call transfer }
 allow mediacodec   droidspacesd fd use
 allow mediametrics droidspacesd binder { call transfer }
 allow mediametrics droidspacesd fd use
 ```
+
+The five hwservicemanager rules come first because that domain is the gate. The
+codec client has to resolve `android.hidl.manager@1.2::IServiceManager` before it
+can look up any HAL, and failing that step aborts immediately with
+`Check failed: serviceManager Hardware service manager is not running`. That
+message reads like a missing IOmx; what is missing is the service manager itself.
+
+Media codecs travel over **hwbinder**, while the `servicemanager` rules already in
+the policy only cover **system binder**. That asymmetry is why PulseAudio always
+worked while decode always aborted: audio goes over system binder.
 
 The `mediacodec` domain is `media.hwcodec`, the provider of IOmx. Note that the
 `hal_codec2_default` type does **not** exist in the policy on the test device

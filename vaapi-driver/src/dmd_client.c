@@ -735,9 +735,16 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         return NULL;
     }
 
-    dmd_c_log(s, "会话建立: port=%u codec=%d %dx%d 传输=%s",
-              (unsigned)port, cfg->codec, cfg->width, cfg->height,
-              s->xfer == DMD_XFER_SHM ? "SHM" : "TCP");
+    /* 控制通道与帧传输是两件事，分开报。混在一起曾把走通的 Unix socket
+     * 误标成 TCP，据此排查会一路查错方向。 */
+    if (cfg->sock_path)
+        dmd_c_log(s, "会话建立: unix=%s codec=%d %dx%d 帧传输=%s",
+                  cfg->sock_path, cfg->codec, cfg->width, cfg->height,
+                  s->xfer == DMD_XFER_SHM ? "SHM" : "内联");
+    else
+        dmd_c_log(s, "会话建立: tcp=%u codec=%d %dx%d 帧传输=%s",
+                  (unsigned)port, cfg->codec, cfg->width, cfg->height,
+                  s->xfer == DMD_XFER_SHM ? "SHM" : "内联");
     return s;
 }
 

@@ -1,0 +1,184 @@
+name: build
+
+# 两个产物的构建环境完全不同，所以分成两个 job：
+#   decode-daemon      NDK 交叉编译，x86_64 runner 直接跑
+#   msm_drm_drv_video.so  必须在 aarch64 上编（Makefile 顶部有说明：
+#                         x86_64 交叉工具链缺 aarch64 glibc），走 QEMU 容器
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daemon:
+    name: decode-daemon (NDK aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+
+      - name: Build
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./build.sh
+
+      - name: Verify it is an aarch64 Android binary
+        run: |
+          file build/decode-daemon
+          file build/decode-daemon | grep -q 'ARM aarch64' || {
+            echo "not an aarch64 binary" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decode-daemon
+          path: build/decode-daemon
+          if-no-files-found: error
+
+  driver:
+    name: msm_drm_drv_video.so (native aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable aarch64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Debian trixie matches the container this driver actually runs in, so the
+      # libva and libdrm headers here are the ones it will be loaded against.
+      - name: Build in aarch64 Debian trixie
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/src" -w /src/vaapi-driver \
+            debian:trixie-slim bash -euxc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                build-essential pkg-config libva-dev libdrm-dev
+              make clean
+              make all
+              make check
+            '
+
+      - name: Verify it is an aarch64 shared object
+        run: |
+          file vaapi-driver/build/msm_drm_drv_video.so
+          file vaapi-driver/build/msm_drm_drv_video.so | grep -q 'ARM aarch64' || {
+            echo "not an aarch64 shared object" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msm_drm_drv_video.so
+          path: vaapi-driver/build/msm_drm_drv_video.so
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [ daemon, driver ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      # Full history and tags: the per-component diff below needs the previous
+      # tag, which a shallow clone does not have.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Same three assets every release has shipped since v0.3.0, so the
+      # download URLs stay predictable.
+      - name: Checksums
+        run: |
+          cd dist
+          ls -la
+          sha256sum decode-daemon msm_drm_drv_video.so > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract release notes for this tag
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Pull just this version's section out of the changelog.
+          awk -v want="## ${tag}" '
+            $0 == want { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no CHANGELOG section for ${tag}" >&2
+            exit 1
+          fi
+          wc -l notes.md
+
+      # Every release ships all three assets, so a reader cannot tell from the
+      # file list which component actually changed. Worse, a rebuild on a
+      # different toolchain changes a binary's checksum with no source change at
+      # all, which looks like a silent code change. Say which source trees moved
+      # and pin the compiler, so a changed checksum is always explainable.
+      - name: Describe what changed per component
+        run: |
+          prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          {
+            echo
+            echo '### 本次各组件的改动范围'
+            echo
+            if [ -n "$prev" ]; then
+              echo "与 \`${prev}\` 相比："
+              echo
+              daemon_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- src/ | wc -l)
+              driver_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | wc -l)
+
+              if [ "$daemon_changed" -gt 0 ]; then
+                echo "- **\`decode-daemon\`**：源码有改动（\`src/\` 下 ${daemon_changed} 个文件）"
+                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- src/ | sed 's/^/      /'
+              else
+                echo "- **\`decode-daemon\`**：**源码无改动**（\`src/\` 零变更）。"
+                echo "  二进制的 checksum 仍可能与上一版不同，因为它是在 CI 上用固定版本的 NDK"
+                echo "  重新编译的，而上一版可能来自不同工具链。行为未变，协议未变。"
+              fi
+
+              if [ "$driver_changed" -gt 0 ]; then
+                echo "- **\`msm_drm_drv_video.so\`**：源码有改动（\`vaapi-driver/src/\` 下 ${driver_changed} 个文件）"
+                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | sed 's/^/      /'
+              else
+                echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更），同上。"
+              fi
+            else
+              echo "首个带此说明的版本，无法与上一 tag 比较。"
+            fi
+            echo
+            echo '### 构建环境'
+            echo
+            echo '| 产物 | 工具链 |'
+            echo '|---|---|'
+            echo "| \`decode-daemon\` | Android NDK r26d，target API 29 |"
+            echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64，系统 gcc |"
+            echo
+            echo '> 换工具链会改变二进制的 checksum，即使源码一字未动。要判断是否真有'
+            echo '> 代码改动，看上面的「改动范围」而不是 checksum。'
+          } >> notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/decode-daemon
+            dist/msm_drm_drv_video.so
+            dist/SHA256SUMS
+          body_path: notes.md
+          fail_on_unmatched_files: true
