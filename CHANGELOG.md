@@ -1,5 +1,46 @@
 # 更新日志
 
+## v0.3.2
+
+日志修正与结论订正。协议未变，解码路径无改动，与 v0.3.1 完全兼容。
+
+### 修复：会话建立日志把 Unix socket 谎报成 TCP
+
+`dmd_client.c` 里那条 `会话建立` 日志无条件打印 `port=%u` 与 `传输=TCP`，
+即使连接实际走的是 `sock_path`。连接分派本身一直是对的（`sock_path` 优先），
+错的只有日志。
+
+代价不小：排查时看到 `port=20003 传输=TCP` 会认定驱动忽略了 `DMD_ENDPOINT`、
+硬走 TCP 兜底，据此一路查错方向。实际上 Unix socket 早已连通。
+
+根子是把两个概念挤进了一个字段：`s->xfer` 描述的是**帧传输方式**
+（内联 / SHM），**控制通道类型**（Unix socket / TCP）是另一件事。现在分开报，
+走 Unix socket 时打印路径而不是那个没用上的端口号。
+
+### 结论订正：v0.3.1 对 SELinux 规则的判断下过头了
+
+v0.3.1 的诊断骨架是对的 —— `binder { transfer }` 确实按 **sender** 判定、
+denial 确实被 `dontaudit` 静默。但它进一步断言「以 `droidspacesd` 为 subject
+加规则不会有任何效果」，**这一步是错的**。
+
+实测：补上五条以 `hwservicemanager` 为 subject、`droidspacesd` 为 target 的
+规则后，硬解从「每次必崩」变为逐字节正确，连续 117 个会话无新 tombstone。
+
+两者不矛盾，是链条上先后两环：codec 客户端要先解析
+`android.hidl.manager@1.2::IServiceManager`，拿不到 hwservicemanager 就根本
+走不到 IOmx 那一步。v0.3.1 看到的 `EX_TRANSACTION_FAILED for ...::IOmx` 是
+**已经越过**第一环之后的现象。
+
+另一半原因是总线不对称：媒体编解码走 **hwbinder**，而策略里既有的
+`servicemanager` 规则只覆盖 **system binder**。这正是「PulseAudio 一直能
+出声、硬解却必崩」的原因 —— 音频走的是 system binder。
+
+完整规则与推导见 [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) §2.2。
+
+教训：`droidspacesd` 是 permissive 域，只说明「以它为 subject 的**访问检查**
+不阻断」，不等于「任何写法里出现它都无效」。它作为 **target** 时判定按 sender
+走，照样生效。
+
 ## v0.3.1
 
 守护进程稳定性修复。协议未变，驱动逻辑无改动，与 v0.3.0 完全兼容。
