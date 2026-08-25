@@ -376,11 +376,20 @@ int main(int argc, char *argv[])
         default:             cid = COMM_CODEC_H264; break;
         }
         /* 握手是必需的：失败说明 daemon 版本不匹配或拒绝了该配置，
-         * 继续发数据只会得到错位的结果，直接中止更有意义。 */
-        if (comm_handshake(comm, cid, vid_width, vid_height) != 0) {
-            fprintf(stderr, "[main] 握手失败，中止（客户端与 daemon 需配套发布）\n");
+         * 继续发数据只会得到错位的结果，直接中止更有意义。
+         * 返回 -2 是 endpoint inode 校验失败（连到了旧 socket）——
+         * 用独立退出码 7 标识，脚本可据此与其它失败区分。 */
+        int hr = comm_handshake(comm, cid, vid_width, vid_height);
+        if (hr != 0) {
+            if (hr == -2)
+                fprintf(stderr, "[main] endpoint inode 校验失败，中止\n");
+            else
+                fprintf(stderr, "[main] 握手失败，中止（客户端与 daemon 需配套发布）\n");
             comm_close(comm);
-            if (pass == 1) { if (renderer) renderer_destroy(renderer); return 1; }
+            if (pass == 1) {
+                if (renderer) renderer_destroy(renderer);
+                return (hr == -2) ? 7 : 1;
+            }
             break;
         }
         if (pass == 1) {

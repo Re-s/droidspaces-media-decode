@@ -35,11 +35,12 @@
 #include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 /* ---- 协议常量，必须与 src/decode-daemon.c 保持一致 ---- */
 #define DMD_HELLO_MAGIC       0x444D4400u
-#define DMD_HELLO_VERSION     2u
+#define DMD_HELLO_VERSION     3u      /* v3: 响应可携带 endpoint dev/ino 扩展 */
 #define DMD_FMTDESC_SENTINEL  0xFFFFFFFFu
 /* 格式描述块头部第 2 个字的能力标志（旧 daemon 恒为 0）。
  * CAP_FRAME_PTS：帧头带额外的 PTS 字段 = 该帧对应的输入单元序号，
@@ -62,6 +63,10 @@ struct dmd_session {
 
     int codec;
     int io_timeout_ms;
+
+    char ep_path[108];      /* 路径式 unix 模式下记录 connect 所用路径，
+                             * 握手后对它 stat 与 daemon 上报的 dev/ino 对账。
+                             * TCP / 抽象命名空间模式为空串。 */
 
     int xfer;               /* 实际生效的传输模式 */
     int input_finished;     /* 已 shutdown(SHUT_WR) */
@@ -484,6 +489,8 @@ static int unix_connect(struct dmd_session *s, const char *path,
                           path, timeout_ms, err) < 0)
         return -1;
 
+    /* 记录端点路径供握手后做 inode 对账（见 do_handshake） */
+    snprintf(s->ep_path, sizeof(s->ep_path), "%s", path);
     s->fd = fd;
     return 0;
 }
@@ -491,11 +498,14 @@ static int unix_connect(struct dmd_session *s, const char *path,
 /*
  * 握手。请求固定 24 字节：
  *   [4B 魔数][4B 版本][4B codec][4B 宽][4B 高][4B 传输模式]
- * 全部大端。daemon 先读 4 字节魔数（decode-daemon.c:335），
- * 再一次读余下 20 字节（:349-350），所以必须一次写满 24 字节。
+ * 全部大端。daemon 先读 4 字节魔数，再一次读余下 20 字节，
+ * 所以必须一次写满 24 字节。本客户端发 version=3。
  *
- * 响应至少 12 字节：[4B status][4B 实际模式][4B 名字长度 n]，之后 n 字节名字。
- * 拒绝路径同样回 12 字节（:344、:376），所以这里对 status!=0 也照读三个字。
+ * 响应至少 12 字节：[4B status][4B 实际模式][4B 名字长度 n]。
+ * v3（daemon>=v0.3.x 配套版本）在 status==0 时把 bit31 置入"名字长度"字段，
+ * 并在其后、名字之前追加 16 字节 endpoint 扩展（dev/ino 各拆高低 u32）；
+ * 客户端对 connect 路径 stat 对账，不一致返回 DMD_ERR_ENDPOINT_MISMATCH。
+ * 旧 daemon 回裸 12 字节 → 跳过校验（一次性 WARN）。错误路径同样是裸 12 字节。
  */
 static int do_handshake(struct dmd_session *s,
                         const struct dmd_session_config *cfg,
@@ -531,7 +541,44 @@ static int do_handshake(struct dmd_session *s,
 
     uint32_t status = ntohl(head[0]);
     uint32_t mode   = ntohl(head[1]);
-    uint32_t nlen   = ntohl(head[2]);
+    uint32_t nlen_w = ntohl(head[2]);
+    int      has_ext = (nlen_w >> 31) != 0;   /* v3: bit31 = 带 endpoint 扩展 */
+    uint32_t nlen   = nlen_w & 0x7fffffffu;
+    uint64_t ep_dev = 0, ep_ino = 0;
+
+    /* daemon 的错误路径回的是裸 12 字节（nlen=0），先处理拒绝再读后续字节 */
+    if (status != 0) {
+        const char *why = (status == 1) ? "daemon 拒绝握手: 协议版本不支持"
+                        : (status == 2) ? "daemon 拒绝握手: codec 不支持"
+                        : (status == 3) ? "daemon 拒绝握手: 分辨率超出 96x96~8192x4320"
+                        : (status == 4) ? "daemon 拒绝握手: 缺少握手"
+                        : "daemon 拒绝握手: 未知 status";
+        err_set(&s->err, DMD_ERR_REJECTED, (int)status, why, 0);
+        if (err)
+            *err = s->err;
+        return -1;
+    }
+
+    /* v3 endpoint 扩展：[u32 dev_hi][u32 dev_lo][u32 ino_hi][u32 ino_lo]，大端 */
+    if (has_ext) {
+        uint32_t ext[4];
+        if (recv_exact(s, ext, sizeof(ext),
+                       s->io_timeout_ms, s->io_timeout_ms) != DMD_OK) {
+            sess_err(s, DMD_ERR_PROTOCOL, "读取 endpoint 扩展失败", 0);
+            if (err)
+                *err = s->err;
+            return -1;
+        }
+        ep_dev = ((uint64_t)ntohl(ext[0]) << 32) | ntohl(ext[1]);
+        ep_ino = ((uint64_t)ntohl(ext[2]) << 32) | ntohl(ext[3]);
+    } else {
+        /* 旧 daemon（协议<3）不携带端点信息。只提醒一次，避免每连接刷屏。 */
+        static int warned_legacy;
+        if (!warned_legacy) {
+            warned_legacy = 1;
+            dmd_c_log(s, "daemon 未上报 endpoint inode（协议<3），跳过 inode 校验");
+        }
+    }
 
     char name[64];
     memset(name, 0, sizeof(name));
@@ -550,16 +597,51 @@ static int do_handshake(struct dmd_session *s,
         }
     }
 
-    if (status != 0) {
-        const char *why = (status == 1) ? "daemon 拒绝握手: 协议版本不支持"
-                        : (status == 2) ? "daemon 拒绝握手: codec 不支持"
-                        : (status == 3) ? "daemon 拒绝握手: 分辨率超出 96x96~8192x4320"
-                        : (status == 4) ? "daemon 拒绝握手: 缺少握手"
-                        : "daemon 拒绝握手: 未知 status";
-        err_set(&s->err, DMD_ERR_REJECTED, (int)status, why, 0);
-        if (err)
-            *err = s->err;
-        return -1;
+    /*
+     * endpoint inode 对账 —— 本函数的核心新增。
+     *
+     * connect 成功只说明"路径上有个活着的监听者"，不说明它是我们要的那个。
+     * 若平台把单个 socket 文件（而非目录）做 bind mount，daemon 重启换 inode
+     * 后，客户端侧解析到的是孤立旧 socket：症状曾是静默退化成软解或断流，
+     * 两侧 stat 甚至可能显示同一个孤立 inode，人工极难定位。
+     * 现在 daemon 在响应里如实上报自己监听路径的 (st_dev, st_ino)，客户端对
+     * 自己 connect 所用路径 stat 对账；不一致就立刻失败并给出可行动的解释。
+     * 绝不带病继续跑 —— 那正是本机制要消灭的"假装连接"。
+     */
+    if (s->ep_path[0] && !(ep_dev == 0 && ep_ino == 0)) {
+        struct stat st;
+        if (stat(s->ep_path, &st) != 0) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "无法 stat endpoint %s 核对 inode，拒绝继续", s->ep_path);
+            sess_err(s, DMD_ERR_ENDPOINT_MISMATCH, msg, 1);
+            if (err)
+                *err = s->err;
+            return -1;
+        }
+        uint64_t my_dev = (uint64_t)st.st_dev, my_ino = (uint64_t)st.st_ino;
+        if (my_dev != ep_dev || my_ino != ep_ino) {
+            /* 详细数值走日志（不受 err.msg 192 字节限制）；
+             * err.msg 只放紧凑但可行动的核心结论。 */
+            if (s->log)
+                dmd_c_log(s, "endpoint inode 不匹配详情: path=%s "
+                             "stat(dev=%llu,ino=%llu) != daemon(dev=%llu,ino=%llu)",
+                          s->ep_path,
+                          (unsigned long long)my_dev, (unsigned long long)my_ino,
+                          (unsigned long long)ep_dev, (unsigned long long)ep_ino);
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "endpoint inode mismatch: stat(ino=%llu) != daemon(ino=%llu)"
+                     "; 挂载点指向旧 socket（bind mount 应挂目录而非 socket 文件）",
+                     (unsigned long long)my_ino, (unsigned long long)ep_ino);
+            sess_err(s, DMD_ERR_ENDPOINT_MISMATCH, msg, 0);
+            if (err)
+                *err = s->err;
+            return -1;
+        }
+        if (s->log)
+            dmd_c_log(s, "endpoint 校验通过: dev=%llu ino=%llu",
+                      (unsigned long long)my_dev, (unsigned long long)my_ino);
     }
 
     /* mode==SHM 只是 daemon 的意向：响应在 memfd 交接之前发出

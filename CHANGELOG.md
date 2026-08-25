@@ -1,5 +1,47 @@
 # 更新日志
 
+## v0.3.2（未发布）
+
+新增 endpoint inode 校验：客户端与服务端对账监听 socket 的真实身份，
+不一致立即报错拒绝连接 —— 消灭"连着但其实是死 socket"的假装连接状态。
+协议向后兼容：v2 客户端/服务端不受影响，可分别滚动升级。
+
+### 新增：握手响应携带 endpoint dev/ino（协议 v3）
+
+daemon 在 `bind+listen` 成功后对自己监听路径 `stat()` 一次，
+握手响应里如实上报 `(st_dev, st_ino)`；客户端对 connect 所用路径 stat 对账。
+两者不一致 = 客户端解析到的不是这个 daemon 的端点。
+
+典型病灶：平台把**单个 socket 文件**而非目录做 bind mount。daemon 重启必
+unlink+重建 socket 换 inode，容器侧持死引用 —— 此前症状是连接失败或静默退化成
+软解，且两侧 stat 可能显示同一个孤立 inode，人工诊断极难（本项目多次误判）。
+现在这一步变成自动报错：`DMD_ERR_ENDPOINT_MISMATCH`（驱动侧）/ 独立退出码 7
+（独立客户端），错误信息直接给出四元组数值与"改用目录级挂载"的可行动结论。
+
+细节：
+- 响应名字长度字段的 bit31 作扩展标记，其后追加 16 字节
+  `[dev_hi][dev_lo][ino_hi][ino_lo]`（各大端 u32）；错误路径恒为裸 12 字节
+- TCP / 抽象命名空间模式无路径概念，填 0，客户端跳过校验
+- 版本判定从严格相等改为区间 `2..3`，允许两端分别滚动更新
+- 服务端启动日志新增 `listening endpoint: dev=%llu ino=%llu` 行
+- 测试钩子（勿在生产设置）：`DMD_TEST_FAKE_INO="dev:ino"` 上报假值、
+  `DMD_TEST_REPLY_LEGACY=1` 强制旧格式回包，用于验证客户端两条分支
+
+### 修复：补 `<fcntl.h>` include
+
+源码使用 `open(O_*)` 却未包含 `<fcntl.h>`，bionic/glibc 靠 `<sys/file.h>`
+间接传递才编译通过，musl 直接失败。显式补上，交叉工具链不再挑环境。
+
+### 验证（本机，无设备参与）
+
+- 双工具链零警告：glibc + aarch64-linux-musl 14.2.0（daemon 与客户端库均过）
+- v3 匹配路径：上报值 == stat 值，两客户端实现均正常建立会话
+- 不匹配路径（FAKE_INO）：驱动库返回 `DMD_ERR_ENDPOINT_MISMATCH` 并打印
+  四元组详情；独立客户端 exit 7；SHM 名字解析不受扩展影响
+- 降级路径（REPLY_LEGACY）：一次性 WARN 后照常工作，v2 裸 12 字节兼容
+- 目录模式重启重连：inode 变更后新连接自动对上，无误报
+- 真机（文件级 bind mount 死 inode 场景）验证待设备恢复后进行
+
 ## v0.3.1
 
 守护进程稳定性修复。协议未变，驱动逻辑无改动，与 v0.3.0 完全兼容。
