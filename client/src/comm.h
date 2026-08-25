@@ -93,7 +93,8 @@ int comm_get_format(CommContext *ctx, CommFormat *out);
  * 缺少握手会被直接拒绝连接（客户端与 daemon 配套发布，无兼容模式）。
  *
  * 返回 0 成功；>0 为 daemon 拒绝的状态码
- * （1=版本不支持 2=未知 codec 3=分辨率超范围 4=缺少握手）；-1 为通信失败。
+ * （1=版本不支持 2=未知 codec 3=分辨率超范围 4=缺少握手）；-1 为通信失败；
+ * -2 为 endpoint inode 校验失败（挂载点指向旧 socket，详见 stderr 说明）。
  */
 int comm_handshake(CommContext *ctx, int codec_id, int width, int height);
 

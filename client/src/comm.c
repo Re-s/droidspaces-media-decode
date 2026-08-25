@@ -19,11 +19,12 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <stddef.h>
 
 /* 握手常量，须与 daemon 的 decode-daemon.c 保持一致 */
 #define HELLO_MAGIC      0x444D4400u
-#define HELLO_VERSION    2      /* v2: 增加共享内存传输协商 */
+#define HELLO_VERSION    3      /* v2: SHM 协商；v3: 响应带 endpoint dev/ino 扩展 */
 #define FMTDESC_BYTES    32
 /* 帧头 frame_size 取该值表示"这不是帧，而是格式描述块" */
 #define FMTDESC_SENTINEL 0xFFFFFFFFu
@@ -40,6 +41,10 @@ struct CommContext {
     int negotiated;      /* 已完成握手 */
     CommFormat fmt;      /* 格式描述块内容 */
     int annexb;          /* 是否自动补 Annex B 起始码，默认 1 */
+
+    /* endpoint inode 对账用：文件系统路径模式下记录 connect 所用路径。
+     * TCP / abstract（'@' 开头）模式为空串，握手时跳过校验。 */
+    char ep_path[108];
 
     /* 共享内存传输 */
     CommXferMode want_xfer;   /* 请求的模式 */
@@ -248,6 +253,8 @@ CommContext *comm_connect(const char *socket_path)
                 fprintf(stderr, "[comm] 无法连接到 %s: %s\n", socket_path, strerror(errno));
                 goto fail;
             }
+            /* 记录端点路径供握手后做 inode 对账（见 comm_handshake） */
+            snprintf(ctx->ep_path, sizeof(ctx->ep_path), "%s", socket_path);
         }
         printf("[comm] 已连接到 daemon: %s\n", socket_path);
     }
@@ -282,7 +289,7 @@ int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
         return -1;
     }
 
-    /* 响应: [4B status][4B 实际模式][4B 名字长度][名字...] */
+    /* 响应: [4B status][4B 实际模式][4B 名字长度(可能带 v3 扩展位)][扩展?][名字...] */
     uint32_t head[3];
     if (reliable_read(ctx->fd, head, sizeof(head)) != 0) {
         fprintf(stderr, "[comm] 未收到握手响应（daemon 版本不匹配？客户端与 daemon 需配套）\n");
@@ -290,7 +297,38 @@ int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
     }
     uint32_t status = ntohl(head[0]);
     uint32_t mode   = ntohl(head[1]);
-    uint32_t nlen   = ntohl(head[2]);
+    uint32_t nlen_w = ntohl(head[2]);
+    int      has_ext = (nlen_w >> 31) != 0;   /* v3: bit31 = 带 endpoint 扩展 */
+    uint32_t nlen   = nlen_w & 0x7fffffffu;
+    unsigned long long ep_dev = 0, ep_ino = 0;
+
+    /* daemon 的错误路径回裸 12 字节，先处理拒绝再读后续 */
+    if (status != 0) {
+        const char *why = (status == 1) ? "协议版本不支持"
+                        : (status == 2) ? "编解码器不支持"
+                        : (status == 3) ? "分辨率超出硬件范围"
+                        : (status == 4) ? "缺少握手"
+                        : "未知原因";
+        fprintf(stderr, "[comm] daemon 拒绝握手: %s (status=%u)\n", why, status);
+        return (int)status;
+    }
+
+    /* v3 endpoint 扩展：dev/ino 各拆高低两个大端 u32，共 16 字节 */
+    if (has_ext) {
+        uint32_t ext[4];
+        if (reliable_read(ctx->fd, ext, sizeof(ext)) != 0) {
+            fprintf(stderr, "[comm] 读取 endpoint 扩展失败\n");
+            return -1;
+        }
+        ep_dev = ((unsigned long long)ntohl(ext[0]) << 32) | ntohl(ext[1]);
+        ep_ino = ((unsigned long long)ntohl(ext[2]) << 32) | ntohl(ext[3]);
+    } else {
+        static int warned_legacy;
+        if (!warned_legacy) {
+            warned_legacy = 1;
+            fprintf(stderr, "[comm] daemon 未上报 endpoint inode（协议<3），跳过 inode 校验\n");
+        }
+    }
 
     char name[64] = { 0 };
     if (nlen > 0) {
@@ -304,14 +342,31 @@ int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
         }
     }
 
-    if (status != 0) {
-        const char *why = (status == 1) ? "协议版本不支持"
-                        : (status == 2) ? "编解码器不支持"
-                        : (status == 3) ? "分辨率超出硬件范围"
-                        : (status == 4) ? "缺少握手"
-                        : "未知原因";
-        fprintf(stderr, "[comm] daemon 拒绝握手: %s (status=%u)\n", why, status);
-        return (int)status;
+    /*
+     * endpoint inode 对账：connect 成功 ≠ 连到的是"我们以为的那个" daemon。
+     * 平台把单个 socket 文件（而非目录）bind mount 进容器时，daemon 重启换
+     * inode 后这里会连到孤立旧 socket —— 症状曾是静默软解/断流且极难诊断。
+     * 不一致就立刻报错退出（-2），绝不带病继续跑。
+     */
+    if (ctx->ep_path[0] && !(ep_dev == 0 && ep_ino == 0)) {
+        struct stat st;
+        if (stat(ctx->ep_path, &st) != 0) {
+            fprintf(stderr, "[comm] endpoint inode mismatch: 无法 stat %s (%s)"
+                            " —— daemon 可能在握手中重启，拒绝继续\n",
+                    ctx->ep_path, strerror(errno));
+            return -2;
+        }
+        unsigned long long my_dev = (unsigned long long)st.st_dev;
+        unsigned long long my_ino = (unsigned long long)st.st_ino;
+        if (my_dev != ep_dev || my_ino != ep_ino) {
+            fprintf(stderr,
+                    "[comm] endpoint inode mismatch: path=%s stat(dev=%llu,ino=%llu)"
+                    " != daemon(dev=%llu,ino=%llu)。挂载点指向旧 socket"
+                    "（典型原因: bind mount 挂的是 socket 文件而非目录），拒绝继续\n",
+                    ctx->ep_path, my_dev, my_ino, ep_dev, ep_ino);
+            return -2;
+        }
+        printf("[comm] endpoint 校验通过: dev=%llu ino=%llu\n", my_dev, my_ino);
     }
 
     ctx->negotiated = 1;

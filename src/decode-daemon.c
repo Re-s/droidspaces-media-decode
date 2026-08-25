@@ -35,6 +35,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock：判活，见 main 里的锁逻辑 */
+#include <fcntl.h>      /* open/O_* ：勿依赖 <sys/file.h> 间接传递，
+                         * bionic/glibc 能过而 musl 直接编译失败（2026-08-25 实测） */
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <stddef.h>
@@ -133,7 +135,43 @@ static void on_signal(int s)
  * 行为与旧版完全一致，无需任何改动。
  */
 #define HELLO_MAGIC     0x444D4400u
-#define HELLO_VERSION   2      /* v2: 增加共享内存传输协商 */
+#define HELLO_VERSION   3      /* v2: 增加共享内存传输协商
+                                * v3: 响应可携带 endpoint dev/ino 扩展（见 do_handshake） */
+
+/*
+ * 监听端点的 (st_dev, st_ino)：unix 分支 bind+listen 成功后对最终 socket 路径
+ * stat 一次，之后每个握手响应原样上报。客户端拿它和自己 stat 同一路径的结果
+ * 比对 —— 不一致说明客户端侧解析到的是旧 socket（典型病因：平台把单个 socket
+ * 文件而非目录做 bind mount，daemon 重启换 inode 后容器侧持死引用）。
+ * 历史上这个场景两侧 stat 可能"看起来一致"（孤立 inode），人工诊断极难；
+ * 让 daemon 报真值、客户端做校验，把这个诊断变成自动报错。
+ * TCP 模式与抽象命名空间模式没有路径概念，保持 0，客户端据此跳过校验。
+ */
+static uint64_t g_ep_dev = 0;
+static uint64_t g_ep_ino = 0;
+
+/* bind/listen 成功后调用：采集真实端点标识，并应用 TEST-ONLY 覆盖。 */
+static void endpoint_probe(const char *sock_path)
+{
+    struct stat st;
+    if (sock_path && stat(sock_path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        g_ep_dev = (uint64_t)st.st_dev;
+        g_ep_ino = (uint64_t)st.st_ino;
+    }
+    /* ---- TEST-ONLY：仅供本机验证客户端的降级/不匹配路径，部署环境勿设 ---- */
+    const char *fake = getenv("DMD_TEST_FAKE_INO");
+    if (fake && *fake) {
+        unsigned long long d = 0, i = 0;
+        if (sscanf(fake, "%llu:%llu", &d, &i) == 2) {
+            g_ep_dev = (uint64_t)d;
+            g_ep_ino = (uint64_t)i;
+            fprintf(stderr, "[TEST-ONLY] endpoint 上报被覆盖为 dev=%llu ino=%llu\n",
+                    d, i);
+        } else {
+            fprintf(stderr, "[TEST-ONLY] DMD_TEST_FAKE_INO 格式应为 \"dev:ino\"，忽略\n");
+        }
+    }
+}
 #define FMTDESC_WORDS   8
 /* 帧头 frame_size 取这些值时表示不是帧数据，而是控制消息 */
 #define FMTDESC_SENTINEL 0xFFFFFFFFu   /* 随后 32 字节格式描述块 */
@@ -371,9 +409,10 @@ static void shm_teardown(Session *s);
 
 /*
  * 握手。读前 4 字节：
- *   等于魔数    → 继续读余下 20 字节，按声明配置会话，回 8 字节响应
- *   不等于魔数  → 协议不符，拒绝连接
+ *   等于魔数    → 继续读余下 20 字节，按声明配置会话，回握手响应
+ *   不等于魔数  → 协议不符，拒绝连接（回裸 12 字节 status=4）
  * 返回 0 表示可以继续，-1 表示应当断开。
+ * 响应格式与版本协商详见函数内注释与本文件 HELLO_VERSION 处说明。
  */
 static int do_handshake(Session *s)
 {
@@ -406,8 +445,12 @@ static int do_handshake(Session *s)
     uint32_t status = 0;
     const char *mime = (cid < CODEC_MAX) ? codec_mime((int)cid) : NULL;
 
-    if (ver != HELLO_VERSION) {
-        dlog(1, "[%d] 握手版本不支持: %u", s->id, ver);
+    /* 版本协商：daemon 支持 {2..HELLO_VERSION}。不再要求严格相等 ——
+     * 严格相等意味着 daemon 与驱动必须同步升级，任何一端先更新就全体断连。
+     * 客户端 version>=3 时响应携带 endpoint 扩展；v2 客户端收到与旧版
+     * 完全相同的 12 字节，行为不变。 */
+    if (ver < 2 || ver > HELLO_VERSION) {
+        dlog(1, "[%d] 握手版本不支持: %u（支持 2..%d）", s->id, ver, HELLO_VERSION);
         status = 1;
     } else if (!mime) {
         dlog(1, "[%d] 未知 codec id: %u", s->id, cid);
@@ -444,10 +487,31 @@ static int do_handshake(Session *s)
     /*
      * 响应：[4B status][4B 实际模式][4B 名字长度][名字...]
      * TCP 模式下名字长度为 0，不跟任何字节。
+     *
+     * v3 扩展（客户端请求 version>=3 时）：namelen 字段的 bit31 置 1 作为
+     * 标记（真实 namelen 远小于 2^31），随后在名字字节之前追加 16 字节：
+     *   [u32 dev_hi][u32 dev_lo][u32 ino_hi][u32 ino_lo]   （各自为大端）
+     * 即 g_ep_dev/g_ep_ino 各按 64 位拆高低两个 u32。
+     * v2 客户端的响应一个字节都不变；错误路径的响应也保持 12 字节裸格式，
+     * 客户端先看 status 再决定是否解析扩展。
+     *
+     * TEST-ONLY：DMD_TEST_REPLY_LEGACY=1 强制按 v2 形状回包，
+     * 用于验证客户端对旧 daemon 的降级路径。
      */
     size_t nlen = (want == XFER_SHM) ? strlen(s->shm_name) : 0;
-    uint32_t reply[3] = { htonl(0), htonl((uint32_t)want), htonl((uint32_t)nlen) };
+    int use_ext = (ver >= 3) && getenv("DMD_TEST_REPLY_LEGACY") == NULL;
+    uint32_t nlen_wire = (uint32_t)nlen;
+    if (use_ext)
+        nlen_wire |= 0x80000000u;
+    uint32_t reply[3] = { htonl(0), htonl((uint32_t)want), htonl(nlen_wire) };
     if (send_all(s->fd, reply, sizeof(reply)) < 0) goto reply_fail;
+    if (use_ext) {
+        uint32_t ext[4] = {
+            htonl((uint32_t)(g_ep_dev >> 32)), htonl((uint32_t)(g_ep_dev & 0xffffffffu)),
+            htonl((uint32_t)(g_ep_ino >> 32)), htonl((uint32_t)(g_ep_ino & 0xffffffffu)),
+        };
+        if (send_all(s->fd, ext, sizeof(ext)) < 0) goto reply_fail;
+    }
     if (nlen > 0 && send_all(s->fd, s->shm_name, nlen) < 0) goto reply_fail;
 
     if (want == XFER_SHM) {
@@ -1401,6 +1465,11 @@ int main(int argc, char **argv)
         }
         /* 与 TCP 分支保持同样的"启动成功"标志格式，外部脚本可统一匹配 */
         fprintf(stderr, "listening on %s\n", sock_path);
+        /* 采集端点标识供握手上报；TEST-ONLY 钩子在此一并生效。
+         * 这两行是 inode 校验机制的"服务端说真话"半边 —— 客户端拿它对账。 */
+        endpoint_probe(sock_path);
+        fprintf(stderr, "listening endpoint: dev=%llu ino=%llu\n",
+                (unsigned long long)g_ep_dev, (unsigned long long)g_ep_ino);
     } else {
         srv = socket(AF_INET, SOCK_STREAM, 0);
         if (srv < 0) { perror("socket"); return 1; }

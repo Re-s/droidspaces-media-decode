@@ -45,7 +45,12 @@ enum {
     DMD_ERR_TIMEOUT   = -6,   /* 等待超时 */
     DMD_ERR_PROTOCOL  = -7,   /* 收到不符合协议的字节 */
     DMD_ERR_STATE     = -8,   /* 会话状态不允许该操作（如已 finish_input 后再发） */
-    DMD_ERR_TOOBIG    = -9    /* 数据单元/帧超出协议上限 */
+    DMD_ERR_TOOBIG    = -9,   /* 数据单元/帧超出协议上限 */
+    DMD_ERR_ENDPOINT_MISMATCH = -10
+    /* 客户端 stat 到的 endpoint (dev,ino) 与 daemon 上报的不一致。
+     * 典型病因：平台把单个 socket 文件而非目录做 bind mount，daemon 重启后
+     * inode 变化，客户端侧解析到旧 socket。此错误不重试、不降级，
+     * 直接把错误抛给调用方（ffmpeg 会立刻看到失败而不是静默软解）。 */
 };
 
 /* daemon 的 codec id，与 decode-daemon.c 的 CodecId 一致 */
