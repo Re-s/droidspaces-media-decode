@@ -45,6 +45,8 @@ struct CommContext {
     /* endpoint inode 对账用：文件系统路径模式下记录 connect 所用路径。
      * TCP / abstract（'@' 开头）模式为空串，握手时跳过校验。 */
     char ep_path[108];
+    /* 原始连接目标（端口号/路径/@抽象名），版本降级重连时要用 */
+    char target[128];
 
     /* 共享内存传输 */
     CommXferMode want_xfer;   /* 请求的模式 */
@@ -260,6 +262,9 @@ CommContext *comm_connect(const char *socket_path)
     }
 
     /* 初始接收缓冲区 256KB */
+    /* 记下连接目标，供协议版本降级重连使用 */
+    snprintf(ctx->target, sizeof(ctx->target), "%s", socket_path);
+
     ctx->recv_buf_size = 256 * 1024;
     ctx->recv_buf = malloc(ctx->recv_buf_size);
     if (!ctx->recv_buf) goto fail;
@@ -271,7 +276,8 @@ fail:
     return NULL;
 }
 
-int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
+static int do_handshake_ver(CommContext *ctx, int codec_id, int width, int height,
+                            uint32_t use_version)
 {
     if (!ctx || ctx->fd < 0) return -1;
     if (ctx->negotiated) {
@@ -280,7 +286,7 @@ int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
     }
 
     uint32_t hello[6] = {
-        htonl(HELLO_MAGIC), htonl(HELLO_VERSION),
+        htonl(HELLO_MAGIC), htonl(use_version),
         htonl((uint32_t)codec_id), htonl((uint32_t)width), htonl((uint32_t)height),
         htonl((uint32_t)ctx->want_xfer)
     };
@@ -382,6 +388,36 @@ int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
         }
     }
     return 0;
+}
+
+/*
+ * 握手外壳：先发 v3，被旧 daemon 以 status=1 拒绝则降级 v2 重连再试。
+ *
+ * 必要性来自部署现实：daemon 由平台 App 投放（会被 App 更新覆盖回旧版），
+ * 驱动/客户端在容器内独立更新，"客户端新 / daemon 旧"是常态错配方向；
+ * 而 v0.3.1 及更早的 daemon 按严格相等判版本，见到 v3 直接拒绝并断开。
+ * 降级后走 v2 无扩展路径，inode 校验自动跳过（会打印说明）。
+ */
+int comm_handshake(CommContext *ctx, int codec_id, int width, int height)
+{
+    if (!ctx) return -1;
+    int r = do_handshake_ver(ctx, codec_id, width, height, HELLO_VERSION);
+    if (r == 1 && HELLO_VERSION > 2) {
+        fprintf(stderr, "[comm] daemon 不接受协议 v%d，降级为 v2 重试"
+                        "（inode 校验将跳过）\n", HELLO_VERSION);
+        close(ctx->fd);
+        ctx->fd = -1;
+        ctx->ep_path[0] = '\0';
+        /* daemon 拒绝后已断开连接，必须重连；复用 comm_connect 的连接逻辑 */
+        CommContext *tmp = comm_connect(ctx->target);
+        if (!tmp) return -1;
+        ctx->fd = tmp->fd;
+        tmp->fd = -1;                  /* 所有权转移，避免 comm_close 关掉它 */
+        snprintf(ctx->ep_path, sizeof(ctx->ep_path), "%s", tmp->ep_path);
+        comm_close(tmp);
+        r = do_handshake_ver(ctx, codec_id, width, height, 2u);
+    }
+    return r;
 }
 
 void comm_set_xfer(CommContext *ctx, CommXferMode mode)

@@ -1,6 +1,6 @@
 # 更新日志
 
-## v0.3.2（未发布）
+## v0.3.3（未发布）
 
 新增 endpoint inode 校验：客户端与服务端对账监听 socket 的真实身份，
 不一致立即报错拒绝连接 —— 消灭"连着但其实是死 socket"的假装连接状态。
@@ -32,15 +32,44 @@ unlink+重建 socket 换 inode，容器侧持死引用 —— 此前症状是连
 源码使用 `open(O_*)` 却未包含 `<fcntl.h>`，bionic/glibc 靠 `<sys/file.h>`
 间接传递才编译通过，musl 直接失败。显式补上，交叉工具链不再挑环境。
 
-### 验证（本机，无设备参与）
+### 修复：新客户端连旧 daemon 被硬拒（真机暴露）
 
-- 双工具链零警告：glibc + aarch64-linux-musl 14.2.0（daemon 与客户端库均过）
+v0.3.1 及更早的 daemon 按**严格相等**判协议版本，见到 v3 一律回 `status=1`
+并断开。而部署现实是 daemon 由平台 App 投放（会被 App 更新覆盖回旧版），
+驱动在容器内独立更新，"客户端新 / daemon 旧"是**常态**错配方向 ——
+真机上容器侧新驱动连生产 daemon 直接 `拒绝握手: 协议版本不支持`。
+
+现在客户端在 `status=1` 时自动重连并降级 v2 再试一次（daemon 拒绝后会断开，
+必须重连）。降级后走无扩展路径，inode 校验随之跳过并打印说明。
+只对 `status=1` 降级：codec/分辨率类拒绝换版本也没用。
+
+### 验证
+
+本机（glibc + aarch64-linux-musl 14.2.0，双工具链零警告）：
+
 - v3 匹配路径：上报值 == stat 值，两客户端实现均正常建立会话
-- 不匹配路径（FAKE_INO）：驱动库返回 `DMD_ERR_ENDPOINT_MISMATCH` 并打印
-  四元组详情；独立客户端 exit 7；SHM 名字解析不受扩展影响
-- 降级路径（REPLY_LEGACY）：一次性 WARN 后照常工作，v2 裸 12 字节兼容
+- 不匹配（`DMD_TEST_FAKE_INO`）：驱动库返回 `DMD_ERR_ENDPOINT_MISMATCH`
+  并打印四元组详情；独立客户端 exit 7；SHM 名字解析不受扩展影响
+- 旧格式响应（`DMD_TEST_REPLY_LEGACY`）：一次性 WARN 后照常工作
 - 目录模式重启重连：inode 变更后新连接自动对上，无误报
-- 真机（文件级 bind mount 死 inode 场景）验证待设备恢复后进行
+
+真机（骁龙设备，Android 宿主 + Droidspaces Debian 容器，静态 aarch64 harness）：
+
+- 宿主匹配路径：上报 `dev=64801 ino=1341980` 与 `stat` 逐位一致
+- **真·文件级 bind mount**（busybox `mount -o bind`，Android toybox 的 `mount`
+  会误走 losetup）：daemon 重启换 inode 后，经陈旧挂载连接在 `connect()`
+  阶段即被内核 `ECONNREFUSED` 拦下 —— **走不到握手，inode 校验不参与**。
+  这条路径本就由连接错误兜住，不会静默。
+- 可达的 mismatch（daemon 上报值 ≠ 客户端 stat 值）：驱动库 exit 7 +
+  `code=-10`，独立客户端 exit 7，两者都打全四元组
+- 对照：同一时刻正确的目录级路径连接正常，无误报
+- 跨 mount namespace（容器 → 宿主生产 daemon）：降级重试生效，会话建立
+
+> **边界更正**：先前把"文件级挂载死 inode"写成 inode 校验的主要战场，
+> 真机测下来不准确 —— 那一类在 connect 阶段就失败了。inode 校验真正覆盖的是
+> **连得上、但对面不是你以为的那个端点**（挂载视图分叉、错配的端点路径、
+> 多实例串台），这类才是原本会一路静默到出错帧的情形。
+
 ## v0.3.2
 
 日志修正与结论订正。协议未变，解码路径无改动，与 v0.3.1 完全兼容。

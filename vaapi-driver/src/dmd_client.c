@@ -509,11 +509,12 @@ static int unix_connect(struct dmd_session *s, const char *path,
  */
 static int do_handshake(struct dmd_session *s,
                         const struct dmd_session_config *cfg,
+                        uint32_t use_version,
                         struct dmd_error *err)
 {
     uint32_t hello[6];
     hello[0] = htonl(DMD_HELLO_MAGIC);
-    hello[1] = htonl(DMD_HELLO_VERSION);
+    hello[1] = htonl(use_version);
     hello[2] = htonl((uint32_t)cfg->codec);
     hello[3] = htonl((uint32_t)cfg->width);
     hello[4] = htonl((uint32_t)cfg->height);
@@ -730,9 +731,36 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         dmd_session_destroy(s);
         return NULL;
     }
-    if (do_handshake(s, cfg, err) < 0) {
-        dmd_session_destroy(s);
-        return NULL;
+    if (do_handshake(s, cfg, DMD_HELLO_VERSION, err) < 0) {
+        /*
+         * 版本降级重试：daemon 侧 v0.3.1 及更早按**严格相等**判版本，
+         * 见到 v3 一律回 status=1 并断开。部署上 daemon 由平台 App 投放、
+         * 驱动在容器内独立更新，"驱动新 / daemon 旧"是常态错配方向，
+         * 所以这里自动退一步用 v2 重连再试一次（v2 响应无 endpoint 扩展，
+         * inode 校验随之跳过 —— 能用总比连不上好，且会打日志说明）。
+         * 只对 status=1 降级：其它拒绝原因（codec/分辨率）换版本也没用。
+         */
+        if (s->err.code == DMD_ERR_REJECTED && s->err.handshake_status == 1 &&
+            DMD_HELLO_VERSION > 2) {
+            dmd_c_log(s, "daemon 不接受协议 v%u，降级为 v2 重试"
+                         "（旧 daemon 按严格相等判版本；inode 校验将跳过）",
+                      (unsigned)DMD_HELLO_VERSION);
+            if (s->fd >= 0) {
+                close(s->fd);        /* daemon 拒绝后已断开，必须重连 */
+                s->fd = -1;
+            }
+            s->ep_path[0] = '\0';
+            memset(&s->err, 0, sizeof(s->err));
+            crc = cfg->sock_path ? unix_connect(s, cfg->sock_path, cto, err)
+                                 : tcp_connect(s, port, cto, err);
+            if (crc < 0 || do_handshake(s, cfg, 2u, err) < 0) {
+                dmd_session_destroy(s);
+                return NULL;
+            }
+        } else {
+            dmd_session_destroy(s);
+            return NULL;
+        }
     }
 
     /* 控制通道与帧传输是两件事，分开报。混在一起曾把走通的 Unix socket
