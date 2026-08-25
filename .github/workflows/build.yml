@@ -107,7 +107,12 @@ jobs:
               gcc -O2 -static -Wall -Wextra -o dmd-probe src/dmd-probe.c
               file dmd-probe | grep -q "ARM aarch64" || {
                 echo "not an aarch64 binary" >&2; exit 1; }
-              ./dmd-probe 2>/dev/null; rc=$?
+              # 无参运行必须返回用法退出码 3。注意 bash -e 下不能直接跑——
+              # 非 0 退出会立刻终止脚本，先关掉 errexit 再取码。
+              set +e
+              ./dmd-probe >/dev/null 2>&1
+              rc=$?
+              set -e
               [ "$rc" = "3" ] || { echo "probe usage rc=$rc, want 3" >&2; exit 1; }
             '
 
