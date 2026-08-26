@@ -14,24 +14,60 @@
 set -u
 
 MODDIR=${0%/*}
+# ⚠️ 路径大小写敏感：实际目录是 Droidspaces（大写 D），不是 droidspaces。
+# Android 的 f2fs/ext4 区分大小写，写错会得到"不存在或不可执行"。
 DS_DIR=/data/local/Droidspaces
-# 运行时文件收进自己的子目录，不污染平台的 Droidspaces 根目录
-# （那里是平台自己的 bin/ Containers/ Decode/ Logs/ Net/，
-#  早期版本把 .dmd-watchdog.{pid,lock,state} 直接扔在根下，是设计错误）
-RUN_DIR=${DS_DIR}/Decode/watchdog
-LOG=${DS_DIR}/Logs/dmd-watchdog.log
+
+# 本项目的全部文件统一收在 dmd/ 下，不再散落到平台的 bin/ Decode/ Logs/。
+# dmd = decode media daemon。布局：
+#   dmd/bin/     可执行文件（decode-daemon 等）
+#   dmd/run/     运行时文件（pid/lock/state/socket）
+#   dmd/logs/    日志
+DMD_DIR=${DS_DIR}/dmd
+BIN_DIR=${DMD_DIR}/bin
+RUN_DIR=${DMD_DIR}/run
+LOG_DIR=${DMD_DIR}/logs
+# socket 与其余运行时文件一同放在 dmd/run/，保持布局统一。
+#
+# ⚠️ 平台侧需要把宿主的这个目录挂进容器：
+#     /data/local/Droidspaces/dmd/run  →  容器 /run/dmd
+# 挂**目录**而不是单个 socket 文件：bind mount 绑的是 inode 而非路径，
+# 挂文件的话 daemon 一旦 unlink 重建 socket，挂载点就指向孤立 inode，
+# 表现为 connect 得到 ECONNREFUSED，必须重挂；挂目录则能自动跟上。
+#
+# 另外别想着"socket 建在别处再软链到挂载点" —— 软链是路径引用，
+# 容器内不存在宿主路径，链接目标解析不了（实测无效）。
+SOCK_DIR=${RUN_DIR}
+DAEMON=${BIN_DIR}/decode-daemon
+LOG=${LOG_DIR}/watchdog.log
 WD=${MODDIR}/dmd-watchdog.sh
 PIDFILE=${RUN_DIR}/watchdog.pid
 
 # 平台自启完成后的额外让位时间（秒）
 GRACE=${DMD_WD_GRACE:-45}
 
-mkdir -p "${DS_DIR}/Logs" "${RUN_DIR}" 2>/dev/null
+mkdir -p "${BIN_DIR}" "${RUN_DIR}" "${LOG_DIR}" 2>/dev/null
 
-# 迁移旧版散落在根目录的运行时文件（一次性，静默）
+# ── 一次性迁移：把历史上散落的文件收进 dmd/（静默，幂等） ──
+# 旧位置 -> 新位置
+#   Droidspaces/.dmd-watchdog.{pid,lock,state}  -> dmd/run/watchdog.*
+#   Droidspaces/Decode/watchdog/watchdog.*      -> dmd/run/watchdog.*
+#   Droidspaces/bin/{decode-daemon,dmd-*}       -> ded/bin/
+#   Droidspaces/Logs/{decode-daemon*,dmd-*}     -> ded/logs/
 for _o in pid lock state; do
     [ -f "${DS_DIR}/.dmd-watchdog.${_o}" ] && \
         mv -f "${DS_DIR}/.dmd-watchdog.${_o}" "${RUN_DIR}/watchdog.${_o}" 2>/dev/null
+    [ -f "${DS_DIR}/Decode/watchdog/watchdog.${_o}" ] && \
+        mv -f "${DS_DIR}/Decode/watchdog/watchdog.${_o}" "${RUN_DIR}/watchdog.${_o}" 2>/dev/null
+done
+rmdir "${DS_DIR}/Decode/watchdog" 2>/dev/null
+# 二进制：只在 dmd/bin 还没有时才搬，避免覆盖更新过的版本
+if [ ! -x "${DAEMON}" ] && [ -x "${DS_DIR}/bin/decode-daemon" ]; then
+    cp -p "${DS_DIR}/bin/decode-daemon" "${DAEMON}" 2>/dev/null
+    chmod 755 "${DAEMON}" 2>/dev/null
+fi
+for _l in "${DS_DIR}"/Logs/decode-daemon*.log "${DS_DIR}"/Logs/dmd-*.log; do
+    [ -f "${_l}" ] && mv -f "${_l}" "${LOG_DIR}/" 2>/dev/null
 done
 
 log() {

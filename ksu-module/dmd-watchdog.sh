@@ -30,13 +30,29 @@
 set -u
 
 MODDIR=${0%/*}
+# ⚠️ 大小写敏感：是 Droidspaces（大写 D），写成 droidspaces 会找不到文件。
 DS_DIR=/data/local/Droidspaces
-SOCK_DIR=${DS_DIR}/Decode
+
+# 本项目全部文件统一在 dmd/ 下（见 service.sh 的布局说明）
+DMD_DIR=${DS_DIR}/dmd
+BIN_DIR=${DMD_DIR}/bin
+RUN_DIR=${DMD_DIR}/run
+LOG_DIR=${DMD_DIR}/logs
+# socket 与其余运行时文件一同放在 dmd/run/，保持布局统一。
+#
+# ⚠️ 平台侧需要把宿主的这个目录挂进容器：
+#     /data/local/Droidspaces/dmd/run  →  容器 /run/dmd
+# 挂**目录**而不是单个 socket 文件：bind mount 绑的是 inode 而非路径，
+# 挂文件的话 daemon 一旦 unlink 重建 socket，挂载点就指向孤立 inode，
+# 表现为 connect 得到 ECONNREFUSED，必须重挂；挂目录则能自动跟上。
+#
+# 另外别想着"socket 建在别处再软链到挂载点" —— 软链是路径引用，
+# 容器内不存在宿主路径，链接目标解析不了（实测无效）。
+SOCK_DIR=${RUN_DIR}
 SOCK=${SOCK_DIR}/decode.sock
-DAEMON=${DS_DIR}/bin/decode-daemon
+DAEMON=${BIN_DIR}/decode-daemon
 PROBE=${MODDIR}/dmd-probe
-RUN_DIR=${DS_DIR}/Decode/watchdog
-LOG=${DS_DIR}/Logs/dmd-watchdog.log
+LOG=${LOG_DIR}/watchdog.log
 LOCK=${RUN_DIR}/watchdog.lock
 STATE=${RUN_DIR}/watchdog.state
 
@@ -56,7 +72,7 @@ LOG_MAX=${DMD_WD_LOG_MAX:-262144}
 CONF=${DS_DIR}/.dmd-watchdog.conf
 [ -f "${CONF}" ] && . "${CONF}"
 
-mkdir -p "${DS_DIR}/Logs" "${RUN_DIR}" 2>/dev/null
+mkdir -p "${BIN_DIR}" "${RUN_DIR}" "${LOG_DIR}" 2>/dev/null
 
 log() {
     echo "[$(date '+%m-%d %H:%M:%S' 2>/dev/null || date +%s)] $*" >> "${LOG}"
