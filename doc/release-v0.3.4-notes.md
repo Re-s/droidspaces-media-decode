@@ -14,13 +14,15 @@
 
 ```bash
 D=/usr/share/applications/google-chrome.desktop
-sudo cp "$D" "$D.bak"
-FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
-sudo sed -i \
-  -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
-  -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
-  "$D"
-grep -c "render-node-override" "$D"    # 输出 >=2 即成功,从图标启动即可
+if ! grep -q "render-node-override" "$D"; then     # 幂等:已配置则跳过
+    [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
+    FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+    sudo sed -i \
+      -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
+      -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
+      "$D"
+fi
+grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不随执行次数增长
 ```
 
 无 sudo 就从宿主侧改 `/mnt/Droidspaces/<容器名>/usr/share/applications/google-chrome.desktop`。
@@ -36,22 +38,24 @@ grep -c "render-node-override" "$D"    # 输出 >=2 即成功,从图标启动即
 
 ```bash
 P=~/.mozilla/firefox/$(grep -m1 '^Default=' ~/.mozilla/firefox/installs.ini | cut -d= -f2)
-mkdir -p "$P"
-cat >> "$P/user.js" <<'EOF'
-user_pref("media.ffmpeg.vaapi.enabled", true);
-user_pref("media.hardware-video-decoding.force-enabled", true);
-user_pref("media.gpu-process-decoding", true);
-user_pref("media.rdd-ffmpeg.enabled", true);
-EOF
-echo "已写入: $P/user.js" && tail -4 "$P/user.js"
+mkdir -p "$P"; touch "$P/user.js"
+add() { grep -qxF "$1" "$P/user.js" || echo "$1" >> "$P/user.js"; }   # 幂等:已存在则跳过
+add 'user_pref("media.ffmpeg.vaapi.enabled", true);'
+add 'user_pref("media.hardware-video-decoding.force-enabled", true);'
+add 'user_pref("media.gpu-process-decoding", true);'
+add 'user_pref("media.rdd-ffmpeg.enabled", true);'
+awk '!(/^user_pref/ && seen[$0]++)' "$P/user.js" > "$P/user.js.tmp" && mv "$P/user.js.tmp" "$P/user.js"
+grep -c '^user_pref' "$P/user.js"    # 每项应为 1
 ```
 
 ### ③ 关闭 RDD 解码进程沙箱（整段复制执行）
 
 ```bash
 F=/usr/share/applications/firefox-esr.desktop
-sudo cp "$F" "$F.bak"
-sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' "$F"
+if ! sudo grep -q "MOZ_DISABLE_RDD_SANDBOX" "$F"; then   # 幂等:已配置则跳过
+    sudo cp "$F" "$F.bak"
+    sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' "$F"
+fi
 grep -c "MOZ_DISABLE_RDD_SANDBOX" "$F"    # 输出 >=1 即成功
 ```
 

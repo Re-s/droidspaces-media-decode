@@ -46,19 +46,21 @@ google-chrome \
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
 
-### 3. 固化到桌面图标
+### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
-在容器终端里**整段复制执行**（自动备份原文件、给所有启动入口追加参数）：
+在容器终端里**整段复制执行**——已配置过的文件自动跳过，备份只在首次创建：
 
 ```shell
 D=/usr/share/applications/google-chrome.desktop
-sudo cp "$D" "$D.bak"
-FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
-sudo sed -i \
-  -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
-  -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
-  "$D"
-grep -c "render-node-override" "$D"    # 输出 >=2 即固化成功
+if ! grep -q "render-node-override" "$D"; then
+    [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
+    FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+    sudo sed -i \
+      -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
+      -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
+      "$D"
+fi
+grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执行次数增长
 ```
 
 容器内没有 sudo 时，从宿主侧改同一个文件
@@ -111,36 +113,39 @@ feedback 断链**，定量特征（向平台方报障时请附上）：
 Firefox 的 VA-API 走 ffmpeg 后端 + WebRender 提交，实测同视频完美流畅，
 是当前 HEVC 观看的首选。
 
-### 1. 写入硬解配置（一条命令，整段复制执行）
+### 1. 写入硬解配置（幂等：重复执行不会写重）
 
 背景：Firefox 的配置写在所选 profile 目录的 `user.js` 文件里；而"选中的
 profile"由 `~/.mozilla/firefox/installs.ini` 的 `Default=` 决定（注意
 `profiles.ini` 里老式 `Default=1` 标记无效，别看错文件）。下面的命令自动
-定位真实 profile 并追加配置：
+定位真实 profile、**逐条检查已存在则跳过**，重复执行安全：
 
 ```shell
 P=~/.mozilla/firefox/$(grep -m1 '^Default=' ~/.mozilla/firefox/installs.ini | cut -d= -f2)
-mkdir -p "$P"
-cat >> "$P/user.js" <<'EOF'
-user_pref("media.ffmpeg.vaapi.enabled", true);
-user_pref("media.hardware-video-decoding.force-enabled", true);
-user_pref("media.gpu-process-decoding", true);
-user_pref("media.rdd-ffmpeg.enabled", true);
-EOF
-echo "已写入: $P/user.js" && tail -4 "$P/user.js"
+mkdir -p "$P"; touch "$P/user.js"
+add() { grep -qxF "$1" "$P/user.js" || echo "$1" >> "$P/user.js"; }
+add 'user_pref("media.ffmpeg.vaapi.enabled", true);'
+add 'user_pref("media.hardware-video-decoding.force-enabled", true);'
+add 'user_pref("media.gpu-process-decoding", true);'
+add 'user_pref("media.rdd-ffmpeg.enabled", true);'
+# 顺手清理旧版本命令可能产生的重复行
+awk '!(/^user_pref/ && seen[$0]++)' "$P/user.js" > "$P/user.js.tmp" && mv "$P/user.js.tmp" "$P/user.js"
+grep -c '^user_pref' "$P/user.js"    # 每项应为 1
 ```
 
-看到四行 `user_pref(...)` 输出即成功。重启 Firefox 生效。
+重启 Firefox 生效。
 
-### 2. 关闭 RDD 沙箱（必需）
+### 2. 关闭 RDD 沙箱（必需，幂等）
 
 RDD（远程解码进程）的 seccomp 沙箱会拦截 `/dev/dri` 打开与 socket 连接，
-容器环境下必须放开。在容器终端整段复制执行（自动备份、改所有 Exec 入口）：
+容器环境下必须放开。已改过的文件会自动跳过：
 
 ```shell
 F=/usr/share/applications/firefox-esr.desktop
-sudo cp "$F" "$F.bak"
-sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' "$F"
+if ! sudo grep -q "MOZ_DISABLE_RDD_SANDBOX" "$F"; then
+    sudo cp "$F" "$F.bak"
+    sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' "$F"
+fi
 grep -c "MOZ_DISABLE_RDD_SANDBOX" "$F"   # 输出 >=1 即成功
 ```
 
