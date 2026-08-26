@@ -9,6 +9,61 @@
 
 ---
 
+## 零、先选对端点：浏览器必须钉住 TCP
+
+⚠️ **这一步比任何浏览器参数都重要，配错了后面全白做。**
+
+驱动的端点探测顺序是 **Unix socket 优先、TCP 兜底**：不设 `DMD_ENDPOINT` 时，
+只要 `/run/dmd/decode.sock` 存在就走它。而实测 **Unix socket 通道存在吞吐
+缺陷**，撑不起实时解码：
+
+| 端点 | 5s / 720p30 HEVC 码流 | 速度 |
+|---|---|---|
+| TCP 20003 | 153 NALU → **150 帧** | **8.6x** |
+| Unix socket | 52 NALU → **49 帧**（会话中断） | **0.92x** |
+
+socket 模式下 daemon 读 NALU 跟不上，MediaCodec 输入缓冲反复填不满，daemon
+日志打出 `输入缓冲暂满，重试 #1（等 5000 ms）`，等满 5 秒放弃会话。ffmpeg 侧
+表现为 `hardware accelerator failed to decode picture` 加大量 `decode errors`，
+**然后静默回落 CPU 软解**——用户只看到 CPU 飙高、视频卡顿，看不到任何硬解
+失败提示。
+
+所以给两个浏览器的 desktop 文件显式钉住 TCP（幂等，已配则跳过）：
+
+```shell
+D=/usr/share/applications
+for f in google-chrome.desktop firefox-esr.desktop; do
+    T="$D/$f"; [ -f "$T" ] || continue
+    grep -q DMD_ENDPOINT "$T" && { echo "$f: 已配置"; continue; }
+    sudo cp "$T" "$T.bak-dmd"
+    sudo sed -i \
+      -e 's|^Exec=env |Exec=env DMD_ENDPOINT=tcp:20003 |' \
+      -e 's|^Exec=/usr/bin/google-chrome-stable|Exec=env DMD_ENDPOINT=tcp:20003 /usr/bin/google-chrome-stable|' \
+      -e 's|^Exec=/usr/lib/firefox-esr/firefox-esr|Exec=env DMD_ENDPOINT=tcp:20003 /usr/lib/firefox-esr/firefox-esr|' \
+      "$T"
+    echo "$f: $(grep -c DMD_ENDPOINT "$T") 处已加"
+done
+```
+
+容器内没有 sudo 时从宿主侧改
+`/mnt/Droidspaces/<容器名>/usr/share/applications/` —— sed 要在目标目录建临时
+文件，容器内普通用户会因权限不足失败（`无法打开临时文件 ./sedXXXX`）。
+
+**怎么确认自己踩没踩坑**：不带环境变量跑一遍，看速度就知道走了哪条路。
+
+```shell
+ffmpeg -hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc \
+       -i test.mp4 -f null - 2>&1 | tail -1
+#  ~150 帧 / 速度 >5x  → 走 TCP,正常
+#  ~50 帧  / 速度 <1x  → 走 socket,中招了
+```
+
+⚠️ 必须带 `-hwaccel_output_format vaapi`。只写 `-hwaccel vaapi` 时 ffmpeg 拿不到
+硬解会**静默回落软解且不报错**，日志里出现 `hevc (native)` 就是软解 ——
+这样测什么配置都"正常"，等于没测。
+
+---
+
 ## 一、Chrome / Chromium（必须 Wayland 模式）
 
 ### 1. 为什么必须 Wayland
@@ -203,3 +258,7 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 | Firefox 有进程不解码 | RDD 沙箱拦设备 | `MOZ_DISABLE_RDD_SANDBOX=1` |
 | user.js 写了没生效 | 写错了 profile | 查 installs.ini 的 Default |
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |
+| 视频卡顿 + CPU 飙高，但"硬解已启用" | 走了 Unix socket 端点（吞吐不足） | 钉 `DMD_ENDPOINT=tcp:20003`，见第零章 |
+| daemon 日志 `输入缓冲暂满，重试` | 同上，socket 通道读 NALU 跟不上 | 同上 |
+| ffmpeg 日志 `hevc (native)` | 根本没用硬解，静默回落软解了 | 测试命令要带 `-hwaccel_output_format vaapi` |
+| watchdog 报 healthy 但实际解不动 | 探活只测端点连通性，不测出帧能力 | 用第零章的 ffmpeg 速度判据自查 |

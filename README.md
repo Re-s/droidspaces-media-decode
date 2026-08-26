@@ -13,12 +13,15 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 - **硬件加速解码**：利用 Android MediaCodec API 硬件解码 H.264 / HEVC / VP8 / VP9
 - **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox、Chrome）无需改动即可用
 - **两种传输通道，自动选择**：
-  - **路径式 Unix socket**（推荐）：不属于 net namespace，靠 bind mount 跨界，
+  - **路径式 Unix socket**：不属于 net namespace，靠 bind mount 跨界，
     **host 型与 NAT 型容器都能用**；鉴权靠文件权限与 SELinux，服务不上网络。
+    ⚠️ **但实测吞吐不足以支撑实时解码**（720p30 仅 0.92x，会话中途因
+    "输入缓冲暂满"中断），详见 CHANGELOG"已知问题"。**当前请优先用 TCP**，
+    客户端显式指定 `DMD_ENDPOINT=tcp:20003`。
     ⚠️ 当前 daemon 建 socket 后 `chmod 0666`（`src/decode-daemon.c` 里标注为
     "先跑通"的放宽值），真实部署应收紧到特定 gid。
-  - **TCP 127.0.0.1**（兜底）：仅在容器与宿主**共享 net namespace** 时可用
-    （host 型容器满足，NAT 型不满足）。
+  - **TCP 127.0.0.1**（**当前推荐**，吞吐实测 6.7~8.6x 实时）：仅在容器与宿主
+    **共享 net namespace** 时可用（host 型容器满足，NAT 型不满足）。
   
   驱动通过 `DMD_ENDPOINT` 显式指定，或自动探测默认路径后退回 TCP。
   ⚠️ **memfd 零拷贝默认关闭**，需 `DMD_WANT_SHM=1` 显式开启。
