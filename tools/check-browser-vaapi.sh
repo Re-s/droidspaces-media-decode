@@ -87,8 +87,20 @@ if [ -n "$FF_RDD" ] && [ -d "/proc/$FF_RDD" ]; then
         ok "RDD($FF_RDD)已加载驱动栈"
     else
         ok "RDD($FF_RDD)存活 (驱动未加载 — 播放视频后才按需初始化, 非故障)"
-        hint "若播放时仍不加载: MOZ_DISABLE_RDD_SANDBOX=1 启动 + user.js 四件套"
+        hint "若播放时仍不加载: MOZ_DISABLE_RDD_SANDBOX=1 启动 + user.js 五件套"
     fi
+    # ⚠️ 两个极易误判之处（都实测踩过）：
+    #
+    # 1) **必须在播放时检查**。RDD 空闲时会释放 VA-API 资源，此时
+    #    drv_video 映射数与 renderD 句柄数都是 0、线程只剩 5 个 ——
+    #    看起来像"从没做过硬解"，其实一开播立刻变成 va=4 dri=4 thr=19。
+    #    判"Firefox 没用硬解"之前，先确认视频正在播放。
+    #
+    # 2) **Firefox 硬解不经 daemon**。它由驱动直接对接 MediaCodec，
+    #    surface 走 msm_drm dumb buffer 导出 dmabuf，所以播放期间
+    #    daemon 日志里**不会**出现它的会话 —— 那是正常的，不是故障。
+    #    daemon 日志里持续刷的 640x480 空会话是 watchdog 探针（每 5s 一次）。
+    #    因此"daemon 无会话"不能用来判断 Firefox 硬解失败。
 else
     hint "(Firefox 未运行, 跳过)"
 fi
@@ -144,6 +156,40 @@ cat <<'NOTE'
   → 「输出格式 WxH stride=...」出现即真实解码; 只有握手无流量 = 上层没喂数据
   → 「帧回传=SHM」= memfd 零拷贝生效; 「帧回传=内联」= 每帧经 socket 拷贝
   → 「输入缓冲暂满，重试」= 吞吐瓶颈, 回传方向堵住导致输入槽位耗尽
+NOTE
+
+echo ""
+echo "== 怎么判断"解码成功了" =="
+cat <<'NOTE'
+  按客户端类型选判据 —— 用错判据是本项目最常见的误诊来源。
+
+  ▸ ffmpeg / 走 daemon 的客户端
+      充分证据: daemon 日志有「输出格式 WxH stride=...」+ 帧数达标 + 速度 >3x
+      只有「握手成功」而无「输出格式」= 通道通了但没真解码
+      有「输出格式」却帧数不足 = 吞吐故障（查「输入缓冲暂满」）
+
+  ▸ Firefox
+      充分证据（播放时）: RDD 进程的 drv_video 映射 >0 且 renderD 句柄 >0
+      检查命令: RDD=$(pgrep -f 'rdd$'); grep -c drv_video /proc/$RDD/maps
+      ⚠️ 停播后这些归零属正常，不是故障
+      ⚠️ daemon 日志无 Firefox 会话属正常（它不经 daemon）
+
+  ▸ Chrome
+      充分证据: GPU 进程 maps 里有 drv_video，且 cmdline 含 ozone-platform=wayland
+      X11 下解码器会创建但零帧（dmabuf 提交路径不通），日志表现为
+      「握手成功」后「收到 0 NALU, 回传 0 帧」
+
+  ▸ 不可靠的判据（别用）
+      ✗ ffmpeg 日志里的 "hevc (native)" —— 硬解生效时这行照样出现
+      ✗ watchdog 报 healthy —— 只验证握手，吞吐故障照样报健康
+      ✗ 只写 -hwaccel vaapi 测试 —— 拿不到硬解会静默回落软解且不报错
+      ✗ 短片跑分比软硬解耗时 —— 720p 小片软解可能更快，硬解优势在
+        高分辨率/高码率/长时间播放的 CPU 与功耗，不是跑分
+
+  ▸ 画面卡顿但上述判据全绿
+      说明解码正常，问题在呈现链：容器内 kwin → anland 桥 →
+      宿主 SurfaceFlinger + HWC，每帧被合成三次（实测四者合计约 122%
+      一个核）。这条链抖动表现为画面断续，解码器无感。
 NOTE
 
 echo ""
