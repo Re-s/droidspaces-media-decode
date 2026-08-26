@@ -48,10 +48,24 @@ google-chrome \
 
 ### 3. 固化到桌面图标
 
-编辑 `/usr/share/applications/google-chrome.desktop`（root 属主，容器内无 sudo
-时可从宿主经 `/mnt/Droidspaces/<容器名>/usr/share/applications/` 直写），
-给**每一处** `Exec=` 行的启动命令追加上述参数，否则右键菜单"新窗口"等入口
-会退回无硬解状态。动手前备份 `.bak`。
+在容器终端里**整段复制执行**（自动备份原文件、给所有启动入口追加参数）：
+
+```shell
+D=/usr/share/applications/google-chrome.desktop
+sudo cp "$D" "$D.bak"
+FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+sudo sed -i \
+  -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
+  -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
+  "$D"
+grep -c "render-node-override" "$D"    # 输出 >=2 即固化成功
+```
+
+容器内没有 sudo 时，从宿主侧改同一个文件
+`/mnt/Droidspaces/<容器名>/usr/share/applications/google-chrome.desktop`
+（宿主 root 直写容器 rootfs）。
+
+只想临时试一次，不固化：把上面 FLAGS 的值接在 `google-chrome` 后面手动启动。
 
 ### 4. 验证三步
 
@@ -97,43 +111,48 @@ feedback 断链**，定量特征（向平台方报障时请附上）：
 Firefox 的 VA-API 走 ffmpeg 后端 + WebRender 提交，实测同视频完美流畅，
 是当前 HEVC 观看的首选。
 
-### 1. 配置 profile
+### 1. 写入硬解配置（一条命令，整段复制执行）
 
-**陷阱先讲**：现代 Firefox 按 `installs.ini` 的 `[Install*] Default=` 决定
-profile，`profiles.ini` 里老式的 `Default=1` 标记是摆设。先确认真实 profile：
+背景：Firefox 的配置写在所选 profile 目录的 `user.js` 文件里；而"选中的
+profile"由 `~/.mozilla/firefox/installs.ini` 的 `Default=` 决定（注意
+`profiles.ini` 里老式 `Default=1` 标记无效，别看错文件）。下面的命令自动
+定位真实 profile 并追加配置：
 
 ```shell
-grep -A1 "Install" ~/.mozilla/firefox/installs.ini   # 看 Default= 指向
-```
-
-往**这个**目录写 `user.js`：
-
-```javascript
+P=~/.mozilla/firefox/$(grep -m1 '^Default=' ~/.mozilla/firefox/installs.ini | cut -d= -f2)
+mkdir -p "$P"
+cat >> "$P/user.js" <<'EOF'
 user_pref("media.ffmpeg.vaapi.enabled", true);
 user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.gpu-process-decoding", true);
 user_pref("media.rdd-ffmpeg.enabled", true);
-user_pref("media.autoplay.default", 0);          // 可选:允许自动播放
-user_pref("media.autoplay.blocking_policy", 0);
+EOF
+echo "已写入: $P/user.js" && tail -4 "$P/user.js"
 ```
+
+看到四行 `user_pref(...)` 输出即成功。重启 Firefox 生效。
 
 ### 2. 关闭 RDD 沙箱（必需）
 
 RDD（远程解码进程）的 seccomp 沙箱会拦截 `/dev/dri` 打开与 socket 连接，
-容器环境下必须放开。改 desktop 文件的 Exec 行加环境变量：
+容器环境下必须放开。在容器终端整段复制执行（自动备份、改所有 Exec 入口）：
 
-```
-Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr %u
+```shell
+F=/usr/share/applications/firefox-esr.desktop
+sudo cp "$F" "$F.bak"
+sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' "$F"
+grep -c "MOZ_DISABLE_RDD_SANDBOX" "$F"   # 输出 >=1 即成功
 ```
 
-手动启动同理。Wayland 原生模式（ESR 121+ 默认开启）无需额外变量。
+没有 sudo 就从宿主侧改 `/mnt/Droidspaces/<容器名>/usr/share/applications/firefox-esr.desktop`。
+手动启动时同理：`env MOZ_DISABLE_RDD_SANDBOX=1 firefox <地址>`。
+Wayland 原生模式（ESR 121+ 默认开启）无需额外变量。
 
 ### 3. 验证
 
 ```shell
-# RDD 进程加载驱动栈(drv_video 应 >0)
-ps -A | grep rdd                    # 拿到 RDD 进程 PID
-grep -c drv_video /proc/<PID>/maps
+# RDD 进程加载驱动栈(数字应 >0; 未播放视频时为 0,属正常,播一段再看)
+grep -c drv_video "/proc/$(pgrep -f 'rdd$' | head -1)/maps"
 ```
 
 - `about:support` → 图形 → 应显示 VA-API 相关条目
