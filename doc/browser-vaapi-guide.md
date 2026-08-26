@@ -168,8 +168,24 @@ grep -c drv_video "/proc/$(pgrep -f 'rdd$' | head -1)/maps"
 
 ## 三、快速体检脚本
 
-见 `tools/check-browser-vaapi.sh`。一键检查 daemon 连通性、两个浏览器的
-驱动栈加载状态、最近解码会话流量。
+一键检查 daemon 连通性、两个浏览器的驱动栈加载状态、最近解码会话流量。
+无需 clone 整个仓库，直接下载运行：
+
+```shell
+# 方式一: 下载后执行(推荐,可先审阅内容)
+curl -fsSLO https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/check-browser-vaapi.sh
+bash check-browser-vaapi.sh
+
+# 方式二: 管道直跑
+curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/check-browser-vaapi.sh | bash
+```
+
+> 直连 GitHub 失败时走系统代理，例如：
+> `curl -fsSL --proxy socks5h://127.0.0.1:1080 ...`
+>
+> 链接锚定在 `v0.3.4` 标签上，脚本行为与本文档描述严格一致；
+> 想要最新版把 URL 里的 `v0.3.4` 换成 `master`。
+> 协议解析客户端（TCP 内联模式演示）：[tools/test_decode.py](../tools/test_decode.py)。
 
 ## 四、排障速查表
 

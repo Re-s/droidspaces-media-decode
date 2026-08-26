@@ -63,10 +63,12 @@ grep -c "MOZ_DISABLE_RDD_SANDBOX" "$F"    # 输出 >=1 即成功
 
 ## 验证
 
-一键体检：
+一键体检（无需 clone，直接下载运行）：
 
 ```bash
-bash tools/check-browser-vaapi.sh
+curl -fsSLO https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/check-browser-vaapi.sh
+bash check-browser-vaapi.sh
+# 直连失败可走系统代理: curl --proxy socks5h://127.0.0.1:1080 ...
 ```
 
 或手动确认 daemon 日志出现真实解码会话（宿主侧执行）：
@@ -91,7 +93,8 @@ adb shell 'su -c "tail -20 /data/local/Droidspaces/Logs/decode-daemon-tcp.log"'
 | [doc/browser-vaapi-guide.md](doc/browser-vaapi-guide.md) | 本指南完整版：参数原理、排障速查表、已知限制定量特征 |
 | [README.md](README.md) | 项目总览、架构、编译与部署 |
 | [doc/platform-integration-contract.md](doc/platform-integration-contract.md) | 平台接入契约（bind mount / SELinux domain / renderD128 透传） |
-| [tools/check-browser-vaapi.sh](tools/check-browser-vaapi.sh) | 浏览器硬解一键体检脚本 |
+| [tools/check-browser-vaapi.sh](tools/check-browser-vaapi.sh) · [直链下载](https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/check-browser-vaapi.sh) | 浏览器硬解一键体检脚本 |
+| [tools/test_decode.py](tools/test_decode.py) · [直链下载](https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/test_decode.py) | 协议解析演示客户端（TCP 内联模式） |
 | [CHANGELOG.md](CHANGELOG.md) | 全版本更新日志 |
 
 **Full Changelog**: https://github.com/Re-s/droidspaces-media-decode/blob/master/CHANGELOG.md

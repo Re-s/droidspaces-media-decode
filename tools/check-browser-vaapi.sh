@@ -40,13 +40,20 @@ fi
 echo "== [3/4] Chrome GPU 进程 =="
 CHROME_GPU=$(pgrep -f "type=gpu-process" | head -1)
 if [ -n "${CHROME_GPU:-}" ]; then
+    PLAT=$(tr '\0' '\n' < /proc/$CHROME_GPU/cmdline 2>/dev/null | grep -oE 'ozone-platform=[a-z0-9]+' | head -1)
+    if [ "$PLAT" = "ozone-platform=wayland" ]; then
+        ok "运行于 Wayland 平台"
+    else
+        bad "未以 Wayland 平台运行 (${PLAT:-未指定}) — 硬解不可用"
+        hint "加 --ozone-platform=wayland: 解码帧经 linux-dmabuf 提交,X11 下走不通"
+    fi
     L=$(grep -c libva /proc/$CHROME_GPU/maps 2>/dev/null); L=${L:-0}
     D=$(grep -c drv_video /proc/$CHROME_GPU/maps 2>/dev/null); D=${D:-0}
     if [ "$D" -gt 0 ]; then
         ok "GPU 进程($CHROME_GPU)已加载驱动栈 (libva=$L drv_video=$D)"
     elif [ "$L" -gt 0 ]; then
         bad "libva 已加载但驱动未打开 — 解码器创建即失败"
-        hint "X11 模式典型症状(0 NALU)。必须 --ozone-platform=wayland"
+        hint "确认 --render-node-override=/dev/dri/renderD128 与三个 enable-features"
     else
         bad "GPU 进程无任何 VA-API 痕迹 — vaInitialize 从未发生"
         hint "确认 --render-node-override=/dev/dri/renderD128 与三个 enable-features"
