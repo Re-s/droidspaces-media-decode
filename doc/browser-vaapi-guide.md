@@ -225,7 +225,36 @@ grep -c drv_video "/proc/$(pgrep -f 'rdd$' | head -1)/maps"
 
 ---
 
-## 三、快速体检脚本
+## 三、实时监视：确认硬解"持续"在用
+
+单次体检只能回答"此刻通不通"。播放视频时 CPU 曲线本身是脉冲状的
+（解码按帧突发 + 播放器有帧缓冲），光看占用起伏无法判断硬解是否中断。
+
+```shell
+# 持续监视，Ctrl-C 退出；加 ADB=1 额外显示宿主侧 VPU 证据
+ADB=1 bash tools/watch-decode.sh
+
+# 只跑 60 秒
+bash tools/watch-decode.sh 60
+```
+
+输出形如：
+
+```
+时刻     │ Firefox RDD          │ Chrome GPU      │ 宿主 VPU
+16:50:47 │ ✅硬解 cpu=61        │ —— 无 GPU 进程   │ ✅解码中 36/5s
+16:50:48 │ ✅硬解 cpu=77        │ —— 无 GPU 进程   │ ✅解码中 71/5s
+16:50:49 │ ✅硬解 cpu=59        │ —— 无 GPU 进程   │ ✅解码中 127/5s
+```
+
+**判读要点：看 ✅ 标记是否稳定，不要看 cpu 数值是否平滑。**
+数值在 59~95 之间起伏是正常的，只要 `✅硬解` 一直在，硬解就没有中断。
+
+其中「宿主 VPU」是最硬的证据 —— 宿主 `omx@1.0-service`（硬件解码服务）
+的 CPU 消耗。实测空闲约 12 jiffies/5s、解码约 107 jiffies/5s，**差约 9 倍**，
+阈值取 30 分界。它涨说明 VPU 真在出帧，与上层怎么统计无关。
+
+## 四、快速体检脚本
 
 一键检查 daemon 连通性、两个浏览器的驱动栈加载状态、最近解码会话流量。
 无需 clone 整个仓库，直接下载运行：
@@ -246,7 +275,7 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 > 想要最新版把 URL 里的 `v0.3.4` 换成 `master`。
 > 协议解析客户端（TCP 内联模式演示）：[tools/test_decode.py](../tools/test_decode.py)。
 
-## 四、排障速查表
+## 五、排障速查表
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
