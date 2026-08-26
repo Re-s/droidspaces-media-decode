@@ -42,6 +42,9 @@ add 'user_pref("media.ffmpeg.vaapi.enabled", true);'
 add 'user_pref("media.hardware-video-decoding.force-enabled", true);'
 add 'user_pref("media.gpu-process-decoding", true);'
 add 'user_pref("media.rdd-ffmpeg.enabled", true);'
+# 第五件:解码帧经 dmabuf 零拷贝纹理直进合成器 —— 缺了它硬解照跑,
+# 但每帧都要拷回内存再做 CPU 软件转色,内容进程能吃掉半个到多个核心
+add 'user_pref("media.vaapi-dmabuf-textures.enabled", true);'
 awk '!(/^user_pref/ && seen[$0]++)' "$P/user.js" > "$P/user.js.tmp" && mv "$P/user.js.tmp" "$P/user.js"
 grep -c '^user_pref' "$P/user.js"    # 每项应为 1
 ```
