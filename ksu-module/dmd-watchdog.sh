@@ -35,9 +35,10 @@ SOCK_DIR=${DS_DIR}/Decode
 SOCK=${SOCK_DIR}/decode.sock
 DAEMON=${DS_DIR}/bin/decode-daemon
 PROBE=${MODDIR}/dmd-probe
+RUN_DIR=${DS_DIR}/Decode/watchdog
 LOG=${DS_DIR}/Logs/dmd-watchdog.log
-LOCK=${DS_DIR}/.dmd-watchdog.lock
-STATE=${DS_DIR}/.dmd-watchdog.state
+LOCK=${RUN_DIR}/watchdog.lock
+STATE=${RUN_DIR}/watchdog.state
 
 # 探活间隔（秒）。5s 足够及时，又不会让探活本身成为负担：
 # 每次探活是一次 connect+握手，daemon 侧会记一条会话日志。
@@ -55,7 +56,7 @@ LOG_MAX=${DMD_WD_LOG_MAX:-262144}
 CONF=${DS_DIR}/.dmd-watchdog.conf
 [ -f "${CONF}" ] && . "${CONF}"
 
-mkdir -p "${DS_DIR}/Logs" 2>/dev/null
+mkdir -p "${DS_DIR}/Logs" "${RUN_DIR}" 2>/dev/null
 
 log() {
     echo "[$(date '+%m-%d %H:%M:%S' 2>/dev/null || date +%s)] $*" >> "${LOG}"

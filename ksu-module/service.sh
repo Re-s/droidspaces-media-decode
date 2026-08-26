@@ -15,14 +15,24 @@ set -u
 
 MODDIR=${0%/*}
 DS_DIR=/data/local/Droidspaces
+# 运行时文件收进自己的子目录，不污染平台的 Droidspaces 根目录
+# （那里是平台自己的 bin/ Containers/ Decode/ Logs/ Net/，
+#  早期版本把 .dmd-watchdog.{pid,lock,state} 直接扔在根下，是设计错误）
+RUN_DIR=${DS_DIR}/Decode/watchdog
 LOG=${DS_DIR}/Logs/dmd-watchdog.log
 WD=${MODDIR}/dmd-watchdog.sh
-PIDFILE=${DS_DIR}/.dmd-watchdog.pid
+PIDFILE=${RUN_DIR}/watchdog.pid
 
 # 平台自启完成后的额外让位时间（秒）
 GRACE=${DMD_WD_GRACE:-45}
 
-mkdir -p "${DS_DIR}/Logs" 2>/dev/null
+mkdir -p "${DS_DIR}/Logs" "${RUN_DIR}" 2>/dev/null
+
+# 迁移旧版散落在根目录的运行时文件（一次性，静默）
+for _o in pid lock state; do
+    [ -f "${DS_DIR}/.dmd-watchdog.${_o}" ] && \
+        mv -f "${DS_DIR}/.dmd-watchdog.${_o}" "${RUN_DIR}/watchdog.${_o}" 2>/dev/null
+done
 
 log() {
     echo "[$(date '+%m-%d %H:%M:%S' 2>/dev/null || date +%s)] [service] $*" >> "${LOG}"
