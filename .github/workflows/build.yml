@@ -121,10 +121,19 @@ jobs:
           mkdir -p pkg
           cp ksu-module/module.prop ksu-module/service.sh \
              ksu-module/dmd-watchdog.sh ksu-module/action.sh \
-             ksu-module/sepolicy.rule ksu-module/README.md pkg/
+             ksu-module/sepolicy.rule ksu-module/README.md \
+             ksu-module/customize.sh pkg/
           cp ksu-module/dmd-probe pkg/
-          chmod 755 pkg/service.sh pkg/dmd-watchdog.sh pkg/action.sh pkg/dmd-probe
-          chmod 644 pkg/module.prop pkg/sepolicy.rule pkg/README.md
+          # 安装元数据:没有 META-INF 刷机器认不出这是模块,
+          # 没有 customize.sh 解包后全是 0644 -> 报"缺少文件或执行权限"
+          mkdir -p pkg/META-INF/com/google/android
+          cp ksu-module/META-INF/com/google/android/update-binary \
+             ksu-module/META-INF/com/google/android/updater-script \
+             pkg/META-INF/com/google/android/
+          chmod 755 pkg/service.sh pkg/dmd-watchdog.sh pkg/action.sh pkg/dmd-probe \
+                    pkg/customize.sh pkg/META-INF/com/google/android/update-binary
+          chmod 644 pkg/module.prop pkg/sepolicy.rule pkg/README.md \
+                    pkg/META-INF/com/google/android/updater-script
           ( cd pkg && zip -r "../dmd_watchdog-${GITHUB_REF_NAME}.zip" . )
           unzip -l "dmd_watchdog-${GITHUB_REF_NAME}.zip"
 
