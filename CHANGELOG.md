@@ -1,5 +1,38 @@
 # 更新日志
 
+## v0.3.4
+
+浏览器硬解接入实战沉淀：Chrome 与 Firefox 调用本硬解后端的完整方法文档
+与一键体检脚本。全部结论来自真机验证（nabu / SD855 / Debian 13 容器）。
+
+### 新增：`doc/browser-vaapi-guide.md`
+
+覆盖两个浏览器的必需参数、原理、固化方法、验证步骤与排障速查表：
+
+- **Chrome 必须 Wayland 模式**：`VaapiVideoDecodeLinux` 的解码帧经
+  linux-dmabuf 协议提交合成器，X11 下无此协议 —— 解码器创建后一帧不喂
+  直接空转（dmd 日志特征：握手成功但 0 NALU）。此结论终结了
+  "X11 + native GL" 的旧思路：当前 Chrome 只剩 ANGLE，native GL 路径不存在。
+- **`--render-node-override` 是 ARM 平台的命门**：Chromium vaapi_wrapper 的
+  `PreSandboxInitialization()` 跳过一切非 PCI 总线 DRM 设备，ARM SoC 的
+  renderD128 必须用该开关从 `LoadDrmFD()` 分支注入。
+- **Firefox 三件套**：user.js 开 VA-API（注意 profile 按 installs.ini 的
+  Default 定位，profiles.ini 老式标记无效）+ `MOZ_DISABLE_RDD_SANDBOX=1`
+  （RDD seccomp 拦截设备访问）+ desktop Exec 固化。
+- **平台兼容性记录**：anland 显示桥对 Chrome 存在呈现反馈缺失
+  （totalVideoFrames 增长但 requestVideoFrameCallback 零回调，五组合复现），
+  表现为 HEVC 掉帧跳跃/绿屏；Firefox 不受影响，为 HEVC 观看推荐。
+
+### 新增：`tools/check-browser-vaapi.sh`
+
+容器内一键体检：daemon 连通性、驱动部署、vainfo 初始化、Chrome GPU 进程
+与 Firefox RDD 进程的驱动栈加载状态，逐项给出可行动的修复建议。
+
+### 文档勘误
+
+README 中"浏览器沙箱能否收 SCM_RIGHTS 未实测"更新为实测可行：
+Firefox RDD 与 Chrome GPU 进程均已真机验证正常建立解码会话。
+
 ## v0.3.3
 
 新增 endpoint inode 校验：客户端与服务端对账监听 socket 的真实身份，

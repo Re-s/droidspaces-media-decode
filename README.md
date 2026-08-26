@@ -21,12 +21,11 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
     （host 型容器满足，NAT 型不满足）。
   
   驱动通过 `DMD_ENDPOINT` 显式指定，或自动探测默认路径后退回 TCP。
-  
   ⚠️ **memfd 零拷贝默认关闭**，需 `DMD_WANT_SHM=1` 显式开启。
   这条路驱动侧从未真正启用过（`want_shm` 长期硬编码为 0），只有单元测试走过
   （150 帧、与 TCP 前 20 帧逐字节一致、无 fd 泄漏），真实消费者环境下未验证。
-  另一个未实测的风险是浏览器沙箱能否收 `SCM_RIGHTS`
-  （Firefox RDD / Chrome GPU 进程都有 seccomp 过滤）。
+  浏览器沙箱收 `SCM_RIGHTS` 已真机实测可行：Firefox RDD 与 Chrome GPU 进程
+  均能正常建立解码会话（2026-08-26，TCP 内联模式）。
 - **最小化实现**：基于 anland 项目的 libdisplay_daemon 库简化而来，代码简洁易懂
 - **进程托管**：daemon 设计为被平台托管的前台进程（DroidSpace 负责启动与守护）
 
@@ -417,6 +416,22 @@ adb shell 'timeout 3 sh -c "echo > /dev/tcp/127.0.0.1/20003" && echo 在听'
 —— 那份文档列出平台必须提供的三件事（bind mount 目录、正确的 SELinux domain
 启动、`/dev/dri/renderD128` 透传）、各自的实测依据与验证命令，
 以及当前唯一的阻塞项（`droidspacesd` 缺一条访问 Codec2 的 allow 规则）。
+
+## 浏览器接入硬解（Chrome / Firefox）
+
+容器内浏览器调用本硬解后端的完整方法、必需启动参数、profile 配置与验证步骤，
+**详见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)**。
+要点速记：
+
+- **Chrome 必须 Wayland 模式**：解码帧经 linux-dmabuf 协议提交，X11 下
+  解码器创建后零流量空转（dmd 日志特征：握手成功但 0 NALU）
+- **Chrome 必带 `--render-node-override=/dev/dri/renderD128`**：
+  Chromium 只枚举 PCI 总线 DRM 设备，ARM 平台设备会被跳过，此开关绕过白名单
+- **Firefox 需 `MOZ_DISABLE_RDD_SANDBOX=1`** + user.js 开 VA-API 四件套；
+  注意按 `installs.ini` 的 Default 找真实 profile
+- HEVC 观看当前推荐 Firefox（Chrome 在 anland 显示桥上有呈现反馈缺失的平台级
+  兼容问题，详见指南"已知限制"）
+- 一键体检：`bash tools/check-browser-vaapi.sh`
 
 ## 测试方法
 
