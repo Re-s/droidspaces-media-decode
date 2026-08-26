@@ -489,6 +489,21 @@ static int unix_connect(struct dmd_session *s, const char *path,
                           path, timeout_ms, err) < 0)
         return -1;
 
+    /* 接收缓冲必须显式放大 —— 这是 Unix 端点能否实时解码的关键。
+     *
+     * AF_UNIX 默认 SO_RCVBUF 只有 229376 (224KB)，而一帧 NV12 是
+     * 1.38MB(720p) / 3.11MB(1080p)。缓冲装不下整帧时，daemon 的 send_all
+     * 会反复阻塞等本端取走，往返次数远高于 TCP（其默认 SO_RCVBUF 有 1MB）：
+     * 实测吞吐从 8.6x 塌到 0.92x，且 daemon 侧因输出线程被堵而报
+     * "输入缓冲暂满"最终放弃会话。服务端也设了 4MB —— 两端一起放大才有效。
+     *
+     * 受 net.core.rmem_max 截断，设不到就退化为原状，失败不致命。 */
+    {
+        int bufsz = 4 * 1024 * 1024;
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    }
+
     /* 记录端点路径供握手后做 inode 对账（见 do_handshake） */
     snprintf(s->ep_path, sizeof(s->ep_path), "%s", path);
     s->fd = fd;

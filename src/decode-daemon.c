@@ -1560,6 +1560,30 @@ int main(int argc, char **argv)
         if (!sock_path)
             setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+        /* 回传缓冲必须显式放大，否则 AF_UNIX 下吞吐塌到无法实时解码。
+         *
+         * 实测（nabu，720p30 HEVC 5s 码流，同一二进制、同一硬件）：
+         *   TCP  153 NALU → 150 帧  8.6x
+         *   UNIX  52 NALU →  49 帧  0.92x，会话因"输入缓冲暂满"中断
+         *
+         * 根因是**默认缓冲容量差一个数量级**，而单帧远大于它：
+         *   AF_UNIX  SO_SNDBUF/SO_RCVBUF = 229376 (224KB)
+         *   AF_INET  SO_SNDBUF = 524288 / SO_RCVBUF = 1048576
+         *   一帧 NV12：720p = 1.38MB，1080p = 3.11MB
+         *
+         * 于是每帧回传都要把 224KB 缓冲反复填满、阻塞等消费者取走，往返
+         * 次数是 TCP 的数倍；output 线程被 send_all 堵住 → MediaCodec 输出
+         * 帧不回收 → 输入槽位耗尽 → 报"输入缓冲暂满"，重试 12 次后放弃。
+         *
+         * 取 4MB：整帧装得下 1080p NV12 并留余量。内核会把 SO_SNDBUF 翻倍
+         * 记账，且受 net.core.{w,r}mem_max 截断，设不到就退化为原状，
+         * 因此失败不致命，忽略返回值。 */
+        {
+            int bufsz = 4 * 1024 * 1024;
+            (void)setsockopt(cli, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+            (void)setsockopt(cli, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        }
+
         Session *s = calloc(1, sizeof(Session));
         if (!s) {
             dlog(0, "会话分配失败");

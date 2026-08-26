@@ -29,8 +29,21 @@ log() {
 }
 
 update_prop() {
-    # module.prop 的 description 是用户在管理器里唯一能看到的状态窗口
-    sed -i "s|^description=.*|description=$*|" "${MODDIR}/module.prop" 2>/dev/null
+    # module.prop 的 description 是用户在管理器里唯一能看到的状态窗口。
+    #
+    # ⚠️ 不能用 sed：状态文本里含 "|"（如 "看护中 (PID 123) | 探活间隔 5s"），
+    # 而 sed 的 s 命令分隔符也是 "|"，内容里的竖线会被当成分隔符导致
+    #   sed: -e 表达式 #1，字符 58："s"的未知选项
+    # 再被 2>/dev/null 吞掉 —— 状态静默不更新，表现为管理器里永远显示
+    # 打包时的初始值"尚未启动"，让人误判模块起不来（实测踩过这个坑）。
+    #
+    # 改用 awk 逐行重写：内容当普通字符串处理，不参与任何模式解析。
+    _mp="${MODDIR}/module.prop"
+    _msg="$*"
+    awk -v m="${_msg}" '
+        /^description=/ { print "description=" m; next }
+        { print }
+    ' "${_mp}" > "${_mp}.tmp" 2>/dev/null && mv "${_mp}.tmp" "${_mp}" 2>/dev/null
 }
 
 # 模块被禁用时不做任何事（KSU 会创建 disable 文件）
@@ -40,10 +53,16 @@ if [ -f "${MODDIR}/disable" ]; then
 fi
 
 # 防重复：已有存活的看护就不再起第二个
+#
+# ⚠️ 这条早退路径必须先回写状态再退出，否则会制造"功能正常但管理器显示
+# 尚未启动"的假故障：平台或上一次开机已经拉起过看护，本次 service.sh 走到
+# 这里直接 exit 0，module.prop 的 description 就永远停在打包时的初始值
+# "尚未启动"，用户据此误判模块刷入后起不来（实测踩过）。
 if [ -f "${PIDFILE}" ]; then
     OLD=$(cat "${PIDFILE}" 2>/dev/null)
     if [ -n "${OLD}" ] && kill -0 "${OLD}" 2>/dev/null; then
         log "看护已在运行（PID ${OLD}），本次不重复启动"
+        update_prop "🟢 看护中 (PID ${OLD}) | 端点探活间隔 5s | 复用已有实例"
         exit 0
     fi
 fi
