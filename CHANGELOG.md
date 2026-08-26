@@ -1,5 +1,40 @@
 # 更新日志
 
+## 未发布：零拷贝帧回传默认开启（2026-08-26）
+
+### ✅ SHM（memfd 零拷贝）转为 Unix socket 模式下的默认
+
+此前 `cfg.want_shm` 需 `DMD_WANT_SHM=1` 显式开启，源码注释记载"驱动侧
+从未真正启用过，只有 tests/test_dmd_client.c 走过"。本次在真实环境
+（驱动被 dlopen 进 ffmpeg、走 /run/dmd/decode.sock）实测通过：
+
+```
+[167] 共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+[167] 握手成功: video/hevc 1280x720 帧回传=SHM
+```
+
+解码结果与内联模式一致（150/150 帧）。收益（固定 1500 帧工作量，
+三组交替对照，daemon 侧 CPU jiffies）：
+
+| 模式 | 三次测量 | 中位数 |
+|---|---|---|
+| 内联 | 493 / 500 / 489 | 493 |
+| SHM | 400 / 367 / 410 | **400** |
+
+**daemon CPU 降低约 19%**，组内方差 ±2%。省下的正是每帧
+1.38MB(720p) / 3.11MB(1080p) 经 socket 的那次拷贝。
+
+保守边界：仅在 `use_sock` 时请求（SHM 交接走 abstract socket，属
+net namespace，NAT 型容器必然降级）；daemon 侧交接失败会自动退回内联，
+所以开启无硬失败风险。`DMD_WANT_SHM=0` 可显式关闭。
+
+### 🐛 修复 daemon 日志写到旧路径
+
+`dmd-watchdog.sh` 拉起 daemon 时的 stdout 重定向仍指向
+`Droidspaces/Logs/decode-daemon.log`，是上一轮 dmd/ 路径重构的遗漏
+（排查时因此在新路径下找不到会话记录，误判请求没到 daemon）。
+已改为 `${LOG_DIR}/decode-daemon.log`。
+
 ## 未发布：两项修复（2026-08-26）
 
 ### ✅ 修复 Unix socket 端点吞吐塌陷（0.92x → 7.4x）

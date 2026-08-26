@@ -459,8 +459,25 @@ static struct dmd_session *session_open(int codec, unsigned int width,
      * 另注：SHM 交接走的是 abstract socket（见上方端点选择处的勘误），
      * 属 net namespace，所以零拷贝**只在 host 型容器可能可用**，
      * NAT 型容器下必然降级。这也是它默认关闭的又一个理由。 */
+    /* 2026-08-26 实测转为默认开启（Unix socket 模式下）。
+     *
+     * 上面那段"从未真正启用过"的顾虑已被实测解决：驱动被 dlopen 进
+     * ffmpeg 进程、走 /run/dmd/decode.sock，daemon 侧日志确认
+     *   共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+     *   握手成功: video/hevc 1280x720 帧回传=SHM
+     * 且解码结果与内联模式一致（150/150 帧）。
+     *
+     * 收益（固定 1500 帧工作量，三组对照，daemon 侧 CPU jiffies）：
+     *   内联  493 / 500 / 489   中位数 493
+     *   SHM   400 / 367 / 410   中位数 400   → 降低约 19%
+     * 省下的正是每帧 1.38MB(720p) 经 socket 的那次拷贝。
+     *
+     * 仍然保守的部分：只在 use_sock 时请求（SHM 交接走 abstract socket，
+     * 属 net namespace，NAT 型容器必然降级），且 daemon 侧交接失败会
+     * 自动退回内联，所以开启没有硬失败风险。
+     * 设 DMD_WANT_SHM=0 可显式关闭（排查用）。 */
     const char *wantshm = getenv("DMD_WANT_SHM");
-    cfg.want_shm = (use_sock && wantshm && *wantshm == '1') ? 1 : 0;
+    cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
 
     memset(&err, 0, sizeof(err));
     struct dmd_session *s = dmd_session_create(&cfg, &err);

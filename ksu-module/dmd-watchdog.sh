@@ -118,7 +118,7 @@ start_daemon() {
         # ——这正是容器能扛住 daemon 换代的原因，别改成传文件路径。
         cd "${DS_DIR}" || exit 13
         setsid "${DAEMON}" --sock "${SOCK_DIR}" \
-            >> "${DS_DIR}/Logs/decode-daemon.log" 2>&1 &
+            >> "${LOG_DIR}/decode-daemon.log" 2>&1 &
         log "已拉起 decode-daemon（PID $!）"
         exit 0
     ) 9>"${LOCK}"
