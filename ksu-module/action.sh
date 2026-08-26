@@ -26,6 +26,7 @@ echo "状态标记: $(cat "${STATE}" 2>/dev/null || echo '无')"
 
 echo
 echo "----- 当前探活结果 -----"
+chmod 755 "${MODDIR}/dmd-probe" 2>/dev/null   # zip 解包丢权限位,先补齐
 if [ -x "${MODDIR}/dmd-probe" ]; then
     "${MODDIR}/dmd-probe" "${SOCK}" 3000
     rc=$?

@@ -56,6 +56,11 @@ done
 log "boot_completed，让位 ${GRACE}s 给平台完成容器自启与 daemon spawn"
 sleep "${GRACE}"
 
+# zip 归档不保留 Unix 权限位：从 Release 下载解包刷入的模块，脚本必然丢 +x。
+# 先无条件补齐再检查，否则下面的 [ -x ] 会永远失败。
+chmod 755 "${WD}" 2>/dev/null
+[ -f "${MODDIR}/dmd-probe" ] && chmod 755 "${MODDIR}/dmd-probe" 2>/dev/null
+
 if [ ! -x "${WD}" ]; then
     log "错误：${WD} 不存在或不可执行"
     update_prop "🔴 错误: dmd-watchdog.sh 缺失或不可执行"
