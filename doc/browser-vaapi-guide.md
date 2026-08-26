@@ -61,6 +61,9 @@ if ! grep -q "render-node-override" "$D"; then
       "$D"
 fi
 grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执行次数增长
+
+# 执行后每个 Exec= 行应形如(注意开头就是 --ozone-platform=wayland):
+# Exec=/usr/bin/google-chrome-stable --ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,... %U
 ```
 
 容器内没有 sudo 时，从宿主侧改同一个文件

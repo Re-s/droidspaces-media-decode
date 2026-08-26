@@ -373,10 +373,9 @@ API=29 ./build.sh                    # 覆盖目标 API level
 
 ## 部署：由 DroidSpace 平台托管
 
-> **变更说明**：早期计划用 KSU/Magisk 模块实现开机自启，`magisk-module/` 目录是
+> **变更说明**：早期计划用 KSU/Magisk 模块实现开机自启，原 `magisk-module/` 目录已删除
 > 那个方案的产物。**该方案已放弃** —— daemon 的启动、重启、守护与日志收集
 > 统一交由 DroidSpace 平台托管，本项目不再自带进程管理。
-> `magisk-module/` 保留供参考，不再维护，也不作为发布形态。
 
 ### daemon 的定位
 
@@ -682,7 +681,6 @@ SHM 模式已省掉 TCP 的两次内核拷贝（吞吐 +17%，daemon CPU −28.6
 - [性能实测与优化路线](doc/performance-and-roadmap.md) - 压测数据、瓶颈归因、零拷贝可行性与硬约束
 - [为什么不直接用 V4L2](doc/why-not-v4l2.md) - 容器内 `/dev/video32` 实测不可用的取证结论
 - [VAAPI Proxy 架构调研报告](doc/vaapi-mediacodec-proxy-research.md) - 详细的 VA-API 代理驱动实现方案
-- [Magisk 模块文档](magisk-module/README.md) - ⚠️ 已废弃方案，保留供参考
 
 ## 许可证
 

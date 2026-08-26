@@ -1,5 +1,3 @@
-# v0.3.4 — 浏览器硬解接入：Chrome / Firefox 完整配置方法
-
 把 Android MediaCodec 硬解码接到容器浏览器的全部步骤。以下命令在
 **DroidSpaces 容器终端**里整段复制执行即可，无需手工编辑任何文件。
 实测环境：nabu（SD855）+ Debian 13 + decode-daemon TCP 模式。
@@ -93,8 +91,9 @@ adb shell 'su -c "tail -20 /data/local/Droidspaces/Logs/decode-daemon-tcp.log"'
 | [doc/browser-vaapi-guide.md](doc/browser-vaapi-guide.md) | 本指南完整版：参数原理、排障速查表、已知限制定量特征 |
 | [README.md](README.md) | 项目总览、架构、编译与部署 |
 | [doc/platform-integration-contract.md](doc/platform-integration-contract.md) | 平台接入契约（bind mount / SELinux domain / renderD128 透传） |
-| [tools/check-browser-vaapi.sh](tools/check-browser-vaapi.sh) · [直链下载](https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/check-browser-vaapi.sh) | 浏览器硬解一键体检脚本 |
-| [tools/test_decode.py](tools/test_decode.py) · [直链下载](https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.4/tools/test_decode.py) | 协议解析演示客户端（TCP 内联模式） |
+| `check-browser-vaapi.sh`（见本页 Assets） | 浏览器硬解一键体检脚本 |
+| `test_decode.py`（见本页 Assets） | 协议解析演示客户端（TCP 内联模式） |
+| 编译产物：`decode-daemon` / `msm_drm_drv_video.so` / `dmd_watchdog-v0.3.4.zip` / `SHA256SUMS` | CI 构建的部署包，校验和见 SHA256SUMS |
 | [CHANGELOG.md](CHANGELOG.md) | 全版本更新日志 |
 
 **Full Changelog**: https://github.com/Re-s/droidspaces-media-decode/blob/master/CHANGELOG.md

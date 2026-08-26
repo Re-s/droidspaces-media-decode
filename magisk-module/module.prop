@@ -1,6 +1,0 @@
-id=decode-daemon
-name=MediaCodec Decode Daemon
-version=1.0
-versionCode=1
-author=droidspaces
-description=Hardware video decode service for DroidSpaces container
