@@ -594,6 +594,13 @@ MAC 不看 uid）；DroidSpaces `enable_hw_access=1` 无效（只透传 `/dev`
 `accept`、事后非 SHM 路径复测一致）→ 属该连接的错误处理问题。
 另外浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测。
 
+> 📌 后续变更：该默认值已于 2026-08-26 反转 —— Unix socket 模式下 SHM 改为
+> 默认开启，`DMD_WANT_SHM=0` 才关闭（TCP 模式仍恒为关闭），并已在真实环境
+> 端到端实测通过。见本页顶部"零拷贝帧回传默认开启（2026-08-26）"条目。
+>
+> 上面那句"浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测"同样已作废 ——
+> Firefox RDD 与 Chrome GPU 进程均实测能正常建立 SHM 解码会话。
+
 ---
 
 ## v0.2.0
@@ -745,3 +752,9 @@ PPS `num_ref_idx` 振荡、daemon 未持久化、无鉴权）。
 
 注意 `DMD_XFER_SHM` 目前**默认关闭**（`decode.c` 里 `want_shm = 0`），
 即浏览器路径从未走过它，其在 Firefox 沙箱下的表现未验证。
+
+> 📌 后续变更：此处"目前"指 v0.1.0 当时。该默认值已于 2026-08-26 反转 ——
+> Unix socket 模式下 SHM 改为默认开启，`DMD_WANT_SHM=0` 才关闭（TCP 模式
+> 仍恒为关闭）。见本页顶部"零拷贝帧回传默认开启（2026-08-26）"条目。
+> "Firefox 沙箱下的表现未验证"也已作废：Firefox RDD 与 Chrome GPU 进程
+> 均实测能正常建立 SHM 解码会话。

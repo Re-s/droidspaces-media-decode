@@ -7,7 +7,7 @@
 - Android 13（SDK 33），内核 `4.14.336-Kuugo-v1.0-260728`，aarch64
 - Root：KernelSU `ksud 3.3.0`，daemon 运行于 SELinux context `u:r:ksu:s0`
 - 容器：DroidSpaces 内的 Debian 13 (trixie) aarch64
-- 验证日期：2026-08-22
+- 验证日期：2026-08-22（§1.4 的 SHM 部分为 2026-08-26 复测更新）
 
 ---
 
@@ -117,16 +117,84 @@ SHM（`DMD_XFER_SHM`）的 memfd 交接**不走**控制通道，而是 daemon
 另开一个 **abstract** socket（`src/decode-daemon.c` 里 `sun_path[0] = 0` 处），
 驱动再去连它。
 
-所以**零拷贝只在 host 型容器可能可用，NAT 型必然降级** —— 即使控制通道
-已经是路径式 Unix socket 也一样。
+所以**零拷贝只在 host 型容器可用（已实测跑通，见下），NAT 型必然降级**
+—— 即使控制通道已经是路径式 Unix socket 也一样。
 
 > **教训**：控制通道能跨 netns，**不等于** memfd 交接通道也跨得过去。
 > 要让零拷贝在 NAT 容器可用，需把交接改走同一条路径式 Unix socket
 > （在已有连接上传 `SCM_RIGHTS`，不必另开 socket）。那是独立改动，尚未实施。
 
-SHM 目前**默认关闭**（需 `DMD_WANT_SHM=1`）。实测开启后单个连接会断
-（118 单元只取回 25 帧），但不会打死 daemon。浏览器沙箱能否收
-`SCM_RIGHTS` 亦**未验证** —— 已验证的只是 ffmpeg（无沙箱）下可用。
+SHM 在 **Unix socket 模式下默认开启**（2026-08-26 起；此前默认关闭）。
+判据是驱动里唯一那处赋值，`vaapi-driver/src/decode.c:483`：
+
+```c
+cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
+```
+
+即走 Unix socket 时无 `DMD_WANT_SHM` 环境变量便取 **1**，
+显式设 `DMD_WANT_SHM=0` 才关闭；**TCP 模式恒为 0**。
+
+已在真实消费者进程里端到端实测（驱动被 dlopen 进 ffmpeg、走
+`/run/dmd/decode.sock`），daemon 日志：
+
+```
+[167] 共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+[167] 握手成功: video/hevc 1280x720 帧回传=SHM
+```
+
+解码结果与内联模式一致（150/150 帧）。收益（固定 1500 帧工作量、
+三组交替对照、daemon 侧 CPU jiffies）：
+
+| 模式 | 三次测量 | 中位数 |
+|---|---|---|
+| 内联 | 493 / 500 / 489 | 493 |
+| SHM | 400 / 367 / 410 | **400** |
+
+**daemon CPU 降低约 19%**。
+
+浏览器沙箱能收 `SCM_RIGHTS` —— **已实测**：Firefox RDD 与 Chrome GPU 进程
+均能正常建立解码会话。此前本文记为"未验证、只在 ffmpeg（无沙箱）下验证过"。
+
+> **已解决的历史现象**（v0.3.0 时期，留档备查）：驱动侧首次启用 SHM 时，
+> `xfer=1`、4 槽 memfd 挂载与 `帧回传=SHM` 握手都成功，但随后该连接断开
+> （`Broken pipe` / `Connection reset by peer`），118 个输入单元只取回 25 帧
+> —— 且不会打死 daemon（无新 tombstone、socket 继续 `accept`）。
+> 该问题**现已修复**，上面那组端到端数据就是修复后测得的。
+
+#### "零拷贝"只覆盖 memfd → 消费者这一段
+
+⚠️ **SHM 不等于"解码器直写共享内存"。** MediaCodec 的输出缓冲由 gralloc
+分配，daemon 无法指定输出缓冲位置，只能 `AMediaCodec_getOutputBuffer`
+拿到 CPU 指针后 `memcpy` 进 memfd（`src/decode-daemon.c` 的
+`send_frame_shm`，约 949 行）。所以 SHM 省掉的是**帧经 socket 的那次拷贝**，
+解码器 → memfd 那一次仍然存在。
+
+实测这次拷贝：3133440 字节单帧 **0.227 ms**（13137 MB/s，300 次测量、
+预热 30 次），按 1080p 峰值 194 fps 折算约占 **4.4% 的单核 CPU**。
+要消除它必须拿到输出缓冲的 dmabuf fd，而 NDK 公开 API 没有这个入口
+（`AHardwareBuffer_lock` 只返回 CPU 指针，`sendHandleToUnixSocket`
+实测跨容器不可用），只能依赖 `libui` / gralloc 私有符号，绑死特定
+Android 版本的 C++ ABI —— 因此**已否决**。
+
+这条事实同时解释了三个实测观测：
+
+| 观测 | 实测值 | 原因 |
+|---|---|---|
+| daemon 侧 CPU | SHM 模式下 300 帧解码仅 **0.12 s** | 每帧只做一次 memcpy，帧数据不再过 socket |
+| `/proc/<pid>/io` 的 `wchar` | 一次 300 帧 720p 会话增长约 **92 KB** | 若帧走 socket 应是 300 × 1.38MB ≈ **414 MB**，实测只有万分之二 —— 那 92 KB 是控制消息与日志 |
+| `/proc/meminfo` 的 `Shmem` | 会话建立时**跳增约 36 MB**，随后回落 | memfd 池一次性分配后循环复用，稳态不再增长 |
+
+> ⚠️ 上面两行曾被记为「`wchar` 恒为 **0**」和「`Shmem` **无跳变**」，
+> **那是采样错误**：`wchar` 那次把 daemon PID 抓错（daemon 曾被看护重启，
+> 需每次重新 `pidof`），`Shmem` 那次的采样窗口错过了会话建立瞬间。
+> 复测取证（0.25 s 窗口连续采样，720p30 十秒内容）：
+> ```
+> t=3.25s  wchar+76614   Shmem +7052 kB
+> t=3.50s  wchar+83533   Shmem+36980 kB   ← memfd 池分配
+> t=4.25s  wchar+91712   Shmem  -780 kB   ← 回落，稳态不增长
+> ```
+> **结论方向不变**（帧确实不过 socket：92 KB vs 应有的 414 MB），
+> 但"恒为 0"这种绝对表述是错的 —— 控制消息本身也要过 socket。
 
 #### 例外：存在一个双向共享目录
 

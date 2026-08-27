@@ -13,22 +13,38 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
 - **硬件加速解码**：利用 Android MediaCodec API 硬件解码 H.264 / HEVC / VP8 / VP9
 - **标准 VA-API 接口**：容器侧提供 VA-API 驱动，应用（ffmpeg、Firefox、Chrome）无需改动即可用
 - **两种传输通道，自动选择**：
-  - **路径式 Unix socket**：不属于 net namespace，靠 bind mount 跨界，
-    **host 型与 NAT 型容器都能用**；鉴权靠文件权限与 SELinux，服务不上网络。
-    ⚠️ **但实测吞吐不足以支撑实时解码**（720p30 仅 0.92x，会话中途因
-    "输入缓冲暂满"中断），详见 CHANGELOG"已知问题"。**当前请优先用 TCP**，
-    客户端显式指定 `DMD_ENDPOINT=tcp:20003`。
+  - **路径式 Unix socket**（**当前推荐**）：不属于 net namespace，靠 bind mount
+    跨界，**host 型与 NAT 型容器都能用**；鉴权靠文件权限与 SELinux，服务不上网络。
+    吞吐实测 720p30 **4.2x 实时**，且是唯一能启用 memfd 零拷贝的模式（见下）。
     ⚠️ 当前 daemon 建 socket 后 `chmod 0666`（`src/decode-daemon.c` 里标注为
     "先跑通"的放宽值），真实部署应收紧到特定 gid。
-  - **TCP 127.0.0.1**（**当前推荐**，吞吐实测 6.7~8.6x 实时）：仅在容器与宿主
-    **共享 net namespace** 时可用（host 型容器满足，NAT 型不满足）。
+  - **TCP 127.0.0.1**：仅在容器与宿主**共享 net namespace** 时可用
+    （host 型容器满足，NAT 型不满足）。裸吞吐更高（6.7~8.6x 实时），
+    但**恒为内联传输**，吃不到零拷贝带来的 daemon CPU −19%。
+
+  > 📌 **推荐项已于 2026-08-26 反转。** 本文档早前写着"Unix socket 实测吞吐
+  > 不足以支撑实时解码（720p30 仅 0.92x，会话中途因『输入缓冲暂满』中断），
+  > 当前请优先用 TCP"。**那个结论已过期** —— 根因是默认 socket 缓冲
+  > （`SO_SNDBUF` 224KB）装不下单帧 NV12（720p 1.38MB / 1080p 3.11MB），
+  > 已通过显式设 4MB 收发缓冲修复，**0.92x → 7.4x**。
+  > 真机复测：720p30 **4.21x**、`帧回传=SHM`、`输入缓冲暂满` 计数 **0**；
+  > `ss -x -m` 显示该 socket 为 `rb8388608,tb8388608`（同机其它 Unix socket
+  > 只有 `rb229376`），可独立确认缓冲修复已生效。
+  > 因此现在推荐 Unix socket —— 它既跨两类容器，又是零拷贝的前提。
   
   驱动通过 `DMD_ENDPOINT` 显式指定，或自动探测默认路径后退回 TCP。
-  ⚠️ **memfd 零拷贝默认关闭**，需 `DMD_WANT_SHM=1` 显式开启。
-  这条路驱动侧从未真正启用过（`want_shm` 长期硬编码为 0），只有单元测试走过
-  （150 帧、与 TCP 前 20 帧逐字节一致、无 fd 泄漏），真实消费者环境下未验证。
+  **memfd 零拷贝在 Unix socket 模式下默认开启**（`vaapi-driver/src/decode.c:483`），
+  `DMD_WANT_SHM=0` 可显式关闭；非 Unix socket（TCP）模式恒为内联 —— memfd 交接
+  走另开的 abstract socket，属 net namespace，**NAT 型容器必然降级**。
+  这条路已在真实消费者环境端到端实测通过（驱动被 `dlopen` 进 ffmpeg、走
+  `/run/dmd/decode.sock`，daemon 日志确认 `共享内存已交接: 4 槽 x 3133440 字节`
+  与 `握手成功: video/hevc 1280x720 帧回传=SHM`，解码结果与内联一致 150/150 帧，
+  daemon CPU 降低约 19%）。daemon 侧交接失败会自动退回内联，开启无硬失败风险。
   浏览器沙箱收 `SCM_RIGHTS` 已真机实测可行：Firefox RDD 与 Chrome GPU 进程
-  均能正常建立解码会话（2026-08-26，TCP 内联模式）。
+  均能正常建立解码会话（2026-08-26）。
+  ⚠️ **"零拷贝"只描述 memfd → 消费者进程这一段**：MediaCodec 的输出缓冲由
+  gralloc 分配，daemon 只能 `AMediaCodec_getOutputBuffer` 拿到 CPU 指针后
+  `memcpy` 进 memfd，**解码器到 memfd 那次 CPU 拷贝仍然存在**。
 - **最小化实现**：基于 anland 项目的 libdisplay_daemon 库简化而来，代码简洁易懂
 - **进程托管**：daemon 设计为被平台托管的前台进程（DroidSpace 负责启动与守护）
 
@@ -237,10 +253,13 @@ TCP 模式与抽象命名空间模式填 0。
 不能因为响应说了 SHM 就假定后续一定是槽位消息。
 本仓库的 `client/` 与 `tools/test_decode.py` 都按此实现。
 
-#### 共享内存传输（可选，省两次拷贝）
+#### 共享内存传输（Unix socket 模式下默认开启，省两次拷贝）
 
 TCP 模式每帧要经过两次内核拷贝（发送进 socket 缓冲、接收再拷出）。
 1080p NV12 一帧 3MB，60fps 下就是 180MB/s 的额外内存带宽。
+
+驱动在走 Unix socket 时默认请求 SHM，`DMD_WANT_SHM=0` 可显式关闭；
+TCP 模式恒为内联（memfd 交接走 abstract socket，属 net namespace）。
 
 SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
 
@@ -281,7 +300,8 @@ SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
 仍存在的边界：分辨率超过 adaptive-playback 声明的上限时依然会终止会话
 （报 `帧 N 字节超出槽位 M，需重建池`），但不会越界写、不影响其他会话。
 
-实测收益（1080p，同一码流，两组独立测量）：
+实测收益（1080p，同一码流，两组独立测量，**测量环境是
+`tests/test_dmd_client.c` 独立测试程序**）：
 
 | 测法 | TCP | SHM | 提升 |
 |------|-----|-----|------|
@@ -293,8 +313,18 @@ SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
 
 daemon CPU：763 → 545 ticks / 1800 帧，**-28.6%**。
 两种模式解出的 PPM 逐字节完全一致（前 3 帧 NV12 12/12 全等）。
-省掉的是内核拷贝；MediaCodec 输出缓冲到共享内存那一次 CPU 拷贝仍然存在，
-要去掉需要 dmabuf 零拷贝（见 `doc/performance-and-roadmap.md`）。
+
+驱动侧（被 `dlopen` 进 ffmpeg、走 `/run/dmd/decode.sock`）的端到端数字另测：
+固定 1500 帧工作量、三组交替对照、daemon 侧 CPU jiffies，内联 493/500/489
+（中位 493）vs SHM 400/367/410（中位 400），**降低约 19%**，组内方差 ±2%。
+省下的是每帧 1.38MB(720p) / 3.11MB(1080p) 经 socket 的那次拷贝。
+
+⚠️ **"零拷贝"只描述 memfd → 消费者进程这一段。** MediaCodec 的输出缓冲由
+gralloc 分配，daemon 只能 `AMediaCodec_getOutputBuffer` 拿到 CPU 指针后
+`memcpy` 进 memfd（`src/decode-daemon.c` 的 `send_frame_shm`，约 949 行），
+**解码器到 memfd 那次 CPU 拷贝仍然存在**。要消除它需走 dmabuf 传递，
+而那条路因需依赖 libui/gralloc 私有符号（会绑死特定 Android 版本的 C++ ABI）、
+且上限收益仅 4.4% 单核 CPU 已被否决（见 `doc/performance-and-roadmap.md`）。
 
 #### 格式描述块
 
@@ -582,22 +612,26 @@ permissive，不可作为交付形态。
 **规则到位前驱动会自动退回 TCP，行为与 v0.2.0 一致，无退化。**
 详见 [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) §2.2。
 
-### 0b. memfd 零拷贝开启后单连接会断
+### 0b. ~~memfd 零拷贝开启后单连接会断~~（v0.3.0 现象，已修复）
 
-`DMD_WANT_SHM=1` 时实测：`xfer=1`、4 槽 memfd 挂载与 `帧回传=SHM` 握手都成功，
-随后该连接断开（`Broken pipe` / `Connection reset by peer`），
-118 个输入单元只取回 25 帧。
+v0.3.0 首次在驱动侧启用 SHM 时实测：`xfer=1`、4 槽 memfd 挂载与 `帧回传=SHM`
+握手都成功，随后该连接断开（`Broken pipe` / `Connection reset by peer`），
+118 个输入单元只取回 25 帧。但**不会打死 daemon** —— 无新 tombstone、
+socket 继续 `accept`、事后非 SHM 路径复测逐字节一致，所以当时判定为该连接的
+错误处理问题而非进程级崩溃。
 
-但**不会打死 daemon** —— 无新 tombstone、socket 继续 `accept`、
-事后非 SHM 路径复测逐字节一致。所以属该连接的错误处理问题，
-不是进程级崩溃 —— 排查方向应放在该连接的错误返回与提前 `close`，
-而不是"daemon 崩了"。具体根因未定位，故默认关闭。
+**2026-08-26 已修复并转为默认开启**：真实环境（驱动被 `dlopen` 进 ffmpeg、走
+`/run/dmd/decode.sock`）解码结果与内联一致（150/150 帧），daemon CPU 降低约 19%。
 
-> 与"已知问题 0"区分：那条是 SELinux domain 导致**任何**解码都不成，
-> 与传输方式无关；这条是 SHM 帧交付路径特有的。两者曾被我误当成同一件事。
+> ⚠️ 保留两条教训：
+> 1. 与"已知问题 0"区分：那条是 SELinux domain 导致**任何**解码都不成，
+>    与传输方式无关；这条是 SHM 帧交付路径特有的。两者曾被我误当成同一件事。
+> 2. **判断某能力是否生效，要先确认它的开关是开的。** 本项目在这上面栽过：
+>    文档一度按独立测试程序的数字声称 SHM 有 +17% 吞吐，而当时 `want_shm`
+>    在驱动侧硬编码为 0，真实消费者进程从未执行过这条路径。
 
 另外零拷贝的 memfd 交接走的是**另开的 abstract socket**，属 net namespace，
-所以它**只在 host 型容器可能可用，NAT 型必然降级**。
+所以它**只在 host 型容器可用，NAT 型必然降级**（这条仍成立）。
 
 ### 1. 共享内存池不支持超出上限的分辨率
 槽位已按 adaptive-playback 上限（≥1920×1088）预留，覆盖了常见的
@@ -643,8 +677,10 @@ permissive，不可作为交付形态。
 - 超出上限时直接关闭新连接，客户端侧只看到连接被断，没有明确的拒绝原因
 
 ### 5. 帧数据仍有一次 CPU 拷贝（已评估，不打算消除）
-SHM 模式已省掉 TCP 的两次内核拷贝（吞吐 +17%，daemon CPU −28.6%），
-但 MediaCodec 输出缓冲 → 共享内存这一次拷贝仍在。
+SHM 模式已省掉 TCP 的两次内核拷贝（独立测试程序：吞吐 +17%、daemon CPU −28.6%；
+驱动侧端到端：daemon CPU −19%），但 MediaCodec 输出缓冲 → 共享内存这一次拷贝仍在
+—— 输出缓冲由 gralloc 分配，daemon 只能 `AMediaCodec_getOutputBuffer` 拿 CPU
+指针后 `memcpy`，所以"零拷贝"只覆盖 memfd → 消费者进程那一段。
 
 实测这次拷贝单帧 0.227 ms（13137 MB/s），按 194 fps 折算只占约
 **4.4% 的单核 CPU**。要去掉它必须拿到输出缓冲的 dmabuf fd，

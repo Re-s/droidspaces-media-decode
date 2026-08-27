@@ -22,11 +22,20 @@ This project provides a MediaCodec hardware decode daemon that runs on an Androi
 
   The driver either takes an explicit endpoint from `DMD_ENDPOINT`, or probes the default path and falls back to TCP.
 
-  ⚠️ **memfd zero-copy is disabled by default** and must be enabled explicitly with `DMD_WANT_SHM=1`.
-  This path has never actually been enabled on the driver side (`want_shm` was hard-coded to 0 for a long time); only the unit test has exercised it
-  (150 frames, byte-for-byte identical to TCP for the first 20 frames, no fd leaks), and it is unverified in a real consumer environment.
-  Another untested risk is whether a browser sandbox can receive `SCM_RIGHTS`
-  (both the Firefox RDD and the Chrome GPU process have seccomp filters).
+  **memfd zero-copy is enabled by default in Unix socket mode** (`vaapi-driver/src/decode.c:483`);
+  it can be turned off explicitly with `DMD_WANT_SHM=0`, and a non-Unix-socket (TCP) transport is always inline —
+  the memfd handover goes over a separate abstract socket, which belongs to a net namespace,
+  so **a NAT-mode container will necessarily be downgraded**.
+  This path has been verified end to end in a real consumer environment (the driver `dlopen`ed into ffmpeg over
+  `/run/dmd/decode.sock`; the daemon log confirms `共享内存已交接: 4 槽 x 3133440 字节` and
+  `握手成功: video/hevc 1280x720 帧回传=SHM`, the decode result matches the inline path 150/150 frames,
+  and daemon CPU drops by about 19%). A failed handover on the daemon side falls back to inline automatically,
+  so enabling it carries no risk of hard failure.
+  A browser sandbox receiving `SCM_RIGHTS` has also been verified on device: both the Firefox RDD and the
+  Chrome GPU process establish decode sessions normally (2026-08-26).
+  ⚠️ **"Zero-copy" only describes the memfd → consumer process leg**: the MediaCodec output buffer is allocated by
+  gralloc, so the daemon can only take a CPU pointer via `AMediaCodec_getOutputBuffer` and `memcpy` it into the memfd —
+  **the CPU copy from the decoder into the memfd is still there**.
 - **Minimal implementation**: simplified from the libdisplay_daemon library of the anland project; the code is concise and easy to follow
 - **Process supervision**: the daemon is designed as a foreground process supervised by the platform (DroidSpace is responsible for starting and keeping it alive)
 
@@ -218,10 +227,13 @@ able to continue parsing in the TCP frame format, and it must not assume that su
 just because the response said SHM.
 Both `client/` and `tools/test_decode.py` in this repository are implemented this way.
 
-#### Shared memory transport (optional, saves two copies)
+#### Shared memory transport (enabled by default in Unix socket mode, saves two copies)
 
 In TCP mode every frame goes through two kernel copies (copied into the socket buffer on send, copied back out on receive).
 A 1080p NV12 frame is 3 MB, which at 60 fps means 180 MB/s of extra memory bandwidth.
+
+The driver requests SHM by default whenever it goes over a Unix socket; `DMD_WANT_SHM=0` turns it off explicitly.
+TCP mode is always inline (the memfd handover goes over an abstract socket, which belongs to a net namespace).
 
 SHM mode puts the frame data into a `memfd` and the socket carries only a 20-byte control message:
 
@@ -263,7 +275,8 @@ The cost is that a 720p stream also occupies a 1080p-sized pool (4 × 3133440 �
 A boundary that remains: if the resolution exceeds the declared adaptive-playback limit the session is still terminated
 (reporting `帧 N 字节超出槽位 M，需重建池`), but there is no out-of-bounds write and other sessions are unaffected.
 
-Measured gains (1080p, same bitstream, two independent measurements):
+Measured gains (1080p, same bitstream, two independent measurements; **the measurement environment was
+the standalone test program `tests/test_dmd_client.c`**):
 
 | Method | TCP | SHM | Improvement |
 |------|-----|-----|------|
@@ -276,8 +289,18 @@ while the steady-state window is closer to the real ceiling; for the size of the
 
 Daemon CPU: 763 → 545 ticks / 1800 frames, **-28.6%**.
 The PPMs decoded in the two modes are byte-for-byte identical (12/12 equal across the first 3 NV12 frames).
-What is saved is the kernel copies; the one CPU copy from the MediaCodec output buffer into shared memory is still there,
-and removing it would require dmabuf zero-copy (see `doc/performance-and-roadmap.md`).
+
+The driver-side end-to-end figures (the driver `dlopen`ed into ffmpeg over `/run/dmd/decode.sock`) were measured
+separately: a fixed 1500-frame workload, three alternating paired runs, daemon-side CPU jiffies — inline
+493/500/489 (median 493) vs SHM 400/367/410 (median 400), **about 19% lower**, with ±2% variance within a group.
+What is saved is the one copy of 1.38 MB (720p) / 3.11 MB (1080p) per frame that used to go through the socket.
+
+⚠️ **"Zero-copy" only describes the memfd → consumer process leg.** The MediaCodec output buffer is allocated by
+gralloc, so the daemon can only take a CPU pointer via `AMediaCodec_getOutputBuffer` and `memcpy` it into the memfd
+(`send_frame_shm` in `src/decode-daemon.c`, around line 949) — **the CPU copy from the decoder into the memfd is
+still there**. Removing it would require passing a dmabuf, and that route was rejected because it would have to rely
+on private libui/gralloc symbols (pinning it to the C++ ABI of a specific Android version) while the upper bound on
+the gain is only 4.4% of one CPU core (see `doc/performance-and-roadmap.md`).
 
 #### Format description block
 
@@ -553,22 +576,27 @@ and cannot be a delivery form.
 **Until the rule is in place the driver falls back to TCP automatically; the behaviour matches v0.2.0, with no regression.**
 See [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) §2.2 for details.
 
-### 0b. A single connection drops once memfd zero-copy is enabled
+### 0b. ~~A single connection drops once memfd zero-copy is enabled~~ (a v0.3.0 symptom, now fixed)
 
-With `DMD_WANT_SHM=1`, measured on device: `xfer=1`, the 4-slot memfd mapping and the `帧回传=SHM` handshake all succeed,
-and then that connection drops (`Broken pipe` / `Connection reset by peer`),
-with only 25 frames collected out of 118 input units.
+When SHM was first enabled on the driver side in v0.3.0, measured on device: `xfer=1`, the 4-slot memfd mapping and
+the `帧回传=SHM` handshake all succeed, and then that connection drops (`Broken pipe` / `Connection reset by peer`),
+with only 25 frames collected out of 118 input units. But **it does not kill the daemon** — there is no new tombstone,
+the socket keeps `accept`ing, and a re-test afterwards on the non-SHM path was byte-for-byte identical, so at the time
+this was judged an error-handling problem on that connection rather than a process-level crash.
 
-But **it does not kill the daemon** — there is no new tombstone, the socket keeps `accept`ing,
-and a re-test afterwards on the non-SHM path was byte-for-byte identical. So this is an error-handling problem
-on that connection, not a process-level crash — investigation should focus on that connection's error returns and
-its early `close`, not on "the daemon crashed". The exact root cause is not identified, so it is disabled by default.
+**Fixed on 2026-08-26 and now enabled by default**: in a real environment (the driver `dlopen`ed into ffmpeg over
+`/run/dmd/decode.sock`) the decode result matches the inline path (150/150 frames) and daemon CPU drops by about 19%.
 
-> To distinguish this from "Known issue 0": that one is an SELinux domain that makes **any** decoding fail,
-> regardless of the transport; this one is specific to the SHM frame delivery path. We once mistook the two for the same thing.
+> ⚠️ Two lessons worth keeping:
+> 1. To distinguish this from "Known issue 0": that one is an SELinux domain that makes **any** decoding fail,
+>    regardless of the transport; this one was specific to the SHM frame delivery path. We once mistook the two for
+>    the same thing.
+> 2. **Before judging whether a capability is working, confirm its switch is actually on.** This project got burned
+>    here: the docs once claimed SHM gave +17% throughput based on standalone-test-program numbers, while `want_shm`
+>    was hard-coded to 0 on the driver side and a real consumer process had never executed that path.
 
 Also, the memfd handover for zero-copy goes over **a separate abstract socket**, which belongs to a net namespace,
-so it **can only possibly work in a host-mode container, and a NAT-mode container will necessarily be downgraded**.
+so it **only works in a host-mode container, and a NAT-mode container will necessarily be downgraded** (this still holds).
 
 ### 1. The shared memory pool does not support resolutions above the limit
 Slots are already reserved at the adaptive-playback limit (≥1920×1088), which covers common
@@ -616,8 +644,10 @@ Still not covered:
 - Beyond the limit new connections are simply closed, and the client only sees the connection dropped, with no explicit reason for the rejection
 
 ### 5. Frame data still involves one CPU copy (assessed; no plan to remove it)
-SHM mode already eliminates TCP's two kernel copies (throughput +17%, daemon CPU −28.6%),
-but the copy from the MediaCodec output buffer into shared memory is still there.
+SHM mode already eliminates TCP's two kernel copies (standalone test program: throughput +17%, daemon CPU −28.6%;
+driver-side end to end: daemon CPU −19%), but the copy from the MediaCodec output buffer into shared memory is still
+there — that output buffer is allocated by gralloc, so the daemon can only take a CPU pointer via
+`AMediaCodec_getOutputBuffer` and `memcpy` it, which is why "zero-copy" covers only the memfd → consumer process leg.
 
 That copy was measured at 0.227 ms per frame (13137 MB/s), which at 194 fps works out to only about
 **4.4% of one CPU core**. Removing it would require getting the dmabuf fd of the output buffer,

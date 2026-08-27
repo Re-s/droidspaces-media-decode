@@ -343,33 +343,48 @@ ls -l /dev/dri/renderD128 && id
 
 ## 4. 可选优化：memfd 零拷贝（SHM 传输）
 
-TCP 模式每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息。
+内联模式（帧数据直接走 socket 字节流，TCP 与 Unix socket 都是如此）每帧经过两次内核拷贝；SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息。
 
-**取证环境为 `tests/test_dmd_client.c`（独立测试程序）**，实测 1080p 收益：稳态窗口吞吐 +12.9%、daemon CPU **−28.6%**，两种模式解出的帧逐字节完全一致。
+**独立测试程序 `tests/test_dmd_client.c` 的 1080p 取证**：稳态窗口吞吐 +12.9%、daemon CPU **−28.6%**，两种模式解出的帧逐字节完全一致。
 
-> ⚠️ **不要把这组数字当作驱动侧的预期收益。** 它出自独立测试程序，
-> 而驱动被 `dlopen` 进真实消费者（ffmpeg / 浏览器）后的 SHM 路径
-> **至今没有端到端跑通**（见下方说明）。真实收益未知，可能更低。
+**驱动侧端到端取证**（驱动被 `dlopen` 进 ffmpeg、走 `/run/dmd/decode.sock`）：固定 1500 帧工作量、三组交替对照，daemon 侧 CPU jiffies 内联 493/500/489（中位 493）vs SHM 400/367/410（中位 400），**降低约 19%**；解码结果与内联模式一致（150/150 帧）。
 
-⚠️ **它只在 host 型容器可能可用，NAT 型容器不可用。**
+> ⚠️ 独立测试程序那组数字（−28.6%）**不要当作驱动侧的预期收益** ——
+> 真实消费者环境下的实测值是**约 −19%**，以后者为准。
 
-> **勘误**：本文档早前版本称"它在两类容器都可用，因为不依赖 net namespace"。**那个结论是错的**。SHM 的 memfd 交接并不走 §2.1 那条路径式 Unix socket，而是 daemon 另开一个 **abstract** socket（`src/decode-daemon.c`，搜 `sun_path[0] = 0`），驱动再去连它。abstract socket **属于 net namespace** —— NAT 型容器 netns 独立，连不上那个交接通道，`DMD_WANT_SHM=1` 在那里必然交接失败再降级，每建一次会话白等一次超时。
+⚠️ **它只在 host 型容器可用，NAT 型容器不可用。**
+
+> **勘误**：本文档早前版本称"它在两类容器都可用，因为不依赖 net namespace"。**那个结论是错的**。SHM 的 memfd 交接并不走 §2.1 那条路径式 Unix socket，而是 daemon 另开一个 **abstract** socket（`src/decode-daemon.c`，搜 `sun_path[0] = 0`），驱动再去连它。abstract socket **属于 net namespace** —— NAT 型容器 netns 独立，连不上那个交接通道。SHM 现已默认开启（见下），所以在 NAT 型容器里每建一次会话都会先交接失败再降级，白等一次超时；要省掉这次超时，可在 NAT 型容器内显式设 `DMD_WANT_SHM=0`。
 >
 > 教训：**控制通道能跨 netns，不等于 SHM 交接通道也跨得过去。** 要让零拷贝在 NAT 容器可用，需把 memfd 交接改走同一条路径式 Unix socket（在已有连接上传 `SCM_RIGHTS` 即可，不必另开 socket）。那是一项独立改动，尚未实施。
 
 已实测确认的部分：路径式 Unix socket 跨 mount namespace 可用、`SCM_RIGHTS` 能跨界传 fd、memfd 跨 namespace 可映射（宿主写入的内容容器侧 `mmap` 后能读到）。这些是零拷贝的必要条件，但当前实现没有用上那条通道。
 
-**平台侧无需为此做任何配置** —— 这一项是后续优化，不是接入要求。
+**平台侧无需为此做任何配置** —— 开关与降级都在本项目内部，不是接入要求。
 
-⚠️ **当前默认关闭。** 驱动侧需 `DMD_WANT_SHM=1` 且已走 Unix socket 才请求 SHM（`vaapi-driver/src/decode.c` 的 `want_shm` 判定（搜 `DMD_WANT_SHM`））。
+✅ **当前默认开启（走 Unix socket 时）。** 驱动侧判定见 `vaapi-driver/src/decode.c` 的 `want_shm`（搜 `DMD_WANT_SHM`）：走 Unix socket 时，未设 `DMD_WANT_SHM` 即取默认值 1；显式设 `DMD_WANT_SHM=0` 可关闭；TCP 模式恒为 0（TCP 下不请求 SHM）。
 
-这条路**驱动侧从未真正启用过**（`want_shm` 长期硬编码为 0），只有 `tests/test_dmd_client.c` 走过：实测 150 帧、与 TCP 前 20 帧逐字节一致、无 fd 泄漏。但那是独立测试程序，不是驱动被 `dlopen` 进消费者进程的真实环境。
+> **勘误**：本文档早前版本称"当前默认关闭，需 `DMD_WANT_SHM=1` 显式开启"。**自 2026-08-26 起逻辑已反转**，那个默认值说明已过期 —— 现在是默认开启、`DMD_WANT_SHM=0` 显式关闭。
 
-尚未验证的风险是浏览器沙箱（Firefox RDD / Chrome GPU 进程的 seccomp 过滤）能否接收 `SCM_RIGHTS`。本项目有先例：一份源码级结论称 RDD 沙箱对 `SYS_SOCKET` 一律返回 `EACCES`，实测却跑通了 713 帧 —— 这类判断只能靠实测。
+默认开启是安全的：daemon 侧交接失败会自动退回内联传输（NAT 型容器就是这种情况），**没有硬失败风险**，代价只是每次建会话多等一次交接超时。
+
+这条路已在真实消费者环境端到端实测通过：驱动被 `dlopen` 进 ffmpeg、走 `/run/dmd/decode.sock`，daemon 日志确认 `共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)` 与 `握手成功: video/hevc 1280x720 帧回传=SHM`，解码结果与内联模式一致（150/150 帧）。此前 `tests/test_dmd_client.c` 的单元测试结论（150 帧、逐字节一致、无 fd 泄漏）同样成立。
+
+浏览器沙箱（Firefox RDD / Chrome GPU 进程的 seccomp 过滤）能否接收 `SCM_RIGHTS` **已实测可行**：两者均能正常建立解码会话。本项目有先例：一份源码级结论称 RDD 沙箱对 `SYS_SOCKET` 一律返回 `EACCES`，实测却跑通了 713 帧 —— 这类判断只能靠实测。
+
+> ⚠️ **"零拷贝"的准确范围（平台方特别注意）**：它只描述 **memfd → 消费者进程**这一段。
+> MediaCodec 的输出缓冲由 gralloc 分配，daemon 只能 `AMediaCodec_getOutputBuffer`
+> 拿到 CPU 指针后 `memcpy` 进 memfd（`src/decode-daemon.c` 的 `send_frame_shm`，约 949 行），
+> **解码器到 memfd 那次 CPU 拷贝仍然存在**。
+>
+> 要消除它需改走 dmabuf 传递，但那条路已被否决：需依赖 libui/gralloc 私有符号
+> （绑死特定 Android 版本的 C++ ABI），上限收益仅 4.4% 单核 CPU。
+>
+> **对平台的含意**：支持 SHM **不要求**平台提供任何 dmabuf 相关能力。
 
 > **勘误**：本文档早前版本称"走 Unix socket + SHM 时 daemon 在 memfd 交接后不再服务、根因未定位"。**那个归因是错的**。真实原因是 §2.2 的 SELinux domain 权限问题（daemon 在 `droidspacesd` 下无权访问 Codec2，在 `CCodec::allocate` 处 SIGABRT），与 SHM 无关 —— 当时日志里的传输模式其实是 TCP。
 
-所以这一项列为"平台不必操心的后续优化"，不是接入要求。
+所以这一项列为"平台不必操心的内部优化"，不是接入要求；平台唯一需要知道的差异是 NAT 型容器拿不到这份收益（见 §3 的支持矩阵）。
 
 ---
 
@@ -466,9 +481,9 @@ Android 的 `stat` **支持** `%i` 与 `%F`，报错纯粹是引号层级问题�
 
 | 项 | 状态 |
 |---|---|
-| SHM（memfd）零拷贝 | 驱动侧**默认关闭**，需 `DMD_WANT_SHM=1`。这条路驱动侧从未真正启用过（只有单元测试走过：150 帧、逐字节一致、无 fd 泄漏），真实消费者环境下未验证；浏览器沙箱能否收 `SCM_RIGHTS` 亦未实测（`vaapi-driver/src/decode.c` 的 SHM 默认关闭说明（搜 `DMD_WANT_SHM`）） |
+| SHM（memfd）零拷贝 | 驱动侧走 Unix socket 时**默认开启**，`DMD_WANT_SHM=0` 可关闭（`vaapi-driver/src/decode.c` 的 `want_shm` 判定（搜 `DMD_WANT_SHM`））。已在真实消费者环境端到端实测通过（ffmpeg 与浏览器沙箱均可），**剩余限制**：① NAT 型容器因 memfd 交接走 abstract socket 而必然降级回内联（见 §4）；② "零拷贝"只覆盖 memfd → 消费者一段，解码器到 memfd 的 CPU `memcpy` 仍存在（dmabuf 方案已否决，见 §4） |
 | ~~**SELinux allow 规则缺失**~~ | **v0.3.1 已解决**。缺的是给**服务端域**的 `binder transfer`（判定按 sender，`droidspacesd` 自身 permissive 救不了），不是给 `droidspacesd` 的规则。平台已在两个策略载体加上并端到端逐字节验证通过 —— 详见 §2.2 |
-| 浏览器沙箱收 `SCM_RIGHTS` | **未验证**（Firefox RDD / Chrome GPU 进程有 seccomp 过滤） |
+| ~~浏览器沙箱收 `SCM_RIGHTS`~~ | **已实测可行**。Firefox RDD 与 Chrome GPU 进程（均有 seccomp 过滤）都能正常建立解码会话。本文档早前版本列为"未验证"，该状态已过期 |
 | Firefox 的 `MOZ_DISABLE_RDD_SANDBOX=1` | 该环境变量的原始理由是"RDD 沙箱禁止驱动创建 **TCP** socket"。**改用 Unix socket 后是否仍需要它，尚未实测**。它降低 RDD 进程隔离强度，属安全权衡 |
 | socket 文件权限 | 当前 `chmod 0666`，任何容器内进程可连；应收紧到特定 gid，等平台确认目标 gid |
 | 鉴权 | Unix socket 路径靠文件权限，但在 0666 下不构成隔离；TCP 路径完全无鉴权且 loopback 在 host 型容器不构成边界。**不要在多租户或不可信 App 环境下使用当前版本** |

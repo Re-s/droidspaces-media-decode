@@ -356,34 +356,51 @@ Endpoint selection logic on the driver side (`session_open` in `vaapi-driver/src
 
 ## 4. Optional optimization: memfd zero-copy (SHM transport)
 
-TCP mode goes through two kernel copies per frame; SHM mode puts frame data into a `memfd` and the socket carries only a 20-byte control message.
+Inline mode (frame data goes directly over the socket byte stream, which is the case for both TCP and Unix sockets) goes through two kernel copies per frame; SHM mode puts frame data into a `memfd` and the socket carries only a 20-byte control message.
 
-**The measurement environment was `tests/test_dmd_client.c` (a standalone test program).** Measured 1080p gains: +12.9% throughput in the steady-state window and **−28.6%** daemon CPU, with frames decoded in the two modes byte-for-byte identical.
+**1080p measurements from the standalone test program `tests/test_dmd_client.c`**: +12.9% throughput in the steady-state window and **−28.6%** daemon CPU, with frames decoded in the two modes byte-for-byte identical.
 
-> ⚠️ **Do not treat these numbers as the expected gain on the driver side.**
-> They come from a standalone test program, whereas the SHM path in the driver
-> — once `dlopen`ed into a real consumer (ffmpeg / a browser) — **has never run
-> end to end** (see below). The real gain is unknown and may be lower.
+**End-to-end measurements on the driver side** (the driver `dlopen`ed into ffmpeg, over `/run/dmd/decode.sock`): a fixed 1500-frame workload, three alternating paired runs, daemon-side CPU jiffies inline 493/500/489 (median 493) vs SHM 400/367/410 (median 400), a reduction of **about 19%**; the decoded output matches inline mode (150/150 frames).
 
-⚠️ **It can possibly be used only in host-mode containers; it does not work in NAT-mode containers.**
+> ⚠️ **Do not treat the standalone-test number (−28.6%) as the expected gain on the driver side** —
+> the measured value in a real consumer environment is **about −19%**; use the latter.
 
-> **Correction**: an earlier version of this document said "it works in both container types because it does not depend on the net namespace". **That conclusion was wrong.** The SHM memfd handoff does not go over the path-based Unix socket of §2.1; instead the daemon opens a separate **abstract** socket (`src/decode-daemon.c`; search for `sun_path[0] = 0`) and the driver connects to that. An abstract socket **belongs to the net namespace** — a NAT-mode container has its own netns and cannot reach that handoff channel, so `DMD_WANT_SHM=1` there inevitably fails the handoff and then degrades, wasting one timeout per session creation.
+⚠️ **It works only in host-mode containers; it does not work in NAT-mode containers.**
+
+> **Correction**: an earlier version of this document said "it works in both container types because it does not depend on the net namespace". **That conclusion was wrong.** The SHM memfd handoff does not go over the path-based Unix socket of §2.1; instead the daemon opens a separate **abstract** socket (`src/decode-daemon.c`; search for `sun_path[0] = 0`) and the driver connects to that. An abstract socket **belongs to the net namespace** — a NAT-mode container has its own netns and cannot reach that handoff channel. SHM is now enabled by default (see below), so in a NAT-mode container every session creation first fails the handoff and then degrades, wasting one timeout; to save that timeout, set `DMD_WANT_SHM=0` explicitly inside a NAT-mode container.
 >
 > Lesson: **the control channel being able to cross netns does not mean the SHM handoff channel can cross it too.** To make zero-copy usable in NAT containers, the memfd handoff has to be moved onto the same path-based Unix socket (passing `SCM_RIGHTS` over the existing connection is enough; no separate socket is needed). That is an independent change and has not been implemented yet.
 
 What has been verified on device: a path-based Unix socket works across mount namespaces, `SCM_RIGHTS` can pass fds across the boundary, and a memfd is mappable across namespaces (content written by the host can be read after `mmap` on the container side). These are the necessary conditions for zero-copy, but the current implementation does not use that channel.
 
-**The platform side needs no configuration for this** — this item is a later optimization, not an integration requirement.
+**The platform side needs no configuration for this** — the switch and the fallback are internal to this project, not an integration requirement.
 
-⚠️ **Currently disabled by default.** On the driver side, SHM is requested only when `DMD_WANT_SHM=1` and the Unix socket is already in use (the `want_shm` decision in `vaapi-driver/src/decode.c`; search for `DMD_WANT_SHM`).
+✅ **Currently enabled by default (when a Unix socket is in use).** The driver-side decision is `want_shm` in `vaapi-driver/src/decode.c` (search for `DMD_WANT_SHM`): when a Unix socket is in use, leaving `DMD_WANT_SHM` unset means the default value 1; setting `DMD_WANT_SHM=0` explicitly disables it; in TCP mode it is always 0 (SHM is never requested over TCP).
 
-This path has **never actually been enabled on the driver side** (`want_shm` has long been hard-coded to 0); only `tests/test_dmd_client.c` has exercised it: 150 frames measured, byte-for-byte identical to TCP for the first 20 frames, no fd leaks. But that is a standalone test program, not the real environment in which the driver is `dlopen`ed into a consumer process.
+> **Correction**: an earlier version of this document said "currently disabled by default, requires `DMD_WANT_SHM=1` to enable explicitly". **The logic was inverted on 2026-08-26**, so that default-value note is out of date — it is now enabled by default and disabled explicitly with `DMD_WANT_SHM=0`.
 
-The risk that has not been verified is whether browser sandboxes (the seccomp filters of the Firefox RDD / Chrome GPU processes) can receive `SCM_RIGHTS`. This project has a precedent: a source-level conclusion claimed that the RDD sandbox returns `EACCES` for all `SYS_SOCKET` calls, yet 713 frames ran through in an on-device test — judgments of this kind can only be settled by measurement.
+Enabling it by default is safe: when the handoff fails on the daemon side it automatically falls back to inline transport (which is exactly what happens in a NAT-mode container), so there is **no hard-failure risk** — the only cost is one extra handoff timeout per session creation.
+
+This path has been verified end to end in a real consumer environment: the driver `dlopen`ed into ffmpeg over `/run/dmd/decode.sock`, with the daemon log confirming `共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)` and `握手成功: video/hevc 1280x720 帧回传=SHM`, and the decoded output matching inline mode (150/150 frames). The earlier `tests/test_dmd_client.c` unit-test conclusions (150 frames, byte-for-byte identical, no fd leaks) still hold as well.
+
+Whether browser sandboxes (the seccomp filters of the Firefox RDD / Chrome GPU processes) can receive `SCM_RIGHTS` **has now been measured and works**: both can establish decoding sessions normally. This project has a precedent: a source-level conclusion claimed that the RDD sandbox returns `EACCES` for all `SYS_SOCKET` calls, yet 713 frames ran through in an on-device test — judgments of this kind can only be settled by measurement.
+
+> ⚠️ **The precise scope of "zero-copy" (platform, please note)**: it only describes the
+> **memfd → consumer process** segment. MediaCodec output buffers are allocated by gralloc,
+> so the daemon can only take the CPU pointer from `AMediaCodec_getOutputBuffer` and
+> `memcpy` it into the memfd (`send_frame_shm` in `src/decode-daemon.c`, around line 949) —
+> **the CPU copy from the decoder into the memfd is still there.**
+>
+> Removing it would require dmabuf passing, and that route has been rejected: it depends on
+> private libui/gralloc symbols (pinning the C++ ABI of one specific Android version) for an
+> upper-bound gain of only 4.4% of one CPU core.
+>
+> **What this means for the platform**: supporting SHM does **not** require the platform to
+> provide any dmabuf-related capability.
 
 > **Correction**: an earlier version of this document said "when using Unix socket + SHM, the daemon stops serving after the memfd handoff, root cause not identified". **That attribution was wrong.** The real cause is the SELinux domain permission problem in §2.2 (under `droidspacesd` the daemon has no permission to access Codec2 and SIGABRTs at `CCodec::allocate`), and has nothing to do with SHM — the transport mode in the logs at the time was in fact TCP.
 
-So this item is listed as "a later optimization the platform need not worry about", not an integration requirement.
+So this item is listed as "an internal optimization the platform need not worry about", not an integration requirement; the only difference the platform needs to know about is that NAT-mode containers do not get this gain (see the support matrix in §3).
 
 ---
 
@@ -480,9 +497,9 @@ An honest list of items that are currently unresolved or unverified, so the plat
 
 | Item | Status |
 |---|---|
-| SHM (memfd) zero-copy | **Disabled by default** on the driver side, requires `DMD_WANT_SHM=1`. This path has never actually been enabled on the driver side (only unit tests exercised it: 150 frames, byte-for-byte identical, no fd leaks); not verified in a real consumer environment; whether browser sandboxes can receive `SCM_RIGHTS` has not been measured either (the SHM-disabled-by-default note in `vaapi-driver/src/decode.c`; search for `DMD_WANT_SHM`) |
+| SHM (memfd) zero-copy | **Enabled by default** on the driver side when a Unix socket is in use; `DMD_WANT_SHM=0` disables it (the `want_shm` decision in `vaapi-driver/src/decode.c`; search for `DMD_WANT_SHM`). Verified end to end in a real consumer environment (both ffmpeg and browser sandboxes). **Remaining limitations**: ① a NAT-mode container inevitably degrades back to inline because the memfd handoff goes over an abstract socket (see §4); ② "zero-copy" only covers the memfd → consumer segment, the CPU `memcpy` from the decoder into the memfd is still there (the dmabuf approach was rejected, see §4) |
 | ~~**Missing SELinux allow rule**~~ | **Resolved in v0.3.1.** What was missing is `binder transfer` for the **service domains** (checked against the sender, so `droidspacesd` being permissive cannot help), not a rule for `droidspacesd`. The platform added it to both policy carriers and verified end to end, byte exact — see §2.2 |
-| Browser sandboxes receiving `SCM_RIGHTS` | **Not verified** (the Firefox RDD / Chrome GPU processes have seccomp filters) |
+| ~~Browser sandboxes receiving `SCM_RIGHTS`~~ | **Measured and works.** Both the Firefox RDD and the Chrome GPU process (both have seccomp filters) can establish decoding sessions normally. An earlier version of this document listed this as "not verified"; that status is out of date |
 | Firefox's `MOZ_DISABLE_RDD_SANDBOX=1` | The original reason for this environment variable was "the RDD sandbox forbids the driver from creating a **TCP** socket". **Whether it is still needed after switching to a Unix socket has not been measured.** It weakens RDD process isolation, so it is a security tradeoff |
 | Socket file permissions | Currently `chmod 0666`, so any process inside the container can connect; it should be tightened to a specific gid, pending the platform's confirmation of the target gid |
 | Authentication | The Unix socket path relies on file permissions, but at 0666 that provides no isolation; the TCP path has no authentication at all, and loopback is not a boundary in a host-mode container. **Do not use the current version in multi-tenant or untrusted-app environments** |

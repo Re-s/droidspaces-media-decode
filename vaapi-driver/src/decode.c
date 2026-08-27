@@ -407,7 +407,9 @@ static struct dmd_session *session_open(int codec, unsigned int width,
      * **abstract** socket（decode-daemon.c 里 sun_path[0] = 0 那处），
      * 驱动再去连它。abstract socket 属于 net namespace ——
      * 于是 NAT 型容器（netns 独立）根本连不上那个交接通道，
-     * DMD_WANT_SHM=1 在那里必然交接失败再降级，每建一次会话白等一次超时。
+     * 请求 SHM 在那里必然交接失败再降级，每建一次会话白等一次超时。
+     * 这正是下方 want_shm 判定要用 `use_sock ? ... : 0` 的原因 ——
+     * 只有走上路径式 Unix socket（即 host 型容器）才请求 SHM。
      *
      * 换句话说：**控制通道跨 netns 的能力，不等于 SHM 交接通道也跨得过去。**
      * 要让零拷贝在 NAT 容器可用，得把 memfd 交接也改走这条路径式
@@ -432,50 +434,53 @@ static struct dmd_session *session_open(int codec, unsigned int width,
     }
 
     cfg.sock_path = use_sock;
-    /* SHM（memfd 零拷贝）默认**关闭**，需 DMD_WANT_SHM=1 显式开启。
+    /* SHM（memfd 零拷贝）在 Unix socket 模式下**默认开启**（2026-08-26 起）。
+     * 设 DMD_WANT_SHM=0 可显式关闭（排查用）。
      *
-     * 之所以保守：这条路**驱动侧从未真正启用过**（cfg.want_shm 长期硬编码
-     * 为 0），只有 tests/test_dmd_client.c 走过 —— 那里实测 150 帧、与 TCP
-     * 前 20 帧逐字节一致、无 fd 泄漏，但那是独立测试程序，不是驱动被
-     * dlopen 进消费者进程的真实环境。
+     * 端到端实测依据：驱动被 dlopen 进 ffmpeg 进程、走 /run/dmd/decode.sock，
+     * daemon 侧日志确认
+     *   共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+     *   握手成功: video/hevc 1280x720 帧回传=SHM
+     * 且解码结果与内联模式一致（150/150 帧）。
      *
-     * 尚未实测的风险：浏览器沙箱能否收 SCM_RIGHTS（Firefox RDD /
-     * Chrome GPU 进程都有 seccomp 过滤）。本项目有先例 —— 一份源码级结论说
-     * RDD 沙箱对 SYS_SOCKET 一律返回 EACCES，实测却跑通了 713 帧。
-     * 这类判断只能靠实测。
+     * 收益（固定 1500 帧工作量，三组交替对照，daemon 侧 CPU jiffies）：
+     *   内联  493 / 500 / 489   中位数 493
+     *   SHM   400 / 367 / 410   中位数 400   → 降低约 19%
+     * 省下的正是每帧 1.38MB(720p) 经 socket 的那次拷贝。
+     *
+     * ⚠️ 注意"零拷贝"只描述 memfd → 消费者进程这一段。MediaCodec 的输出
+     * 缓冲由 gralloc 分配，daemon 只能 getOutputBuffer 拿到 CPU 指针后
+     * memcpy 进 memfd（decode-daemon.c 的 send_frame_shm）。解码器到 memfd
+     * 那次拷贝仍在，消除它要走 dmabuf，而那条路因需依赖私有符号已被否决。
+     *
+     * 保守的部分：只在 use_sock 时请求 —— SHM 交接走 abstract socket
+     * （属 net namespace），所以**NAT 型容器必然降级**。daemon 侧交接失败
+     * 会自动退回内联，因此默认开启没有硬失败风险。
+     *
+     * ── 以下是历史顾虑，均已被实测解决，保留供参考 ──
+     *
+     * 曾长期默认关闭（cfg.want_shm 硬编码为 0），理由是这条路"驱动侧从未
+     * 真正启用过"：只有 tests/test_dmd_client.c 走过，那是独立测试程序，
+     * 不是驱动被 dlopen 进消费者进程的真实环境。这个顾虑本身是对的 ——
+     * 文档一度据那组数字声称 SHM 有 +17% 吞吐，而真实路径从未执行过。
+     * 教训：判断某能力是否生效，要先确认它的开关是开的。
+     *
+     * 曾担心浏览器沙箱收不了 SCM_RIGHTS（Firefox RDD / Chrome GPU 都有
+     * seccomp 过滤）。实测可行。本项目在这类判断上有先例 —— 一份源码级结论
+     * 说 RDD 沙箱对 SYS_SOCKET 一律返回 EACCES，实测却跑通了 713 帧。
+     * 这类事只能靠实测，读源码推不出来。
      *
      * ⚠️ 勘误：此处一度写着"SHM 帧交付路径有 bug、daemon 在 memfd 交接后
-     * 不再服务、根因未定位"。**那个归因是错的**，已订正。那些 0 帧现象的真实
-     * 原因是 SELinux domain 权限 —— daemon 以 runcon u:r:droidspacesd:s0
-     * 启动时能建 socket，但无权访问 hwservicemanager/Codec2，于是在
-     * CCodec::allocate 处 SIGABRT（tombstone 栈顶 Codec2Client::GetServiceNames，
+     * 不再服务、根因未定位"。**那个归因是错的**。那些 0 帧现象的真实原因是
+     * SELinux domain 权限 —— daemon 以 runcon u:r:droidspacesd:s0 启动时能建
+     * socket，但无权访问 hwservicemanager/Codec2，于是在 CCodec::allocate 处
+     * SIGABRT（tombstone 栈顶 Codec2Client::GetServiceNames，
      * "Hardware service manager is not running"）。与 SHM 无关 ——
      * 当时日志里的传输模式其实是 TCP。三组对照实验：
      *   u:r:ksu:s0          + TCP         → 正常解码（但该 domain 无权 bind）
      *   u:r:droidspacesd:s0 + TCP         → 同样 SIGABRT（与传输方式无关）
      *   u:r:droidspacesd:s0 + Unix socket + SELinux permissive → 正常解码
-     * 结论：Unix socket 通道本身是正确的，缺的只是一条 allow 规则。
-     *
-     * 另注：SHM 交接走的是 abstract socket（见上方端点选择处的勘误），
-     * 属 net namespace，所以零拷贝**只在 host 型容器可能可用**，
-     * NAT 型容器下必然降级。这也是它默认关闭的又一个理由。 */
-    /* 2026-08-26 实测转为默认开启（Unix socket 模式下）。
-     *
-     * 上面那段"从未真正启用过"的顾虑已被实测解决：驱动被 dlopen 进
-     * ffmpeg 进程、走 /run/dmd/decode.sock，daemon 侧日志确认
-     *   共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
-     *   握手成功: video/hevc 1280x720 帧回传=SHM
-     * 且解码结果与内联模式一致（150/150 帧）。
-     *
-     * 收益（固定 1500 帧工作量，三组对照，daemon 侧 CPU jiffies）：
-     *   内联  493 / 500 / 489   中位数 493
-     *   SHM   400 / 367 / 410   中位数 400   → 降低约 19%
-     * 省下的正是每帧 1.38MB(720p) 经 socket 的那次拷贝。
-     *
-     * 仍然保守的部分：只在 use_sock 时请求（SHM 交接走 abstract socket，
-     * 属 net namespace，NAT 型容器必然降级），且 daemon 侧交接失败会
-     * 自动退回内联，所以开启没有硬失败风险。
-     * 设 DMD_WANT_SHM=0 可显式关闭（排查用）。 */
+     * 结论：Unix socket 通道本身是正确的，缺的只是一条 allow 规则。 */
     const char *wantshm = getenv("DMD_WANT_SHM");
     cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
 
