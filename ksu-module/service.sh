@@ -141,5 +141,19 @@ setsid "${WD}" &
 WDPID=$!
 echo "${WDPID}" > "${PIDFILE}"
 log "看护循环已启动（PID ${WDPID}）"
+
+# 启动容器侧解码状态导出脚本
+# Firefox/Chrome 的 VA-API 解码走内核 DRM，不经过 Android 媒体栈，
+# 宿主侧 APK 无法直接检测。此脚本每秒检查 RDD/GPU/daemon CPU 并写入共享文件。
+STATUS_SCRIPT="${MODDIR}/export-decode-status.sh"
+STATUS_OUT="${DS_DIR}/dmd/run/decode-status"
+if [ -x "$STATUS_SCRIPT" ]; then
+    # 杀旧实例（幂等）
+    kill $(pgrep -f export-decode-status) 2>/dev/null
+    sleep 1
+    setsid "$STATUS_SCRIPT" </dev/null >/dev/null 2>&1 &
+    log "容器侧状态导出脚本已启动"
+fi
+
 update_prop "🟢 看护中 (PID ${WDPID}) | 端点探活间隔 5s"
 exit 0
