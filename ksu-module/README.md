@@ -15,11 +15,23 @@
 
 ## 安装
 
+> **模块 zip 自带 `decode-daemon`**，刷入即完成**安卓侧**部署
+> （装到 `/data/local/Droidspaces/dmd/bin/`，并建好 `bin/ run/ logs/`）。
+> **容器侧要自己装**：把 Release 里的 `msm_drm_drv_video.so` 放进容器的
+> `/usr/lib/aarch64-linux-gnu/dri/`，再确认容器内有 `libva2`、`libva-drm2`，
+> 且平台已透传 `/dev/dri/renderD128`。之所以不自动装，是容器名与发行版
+> 布局都不确定（Alpine 没有那条多架构路径），猜错就会静默装到无用位置。
+
 ### 方式 A：管理器刷入（推荐）
 
 KSU / Magisk 管理器 → 模块 → 从本地安装 → 选 `dmd_watchdog-<版本>.zip` → 重启。
 
+安装期 `customize.sh` 会打印每一步结果，其中应当看到 `decode-daemon → dmd/bin/`。
+
 ### 方式 B：手动解压（不重启即可生效）
+
+⚠️ 这条路**绕过 `customize.sh`**，所以 daemon 与目录都得自己部署 ——
+下面第二段就是补做 `customize.sh` 的活。
 
 ```sh
 su
@@ -27,11 +39,26 @@ mkdir -p /data/adb/modules/dmd_watchdog
 unzip -o dmd_watchdog-*.zip -d /data/adb/modules/dmd_watchdog   # 或 busybox unzip
 chown -R root:root /data/adb/modules/dmd_watchdog
 chmod 755 /data/adb/modules/dmd_watchdog/*.sh \
-          /data/local/Droidspaces/bin/decode-daemon 2>/dev/null
-chmod 755 /data/adb/modules/dmd_watchdog/dmd-probe
+          /data/adb/modules/dmd_watchdog/dmd-probe
 chcon -R u:object_r:system_file:s0 /data/adb/modules/dmd_watchdog
+
+# 部署安卓侧运行时（管理器刷入时由 customize.sh 自动完成）
+DMD=/data/local/Droidspaces/dmd
+mkdir -p "$DMD/bin" "$DMD/run" "$DMD/logs"
+mv -f /data/adb/modules/dmd_watchdog/decode-daemon "$DMD/bin/decode-daemon"
+chmod 755 "$DMD/bin/decode-daemon"
+
 # 手动启动看护（不必等重启）
 setsid /data/adb/modules/dmd_watchdog/service.sh &
+```
+
+装完自检：
+
+```sh
+# 看护应报 healthy，且探针能拿到真实帧
+cat /data/local/Droidspaces/dmd/run/watchdog.state
+/data/adb/modules/dmd_watchdog/dmd-probe /data/local/Droidspaces/dmd/run/decode.sock
+# 期望输出形如：probe: 健康 帧=5 dev=... ino=...
 ```
 
 > `unzip` 设备上可能没有：`busybox unzip` 同样可用（KernelSU 自带 busybox）。

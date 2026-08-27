@@ -85,6 +85,17 @@ jobs:
 
   watchdog:
     name: dmd_watchdog module zip
+    # 依赖 daemon job：模块 zip 要把 decode-daemon 一起打进去，好让刷入模块
+    # 就完成**安卓侧**部署（customize.sh 负责装到 dmd/bin/）。
+    # 曾经不打包它，结果新设备刷完模块后 dmd/ 目录是空的 ——
+    # service.sh 只 mkdir 空目录，看护找不到 daemon 就一直报错；
+    # 老设备看不出来，因为那里的 daemon 是当初手动放的。
+    #
+    # 容器侧的 msm_drm_drv_video.so **故意不打包**：容器名与发行版布局都不
+    # 确定（Debian 的 usr/lib/aarch64-linux-gnu/dri 未必存在，Alpine 更不同），
+    # 遍历 Containers/*/ 猜路径一旦猜错就是静默装到无用位置，比不装更糟。
+    # 它作为独立 release 资产提供，由用户自行放进容器。
+    needs: [ daemon ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +104,12 @@ jobs:
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
+
+      - name: Fetch decode-daemon
+        uses: actions/download-artifact@v4
+        with:
+          name: decode-daemon
+          path: prebuilt
 
       # dmd-probe 是唯一需要编译的部件；静态链接，容器里不挑 libc。
       # 与驱动同用 arm64 debian：编出来的二进制能在 qemu 下直接跑，
@@ -124,6 +141,10 @@ jobs:
              ksu-module/sepolicy.rule ksu-module/README.md \
              ksu-module/customize.sh pkg/
           cp ksu-module/dmd-probe pkg/
+          # 安卓侧运行时：customize.sh 会把它搬到 dmd/bin/ 并从模块目录删除，
+          # 所以不长期占用 /data/adb 空间。容器侧驱动不在此列（见 job 注释）。
+          cp prebuilt/decode-daemon pkg/
+          test -s pkg/decode-daemon || { echo "decode-daemon 缺失或为空" >&2; exit 1; }
           # 安装元数据:没有 META-INF 刷机器认不出这是模块,
           # 没有 customize.sh 解包后全是 0644 -> 报"缺少文件或执行权限"
           mkdir -p pkg/META-INF/com/google/android
@@ -131,6 +152,7 @@ jobs:
              ksu-module/META-INF/com/google/android/updater-script \
              pkg/META-INF/com/google/android/
           chmod 755 pkg/service.sh pkg/dmd-watchdog.sh pkg/action.sh pkg/dmd-probe \
+                    pkg/decode-daemon \
                     pkg/customize.sh pkg/META-INF/com/google/android/update-binary
           chmod 644 pkg/module.prop pkg/sepolicy.rule pkg/README.md \
                     pkg/META-INF/com/google/android/updater-script
