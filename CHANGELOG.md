@@ -1,5 +1,40 @@
 # 更新日志
 
+## v0.3.6
+
+发布日期 2026-08-27。修一个只在**新设备**上暴露的部署缺口。
+
+### 🐛 模块 zip 自带 `decode-daemon`，刷入即完成安卓侧部署
+
+新设备刷入模块后 `/data/local/Droidspaces/dmd/` 是空的，看护持续报
+`decode-daemon 不存在或不可执行`。
+
+根因是模块只装看护自身，从不部署 daemon —— `service.sh` 只 `mkdir` 空目录，
+它那段 `cp` 是给老用户从旧路径 `Droidspaces/bin/` 迁移用的兼容逻辑，
+新设备没有源文件所以不生效。此前一直没暴露，是因为已有设备上的 daemon
+是当初手动放进去的，典型的"在我机器上是好的"。
+
+改动：
+
+| 项 | 处理 |
+|---|---|
+| CI `watchdog` job | 增加 `needs: [ daemon ]`，把 `decode-daemon` 打进模块 zip |
+| `customize.sh` | 建 `dmd/{bin,run,logs}`，daemon 装到 `dmd/bin/`（0755），装完从模块目录移走 |
+| 已有 daemon | 保留原版本，不覆盖 |
+| 都没有 | 打印手动补救步骤，不让安装静默成功 |
+
+容器侧的 `msm_drm_drv_video.so` **故意不自动部署**：容器名与发行版布局都不
+确定（Alpine 没有 `usr/lib/aarch64-linux-gnu/dri` 这条路径），遍历
+`Containers/*/` 猜路径一旦猜错就是静默装到无用位置，比不装更糟。
+它继续作为独立 release 资产，由用户自行放入，安装结束时打印所需步骤。
+
+顺带修 `ksu-module/README.md` 方式 B 的一个真 bug：它 `chmod` 的是旧路径
+`Droidspaces/bin/decode-daemon`，且手动解压绕过 `customize.sh` 后 daemon
+根本不会被部署。现补齐部署命令并加装后自检。
+
+三种安装场景已用桩函数模拟验证：包内有 daemon（部署并移走）、包内无但设备
+已有（保留原版本）、两者都无（打印补救步骤）。
+
 ## v0.3.5
 
 发布日期 2026-08-27。三条主线：探活判据从"能握手"改为"能出帧"、
