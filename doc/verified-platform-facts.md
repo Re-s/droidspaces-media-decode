@@ -30,6 +30,9 @@
 | `127.0.0.1:20003` 连宿主 | 可达 | **不可达** |
 | abstract socket 可见数 | 31（与宿主一致） | **0** |
 | mnt / pid / uts / ipc / cgroup | 均独立 | 均独立 |
+
+> **pid ns 独立 ≠ 互不可见**：宿主能看到容器进程，反之不行。
+> 这是宿主侧监控方案成立的根据，详见 §1.1.5。
 | `/dev/dri/renderD128` | 有 | 需平台透传（可配置） |
 
 宿主侧 `ds-br0`（`172.28.0.1/16`）加 veth 对承载 NAT 型容器的网络，
@@ -44,6 +47,41 @@
 > 变（本项目先后实测到 `4026535651` 与 `4026535650`）。文档各处引用的具体
 > 数字只是取证快照，**判断依据应当是"与宿主的 `4026531937` 是否相同"**，
 > 而不是去比对某个记下来的值。宿主侧那个是内核初始 namespace，才是稳定的。
+
+### 1.1.5 pid namespace 独立但**可见性是单向的**（易错）
+
+上表把 pid ns 记为"均独立"，这没错但不完整 —— 独立不等于互相不可见。
+实测方向性：
+
+| 方向 | 结果 |
+|---|---|
+| 宿主 → 容器进程 | ✅ **可见**，能列出容器内的 firefox / chrome 并读其 `/proc/<pid>/stat` |
+| 容器 → 宿主进程 | ❌ 不可见，容器内 `pidof decode-daemon` 查不到宿主上的 daemon |
+
+取证：同一个 Firefox RDD 进程，宿主侧 `pgrep -f 'rdd$'` 得到 **26043**，
+容器内同样命令得到 **21381** —— 两个视角的同一进程，PID 不同。
+拿宿主那个号读 `cmdline` 能取到完整的容器内命令行
+（`/usr/lib/firefox-esr/firefox-esr -contentproc … 3 rdd`）。
+
+原因：容器的 pid ns 是宿主 ns 的**子** ns。子 ns 里的进程在父 ns 中同样有
+一个 pid（只是号不同），反之父 ns 的进程在子 ns 里根本没有编号。
+
+**这条事实的用处**：它是"宿主侧监控容器内解码"这一整类方案成立的根据。
+容器内浏览器走 VA-API 解码时不经 Android 媒体栈，`media.metrics` 与 HAL CPU
+都测不到，但既然宿主能直接读到那些进程的 `/proc/<pid>/stat`，
+就能在宿主侧完成来源归因，**不需要在容器内驻留任何脚本**。
+
+> ⚠️ 本项目在这里栽过：`ksu-module/export-decode-status.sh` 的注释写着
+> "容器内运行"，实际是被 KSU 的 `service.sh` 在**宿主侧**启动的 ——
+> 它的 shebang 是 `/system/bin/sh`（容器内无此路径），依赖的
+> `pgrep`/`pidof`/`awk` 也都是 `/system/bin` 下的 Android 版本，
+> 在容器里根本跑不起来。那句注释误导了一整轮排查。
+> 该脚本已删除，职责搬进 dshmon APK。
+
+附带一条权限事实：宿主 `/proc` 挂载带 **`hidepid=2`**
+（`proc /proc proc rw,relatime,gid=3009,hidepid=2 0 0`），
+所以普通 Android 应用看不到别的进程 —— 宿主侧做进程归因**需要 root**。
+不需要 root 的替代信号见本文 §6.5（`msm_vidc` 中断计数）。
 
 ### 1.2 三条通道的适用范围
 
@@ -260,7 +298,7 @@ H.264 / HEVC 解码器规格（两者一致）：
 |---|---|
 | MediaCodec `media.metrics` | 滞后一个会话；容器侧 VA-API 解码不写 metrics |
 | HAL / daemon CPU jiffies | SHM 生效后 daemon 每帧只做一次 memcpy，300 帧仅 0.12s CPU，与探活开销无法区分 |
-| 容器侧 `export-decode-status.sh` | 依赖容器内脚本存活，且只有 `IDLE\|cpu=2` 粗粒度 |
+| ~~`export-decode-status.sh` 共享文件~~（已删除） | 依赖一个独立后台循环存活（实测会静默死掉且不自愈、不告警），粒度只有 `IDLE\|cpu=2`，且用单一 CPU 阈值兼任判定与归因 —— SHM 生效后实测 240 帧解码有 1/5 采样点漏判，还会把看护探针的开销误判成真实解码 |
 
 **踩过的坑（重要）**：调查初期得出过"IRQ 测不到帧级解码"的**错误**结论 ——
 因为测试码流是 `libx264 -preset ultrafast` 默认生成的 High 4:4:4 Predictive /
