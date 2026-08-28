@@ -24,7 +24,11 @@
 /* 驱动版本，随 vendor 串一起被消费者看到。
  * 注意 ffmpeg 按 vendor 串匹配 vaapi_driver_quirks 名单；我们不在名单内，
  * 走 standard behaviour，即要求语义标准。 */
-#define DMD_DRIVER_VERSION "0.3.3"
+/* ⚠️ 发版时必须同步：本串经 DMD_VENDOR_STRING 显示在 vainfo 的
+ * "Driver version" 里，是用户可见信息。曾长期停在 0.3.3 而项目已到
+ * 0.3.7（落后 4 版），用户按 vainfo 报 bug 时会指向错误的版本。
+ * 同步清单：本文件、ksu-module/module.prop、CHANGELOG.md。 */
+#define DMD_DRIVER_VERSION "0.3.7"
 #define DMD_VENDOR_STRING "DroidSpaces MediaCodec VA-API driver " DMD_DRIVER_VERSION
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。
@@ -57,7 +61,13 @@
  * SyncSurface 用它作为"放行额度"：在飞帧数低于此值时不阻塞消费者，
  * 让它继续送料把流水线填满；达到之后才真正阻塞等帧。
  * 取 6（滞后 4 再留 2 的余量）—— 太小会退回死锁，太大会让队列变长、
- * 增加延迟且浪费 surface。 */
+ * 增加延迟且浪费 surface。
+ *
+ * ⚠️ 跨目录耦合：daemon 侧的 SHM_SLOTS（src/decode-daemon.c）必须
+ * >= 本值。本值决定驱动会放行多少帧不取，池装不下就会撞"槽位全忙"。
+ * 历史事故：SHM_SLOTS=4 < 本值 6，第 5 帧必然撞池满，daemon 在
+ * 1 秒后判死并杀掉会话 —— 4K + 慢消费者场景 10/10 丢帧（238/300）。
+ * 调大本值时必须同步检查 SHM_SLOTS。 */
 #define DMD_PIPELINE_DEPTH 6
 
 /* 队列满时为腾空位收一帧的等待上限。
@@ -88,7 +98,13 @@
 #define DMD_HEIGHT_ALIGN 32
 
 /* 等一帧从 daemon 回来的上限。driver 跑在宿主进程里，绝不允许无限等：
- * 超时返回错误让消费者自己决定重试或放弃，比挂死整个进程好。 */
+ * 超时返回错误让消费者自己决定重试或放弃，比挂死整个进程好。
+ *
+ * ⚠️ 跨目录耦合：daemon 侧的 SHM_SLOT_WAIT_MS（src/decode-daemon.c）
+ * 必须 > 本值。本值是客户端愿意等一帧的时长，daemon 等空闲槽位的上限
+ * 若比它短，daemon 就会在客户端还愿意等的时候先放弃并杀掉会话。
+ * 历史事故：daemon 只等 1000ms < 本值 5000ms，把本可正常完成的解码
+ * 变成丢帧。调大本值时必须同步检查 SHM_SLOT_WAIT_MS。 */
 #define DMD_FRAME_TIMEOUT_MS 5000
 
 /* 一个 surface：VA-API 的解码目标，持有一块 NV12 缓冲。

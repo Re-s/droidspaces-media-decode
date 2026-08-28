@@ -515,13 +515,23 @@ int comm_recv_frame(CommContext *ctx, DecodedFrame *frame)
         frame->width      = ntohl(w_be);
         frame->height     = ntohl(h_be);
         frame->frame_size = ntohl(sz_be);
+        frame->unit_seq   = 0;
 
         if (frame->frame_size == SHMFRAME_SENTINEL) {
-            /* 帧数据在共享内存里：socket 只带槽位号与长度，没有帧数据拷贝 */
-            uint32_t si[2];
+            /* 帧数据在共享内存里：socket 只带槽位号与长度，没有帧数据拷贝。
+             *
+             * ⚠️ 控制消息共 6 个字（24 字节）：
+             *   [宽][高][SHM哨兵][槽位][长度][PTS]
+             * 前 3 个字已由上面的 12 字节帧头读掉，这里必须把剩下 3 个
+             * 字全部读完 —— 少读一个字（PTS）会让下一帧从 PTS 开始解析，
+             * 整条流从此错位。daemon 侧是**无条件**发送这 6 个字的
+             * （src/decode-daemon.c:1007 的 msg[6]，其前没有能力位判断），
+             * 能力标志 CAP_FRAME_PTS 只在格式描述块里告知，不影响发送。 */
+            uint32_t si[3];
             if (reliable_read(ctx->fd, si, sizeof(si)) < 0) return 1;
             int slot = (int)ntohl(si[0]);
             uint32_t dlen = ntohl(si[1]);
+            frame->unit_seq = ntohl(si[2]);   /* PTS = 输入单元序号 */
             if (!ctx->shm_base || slot < 0 || slot >= ctx->shm_slots) {
                 fprintf(stderr, "[comm] 非法共享内存槽位 %d\n", slot);
                 return -1;
@@ -559,6 +569,20 @@ int comm_recv_frame(CommContext *ctx, DecodedFrame *frame)
         fprintf(stderr, "[comm] 帧头异常: %ux%u, size=%u\n",
                 frame->width, frame->height, frame->frame_size);
         return -1;
+    }
+
+    /* 内联模式的第 4 个字段：PTS（该帧对应的输入单元序号）。
+     *
+     * ⚠️ 与 SHM 路径同理，daemon 是无条件发送的（帧数据之前先发这个字），
+     * 不读掉它会让后续解析整体错位 4 字节。格式描述块里的
+     * CAP_FRAME_PTS 只是能力告知，不是发送开关。 */
+    {
+        uint32_t pts_be;
+        if (reliable_read(ctx->fd, &pts_be, sizeof(pts_be)) < 0) {
+            perror("[comm] 读取 PTS 字段失败");
+            return -1;
+        }
+        frame->unit_seq = ntohl(pts_be);
     }
 
     /* 确保缓冲区足够 */

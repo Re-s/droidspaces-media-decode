@@ -39,6 +39,9 @@ typedef struct {
     uint8_t *data;       /* NV12 格式的帧数据。SHM 模式下直接指向共享内存 */
     size_t   data_alloc; /* data 缓冲区分配大小；SHM 模式下为 0（非自有内存）*/
     int      shm_slot;   /* SHM 模式下的槽位号；TCP 模式为 -1 */
+    uint32_t unit_seq;   /* 该帧对应的输入单元序号（协议里的 PTS 字段）。
+                          * daemon 无条件发送此字段，客户端必须读掉它，
+                          * 否则流会错位 —— 详见 comm.c 里的说明。 */
 } DecodedFrame;
 
 /* 通信上下文（前向声明） */
