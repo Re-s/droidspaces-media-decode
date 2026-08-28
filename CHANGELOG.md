@@ -1,5 +1,77 @@
 # 更新日志
 
+## 未发布
+
+文档审计的连带修复。三处都是审计时交叉核实发现的，与文档本身无关。
+
+### 🐛 `client/` 参考实现漏读 PTS 字段，会让整条流错位
+
+daemon 是**无条件**发送 PTS 的：SHM 路径 `msg[6]` = 24 字节
+（`src/decode-daemon.c:1007`）、内联路径 `hdr[4]` = 16 字节（`:1101`），
+两处 `htonl(pts)` 之前都没有能力位判断。能力标志 `CAP_FRAME_PTS`
+只在格式描述块里**告知**客户端（`:1038`），**不是发送开关** ——
+此前把它当开关理解是这个 bug 的根源。
+
+而 `client/src/comm.c` 两条路径都少读一个字：
+
+| 路径 | 实际读取 | daemon 发送 | 差 |
+|---|---|---|---|
+| SHM | 12 字节帧头 + `si[2]` = 20 | 24 | 4 字节 |
+| 内联 | 12 字节帧头后直接读帧数据 | 16 | 4 字节 |
+
+后果是下一帧从 PTS 开始解析，整条流从此错位。
+
+真实驱动 `vaapi-driver/src/dmd_client.c:1014-1025` **处理正确**
+（按 `caps` 读取并存入 `last_pts`），所以生产路径不受影响，
+只有参考实现有此问题 —— 这也解释了它为何长期未暴露。
+
+修复：两条路径都补读该字段，`DecodedFrame` 新增 `unit_seq` 承载。
+
+实测（各解 300 帧，`rc=0`，零异常，帧尺寸全为 3133440）：
+```
+SHM  路径（--shm）  300/300
+内联路径（默认）    300/300，57.36 fps
+```
+
+### 🐛 `DMD_DRIVER_VERSION` 落后 4 版，且是用户可见信息
+
+该串经 `DMD_VENDOR_STRING` 显示在 `vainfo` 的 `Driver version` 里。
+实测设备上显示：
+
+```
+vainfo: Driver version: DroidSpaces MediaCodec VA-API driver 0.3.3
+```
+
+而项目已到 v0.3.7，用户按此报 bug 会指向错误版本。已改为 0.3.7
+并在 `driver.h` 补发版同步清单（本文件、`module.prop`、`CHANGELOG.md`）。
+
+⚠️ 踩坑记录：`vaapi-driver/Makefile` **不跟踪头文件依赖**，
+改了 `driver.h` 后直接 `make` 产物里仍是旧版本串，必须 `make clean`。
+根治要给 Makefile 加 `-MMD -MP`，本次未做。
+
+### 📝 补齐 v0.3.7 只做了一半的跨目录耦合注释
+
+v0.3.7 的变更表声称「注释写明跨目录依赖，改一侧须查另一侧」，
+但当时**只在 daemon 侧写了**，`vaapi-driver/src/driver.h` 侧没写 ——
+`grep SHM_SLOTS vaapi-driver/src/driver.h` 零命中。该条描述与实际不符。
+
+现补两处，均附 v0.3.7 那次事故的具体数据：
+
+| 位置 | 约束 |
+|---|---|
+| `driver.h` `DMD_PIPELINE_DEPTH` | daemon 侧 `SHM_SLOTS` 必须 >= 本值 |
+| `driver.h` `DMD_FRAME_TIMEOUT_MS` | daemon 侧 `SHM_SLOT_WAIT_MS` 必须 > 本值 |
+
+### 🔧 已知遗留
+
+- `CHANGELOG.md:222`（v0.3.5 条目）引用的 `src/decode-daemon.c:949`
+  已漂移到 `:1000` —— v0.3.7 新增常量把它推后了 51 行。文字描述本身正确。
+  文档引用源码位置**应改用函数名/宏名而非行号**：全仓库三处行号引用
+  已全部失效，靠人工同步不现实。
+- 本轮文档审计另查出多份文档的过时常量与失效事实（SHM 4 槽 / 1 秒等待 /
+  20 字节控制消息 / NDK r27c 下限 / 英文版协议版本写成 2 /
+  `doc/why-not-v4l2.md` 整份归因错误），尚未修改。
+
 ## v0.3.7
 
 发布日期 2026-08-28。修一个真实丢帧的 bug，以及掩盖了它整整一年的日志假警报。
