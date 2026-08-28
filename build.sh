@@ -49,12 +49,23 @@ esac
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$HOST_TAG"
 CC="$TOOLCHAIN/bin/${TARGET}${API}-clang"
 
-if [ ! -x "$CC" ]; then
-    echo "错误: 找不到编译器 $CC" >&2
-    echo "      NDK=$NDK  API=$API" >&2
-    echo "      可用的 target: " >&2
-    ls "$TOOLCHAIN/bin/" 2>/dev/null | grep -E 'aarch64.*clang$' | sed 's/^/        /' >&2 || true
-    exit 1
+# ARM64 主机的回退路径：Google 只发布 x86_64 主机版 NDK，NDK 自带的 clang
+# 在 aarch64 上根本跑不起来（表现为 libz.so.1 缺失，实质是架构不符）。
+# 但 NDK 的 sysroot 是纯数据（头文件 + aarch64-android 库），可以配合
+# 系统自带的 clang 使用。链接需分两步：clang 驱动会去找它自己版本的
+# libclang_rt.builtins（系统 clang 19 vs NDK clang 17，路径不匹配且无法
+# 用 -rtlib 覆盖），所以只让 clang 编译，再用 GNU ld 手动链接。
+USE_HOST_CLANG=0
+if [ ! -x "$CC" ] || ! "$CC" --version >/dev/null 2>&1; then
+    if command -v clang >/dev/null 2>&1 \
+       && [ -d "$TOOLCHAIN/sysroot/usr/lib/${TARGET}/${API}" ]; then
+        USE_HOST_CLANG=1
+    else
+        echo "错误: 找不到可用的编译器" >&2
+        echo "      NDK 的 $CC 无法执行（主机架构 $(uname -m)，NDK 仅提供 x86_64 版）" >&2
+        echo "      且系统未安装 clang 或 NDK sysroot 不完整" >&2
+        exit 1
+    fi
 fi
 
 NDK_VERSION="$(sed -n 's/^Pkg.Revision *= *//p' "$NDK/source.properties" 2>/dev/null || echo unknown)"
@@ -68,11 +79,34 @@ mkdir -p "$OUT_DIR"
 
 # -lmediandk 同时提供 AMediaCodec_* 与 AMediaFormat_* 符号。
 # 注意: README 早期版本写的 -lmEDIAndk 是笔误，该库不存在。
-"$CC" \
-    -O2 -Wall -Wextra \
-    -o "$OUT_DIR/decode-daemon" \
-    "$REPO_DIR/src/decode-daemon.c" \
-    -lmediandk -llog -landroid
+if [ "$USE_HOST_CLANG" = 0 ]; then
+    "$CC" \
+        -O2 -Wall -Wextra \
+        -o "$OUT_DIR/decode-daemon" \
+        "$REPO_DIR/src/decode-daemon.c" \
+        -lmediandk -llog -landroid
+else
+    SYSROOT="$TOOLCHAIN/sysroot"
+    LIBDIR="$SYSROOT/usr/lib/${TARGET}/${API}"
+    RTDIR="$(dirname "$(find "$TOOLCHAIN/lib" -name 'libclang_rt.builtins-aarch64-android.a' | head -1)")"
+    LD="${LD:-/usr/bin/aarch64-linux-gnu-ld}"
+    if [ ! -x "$LD" ]; then
+        echo "错误: 需要 aarch64 GNU 链接器，未找到 $LD" >&2
+        echo "      可设 LD=/path/to/ld 覆盖" >&2
+        exit 1
+    fi
+    clang --target="${TARGET}${API}" --sysroot="$SYSROOT" \
+        -c -O2 -Wall -Wextra -DNDEBUG -fPIE \
+        -o "$OUT_DIR/decode-daemon.o" "$REPO_DIR/src/decode-daemon.c"
+    "$LD" -pie --sysroot="$SYSROOT" -L"$LIBDIR" \
+        -dynamic-linker /system/bin/linker64 \
+        -o "$OUT_DIR/decode-daemon" \
+        "$LIBDIR/crtbegin_dynamic.o" "$OUT_DIR/decode-daemon.o" \
+        -lmediandk -llog -landroid -lc -lm -ldl \
+        "$RTDIR/libclang_rt.builtins-aarch64-android.a" \
+        "$LIBDIR/crtend_android.o"
+    rm -f "$OUT_DIR/decode-daemon.o"
+fi
 
 echo "产物     : $OUT_DIR/decode-daemon ($(stat -c%s "$OUT_DIR/decode-daemon" 2>/dev/null || stat -f%z "$OUT_DIR/decode-daemon") 字节)"
 echo
