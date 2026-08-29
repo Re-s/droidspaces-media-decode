@@ -459,6 +459,26 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
     }
 }
 
+/*
+ * ============ AV1 合成正确性的验证基线（实测，勿凭记忆改动） ============
+ *
+ * 源码流 av1_1080p.obu 的 temporal unit 结构并非一帧一 TU：
+ *   150 个 TU，各含帧数 [1,5,0,1,0,2,0,1...] —— TU2 就含 5 帧。
+ * 因此任何"取前 N 帧"的截断都会破坏 TU 完整性，实测源码流原始字节
+ * 按帧截断到 5 帧后 dav1d 也只解出 1 帧。对照必须按 **TU 边界** 截断。
+ *
+ * 硬件 V4L2 基线（每帧一单元送料）：
+ *   前 2 TU（ 6 帧）→ 送 6 收 2
+ *   前 6 TU（ 9 帧）→ 送 9 收 6
+ *   前16 TU（17 帧）→ 送17 收16
+ * 解码器有约 1 帧固有延迟，序列越长越接近 N-1。
+ *
+ * dav1d 侧同一基线：2/6/16 TU 分别出 2/6/16 帧。
+ *
+ * ⚠️ 曾长期误用"送 6 收 6"作基线 —— 那是 6 个 TU 共 9 帧的结果，
+ *    与"6 帧"不是同一量级，据此判断合成质量会得出错误结论。
+ */
+
 /* cdef_params()，AV1 规范 5.9.19。 */
 static void put_cdef_params(struct dmd_bitwriter *bw,
                             const VADecPictureParameterBufferAV1 *p,
