@@ -710,10 +710,14 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
     }
 
     if (c->codec == DMD_CODEC_AV1 && c->av1_sef_visits)
-        dmd_log("SEF 统计: 取槽点执行 %lu 次（其中 send_show=1 %lu 次）"
-                "入队 %lu 丢弃 %lu 追加 %lu\n",
+        dmd_log("SEF 统计: EndPicture 进入 %lu (unit非空 %lu, NULL %lu) "
+                "取槽点 %lu（send_show=1 %lu）入队 %lu 丢弃 %lu 追加 %lu\n",
+                c->av1_ep_enter, c->av1_ep_unit, c->av1_ep_null,
                 c->av1_sef_visits, c->av1_sef_show1,
-                c->av1_sef_enq, c->av1_sef_drop, c->av1_sef_sent);
+                c->av1_sef_enq, c->av1_sef_drop, c->av1_sef_sent),
+        dmd_log("SEF 统计2: 入暂存时当前帧show=1 %lu, send_show被赋1 %lu, "
+                "flush送出 %lu\n",
+                c->av1_hold_show1, c->av1_sendset1, c->av1_flushed);
 
     /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
      * 会话也不能挂死宿主进程的 Terminate 路径。 */
@@ -1629,6 +1633,8 @@ static const unsigned char *build_unit(struct dmd_context *c,
                         (unsigned)c->current_target);
             c->av1_send_surface = c->av1_hold_surface;
             c->av1_send_show = c->av1_hold_show;
+            if (c->av1_send_show) c->av1_sendset1++;
+            if (pp->pic_info_fields.bits.show_frame) c->av1_hold_show1++;
             c->av1_hold_surface = c->current_target;
             c->av1_hold_show = (int)pp->pic_info_fields.bits.show_frame;
             c->av1_hold = buf;
@@ -1854,7 +1860,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     /* 组装码流（持锁做，纯内存操作）。 */
     unsigned char *scratch = NULL;
     size_t unit_len = 0;
+    if (c->codec == DMD_CODEC_AV1) c->av1_ep_enter++;
     const unsigned char *unit = build_unit(c, &scratch, &unit_len);
+    if (c->codec == DMD_CODEC_AV1) {
+        if (unit) c->av1_ep_unit++; else c->av1_ep_null++;
+    }
 
     /* ================================================================
      * AV1 当前的阻塞点：ffmpeg 对 show_frame=0 的 surface 也要求像素
@@ -2395,6 +2405,36 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->av1_sef_visits++;
         if (c->av1_send_show) c->av1_sef_show1++;
     }
+    /* ================================================================
+     * 为什么 SEF 只追加了 4 个（本轮用无条件计数器查清）
+     * ================================================================
+     * 全量 150 帧实测：
+     *   EndPicture 进入 150（build_unit 非空 75、返回 NULL 75）
+     *   取槽点执行 75（其中 send_show=1 仅 5）
+     *   入队 68、丢弃 2、追加 4
+     *   入暂存时当前帧 show=1 共 35 次
+     *   av1_send_show 被赋 1 —— **0 次**
+     *   sync flush 送出暂存帧 75 次
+     *
+     * 两个矛盾都解开了：
+     * (a) 取槽点 75 次而送出 154 单元：
+     *     延迟一帧机制下只有一半的帧走 EndPicture 送出（75 次），
+     *     另一半（75 次）由 sync flush 送出，而 flush 路径上没有取槽点。
+     *     154 = 75(EndPicture) + 75(flush) + 4(SEF)，账目对齐。
+     * (b) send_show=1 只 5 次：
+     *     决定性数据是"av1_send_show 被赋 1 共 0 次"。
+     *     那 5 次全部来自 KEY 帧分支（decode.c:1606 直接置 1）。
+     *     hold-swap 分支（1635 行）读 av1_hold_show，
+     *     而它要到 1639 行才被更新为当前帧的值 ——
+     *     读的永远是上一帧的 show，且首次进来是初始值 0。
+     *     所以"入暂存时 show=1 有 35 次"这个信息全被丢掉了。
+     *
+     * ⚠️ 但这不是简单换个字段就能修的（上一轮试过 av1_hold_show，
+     * 送入从 154 掉到 8）：flush 送出的帧不经过这里，
+     * 真正需要的是"本次实际送出的那个单元对应的帧是否显示"，
+     * 而这个信息在 EndPicture 与 flush 两条路径上都要能拿到。
+     * ================================================================ */
+
     /* ⚠️ 触发条件用"本次送出的帧是否显示"，而不是当前帧。
      * av1_send_show 因延迟一帧机制反映的正是送出帧 —— 语义是对的，
      * 但实测它在 150 帧里只有 5 次为 1、70 次为 0：
@@ -2884,6 +2924,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         dmd_log("sync: 冲出暂存的 AV1 末帧（%zu 字节）", held_len);
         av1_dump_sent(held, held_len);
         (void)dmd_session_send_unit(c->session, held, held_len);
+        c->av1_flushed++;
         free(held);
     }
 

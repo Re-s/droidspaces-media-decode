@@ -345,6 +345,12 @@ struct dmd_context {
     unsigned long  av1_sef_enq;      /* 入队次数 */
     unsigned long  av1_sef_drop;     /* 队列满而丢弃的次数 */
     unsigned long  av1_sef_sent;     /* 实际追加的 SEF 单元数 */
+    unsigned long  av1_ep_enter;     /* EndPicture 进入次数 */
+    unsigned long  av1_ep_unit;      /* build_unit 返回非空的次数 */
+    unsigned long  av1_ep_null;      /* build_unit 返回 NULL（入暂存）次数 */
+    unsigned long  av1_hold_show1;   /* 入暂存时当前帧 show=1 的次数 */
+    unsigned long  av1_sendset1;     /* av1_send_show 被赋 1 的次数 */
+    unsigned long  av1_flushed;      /* sync flush 送出暂存帧的次数 */
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */
