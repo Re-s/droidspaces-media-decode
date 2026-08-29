@@ -2210,26 +2210,23 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
 
     int pick = c->pending_head;
 
-    /* ⚠️ HEVC 实测：V4L2 回传的 timestamp **不可信**，不能用于精确配对。
+    /* ⚠️ 配对依赖两侧编号同源，这一点曾经失效过，改动此处务必先读完。
      *
-     * 证据（DMD_SURF_DUMP 把 surface 原始缓冲整块落盘后逐帧匹配软解）：
-     *   日志称 "配对: 帧 -> surface 1 (unit 1 seq 0 POC 0)"，
-     *   而 surface 1 的实际内容精确匹配软解**第 7 帧**（平均差 0.000），
-     *   与 POC 0 那帧的平均差是 8.15。
-     *   落盘时机已核对无误：第 40 行配对 unit 1、第 41 行落盘，
-     *   且 surface 1 全程只被配对一次，不存在覆写。
+     * 驱动侧在 EndPicture 里每**帧**加一号（参数集不经过 EndPicture），
+     * 而 session 层原先对每个 send_unit 都加号 —— HEVC 一帧要送多个 NAL，
+     * 参数集白占了编号，两套编号从此错开。
      *
-     * 出帧顺序实测为 4,5,6,7,8,9,10,11,1,3,2,12 —— 既不是送入序也不是
-     * 显示序，而 unit_seq 是按送入序标号的。二者对不上，配对必然错帧。
+     * 实测后果（1920x1080 HEVC 12 帧）：ffmpeg 调 12 次 EndPicture 登记
+     * 1..12，session 层却送出 15 个单元编号 1..15。配对按值相等匹配，
+     * 于是系统性错帧 —— **帧数看着完全正确（12/12）、画面却张冠李戴**：
+     * 标称 POC 0 的 surface 实际装的是显示序第 7 帧（逐帧匹配平均差 0.000）。
      *
-     * 这也解释了为什么"帧数 12/12 正确、像素却错"：数量对得上，
-     * 内容却张冠李戴。用静态画面测会完全看不出来。
+     * 已修：dmd_v4l2_session.c 的 unit_is_param_set_only() 让纯参数集单元
+     * 不占编号。修后 12 帧逐字节与 ffmpeg 软解完全一致（md5 237fed06）。
      *
-     * 下面这段"按 unit_seq 精确配对"的注释是 daemon/MediaCodec 时代写的，
-     * 当时 tools/probe_negotiate.c 实测 PTS 原样回传成立；
-     * 换到 msm_vidc V4L2 直通后该前提**不再成立**，需要另找配对依据
-     * （候选：V4L2_BUF_FLAG_* 序号、按出帧顺序 + POC 重排、
-     *  或改用 CAPTURE buffer index 与提交顺序的稳定映射）。
+     * 排查中曾误判 V4L2 timestamp 不可信 —— 后端自测证明它透传正确
+     * （回传值无重复、是送入编号的有效排列），只是出帧顺序≠送入顺序。
+     * 真正的问题从来不在 timestamp，而在两侧编号不同源。
      *
      * 首选：按提交序号精确配对。
      *

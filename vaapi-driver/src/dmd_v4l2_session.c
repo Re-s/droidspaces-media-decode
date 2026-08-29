@@ -214,6 +214,54 @@ void dmd_session_destroy(struct dmd_session *s)
     free(s);
 }
 
+/* 判断一个 Annex-B 单元是否只含参数集（VPS/SPS/PPS 及 H.264 的 SPS/PPS）。
+ *
+ * 为什么必须区分：配对依赖"驱动登记的序号"与"V4L2 回传的 timestamp"用同一套
+ * 编号。驱动侧在 EndPicture 里每**帧**加一号（参数集不经过 EndPicture），
+ * 而这里若对每个 send_unit 都加号，参数集就会白占编号，两侧从此错开。
+ *
+ * 实测后果（HEVC 1920x1080 12 帧）：ffmpeg 调 12 次 EndPicture 登记 1..12，
+ * 而 session 层送出 15 个单元编号 1..15。配对按值相等匹配，于是系统性错帧 ——
+ * 帧数看着完全正确（12/12），画面却张冠李戴：标称 POC 0 的 surface
+ * 实际装的是显示序第 7 帧（逐帧匹配平均差 0.000）。
+ *
+ * 这个 bug 只在动态画面下暴露：测试素材上半 797 行恰好是静态图案，
+ * 与真帧逐字节相同，只有下半的动态渐变带露馅。 */
+static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
+{
+    if (codec != DMD_CODEC_H264 && codec != DMD_CODEC_HEVC)
+        return 0;
+    size_t i = 0;
+    int saw_vcl = 0, saw_any = 0;
+    while (i + 4 <= len) {
+        /* 定位起始码（3 或 4 字节） */
+        size_t sc = 0;
+        if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1)
+            sc = 3;
+        else if (i + 4 <= len && d[i] == 0 && d[i+1] == 0 &&
+                 d[i+2] == 0 && d[i+3] == 1)
+            sc = 4;
+        if (!sc) { i++; continue; }
+        size_t h = i + sc;
+        if (h >= len) break;
+        saw_any = 1;
+        if (codec == DMD_CODEC_HEVC) {
+            /* HEVC NAL 头 2 字节，type = (byte0 >> 1) & 0x3F。
+             * VCL NAL 是 0..31；VPS=32 SPS=33 PPS=34 AUD=35 EOS/EOB/FD/SEI=36..40。 */
+            unsigned t = (unsigned)((d[h] >> 1) & 0x3F);
+            if (t < 32) saw_vcl = 1;
+        } else {
+            /* H.264 NAL 头 1 字节，type = byte0 & 0x1F。
+             * VCL 是 1(非IDR)/5(IDR)；SPS=7 PPS=8 SEI=6 AUD=9。 */
+            unsigned t = (unsigned)(d[h] & 0x1F);
+            if (t == 1 || t == 5 || (t >= 2 && t <= 4)) saw_vcl = 1;
+        }
+        i = h + 1;
+    }
+    /* 只有确实解析到了 NAL 且其中没有任何 VCL，才算纯参数集单元。 */
+    return saw_any && !saw_vcl;
+}
+
 /* -------------------------------------------------------------------- 送料 */
 
 int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
@@ -226,12 +274,20 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
      *
      * 与 daemon 版的差异：那边是靠 output 线程并发回收，这边是单线程，
      * 所以要主动调 recv 推进流水线。 */
+    /* 纯参数集单元不占编号：驱动侧在 EndPicture 里每帧加一号，
+     * 参数集不经过 EndPicture，这里也必须跳过，否则两侧编号错开。 */
+    const int ps_only = unit_is_param_set_only(s->codec,
+                                               (const unsigned char *)data, len);
+
     int spins = 0;
     for (;;) {
+        /* 参数集沿用当前编号（不预占下一号），VCL 单元才推进。 */
         int r = dmd_v4l2_send(&s->dec, data, len,
-                              (uint64_t)(s->units_sent + 1) * 1000ULL);
+                              (uint64_t)(s->units_sent + (ps_only ? 0 : 1))
+                                  * 1000ULL);
         if (r == 0) {
-            s->units_sent++;
+            if (!ps_only)
+                s->units_sent++;
 
             /* ⚠️ 送完必须顺手推一次收帧，哪怕调用方还没来取。
              *
