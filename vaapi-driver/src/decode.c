@@ -2678,16 +2678,39 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * 原因：dpb_shadow / prev_valid 已在同一帧的 build_unit 里
          * 被这个 pic_param 更新过，此刻再差分得到的是空集。
          * 该开关与代码已移除，只留这段记录，免得下次再试。 */
+        /* ---- 150 帧样本对这条路径的完整测绘（本轮）----
+         * 触发 75 次：70 次 bitpos=50、5 次 bitpos=58。
+         * 而全部 refresh 类错帧恰是 bitpos=58 那 5 帧
+         * （帧30/60/90/120/150），源 refresh 全是 0x10，
+         * 此刻 dpb_next_slot=5（轮转值 0x20）。
+         *
+         * 已试过并否证的三种写入值（判据：逐字节比对，基线 140/150）：
+         *   写 0（保留）                   140/150
+         *   保留轮转占位值（KEEP_ROT）      70/150
+         *   全部改写 1<<(slot-1)（SLOT1）   85/150
+         *   仅 bitpos=58 用 1<<(slot-1)    140/150（无变化）
+         * 最后一项无变化说明：改写发生的时机与 dump 记录的
+         * dpb_next_slot 不在同一时刻，或该值此刻已被推进 ——
+         * 不能靠此刻的 slot 反推目标值。
+         * 结论：写 0 仍是最优；这 5 帧要靠解开 flush 死结才能修。 */
+        unsigned patch_val = 0;
         if (held_bitpos != (size_t)-1) {
             int patched = 1;
             for (int i = 0; i < 8; i++) {
                 size_t bp = held_bitpos + (size_t)i;
                 size_t byte = bp >> 3;
                 if (byte >= held_len) { patched = 0; break; }
-                held[byte] &= (unsigned char)~(1u << (7 - (bp & 7)));
+                unsigned bit = (patch_val >> (7 - i)) & 1u;
+                if (bit)
+                    held[byte] |= (unsigned char)(1u << (7 - (bp & 7)));
+                else
+                    held[byte] &= (unsigned char)~(1u << (7 - (bp & 7)));
             }
-            dmd_log("sync: 末帧 refresh 改写为 0（bitpos=%zu %s）",
-                    held_bitpos, patched ? "成功" : "越界跳过");
+            dmd_log("sync: 末帧 refresh 改写为 0（bitpos=%zu %s slot=%u "
+                    "轮转值=0x%02x）",
+                    held_bitpos, patched ? "成功" : "越界跳过",
+                    c->av1_dpb.dpb_next_slot & 7u,
+                    1u << (c->av1_dpb.dpb_next_slot & 7u));
         }
         /* 末帧是否入队 —— 两种做法都试过，都不理想，此处保留入队：
          *   入队   → 该 surface 之后被 ffmpeg 复用时会重复登记
