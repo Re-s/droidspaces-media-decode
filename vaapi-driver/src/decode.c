@@ -2112,7 +2112,28 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              *
              * 折中：复制最近一个已就绪 surface 的像素。
              * 这不是该帧真正的画面，但比全零接近 —— 且不改变流程。
-             * DMD_AV1_NO_CARRY=1 可关掉，退回全零行为便于对照。 */
+             * DMD_AV1_NO_CARRY=1 可关掉，退回全零行为便于对照。
+             *
+             * ---- 承接被证明无效（本轮实测）----
+             * 开关两侧都是"30 帧 / 17 个不同画面"，只有 md5 不同
+             * （ac444da7 vs 3faf63ad，软解基线 e8b97d00）。
+             * 承接既没污染 SEF 的引用源，也没增加任何信息量。
+             *
+             * ---- 真正的结构（md5 逐帧精确匹配得出）----
+             * 硬解 30 帧对软解逐帧比对：
+             *   奇数位置 1,3,5,...,27 **全部**精确等于软解同位置帧
+             *   偶数位置 2,4,6,... 全是全零或错帧（拿到别的帧的内容）
+             * 奇偶完全分离，无一例外 —— 系统性错位，不是数据损坏。
+             *
+             * 成因：码流的显示事件序列是 SEF 与 show_frame=1 交替
+             *   [F1, F0,F0,F0,F0, F1, SEF, F1, SEF, F0, F1, SEF, ...]
+             * SEF 恰好落在偶数输出位，而它引用的是 show_frame=0 的帧 ——
+             * 也就是这些空壳 surface。ffmpeg 复显时读到空壳/别人的像素。
+             *
+             * 所以修法不是"给空壳填点什么"，而是让 show_frame=0 的
+             * surface 装上它自己那一帧的真实像素。
+             * 但硬件不吐这些帧（送 150 收 80，与 show_frame=1 数量吻合），
+             * 需要另找途径拿到它们 —— 这是下一步的问题。 */
             if (!getenv("DMD_AV1_NO_CARRY") && ns->data &&
                 c->av1_last_ready != VA_INVALID_ID &&
                 c->av1_last_ready != c->av1_send_surface) {
