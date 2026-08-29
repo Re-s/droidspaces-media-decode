@@ -439,8 +439,10 @@ static struct dmd_session *session_open(int codec, unsigned int width,
      *
      * 端到端实测依据：驱动被 dlopen 进 ffmpeg 进程、走 /run/dmd/decode.sock，
      * daemon 侧日志确认
-     *   共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+     *   共享内存已交接: 8 槽 x 3133440 字节 (共 25067520)
      *   握手成功: video/hevc 1280x720 帧回传=SHM
+     * （槽位数 v0.3.7 由 4 改为 8，见 src/decode-daemon.c 的 SHM_SLOTS；
+     *  上面这条 hevc 日志是当时的取证样例，HEVC 路径本身尚未系统验证。）
      * 且解码结果与内联模式一致（150/150 帧）。
      *
      * 收益（固定 1500 帧工作量，三组交替对照，daemon 侧 CPU jiffies）：
