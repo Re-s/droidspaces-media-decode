@@ -94,6 +94,31 @@ void dmd_av1_trailing_bits(struct dmd_bitwriter *bw);
 size_t dmd_av1_build_sequence_header(const void *pic,
                                      unsigned char *out, size_t out_cap);
 
+/* --------------------------------------------- OBU_FRAME 组装（3/4 + 4/4） */
+
+/* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
+struct dmd_av1_tile {
+    const unsigned char *data;
+    size_t               len;
+};
+
+/* 合成一个完整的 OBU_FRAME(6)：帧头 + byte_alignment + tile_group。
+ *
+ * ⚠️ 为什么用 OBU_FRAME 而不是分离的 FRAME_HEADER(3) + TILE_GROUP(4)：
+ * 实测 dav1d 对分离形式报 "Failed to read unit 0 (type 3)"，而合并形式
+ * 直接通过。libaom 生成的真实码流用的也是 OBU_FRAME。
+ *
+ * ⚠️ 关键差别：OBU_FRAME 内的帧头结尾用 **byte_alignment（纯补零）**，
+ * 而不是 trailing_bits（写 1 再补零）—— 规范 5.10.1 frame_obu() 里
+ * frame_header_obu() 之后紧跟 byte_alignment()。用错会让 tile_group
+ * 的起始位置偏移，dav1d 就是这么报错的。
+ *
+ * tiles 按 tile_row-major 顺序给出，数量必须等于 tile_cols*tile_rows。
+ * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+size_t dmd_av1_build_frame(const void *pic,
+                           const struct dmd_av1_tile *tiles, int num_tiles,
+                           unsigned char *out, size_t out_cap);
+
 /* ------------------------------------------------------- 帧头合成（3/4） */
 
 /* 从 VADecPictureParameterBufferAV1 合成一个完整的 OBU_FRAME_HEADER

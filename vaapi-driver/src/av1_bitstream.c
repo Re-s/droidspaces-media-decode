@@ -611,16 +611,19 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     return hdr + body_len;
 }
 
-size_t dmd_av1_build_frame_header(const void *pic_v,
-                                  unsigned char *out, size_t out_cap)
+/* 把 uncompressed_header() 写进 bw，不含结尾的 trailing_bits /
+ * byte_alignment —— 由调用方按封装形式决定：
+ *   OBU_FRAME_HEADER(3) 用 trailing_bits（规范 5.9.1）
+ *   OBU_FRAME(6)        用 byte_alignment（规范 5.10.1）
+ * 这个区别是实测踩出来的：用错会让 tile_group 起始位置偏移，
+ * dav1d 报 "Failed to read unit"。 */
+static void put_uncompressed_header(struct dmd_bitwriter *bwp,
+                                    const VADecPictureParameterBufferAV1 *p)
 {
-    const VADecPictureParameterBufferAV1 *p = pic_v;
-    if (!p || !out || out_cap < 8)
-        return 0;
-
-    unsigned char body[512];
-    struct dmd_bitwriter bw;
-    dmd_bw_init(&bw, body, sizeof(body));
+    /* struct dmd_bitwriter 是纯值结构：buf 指向调用方的缓冲，其余成员
+     * 都是计数器。所以"拷入 → 写 → 拷回"是安全的，函数体内得以保留
+     * 已与真实码流逐字段对齐过的 `&bw` 写法，不必逐行改动引入笔误。 */
+    struct dmd_bitwriter bw = *bwp;
 
     const uint32_t frame_type   = p->pic_info_fields.bits.frame_type;
     const int is_key            = (frame_type == 0);   /* KEY_FRAME */
@@ -854,12 +857,48 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
          p->pic_info_fields.bits.showable_frame))
         dmd_bw_put_flag(&bw, 0);         /* apply_grain = 0 */
 
-    dmd_av1_trailing_bits(&bw);
+    /* 结尾不写 trailing_bits / byte_alignment —— 交给调用方按封装形式决定。 */
+    *bwp = bw;
+}
+
+/* 把帧头 payload 装进指定类型的 OBU。obu_type 决定结尾用哪种对齐：
+ *   DMD_OBU_FRAME_HEADER → trailing_bits（规范 5.9.1）
+ *   DMD_OBU_FRAME        → byte_alignment（规范 5.10.1），之后紧跟 tile_group
+ * 返回写入 out 的字节数（含 OBU 头），失败返回 0。
+ * tail_out 回传 payload 的位长度，供 OBU_FRAME 继续拼 tile_group。 */
+static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
+                                     int obu_type,
+                                     unsigned char *body, size_t body_cap,
+                                     size_t *body_len_out)
+{
+    struct dmd_bitwriter bw;
+    dmd_bw_init(&bw, body, body_cap);
+    put_uncompressed_header(&bw, p);
+
+    if (obu_type == DMD_OBU_FRAME)
+        dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
+    else
+        dmd_av1_trailing_bits(&bw);   /* 写 1 再补零 */
 
     if (bw.overflow)
         return 0;
+    *body_len_out = dmd_bw_bytes(&bw);
+    return *body_len_out;
+}
 
-    const size_t body_len = dmd_bw_bytes(&bw);
+size_t dmd_av1_build_frame_header(const void *pic_v,
+                                  unsigned char *out, size_t out_cap)
+{
+    const VADecPictureParameterBufferAV1 *p = pic_v;
+    if (!p || !out || out_cap < 8)
+        return 0;
+
+    unsigned char body[512];
+    size_t body_len = 0;
+    if (build_frame_header_obu(p, DMD_OBU_FRAME_HEADER,
+                              body, sizeof(body), &body_len) == 0)
+        return 0;
+
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME_HEADER,
                                          body_len, out, out_cap);
     if (hdr == 0 || hdr + body_len > out_cap)
@@ -867,6 +906,76 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
     for (size_t i = 0; i < body_len; i++)
         out[hdr + i] = body[i];
     return hdr + body_len;
+}
+
+size_t dmd_av1_build_frame(const void *pic_v,
+                           const struct dmd_av1_tile *tiles, int num_tiles,
+                           unsigned char *out, size_t out_cap)
+{
+    const VADecPictureParameterBufferAV1 *p = pic_v;
+    if (!p || !out || !tiles || num_tiles <= 0 || out_cap < 16)
+        return 0;
+
+    /* 帧头（结尾 byte_alignment，不是 trailing_bits）。 */
+    unsigned char fh[512];
+    size_t fh_len = 0;
+    if (build_frame_header_obu(p, DMD_OBU_FRAME,
+                              fh, sizeof(fh), &fh_len) == 0)
+        return 0;
+
+    /* tile_group_obu()（规范 5.11.1）的 payload：
+     *   NumTiles > 1 时先写 tile_start_and_end_present_flag
+     *   置 0 表示本 group 覆盖全部 tile（tg_start=0, tg_end=NumTiles-1）
+     *   随后 byte_alignment，再逐 tile 写 tile_size_minus_1 + 数据
+     *   最后一个 tile 不写长度（由 OBU 剩余长度隐含）
+     *
+     * tile_size_minus_1 用 le(4)，宽度必须与帧头 tile_info 里写的
+     * tile_size_bytes_minus_1 = 3 一致 —— 两处不符会从第二个 tile 起全错位。 */
+    const uint32_t tile_total =
+        (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
+
+    unsigned char tg_hdr[8];
+    struct dmd_bitwriter tgw;
+    dmd_bw_init(&tgw, tg_hdr, sizeof(tg_hdr));
+    if (tile_total > 1)
+        dmd_bw_put_flag(&tgw, 0);     /* tile_start_and_end_present_flag */
+    dmd_av1_byte_align(&tgw);
+    if (tgw.overflow)
+        return 0;
+    const size_t tg_hdr_len = dmd_bw_bytes(&tgw);
+
+    /* 先算 OBU payload 总长，才能写 leb128 的 obu_size。 */
+    size_t payload_len = fh_len + tg_hdr_len;
+    for (int i = 0; i < num_tiles; i++) {
+        if (!tiles[i].data && tiles[i].len)
+            return 0;
+        payload_len += tiles[i].len;
+        if (i + 1 < num_tiles)
+            payload_len += 4;         /* tile_size_minus_1，le(4) */
+    }
+
+    const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME, payload_len,
+                                          out, out_cap);
+    if (hdr == 0 || hdr + payload_len > out_cap)
+        return 0;
+
+    unsigned char *q = out + hdr;
+    for (size_t i = 0; i < fh_len; i++)
+        *q++ = fh[i];
+    for (size_t i = 0; i < tg_hdr_len; i++)
+        *q++ = tg_hdr[i];
+    for (int i = 0; i < num_tiles; i++) {
+        if (i + 1 < num_tiles) {
+            const uint32_t v = (uint32_t)(tiles[i].len - 1);
+            *q++ = (unsigned char)(v & 0xFF);
+            *q++ = (unsigned char)((v >> 8) & 0xFF);
+            *q++ = (unsigned char)((v >> 16) & 0xFF);
+            *q++ = (unsigned char)((v >> 24) & 0xFF);
+        }
+        for (size_t k = 0; k < tiles[i].len; k++)
+            *q++ = tiles[i].data[k];
+    }
+    return hdr + payload_len;
 }
 
 /* ---------------------------------------------------------------- OBU 头 */
