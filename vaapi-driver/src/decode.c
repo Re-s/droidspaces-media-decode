@@ -719,7 +719,9 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
                 "flush送出 %lu\n",
                 c->av1_hold_show1, c->av1_sendset1, c->av1_flushed),
         dmd_log("SEF 统计3: EndPicture送出中show=1 %lu, flush送出中show=1 %lu\n",
-                c->av1_ep_show1, c->av1_flush_show1);
+                c->av1_ep_show1, c->av1_flush_show1),
+        dmd_log("SEF 统计4: NOHOLD 命中 %lu（其中本就是KEY帧 %lu）\n",
+                c->av1_nohold_hits, c->av1_nohold_wasted);
 
     /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
      * 会话也不能挂死宿主进程的 Terminate 路径。 */
@@ -1524,6 +1526,22 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 而序列级参数（尺寸、profile、能力位）在一个 session 内不变，
          * 变了本驱动会重建 session。 */
         const uint32_t ft = pp->pic_info_fields.bits.frame_type;
+        /* ⚠️ 已试过并撤回：让 show_frame=1 的帧也走直送（不入暂存）。
+         *
+         * 依据看起来充分：show=1 的帧必然被 ffmpeg 立刻 Sync，
+         * 于是总是 sync 的 target、总走 flush 送出 ——
+         * 实测 flush 送出的 75 帧里 75 个都是 show=1。
+         *
+         * 但实测结果无法解释：开关命中 80 次（其中 5 次本就是 KEY 帧，
+         * 即 75 帧真的改走了直送分支），而三组送出统计
+         *   EndPicture 非空 75 / send_show=1 5
+         *   flush 送出 75 / 其中 show=1 75
+         * 在开关前后**完全一致**，一个数字都没动。
+         * 若 75 帧真改了路径，EndPicture 非空必然接近 150。
+         * 已排除多 context 干扰（统计只输出 1 次）。
+         *
+         * 这个矛盾说明我对送料路径的理解仍有缺口 ——
+         * 在解释清楚之前不改主路径。开关已移除。 */
         if (ft == 0 /* KEY_FRAME */) {
             const size_t sn = dmd_av1_build_sequence_header(pp, buf + n, cap - n);
             if (sn == 0) {
