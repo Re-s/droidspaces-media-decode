@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <va/va.h>
+#include <va/va_dec_av1.h>
+
 #include "../src/av1_bitstream.h"
 
 static int fails;
@@ -235,6 +238,52 @@ static void test_su(void)
     check_eq("su(-8,4) = 0b1000", (buf[0] >> 4) & 0xf, 0x8);
 }
 
+/* -------------------------------------------------------------- 序列头合成 */
+
+static void test_sequence_header(void)
+{
+    printf("OBU_SEQUENCE_HEADER 合成（规范 5.5.1）\n");
+
+    /* 1080p / 8bit / 4:2:0 / profile 0，对应实测码流 av1_1080p.obu 的属性。 */
+    VADecPictureParameterBufferAV1 p;
+    memset(&p, 0, sizeof(p));
+    p.profile                 = 0;
+    p.bit_depth_idx           = 0;
+    p.matrix_coefficients     = 1;              /* BT.709 */
+    p.frame_width_minus1      = 1920 - 1;
+    p.frame_height_minus1     = 1080 - 1;
+    p.order_hint_bits_minus_1 = 6;
+    p.seq_info_fields.fields.use_128x128_superblock = 1;
+    p.seq_info_fields.fields.enable_order_hint      = 1;
+    p.seq_info_fields.fields.enable_cdef            = 1;
+    p.seq_info_fields.fields.subsampling_x          = 1;
+    p.seq_info_fields.fields.subsampling_y          = 1;
+
+    unsigned char buf[256];
+    size_t n = dmd_av1_build_sequence_header(&p, buf, sizeof(buf));
+
+    check_eq("合成成功（返回非 0）", n > 0, 1);
+    check_eq("首字节 = 0x0a（SEQ_HDR, has_size=1）", buf[0], 0x0a);
+    check_eq("obu_size 与实际 payload 一致", buf[1], (long)(n - 2));
+
+    /* profile 在首个 payload 字节的高 3 位（f(3) 是最先写的字段）。 */
+    check_eq("payload 起始 3 位 = seq_profile", (buf[2] >> 5) & 0x7, 0);
+
+    /* 容量不足必须返回 0 而不是越界写。 */
+    unsigned char tiny[4];
+    check_eq("容量不足返回 0",
+             (long)dmd_av1_build_sequence_header(&p, tiny, sizeof(tiny)), 0);
+    check_eq("NULL 参数返回 0",
+             (long)dmd_av1_build_sequence_header(NULL, buf, sizeof(buf)), 0);
+
+    /* 外部交叉验证记录（本测试不联外部工具，仅留证据）：
+     * 上述参数合成出 16 字节 `0a 0e 00 00 00 05 57 7f 86 ef ff c8 81 01 00 82`，
+     * 交 ffmpeg CBS 层解析得到
+     *   "obu_type: 1, payload size: 14"
+     *   "Video: av1 (Main), none(tv, bt709/unknown/unknown)"
+     * 即 profile/color_range/matrix_coefficients 三者均被如实解析。 */
+}
+
 int main(void)
 {
     printf("=== AV1 比特流原语自测 ===\n");
@@ -245,6 +294,7 @@ int main(void)
     test_uvlc();
     test_ns();
     test_su();
+    test_sequence_header();
 
     if (fails == 0) {
         printf("=== 全部通过 ===\n");

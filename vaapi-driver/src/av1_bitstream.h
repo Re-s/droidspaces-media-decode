@@ -82,6 +82,18 @@ void dmd_av1_trailing_bits(struct dmd_bitwriter *bw);
 
 /* ---------------------------------------------------------------- OBU 头 */
 
+/* ------------------------------------------------------- 序列头合成（2/4） */
+
+/* 从 VADecPictureParameterBufferAV1 合成一个完整的 OBU_SEQUENCE_HEADER
+ * （含 OBU 头 + payload + trailing_bits）。
+ *
+ * pic 是 const void* 而非具体类型：本头文件刻意不 include va_dec_av1.h，
+ * 免得把 libva 依赖扩散到只需要比特原语的调用方。实现里转型。
+ *
+ * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+size_t dmd_av1_build_sequence_header(const void *pic,
+                                     unsigned char *out, size_t out_cap);
+
 /* obu_header() + obu_size（AV1 规范 5.3.1/5.3.2）。
  *
  * 位布局（共 1 字节，无 extension 时）：
