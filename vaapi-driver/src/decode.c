@@ -719,9 +719,7 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
                 "flush送出 %lu\n",
                 c->av1_hold_show1, c->av1_sendset1, c->av1_flushed),
         dmd_log("SEF 统计3: EndPicture送出中show=1 %lu, flush送出中show=1 %lu\n",
-                c->av1_ep_show1, c->av1_flush_show1),
-        dmd_log("SEF 统计4: NOHOLD 命中 %lu（其中本就是KEY帧 %lu）\n",
-                c->av1_nohold_hits, c->av1_nohold_wasted);
+                c->av1_ep_show1, c->av1_flush_show1);
 
     /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
      * 会话也不能挂死宿主进程的 Terminate 路径。 */
@@ -1526,22 +1524,13 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 而序列级参数（尺寸、profile、能力位）在一个 session 内不变，
          * 变了本驱动会重建 session。 */
         const uint32_t ft = pp->pic_info_fields.bits.frame_type;
-        /* ⚠️ 已试过并撤回：让 show_frame=1 的帧也走直送（不入暂存）。
+        /* KEY 帧要额外前置一个序列头 OBU。
          *
-         * 依据看起来充分：show=1 的帧必然被 ffmpeg 立刻 Sync，
-         * 于是总是 sync 的 target、总走 flush 送出 ——
-         * 实测 flush 送出的 75 帧里 75 个都是 show=1。
-         *
-         * 但实测结果无法解释：开关命中 80 次（其中 5 次本就是 KEY 帧，
-         * 即 75 帧真的改走了直送分支），而三组送出统计
-         *   EndPicture 非空 75 / send_show=1 5
-         *   flush 送出 75 / 其中 show=1 75
-         * 在开关前后**完全一致**，一个数字都没动。
-         * 若 75 帧真改了路径，EndPicture 非空必然接近 150。
-         * 已排除多 context 干扰（统计只输出 1 次）。
-         *
-         * 这个矛盾说明我对送料路径的理解仍有缺口 ——
-         * 在解释清楚之前不改主路径。开关已移除。 */
+         * ⚠️ 本文件里判断 KEY 帧的那行 if 语句出现**两次**（文本完全相同）：
+         * 这一处只决定"是否写序列头"，另一处（送料路径）才决定
+         * "立即送还是入暂存"。两行文本完全相同，极易改错 —— 
+         * 第 63 轮就是把开关加在了这一处，却以为改的是送料路径。
+         * 改动前务必先确认行号与上下文。 */
         if (ft == 0 /* KEY_FRAME */) {
             const size_t sn = dmd_av1_build_sequence_header(pp, buf + n, cap - n);
             if (sn == 0) {
@@ -1633,10 +1622,35 @@ static const unsigned char *build_unit(struct dmd_context *c,
             }
         }
 
+        /* ---- 第 63 轮那个"无法解释的矛盾"已查明：是我的工具误用 ----
+         * 当时想让 show_frame=1 的帧也走直送，于是给"ft == 0"加了个开关，
+         * 但加在了上面那处**写序列头**的同名 if 上（两行文本一模一样）。
+         * 于是开关命中 80 次却完全没碰送料路径 ——
+         * 三组统计一个数字不动是**正确结果**，不是矛盾。
+         * 教训：对重复文本做替换前先用行号锚定，别信"唯一匹配"的直觉。
+         *
+         * 那个改法本身仍未验证，重做时要改的是这一处。 */
+        /* ⚠️ 已在**正确位置**验证并否证：让 show_frame=1 的帧也直送。
+         *
+         * 第 63 轮把开关误加在上面那处"写序列头"的同名 if 上，
+         * 于是统计毫无变化，我错当成"无法解释的矛盾"。
+         * 本轮加在这一处（真正的送料分支）后开关确实生效，
+         * 三组统计全变 —— 但会话直接崩掉：
+         *     EndPicture 进入 9（正常 150）、flush 送出 2（正常 75）
+         *     ffmpeg 输出 6 帧（正常 150）
+         * 成因：show=1 的帧直送后不再进 av1_hold，
+         * 下一帧就没有"上一帧"可反算 refresh_frame_flags，
+         * 延迟一帧机制的链条被打断，硬件很快拒绝后续单元。
+         *
+         * 结论：show=1 的帧必须继续走暂存 ——
+         * 延迟一帧不是可选优化，是 refresh 反算的前提。
+         * 于是 SEF 也就必然只能在 flush 路径追加，
+         * 而第 62 轮已证明那里插单元会打乱配对（150→111 帧）。
+         * 两条路都堵死，需要的是别的机制而不是换钩子位置。 */
         if (ft == 0 /* KEY_FRAME */) {
             /* KEY 帧不延迟。此时 av1_hold 必为空（KEY 帧开启新的参考链）。 */
             c->av1_send_surface = c->current_target;
-            c->av1_send_show = 1;   /* KEY 帧必然显示 */
+            c->av1_send_show = 1;   /* KEY 帧必然显示；直送的也是 show=1 */
             av1_dump_sent(buf, n);
             *scratch = buf;
             *out_len = n;
