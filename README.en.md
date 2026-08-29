@@ -787,7 +787,8 @@ For the detailed accounting and the corrected UBWC conclusion, see `doc/performa
 - [Performance measurements and roadmap](doc/performance-and-roadmap.md) - benchmark data, bottleneck attribution, zero-copy feasibility and hard constraints
 - [Why not use V4L2 directly](doc/why-not-v4l2.md) - the forensic conclusion that `/dev/video32` is measurably unusable inside the container
 - [VAAPI proxy architecture research report](doc/vaapi-mediacodec-proxy-research.md) - a detailed implementation plan for the VA-API proxy driver
-- [KSU module documentation](ksu-module/README.md) - an abandoned approach, no longer maintained
+- [KSU module documentation](ksu-module/README.md) - the KernelSU / Magisk module that deploys and supervises the Android-side daemon
+- [Release archive](doc/release-archive.md) - version overview, whether to roll back, artefacts and protocol compatibility
 
 ## License
 

@@ -777,6 +777,8 @@ SHM 模式已省掉 TCP 的两次内核拷贝（独立测试程序：吞吐 +17%
 - [性能实测与优化路线](doc/performance-and-roadmap.md) - 压测数据、瓶颈归因、零拷贝可行性与硬约束
 - [为什么不直接用 V4L2](doc/why-not-v4l2.md) - 容器内 `/dev/video32` 实测不可用的取证结论
 - [VAAPI Proxy 架构调研报告](doc/vaapi-mediacodec-proxy-research.md) - 详细的 VA-API 代理驱动实现方案
+- [KSU 模块说明](ksu-module/README.md) - 部署并看护安卓侧 daemon 的 KernelSU / Magisk 模块
+- [版本归档](doc/release-archive.md) - 历史版本一览、该不该回退、产物与协议兼容性
 
 ## 许可证
 
