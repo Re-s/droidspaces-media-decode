@@ -1487,6 +1487,10 @@ static const unsigned char *build_unit(struct dmd_context *c,
             n += sn;
         }
 
+        /* 记下 OBU_FRAME 在 buf 里的起始偏移（TD、必要时还有序列头）。
+         * build_frame 记的 bitpos 是"本 OBU 内"的，改写时作用于整个 buf，
+         * 故须再叠加这段外层前缀。 */
+        const size_t frame_off = n;
         const size_t fn = dmd_av1_build_frame(pp, tiles, c->av1_tile_count,
                                               buf + n, cap - n, &c->av1_dpb);
         if (fn == 0) {
@@ -1558,7 +1562,9 @@ static const unsigned char *build_unit(struct dmd_context *c,
             size_t prev_len = c->av1_hold_len;
             c->av1_hold = buf;
             c->av1_hold_len = n;
-            c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos;
+            c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
+                               ? (size_t)-1
+                               : c->av1_dpb.last_refresh_bitpos + frame_off * 8;
             av1_dump_sent(prev, prev_len);
             *scratch = prev;
             *out_len = prev_len;
@@ -1570,7 +1576,9 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * "码流重建失败"区分开。 */
         c->av1_hold = buf;
         c->av1_hold_len = n;
-        c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos;
+        c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
+                           ? (size_t)-1
+                           : c->av1_dpb.last_refresh_bitpos + frame_off * 8;
         *scratch = NULL;
         *out_len = 0;
         return NULL;

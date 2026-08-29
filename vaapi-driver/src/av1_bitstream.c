@@ -1151,6 +1151,19 @@ size_t dmd_av1_build_frame(const void *pic_v,
     if (hdr == 0 || hdr + payload_len > out_cap)
         return 0;
 
+    /* ⚠️ 把 last_refresh_bitpos 由"帧头内偏移"换算为"本 OBU 内偏移"。
+     *
+     * put_uncompressed_header 里的 bitwriter 基于局部 body 缓冲，
+     * 记下的是帧头内的位偏移（实测 19）。但上层改写时拿到的是含
+     * OBU 头的完整缓冲，直接用会打偏 hdr*8 位。
+     * 实测后果：OBU 头首字节由 0x32 被改成 0x20，
+     * type 6(FRAME) 变成 4(TILE_GROUP) 且 has_size 被清零，
+     * 整条流从该处结构崩塌 —— dav1d 只认出 5 个 OBU 就报 Invalid data。
+     *
+     * 调用方（decode.c）再叠加 TD 等更外层前缀的长度。 */
+    if (dpb && dpb->last_refresh_bitpos != (size_t)-1)
+        dpb->last_refresh_bitpos += hdr * 8;
+
     unsigned char *q = out + hdr;
     for (size_t i = 0; i < fh_len; i++)
         *q++ = fh[i];
