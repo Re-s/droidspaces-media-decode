@@ -2628,8 +2628,19 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
      *
      * 诊断开关：DMD_AV1_NO_FLUSH=1 完全不冲出暂存帧。
      * ================================================================ */
+    /* ⚠️ 只在"被等的正是暂存帧"时才冲出它。
+     *
+     * flush 的唯一必要场景是：ffmpeg 等的 surface 就压在暂存里，
+     * 不发它就永远等不到。若等的是别的 surface，flush 纯属多余 ——
+     * 而代价很大：发出去的帧再也没机会反算 refresh，只能带占位值。
+     *
+     * 60 帧样本实测（逐字节比对）：
+     *   无条件 flush（30 次）→ 56/61 正确
+     *   完全不 flush         →  5/5 正确但会话停摆（只送 5 单元）
+     * 按 target 收窄，目标是既保留必要的 flush 又减少误发。 */
+    const int hold_is_target = (c->av1_hold_surface == target);
     if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session &&
-        !getenv("DMD_AV1_NO_FLUSH")) {
+        hold_is_target && !getenv("DMD_AV1_NO_FLUSH")) {
         unsigned char *held = c->av1_hold;
         size_t held_len = c->av1_hold_len;
         size_t held_bitpos = c->av1_hold_bitpos;
@@ -2657,6 +2668,16 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * 第 43 轮加过同样的门又撤销了，因为当时看"像素导出帧数"从 6 掉到 3。
          * 但那个判据本身不稳定（同配置重复测量在 3~8 帧之间浮动），
          * 不足以评判任何改动。本轮改用逐字节比对这个稳定判据重做。 */
+        /* ⚠️ 已否证的一条路：flush 时用当前 pic_param 差分反算 refresh。
+         *
+         * 想法是：走到这里 c->av1_pic_param 存着最近一次 BeginPicture 的
+         * 参数，若它比暂存帧新就能作差分基准，算出真 refresh 而非写 0。
+         * 实测（60 帧，DMD_AV1_FLUSH_DERIVE 开关）：
+         *   差分路径执行 30 次，与写 0 的结果**完全一致** 56/61，
+         *   错帧一个不少（18/26/30/48/60）。
+         * 原因：dpb_shadow / prev_valid 已在同一帧的 build_unit 里
+         * 被这个 pic_param 更新过，此刻再差分得到的是空集。
+         * 该开关与代码已移除，只留这段记录，免得下次再试。 */
         if (held_bitpos != (size_t)-1) {
             int patched = 1;
             for (int i = 0; i < 8; i++) {
