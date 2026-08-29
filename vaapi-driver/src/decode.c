@@ -2085,9 +2085,36 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     /* AV1 延迟一帧：本次送出的是上一帧的数据，登记它的 surface。
      * 其余 codec 送的就是当前帧，直接用 target。 */
-    c->pending[qpos] = (c->codec == DMD_CODEC_AV1 &&
-                        c->av1_send_surface != VA_INVALID_ID)
-                     ? c->av1_send_surface : target;
+    const VASurfaceID reg_surf = (c->codec == DMD_CODEC_AV1 &&
+                                  c->av1_send_surface != VA_INVALID_ID)
+                               ? c->av1_send_surface : target;
+
+    /* ⚠️ 同一 surface 不能在待配对队列里出现两次。
+     *
+     * 实测踩过（本轮的真实根因，与上一轮记的"空壳 surface"无关）：
+     * ffmpeg 会复用 surface。sync flush 把暂存帧按 av1_hold_surface 入队后，
+     * ffmpeg 随后又拿同一个 surface 当新帧的目标，于是它被登记第二次 ——
+     * 日志同时出现 "末帧 surface=8 入队（unit 8）" 与
+     * "登记: target=8 → pending[10]=8"，而**从未有帧配给 surface 8**，
+     * ffmpeg 报 "Failed to read image from surface 0x8"。
+     * 注意失败的是 surface 8，而被标 show_frame=0 的是 3/4/5 ——
+     * 上一轮把两者混为一谈，方向错了。
+     *
+     * 重复项一旦进队，精确配对会命中错误的那条，
+     * 另一条永远配不上，队列越积越深。
+     * 这里扫一遍队列，已在队中就不再登记。 */
+    int dup_pending = 0;
+    for (int k = 0; k < c->pending_count; k++) {
+        int kp = (c->pending_head + k) % DMD_MAX_SURFACES;
+        if (c->pending[kp] == reg_surf) { dup_pending = 1; break; }
+    }
+    if (dup_pending)
+        dmd_log("EndPicture: ⚠️ surface=%u 已在待配对队列（重复项）\n",
+                (unsigned)reg_surf);
+
+    /* ⚠️ 只跳过入队，**数据照送**。送料在下方 dmd_session_send_unit，
+     * 这里 early-return 就等于不送 —— 本会话已踩过两次，别再犯。 */
+    c->pending[qpos] = reg_surf;
     /* ⚠️ 这里**不要**打印 c->av1_pic_param 的 show_frame/order_hint：
      * 那是当前帧的参数，而登记的 surface 属于上一帧（延迟一帧送料）。
      * 我据此误读过一次，得出"send=5 对应 show=1"的错误结论。 */
@@ -2601,9 +2628,13 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             dmd_log("sync: 末帧 refresh 改写为 0（bitpos=%zu %s）",
                     held_bitpos, patched ? "成功" : "越界跳过");
         }
-        /* 末帧也要进待配对队列：它的解码结果回来时才有对应项可查。
-         * 漏登记的后果与登记错 surface 一样 —— unit_seq 无匹配、
-         * 退到顺序推断、配到别的 surface 上。 */
+        /* 末帧是否入队 —— 两种做法都试过，都不理想，此处保留入队：
+         *   入队   → 该 surface 之后被 ffmpeg 复用时会重复登记
+         *            （日志 "surface=8 已在待配对队列"），但像素能出 12 帧
+         *   不入队 → 重复消失，但该帧永远配不上，像素掉到 6 帧
+         * 说明重复项本身不是主因，真正缺的是"一个 surface 承载两帧"
+         * 这件事在当前配对模型里无法表达。留待重构配对键（改用
+         * surface+unit 组合而非仅 surface）时一并解决。 */
         if (held_surf != VA_INVALID_ID &&
             c->pending_count < DMD_MAX_SURFACES) {
             int hq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
