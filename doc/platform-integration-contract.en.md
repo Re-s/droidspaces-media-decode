@@ -137,7 +137,12 @@ Creating the socket **does not require any new SELinux rule** — policy already
 
 ### ⚠️ But switching the domain alone is not enough: the platform must add one allow rule
 
-This is the only issue currently **blocking delivery of the Unix socket channel**. Each of the two usable identities has only half of the required permissions:
+> ✅ **Status: implemented and verified on the platform side in v0.3.1**
+> (see the end of this section and the appendix table). The text below is kept
+> as the diagnostic reasoning from when the requirement was raised; it was
+> called "the only blocker" at that time and is no longer one.
+
+When this requirement was raised it was the only issue **blocking delivery of the Unix socket channel**. Each of the two usable identities has only half of the required permissions:
 
 | Startup identity | Can `bind()` the socket | Can use MediaCodec |
 |---|---|---|
@@ -356,7 +361,7 @@ Endpoint selection logic on the driver side (`session_open` in `vaapi-driver/src
 
 ## 4. Optional optimization: memfd zero-copy (SHM transport)
 
-Inline mode (frame data goes directly over the socket byte stream, which is the case for both TCP and Unix sockets) goes through two kernel copies per frame; SHM mode puts frame data into a `memfd` and the socket carries only a 20-byte control message.
+Inline mode (frame data goes directly over the socket byte stream, which is the case for both TCP and Unix sockets) goes through two kernel copies per frame; SHM mode puts frame data into a `memfd` and the socket carries only a 24-byte control message (`uint32_t msg[6]`: `[width][height][SHM sentinel][slot][length][PTS]`).
 
 **1080p measurements from the standalone test program `tests/test_dmd_client.c`**: +12.9% throughput in the steady-state window and **−28.6%** daemon CPU, with frames decoded in the two modes byte-for-byte identical.
 
@@ -381,7 +386,7 @@ What has been verified on device: a path-based Unix socket works across mount na
 
 Enabling it by default is safe: when the handoff fails on the daemon side it automatically falls back to inline transport (which is exactly what happens in a NAT-mode container), so there is **no hard-failure risk** — the only cost is one extra handoff timeout per session creation.
 
-This path has been verified end to end in a real consumer environment: the driver `dlopen`ed into ffmpeg over `/run/dmd/decode.sock`, with the daemon log confirming `共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)` and `握手成功: video/hevc 1280x720 帧回传=SHM`, and the decoded output matching inline mode (150/150 frames). The earlier `tests/test_dmd_client.c` unit-test conclusions (150 frames, byte-for-byte identical, no fd leaks) still hold as well.
+This path has been verified end to end in a real consumer environment: the driver `dlopen`ed into ffmpeg over `/run/dmd/decode.sock`, with the daemon log confirming `共享内存已交接: 8 槽 x 3133440 字节 (共 25067520)` and `握手成功: video/hevc 1280x720 帧回传=SHM`, and the decoded output matching inline mode (150/150 frames). The slot count changed from 4 to 8 in v0.3.7 (`SHM_SLOTS`); the log captured at the time of that verification printed 4 slots. The earlier `tests/test_dmd_client.c` unit-test conclusions (150 frames, byte-for-byte identical, no fd leaks) still hold as well.
 
 Whether browser sandboxes (the seccomp filters of the Firefox RDD / Chrome GPU processes) can receive `SCM_RIGHTS` **has now been measured and works**: both can establish decoding sessions normally. This project has a precedent: a source-level conclusion claimed that the RDD sandbox returns `EACCES` for all `SYS_SOCKET` calls, yet 713 frames ran through in an on-device test — judgments of this kind can only be settled by measurement.
 
