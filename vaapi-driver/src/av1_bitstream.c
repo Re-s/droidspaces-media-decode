@@ -779,17 +779,51 @@ static void put_lr_params(struct dmd_bitwriter *bw,
 
     /* lr_type 用 f(2)，取值顺序与 VA-API 的 restoration_type 枚举一致
      * （0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE）。 */
-    dmd_bw_put_bits(bw, ry, 2);
+    if (getenv("DMD_AV1_BITS"))
+        fprintf(stderr, "[lr] oh=%u ry=%u rcb=%u rcr=%u shift=%u uv=%u\n",
+                p->order_hint, ry, rcb, rcr,
+                p->loop_restoration_fields.bits.lr_unit_shift,
+                p->loop_restoration_fields.bits.lr_uv_shift);
+    /* ⚠️ lr_type 的码流编码与 VA-API 枚举**不是**同一套取值，必须映射。
+     *
+     * 规范 5.9.20 用 Remap_Lr_Type[4] = {NONE, SWITCHABLE, WIENER, SGRPROJ}
+     * 把码流里的 f(2) 映射成 FrameRestorationType；
+     * VA-API 直接给 FrameRestorationType 枚举
+     * （0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE）。
+     * 写码流要做**反向**映射：
+     *   NONE(0)→0   WIENER(1)→2   SGRPROJ(2)→3   SWITCHABLE(3)→1
+     *
+     * 实测证据（帧26，oh=28）：VA-API 给 ry=1(WIENER)，
+     * 源码流该位写 2 —— 直接转写得到 1，正是差异位 115/116。
+     * 早先"put_lr_params 已验证正确"的结论来自 6 帧样本，
+     * 那些帧恰好 ry=rcb=rcr=0，映射前后都是 0，掩盖了这个缺陷。 */
+    static const unsigned char lr_to_bits[4] = { 0, 2, 3, 1 };
+    dmd_bw_put_bits(bw, lr_to_bits[ry & 3], 2);
     if (!p->seq_info_fields.fields.mono_chrome) {
-        dmd_bw_put_bits(bw, rcb, 2);
-        dmd_bw_put_bits(bw, rcr, 2);
+        dmd_bw_put_bits(bw, lr_to_bits[rcb & 3], 2);
+        dmd_bw_put_bits(bw, lr_to_bits[rcr & 3], 2);
     }
 
     if (ry || rcb || rcr) {
-        dmd_bw_put_bits(bw, p->loop_restoration_fields.bits.lr_unit_shift, 1);
-        if (p->seq_info_fields.fields.use_128x128_superblock == 0 &&
-            p->loop_restoration_fields.bits.lr_unit_shift)
-            dmd_bw_put_bits(bw, 0, 1);   /* lr_unit_extra_shift */
+        /* ⚠️ VA-API 的 lr_unit_shift 是**总位移量**（0..2），
+         * 而码流里分成两个各 1 位的字段（规范 5.9.20）：
+         *   use_128x128_superblock=1: lr_unit_shift 一位即表示 0 或 1
+         *   否则: lr_unit_shift(1) + 若为 1 再写 lr_unit_extra_shift(1)
+         *         总位移 = lr_unit_shift + lr_unit_extra_shift
+         * 所以 shift=2 要写成 1 再写 1。
+         *
+         * 早先代码写 `lr_unit_shift` 的低 1 位、extra 恒填 0：
+         * shift=2 被写成 0，且不写 extra —— 实测帧26（shift=2）
+         * 差异位 121/122 正是此处。
+         * 6 帧样本里 ry=rcb=rcr=0，整个 if 块被跳过，掩盖了缺陷。 */
+        const unsigned sh = p->loop_restoration_fields.bits.lr_unit_shift;
+        if (p->seq_info_fields.fields.use_128x128_superblock) {
+            dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
+        } else {
+            dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
+            if (sh)
+                dmd_bw_put_bits(bw, sh > 1 ? 1 : 0, 1);
+        }
         if (p->seq_info_fields.fields.subsampling_x &&
             p->seq_info_fields.fields.subsampling_y && (rcb || rcr))
             dmd_bw_put_bits(bw, p->loop_restoration_fields.bits.lr_uv_shift, 1);
