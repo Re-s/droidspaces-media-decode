@@ -815,6 +815,20 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         dmd_bw_put_bits(&bw, refresh_mask, 8);
     }
 
+    /* ref_order_hint[i]（规范 5.9.2）：条件是
+     *   !refresh_all && error_resilient_mode && enable_order_hint
+     *
+     * 本码流实测不触发（DMD_AV1_LOG 采得）：
+     *   ft=0 refresh_all=1 err_res=1   ← KEY 帧，refresh_all 已排除
+     *   ft=1 refresh_all=0 err_res=0   ← 帧间帧，err_res 为 0
+     * 即 KEY 帧被 refresh_all 挡住、帧间帧 err_res 为假，一个字节都不写。
+     *
+     * 故此处不实现。若将来遇到 error_resilient 的帧间码流需要补上，
+     * 注意两点：(1) 必须带 !refresh_all 条件，否则给 KEY 帧多写
+     * 8*order_hint_bits 位会让整个帧头错位（实测 dav1d 把 8 tile 读成
+     * 2x17 后报 zero_bit out of range）；(2) VA-API 不提供各槽的 order
+     * hint，需从自洽 DPB 的 dpb_order_hint[] 取。 */
+
     /* 参考帧索引：帧间帧才有。 */
     if (!intra_only) {
         /* frame_refs_short_signaling 需要 enable_order_hint；置 0 表示
@@ -827,13 +841,20 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 再在影子 DPB 里找该 surface 现在占我的哪个槽。 */
         for (int i = 0; i < 7; i++) {
             unsigned va_slot = p->ref_frame_idx[i];
-            unsigned my = 0;
-            if (va_slot < 8) {
-                VASurfaceID want = p->ref_frame_map[va_slot];
-                for (int k = 0; k < 8; k++) {
-                    if (dpb->dpb_shadow[k] == want) { my = (unsigned)k; break; }
-                }
-            }
+            unsigned my = va_slot < 8 ? va_slot : 0;
+            /* 直接沿用 VA-API 的槽号。
+             *
+             * 先前试过"经 ref_frame_map 翻成 surface id 再查影子 DPB"，
+             * 实测第 2 帧即解码失败：VA-API 给的是槽 2，影子表查得槽 0。
+             * 两者都指向同一个 KEY 帧 surface，但 dav1d 按规范推断出的
+             * DPB 状态里槽 0 与槽 2 的 order hint 不同 —— 我们无法让
+             * 影子表与解码器的推断状态保持一致（KEY+show 帧的
+             * refresh_frame_flags 不写入码流，由双方各自推断）。
+             *
+             * 于是放弃重映射：VA-API 的槽号本就与源码流一致（实测
+             * ref_frame_idx 全为 2，与源码流 trace_headers 相同），
+             * 直接透传最安全。影子 DPB 仅用于 refresh_frame_flags 的
+             * 槽位轮转，不再参与引用翻译。 */
             dmd_bw_put_bits(&bw, my, 3);
         }
         /* frame_id_numbers_present=0，不写 delta_frame_id。 */
@@ -1145,11 +1166,15 @@ size_t dmd_av1_build_frame(const void *pic_v,
         int is_key_frame = (pp->pic_info_fields.bits.frame_type == 0);
         if (is_key_frame && pp->pic_info_fields.bits.show_frame) {
             /* KEY + show 帧刷新全部 8 槽（规范如此，字段不写入码流）。 */
-            for (int k = 0; k < 8; k++) dpb->dpb_shadow[k] = pp->current_frame;
+            for (int k = 0; k < 8; k++) {
+                dpb->dpb_shadow[k] = pp->current_frame;
+                dpb->dpb_order_hint[k] = pp->order_hint;
+            }
             dpb->dpb_next_slot = 0;
         } else {
             unsigned sl = dpb->dpb_next_slot & 7u;
             dpb->dpb_shadow[sl] = pp->current_frame;
+            dpb->dpb_order_hint[sl] = pp->order_hint;
             dpb->dpb_next_slot = (sl + 1u) & 7u;
         }
     }

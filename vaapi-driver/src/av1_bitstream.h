@@ -109,8 +109,11 @@ size_t dmd_av1_build_sequence_header(const void *pic,
  * 新建 context 时整体清零即为初始状态。
  */
 struct dmd_av1_dpb {
-    VASurfaceID dpb_shadow[8];   /* 槽 -> 该槽当前存的 surface id */
-    unsigned    dpb_next_slot;   /* 下一个要写入的槽，8 槽轮转 */
+    VASurfaceID dpb_shadow[8];     /* 槽 -> 该槽当前存的 surface id */
+    unsigned    dpb_order_hint[8]; /* 槽 -> 该槽帧的 order hint。
+                                    * error_resilient 帧的帧头要逐槽写出
+                                    * （规范 5.9.2 的 ref_order_hint[i]）。 */
+    unsigned    dpb_next_slot;     /* 下一个要写入的槽，8 槽轮转 */
 };
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
