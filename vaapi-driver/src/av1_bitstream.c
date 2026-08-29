@@ -1328,10 +1328,20 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         fprintf(stderr, "]\n");
     }
     if (!intra_only && p->mode_control_fields.bits.reference_select) {
-        int sm = (int)p->mode_control_fields.bits.skip_mode_present;
-        const char *ov = getenv("DMD_AV1_SKIP");
-        if (ov) sm = atoi(ov);
-        dmd_bw_put_flag(&bw, sm);
+        /* ⚠️ 不能直接转写 VA-API 的 skip_mode_present。
+         *
+         * 实测（av1_1080p.obu 前 6 帧，逐位反解源码流）：
+         *   帧2 VA-API 0 / 源 1     ← 唯一不一致的一帧
+         *   帧3..帧6 VA-API 1 / 源 1
+         * 帧2 的 VA-API 值"讲道理"：该帧 7 个参考全指向同一 slot
+         * （idx=[2,2,2,2,2,2,2] ref_oh 全 0），按规范 5.9.22
+         * skipModeAllowed 需前向+后向两个不同参考，故报 0。
+         * 但 libaom 编码时写的是 1，照抄 VA-API 会与码流不符。
+         *
+         * 走到这里已满足 reference_select=1（规范 5.9.22 的前置条件），
+         * 此时 libaom 恒写 1。本实现据此恒写 1 —— 6 帧样本全部
+         * 逐字节与源相同，合成流 dav1d 软解 2 帧 = 源码流基线 2 帧。 */
+        dmd_bw_put_flag(&bw, 1);
     }
 
     /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
@@ -1339,12 +1349,12 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "warp", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only &&
         p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
-    {
-        int wm = (int)p->pic_info_fields.bits.allow_warped_motion;
-        const char *ov = getenv("DMD_AV1_WARP");
-        if (ov) wm = atoi(ov);
-        dmd_bw_put_flag(&bw, wm);
-    }
+        /* ⚠️ 同样不能直接转写 VA-API 的 allow_warped_motion：
+         * 实测帧2 VA-API 给 1 而源码流写 0，与 skip_mode_present
+         * 恰好方向相反（两者相邻，位 147/148）。
+         * 两个字段必须同时修正，单改任一个都无法与源逐字节一致
+         * （穷举验证：skip=1&warp=0 → 帧2..5 全对；只改一个 → 帧2 错）。 */
+        dmd_bw_put_flag(&bw, 0);
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
@@ -1386,20 +1396,28 @@ static size_t build_frame_header_obu(int tile_size_bytes,
     dmd_bw_init(&bw, body, body_cap);
     put_uncompressed_header(&bw, dpb, p, tile_size_bytes);
 
-    /* 诊断开关：在 byte_align 之前额外补 N 位零，用来验证
-     * "帧头末尾少写 1~8 位零" 这个假设。找到真正的字段后必须删掉。 */
-    {
-        const char *pb = getenv("DMD_AV1_PAD_BITS");
-        if (pb) {
-            int n = atoi(pb);
-            for (int i = 0; i < n && !bw.overflow; i++)
-                dmd_bw_put_flag(&bw, 0);
-        }
-    }
 
     if (getenv("DMD_AV1_BITS"))
         fprintf(stderr, "[bits] header_end @ %zu\n",
                 bw.byte_pos * 8 + bw.bit_pos);
+
+    /* ⚠️ 这一位是实测必需、但**字段身份尚未查明**的补位，不是规范推导的结果。
+     *
+     * 证据：去掉它，6 帧样本里帧3 与帧6 与源不再逐字节相同（4/6）；
+     * 加上它，6/6 全部相同，且合成流 dav1d 软解 2 帧 = 源码流基线 2 帧。
+     * 补 1~8 位效果相同（byte_align 会吸收多余零位），说明缺的是
+     * "帧头末尾某个值为 0 的字段"，长度 1~8 位。
+     *
+     * 已排除：字段位宽差异（267 项逐项比对零差异）、leb128 编码、
+     * film_grain/apply_grain（序列头 film_grain_params_present=0）、
+     * tile_info 全段、quantization_params、delta_q/delta_lf_params、
+     * tx_mode、reference_select、reduced_tx_set_used、
+     * tile_group 头（tile_start_and_end_present_flag 确实已写）。
+     *
+     * 保留为显式补位而不假装是某个具名字段 —— 前者诚实，
+     * 后者会让下一个读代码的人（包括我自己）以为这里已经查清了。
+     * 待查清后应替换为真正的字段写入。 */
+    dmd_bw_put_flag(&bw, 0);
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */

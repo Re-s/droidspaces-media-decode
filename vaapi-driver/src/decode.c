@@ -2394,16 +2394,43 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
      * 永远压在暂存里。ffmpeg 等 surface=6 的像素，5000ms 超时后
      * 报 "Failed to read image from surface 0x6"，整个会话只出 1 帧。
      *
-     * 所以只要开始等帧，就说明上游这一轮不再送料了，
-     * 必须把暂存帧冲出去。它的 refresh 无从反算（没有下一帧的
-     * ref_frame_map 可差分），保持轮转策略给出的值即可 ——
-     * 末帧不被任何后续帧引用，该值不影响解码结果。 */
+     * 所以只要开始等帧，就说明上游这一轮不再送料了，必须把暂存帧冲出去。
+     *
+     * ⚠️ 曾在此写着"它的 refresh 无从反算，保持轮转策略给出的占位值即可 ——
+     * 末帧不被任何后续帧引用，该值不影响解码结果"。**这个假设是错的**，
+     * 实测直接否证：
+     *   源码流末帧 refresh_frame_flags = 0x00，
+     *   而轮转占位值给出 0x20 —— 落盘流与源逐字节比对，
+     *   6 帧样本里前 5 帧全部相同、唯独末帧因此不同；
+     *   解码在该帧之后立即 "Error processing packet: Input/output error"
+     *   中止，整段码流只出 1 帧。
+     *
+     * 原因：refresh_frame_flags 声明的是"本帧解码后要占用哪些参考槽"。
+     * 写非 0 会让解码器把这一帧塞进参考槽、顶掉原有内容，
+     * 破坏解码器内部的参考帧状态 —— 即使后续没有帧显式引用它。
+     *
+     * 正确做法：冲出暂存帧时把 refresh 改写为 0。
+     * 语义上成立：走到这里说明上游本轮不再送料，该帧不必留驻参考槽。
+     * 若之后又有新帧到来，它会各自携带正确的 refresh 值，不受影响。 */
     if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session) {
         unsigned char *held = c->av1_hold;
         size_t held_len = c->av1_hold_len;
+        size_t held_bitpos = c->av1_hold_bitpos;
         c->av1_hold = NULL;
         c->av1_hold_len = 0;
         c->av1_hold_bitpos = (size_t)-1;
+        /* 把 refresh_frame_flags 就地改写为 0（8 位，MSB 在前）。 */
+        if (held_bitpos != (size_t)-1) {
+            int patched = 1;
+            for (int i = 0; i < 8; i++) {
+                size_t bp = held_bitpos + (size_t)i;
+                size_t byte = bp >> 3;
+                if (byte >= held_len) { patched = 0; break; }
+                held[byte] &= (unsigned char)~(1u << (7 - (bp & 7)));
+            }
+            dmd_log("sync: 末帧 refresh 改写为 0（bitpos=%zu %s）",
+                    held_bitpos, patched ? "成功" : "越界跳过");
+        }
         dmd_log("sync: 冲出暂存的 AV1 末帧（%zu 字节）", held_len);
         av1_dump_sent(held, held_len);
         (void)dmd_session_send_unit(c->session, held, held_len);
