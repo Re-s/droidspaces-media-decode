@@ -548,6 +548,39 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  *     实测 delta_q_present=1、delta_q_res=0
  *   · tx_mode（increment 编码）、reference_select、reduced_tx_set_used
  *
+ * ---- 补位实验结论（DMD_AV1_PAD_BITS，决定性）----
+ *
+ * 在 byte_align 之前额外补 N 位零，逐帧与源比对（6 帧样本）：
+ *       pad=0  pad=1  pad=2  pad=3
+ *   帧2   ·      ·      ·      ·
+ *   帧3   ·      ✓      ✓      ✓
+ *   帧4   ✓      ✓      ✓      ✓
+ *   帧5   ✓      ✓      ✓      ✓
+ *   帧6   ·      ·      ·      ·
+ * （✓ = 与源**逐字节完全相同**）
+ *
+ * 三点确证：
+ * 1. 帧3 只要补 ≥1 位零就逐字节正确 —— 上一轮"帧头末尾少写 1~8 位零"
+ *    的假设成立。位数不敏感是因为 byte_align 会吸收多余零位。
+ * 2. 帧4、帧5 在任何 pad 值下都正确，说明它们本来就落在字节边界上，
+ *    补零不影响 —— 所以这个补位不是"某帧特有"，而是**所有帧都该补**。
+ * 3. 帧2、帧6 补零救不了：它们差的是**非零位**，属另一类缺陷。
+ *
+ * ---- 帧2 / 帧6 的残余缺陷（各只差 1 个字节，其余全同）----
+ *   帧2 (2683B) 共同前缀 18B，仅 [18] 不同：
+ *       源 0x70 = 01110000   合成 0x68 = 01101000
+ *       XOR = 0x18 —— 相邻两位模式不同（源 11 0 / 合成 10 1）
+ *   帧6 (83B) 共同前缀 2B，仅 [2] 不同：
+ *       源 0x00 = 00000000   合成 0x04 = 00000100
+ *       XOR = 0x04 —— 合成**多写**了 1 位
+ * 方向相反（帧2 少、帧6 多），故不是同一个常量偏差。
+ * 帧6 偏移 2 落在 refresh_frame_flags 一带（本会话修过该字段）；
+ * 帧2 是第一个 inter 帧（order_hint=16），偏移 18 接近帧头末尾。
+ *
+ * 注意：帧2 是链条上第一个 inter 帧，它错则后续全废 ——
+ * 这解释了为什么补位让 3 帧变正确、硬件解码帧数却仍是 1。
+ * 修复顺序应当是 帧2 → 帧6，而非先追帧数。
+ *
  * 剩余嫌疑（按位置从后往前）：
  *   · skip_mode_present 的**门条件**：代码用 `reference_select` 当门（1154 行），
  *     而规范 5.9.22 的 skipModeAllowed 推导并不含该项。实测
@@ -1227,6 +1260,17 @@ static size_t build_frame_header_obu(int tile_size_bytes,
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, body_cap);
     put_uncompressed_header(&bw, dpb, p, tile_size_bytes);
+
+    /* 诊断开关：在 byte_align 之前额外补 N 位零，用来验证
+     * "帧头末尾少写 1~8 位零" 这个假设。找到真正的字段后必须删掉。 */
+    {
+        const char *pb = getenv("DMD_AV1_PAD_BITS");
+        if (pb) {
+            int n = atoi(pb);
+            for (int i = 0; i < n && !bw.overflow; i++)
+                dmd_bw_put_flag(&bw, 0);
+        }
+    }
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
