@@ -21,6 +21,7 @@
  * 用 1080 算会让 UV 平面整体偏移 1920*8 字节 —— 症状是绿边、花屏、色度错位。
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -282,6 +283,29 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     VAStatus wait = dmd_surface_wait(drv, surface);
     if (wait != VA_STATUS_SUCCESS)
         return wait;
+
+    /* 诊断：把 surface 原始缓冲整块落盘，用来区分
+     * "解码器给的就不对" 和 "拷进 VAImage 时几何算错"。 */
+    {
+        const char *dp = getenv("DMD_SURF_DUMP");
+        if (dp) {
+            pthread_mutex_lock(&drv->lock);
+            struct dmd_surface *sd = dmd_find_surface_locked(drv, surface);
+            if (sd && sd->data) {
+                FILE *fp = fopen(dp, "wb");
+                if (fp) {
+                    fwrite(sd->data, 1, sd->data_size, fp);
+                    fclose(fp);
+                    dmd_log("SURF_DUMP: surface=%u %zu 字节 "
+                            "stride=%u slice=%u w=%u h=%u\n",
+                            (unsigned)surface, sd->data_size,
+                            sd->stride, sd->slice_height,
+                            sd->buf_width, sd->buf_height);
+                }
+            }
+            pthread_mutex_unlock(&drv->lock);
+        }
+    }
 
     pthread_mutex_lock(&drv->lock);
 

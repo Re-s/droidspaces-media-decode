@@ -2210,7 +2210,28 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
 
     int pick = c->pending_head;
 
-    /* 首选：按提交序号精确配对。
+    /* ⚠️ HEVC 实测：V4L2 回传的 timestamp **不可信**，不能用于精确配对。
+     *
+     * 证据（DMD_SURF_DUMP 把 surface 原始缓冲整块落盘后逐帧匹配软解）：
+     *   日志称 "配对: 帧 -> surface 1 (unit 1 seq 0 POC 0)"，
+     *   而 surface 1 的实际内容精确匹配软解**第 7 帧**（平均差 0.000），
+     *   与 POC 0 那帧的平均差是 8.15。
+     *   落盘时机已核对无误：第 40 行配对 unit 1、第 41 行落盘，
+     *   且 surface 1 全程只被配对一次，不存在覆写。
+     *
+     * 出帧顺序实测为 4,5,6,7,8,9,10,11,1,3,2,12 —— 既不是送入序也不是
+     * 显示序，而 unit_seq 是按送入序标号的。二者对不上，配对必然错帧。
+     *
+     * 这也解释了为什么"帧数 12/12 正确、像素却错"：数量对得上，
+     * 内容却张冠李戴。用静态画面测会完全看不出来。
+     *
+     * 下面这段"按 unit_seq 精确配对"的注释是 daemon/MediaCodec 时代写的，
+     * 当时 tools/probe_negotiate.c 实测 PTS 原样回传成立；
+     * 换到 msm_vidc V4L2 直通后该前提**不再成立**，需要另找配对依据
+     * （候选：V4L2_BUF_FLAG_* 序号、按出帧顺序 + POC 重排、
+     *  或改用 CAPTURE buffer index 与提交顺序的稳定映射）。
+     *
+     * 首选：按提交序号精确配对。
      *
      * daemon 把每个输入单元的序号当 PTS 送给 MediaCodec，解码器原样回传到
      * 对应的输出帧上（tools/probe_negotiate.c 实测未被改写），于是这一帧
