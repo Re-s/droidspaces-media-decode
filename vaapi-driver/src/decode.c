@@ -2050,8 +2050,24 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 只是不进显示队列。ffmpeg 读它大概是为了 film grain 的
      * current_frame / current_display_picture 两路输出
      * （见 vaapi_av1.c 的注释：VAAPI 对每帧产生 2 个 output）。
-     * 待查：msm_vidc 能否被要求输出这些不显示的帧，
-     * 或驱动应把被引用帧的内容复制给它。 */
+     * ---- 已排除的一条路：V4L2 DISPLAY_DELAY 控制 ----
+     * msm_vidc /dev/video32 确实暴露标准控制
+     *   V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE (0x00990b8e)
+     *   V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY        (0x00990b8d)
+     * 两者默认都是 0，S_CTRL 设置均返回 OK（已接进 v4l2_backend.c，
+     * 由 DMD_V4L2_DISPLAY_DELAY=1 开启）。
+     * 但实测**无效**：像素导出仍是 6 帧，报错仍是
+     * "Failed to read image from surface 0x8"。
+     * 该控制只影响输出时机/重排深度，不改变 AV1 的 show_frame 语义 ——
+     * 不显示的帧依旧不吐 CAPTURE 缓冲。这条路走不通。
+     *
+     * ---- 另外两条已否证的尝试（本轮踩过，勿重复）----
+     * 给 sync flush 加 input_finished 门 → 帧数从 150 掉回 1：
+     * 正常流程里 input_finished 直到很晚才置位，暂存帧因此永远送不出去。
+     * 给 refresh 改写加同样的门 → 像素从 6 掉到 3。两者均已撤销。
+     *
+     * 待查方向：驱动把被引用帧的内容复制给这些 surface，
+     * 或让 CAPTURE 缓冲在多个 surface 间共享。 */
     const int av1_no_output = (c->codec == DMD_CODEC_AV1 &&
                                !c->av1_send_show &&
                                c->av1_send_surface != VA_INVALID_ID);
@@ -2543,6 +2559,18 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
      * 正确做法：冲出暂存帧时把 refresh 改写为 0。
      * 语义上成立：走到这里说明上游本轮不再送料，该帧不必留驻参考槽。
      * 若之后又有新帧到来，它会各自携带正确的 refresh 值，不受影响。 */
+    /* ⚠️ 只在输入确实结束后才冲出暂存帧。
+     *
+     * 实测踩过：ffmpeg 用较短超时反复轮询 Sync，本处被触发 7 次
+     * （一段 10 帧的码流），每次都把当时的暂存帧当"末帧"送出。
+     * 后果有两重：
+     *   1. 暂存帧的 refresh 被改写为 0，而后面还有帧要引用它 → 参考链断
+     *   2. 送出后 av1_hold 变空，下一个 EndPicture 走"第一个帧间帧"分支
+     *      只入暂存不送数据，队列与 surface 的对应被打乱一格
+     * 表现为某个 surface 永远拿不到解码结果（实测 surface=8，
+     * ffmpeg 报 "Failed to read image from surface 0x8"）。
+     *
+     * input_finished 由上方 finish_input 路径置位，那才是流真结束的信号。 */
     if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session) {
         unsigned char *held = c->av1_hold;
         size_t held_len = c->av1_hold_len;
@@ -2552,7 +2580,16 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         c->av1_hold = NULL;
         c->av1_hold_len = 0;
         c->av1_hold_bitpos = (size_t)-1;
-        /* 把 refresh_frame_flags 就地改写为 0（8 位，MSB 在前）。 */
+        /* 把 refresh_frame_flags 就地改写为 0（8 位，MSB 在前）。
+         *
+         * ⚠️ 仅当这真是流的末帧时才成立。实测踩过：ffmpeg 用较短超时
+         * 轮询 Sync，本函数被反复触发（一段 10 帧的码流里 flush 了 7 次），
+         * 每次都把当时的暂存帧当"末帧"改写成 refresh=0 ——
+         * 而它们后面还有帧要引用它们，参考链因此被破坏，
+         * 表现为某个 surface 拿不到解码结果（实测 surface=8）。
+         *
+         * 所以只在输入确实结束后才改写。未结束时保留轮转占位值：
+         * 那个值虽不等于源码流，但至少不会把该帧从参考槽里抹掉。 */
         if (held_bitpos != (size_t)-1) {
             int patched = 1;
             for (int i = 0; i < 8; i++) {

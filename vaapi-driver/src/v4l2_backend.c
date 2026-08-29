@@ -29,6 +29,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -267,6 +268,32 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     if (bufs_alloc(d, d->out, d->n_out, d->in_size, 1) < 0) goto fail;
 
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    /* AV1 金字塔 B 结构下，解码器默认只对 show_frame=1 的帧吐 CAPTURE
+     * 缓冲（正确行为），但 ffmpeg 的 VA-API 后端会对部分 show_frame=0 的
+     * surface 也读像素。V4L2 标准控制 DISPLAY_DELAY(_ENABLE) 可要求解码器
+     * 不做重排、逐帧立即输出，从而让每个 surface 都拿到内容。
+     *
+     * 实测这两项在 msm_vidc /dev/video32 上 S_CTRL 均返回 OK（默认都是 0）。
+     * 用 DMD_V4L2_DISPLAY_DELAY=1 开启，便于与默认行为对照；
+     * 设置失败不致命 —— 只是回到默认的重排输出。 */
+    if (getenv("DMD_V4L2_DISPLAY_DELAY")) {
+        struct v4l2_control ctl;
+        memset(&ctl, 0, sizeof(ctl));
+        ctl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+        ctl.value = 1;
+        if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) == 0) {
+            memset(&ctl, 0, sizeof(ctl));
+            ctl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
+            ctl.value = 0;
+            if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) == 0)
+                V4L2_LOG("已启用 DISPLAY_DELAY=0（逐帧输出，不重排）");
+            else
+                V4L2_LOG("DISPLAY_DELAY 设置失败，沿用默认重排输出");
+        } else {
+            V4L2_LOG("DISPLAY_DELAY_ENABLE 设置失败，沿用默认重排输出");
+        }
+    }
+
     if (xioctl(d->fd, VIDIOC_STREAMON, &type, "STREAMON(OUTPUT)") < 0) goto fail;
     d->out_streaming = 1;
 
