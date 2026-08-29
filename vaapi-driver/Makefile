@@ -21,9 +21,13 @@ DRM_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
+# -MMD -MP：生成 .d 依赖文件，让改动头文件也能触发重编译。
+# 没有这两个选项时，规则只依赖 .c —— 改了 driver.h 后 make 会认为
+# 目标是最新的，产物里仍是旧值（v0.3.7 改 DMD_DRIVER_VERSION 时实测踩到：
+# 版本串没进 .so，必须 make clean 才生效）。
 CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
            -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) $(DRM_CFLAGS) \
-           -I$(SRCDIR)
+           -I$(SRCDIR) -MMD -MP
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
@@ -31,6 +35,7 @@ SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDI
            $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
            $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
+DEPS    := $(OBJECTS:.o=.d)
 
 # 客户端库的自测程序：独立目标，make all 不依赖它。
 # 它只链 dmd_client.c，不碰 libva，也不需要 driver 的其余部分。
@@ -95,3 +100,6 @@ uninstall:
 
 clean:
 	rm -rf $(BUILD)
+
+# 头文件依赖（-MMD 生成）。放在末尾，且用 - 前缀忽略首次构建时的缺失。
+-include $(DEPS)
