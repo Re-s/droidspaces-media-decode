@@ -290,6 +290,18 @@ struct dmd_context {
      * 详见 av1_bitstream.h 的 struct dmd_av1_dpb 说明。 */
     struct dmd_av1_dpb av1_dpb;
 
+    /* AV1 延迟一帧送料所需的暂存。
+     *
+     * 为什么必须延迟：refresh_frame_flags 的正确值等于"下一帧的
+     * ref_frame_map 与本帧的差异位"（实测 4 帧全部命中源码流真实值），
+     * 所以本帧合成完还不能立刻送走 —— 要等下一帧到来、反算出正确值、
+     * 就地改写那 8 位之后才能送。
+     *
+     * av1_hold 持有已合成但尚未送出的上一帧字节（本模块 malloc，
+     * 送出后 free）。av1_hold_len 是其长度。 */
+    unsigned char *av1_hold;
+    size_t         av1_hold_len;
+
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
     int have_h264_pic_param;

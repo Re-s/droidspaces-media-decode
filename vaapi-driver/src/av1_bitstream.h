@@ -114,7 +114,39 @@ struct dmd_av1_dpb {
                                     * error_resilient 帧的帧头要逐槽写出
                                     * （规范 5.9.2 的 ref_order_hint[i]）。 */
     unsigned    dpb_next_slot;     /* 下一个要写入的槽，8 槽轮转 */
+
+    /* 上一帧 refresh_frame_flags 字段在其帧头内的**位**偏移。
+     * 正确值要等下一帧的 ref_frame_map 才能算出，届时用它就地改写。
+     * SIZE_MAX 表示上一帧没有该字段（KEY+show 帧不写入）。 */
+    size_t      last_refresh_bitpos;
+
+    /* 上一帧的 ref_frame_map 快照，用于与本帧的 map 做差分。 */
+    VASurfaceID prev_ref_map[8];
+    int         prev_valid;
 };
+
+/*
+ * 用本帧的 ref_frame_map 反算**上一帧**的 refresh_frame_flags，并就地改写
+ * 上一帧已合成的字节。
+ *
+ * 原理（实测验证，4 帧全部命中源码流真实值 1/8/32/64）：
+ *   第 N 帧的 refresh_frame_flags = 第 N+1 帧 map 与第 N 帧 map 的差异位
+ * 因为"本帧写入了哪些槽"正是在下一帧的 DPB 快照里显现出来的。
+ *
+ * 这是唯一可行的推导方式。已否决的四种（细节见 .c 内注释）：
+ *   1. 在本帧 ref_frame_map 里找 current_frame —— 该数组是解码**前**快照
+ *   2. 本帧 map 与**上**帧 map 差分 —— 方向错，给出的是上帧的 refresh
+ *   3. 恒 1 或 8 槽轮转 1<<slot —— 无法表达 refresh=0（不占槽的帧），
+ *      而真实序列里这类帧占三分之一
+ *   4. 取第一个空槽 / 未被引用的槽 —— 实测仅首帧碰对
+ *
+ * prev_frame_bytes 指向上一帧帧头所在的缓冲（调用方保存），
+ * 该缓冲必须在本次调用时仍然有效且尚未送入解码器。
+ */
+void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
+                                const void *cur_pic,
+                                unsigned char *prev_frame_bytes,
+                                size_t prev_len);
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {

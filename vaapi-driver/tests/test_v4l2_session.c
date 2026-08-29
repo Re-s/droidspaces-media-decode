@@ -7,6 +7,10 @@
 #include "dmd_client.h"
 int main(int argc,char**argv){
     int n=atoi(argv[2]);
+    /* argv[3]=whole：整条流一次 send_unit，用于验证送料粒度。
+     * 上一轮定界发现：合成流按帧切分送料只出 1 帧，而源码流一个
+     * temporal unit 含多帧。需要能测"多帧一单元"才能证实该假设。 */
+    int whole = (argc>3 && argv[3][0]=='w');
     FILE*f=fopen(argv[1],"rb");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
     uint8_t*d=malloc(sz);fread(d,1,sz,f);fclose(f);
     long offs[64],lens[64];int nu=0;long i=0;
@@ -27,6 +31,21 @@ int main(int argc,char**argv){
     if(!s){printf("create 失败: %s\n",err.msg);return 1;}
 
     int sent=0,got=0;
+    if(whole){
+        int rc=dmd_session_send_unit(s,d,sz);
+        printf("整块送入 %ld 字节 rc=%d\n",sz,rc);
+        if(rc==0){
+            sent=1;
+            for(int loop=0;loop<200;loop++){
+                struct dmd_frame fr; memset(&fr,0,sizeof(fr));
+                int r=dmd_session_next_frame(s,&fr,200);
+                if(r==0){got++;dmd_session_release_frame(s,&fr);}
+                else if(r==1)break;
+            }
+        }
+        printf("session API: 送 %d 单元, 收 %d 帧\n",sent,got);
+        dmd_session_destroy(s);return 0;
+    }
     for(int k=0;k<nu;k++){
         int rc=dmd_session_send_unit(s,d+offs[k],lens[k]);
         if(rc!=0){printf("send_unit[%d] 失败 rc=%d: %s\n",k,rc,dmd_session_last_error(s));break;}

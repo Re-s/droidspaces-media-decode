@@ -808,11 +808,20 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      *     且无法表达"本帧不刷新"（值 0）
      *  3. 取第一个未被引用/仍为初值的空槽 —— 实测 5 帧里只有首帧碰对
      * ==================================================================== */
+    if (getenv("DMD_AV1_LOG"))
+        fprintf(stderr, "[av1] ft=%u oh=%u refresh_all=%d err_res(生效)=%d "
+                        "er_inferred=%d 原始er=%u\n",
+                frame_type, p->order_hint, refresh_all, err_res, er_inferred,
+                p->pic_info_fields.bits.error_resilient_mode);
     unsigned refresh_mask = 0;
     int my_slot = -1;
     if (!refresh_all) {
         my_slot = (int)(dpb->dpb_next_slot & 7u);
         refresh_mask = 1u << my_slot;
+        /* 记录本字段在帧头里的位偏移，供上层"延迟一帧后就地改写"使用。
+         * 正确的 refresh 值要等下一帧的 ref_frame_map 才能算出（见
+         * dmd_av1_dpb 说明），而那时本帧已经合成完毕。 */
+        dpb->last_refresh_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
         dmd_bw_put_bits(&bw, refresh_mask, 8);
     }
 
@@ -1183,6 +1192,46 @@ size_t dmd_av1_build_frame(const void *pic_v,
 
     return hdr + payload_len;
 }
+
+void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
+                                const void *cur_pic,
+                                unsigned char *prev_frame_bytes,
+                                size_t prev_len)
+{
+    if (!dpb || !cur_pic || !prev_frame_bytes) return;
+    const VADecPictureParameterBufferAV1 *p = cur_pic;
+
+    if (dpb->prev_valid && dpb->last_refresh_bitpos != (size_t)-1) {
+        /* 本帧 map 与上帧 map 的差异位 = 上一帧实际写入的槽。
+         * 实测 4 帧全部命中源码流真实值（1/8/32/64）。 */
+        unsigned mask = 0;
+        for (int i = 0; i < 8; i++) {
+            if (p->ref_frame_map[i] != dpb->prev_ref_map[i])
+                mask |= (1u << i);
+        }
+
+        /* 就地改写上一帧帧头里那 8 位。
+         * refresh_frame_flags 未必字节对齐，须按位写，MSB first。 */
+        if (getenv("DMD_AV1_LOG"))
+            fprintf(stderr, "[av1] 反算上帧 refresh=0x%02x (bitpos=%zu len=%zu)\n",
+                    mask, dpb->last_refresh_bitpos, prev_len);
+        size_t bp = dpb->last_refresh_bitpos;
+        if ((bp + 8 + 7) / 8 <= prev_len) {
+            for (int k = 0; k < 8; k++) {
+                size_t bit = bp + (size_t)k;
+                size_t byi = bit >> 3;
+                int    bii = 7 - (int)(bit & 7);
+                int    v   = (mask >> (7 - k)) & 1;
+                if (v) prev_frame_bytes[byi] |=  (unsigned char)(1 << bii);
+                else   prev_frame_bytes[byi] &= (unsigned char)~(1u << bii);
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; i++) dpb->prev_ref_map[i] = p->ref_frame_map[i];
+    dpb->prev_valid = 1;
+}
+
 
 /* ---------------------------------------------------------------- OBU 头 */
 
