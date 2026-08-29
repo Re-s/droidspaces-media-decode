@@ -306,6 +306,15 @@ struct dmd_context {
      * build_frame 覆盖。实测踩过：日志显示 "bitpos=19 len=655"，
      * 而 len=655 是新合成帧的长度，暂存帧长 2686，一眼即知拿错了帧。 */
     size_t         av1_hold_bitpos;
+    /* AV1 延迟一帧送料，EndPicture 里送出的是**上一帧**的数据，
+     * 所以待配对队列必须登记那一帧的 surface 而不是当前 surface。
+     * 实测不这样做的后果：回传 unit_seq 在队列里找不到对应项
+     * （"unit_seq=6 无匹配项，回退顺序推断"），帧被配到错误的 surface，
+     * ffmpeg 等不到它要的那个 → 超时 → flush → 整段码流只出 1 帧。
+     *   av1_hold_surface：当前压在 av1_hold 里那一帧的 surface
+     *   av1_send_surface：build_unit 本次实际送出的那一帧的 surface */
+    VASurfaceID    av1_hold_surface;
+    VASurfaceID    av1_send_surface;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */

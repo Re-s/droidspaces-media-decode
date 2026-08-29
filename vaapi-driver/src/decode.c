@@ -567,6 +567,8 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
      * 置 0 表示"该项无有效序号"，不会匹配任何回传的 PTS，
      * 只能由回退推断按顺序配掉 —— 这正是需要的语义。 */
     c->units_submitted = 0;
+    c->av1_hold_surface = VA_INVALID_ID;
+    c->av1_send_surface = VA_INVALID_ID;
     for (int k = 0; k < c->pending_count; k++) {
         int idx = (c->pending_head + k) % DMD_MAX_SURFACES;
         c->pending_unit[idx] = 0;
@@ -1567,6 +1569,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
 
         if (ft == 0 /* KEY_FRAME */) {
             /* KEY 帧不延迟。此时 av1_hold 必为空（KEY 帧开启新的参考链）。 */
+            c->av1_send_surface = c->current_target;
             av1_dump_sent(buf, n);
             *scratch = buf;
             *out_len = n;
@@ -1576,6 +1579,9 @@ static const unsigned char *build_unit(struct dmd_context *c,
         if (c->av1_hold) {
             unsigned char *prev = c->av1_hold;
             size_t prev_len = c->av1_hold_len;
+            /* 本次送出的是上一帧，配对要用它的 surface。 */
+            c->av1_send_surface = c->av1_hold_surface;
+            c->av1_hold_surface = c->current_target;
             c->av1_hold = buf;
             c->av1_hold_len = n;
             c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
@@ -1590,6 +1596,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
         /* 第一个帧间帧：只入暂存，本次无数据可送。
          * 用 (unit==NULL && unit_len==0 && av1_hold!=NULL) 与
          * "码流重建失败"区分开。 */
+        c->av1_hold_surface = c->current_target;
         c->av1_hold = buf;
         c->av1_hold_len = n;
         c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
@@ -1981,7 +1988,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         }
     }
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
-    c->pending[qpos] = target;
+    /* AV1 延迟一帧：本次送出的是上一帧的数据，登记它的 surface。
+     * 其余 codec 送的就是当前帧，直接用 target。 */
+    c->pending[qpos] = (c->codec == DMD_CODEC_AV1 &&
+                        c->av1_send_surface != VA_INVALID_ID)
+                     ? c->av1_send_surface : target;
     /* 记下本帧 POC 供按显示序配对，并带上"序列号"。
      *
      * ⚠️ POC 只在**同一个 coded video sequence 内**单调，每个 IDR 都会把它
@@ -2450,6 +2461,8 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         unsigned char *held = c->av1_hold;
         size_t held_len = c->av1_hold_len;
         size_t held_bitpos = c->av1_hold_bitpos;
+        const VASurfaceID held_surf = c->av1_hold_surface;
+        c->av1_hold_surface = VA_INVALID_ID;
         c->av1_hold = NULL;
         c->av1_hold_len = 0;
         c->av1_hold_bitpos = (size_t)-1;
@@ -2464,6 +2477,21 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             }
             dmd_log("sync: 末帧 refresh 改写为 0（bitpos=%zu %s）",
                     held_bitpos, patched ? "成功" : "越界跳过");
+        }
+        /* 末帧也要进待配对队列：它的解码结果回来时才有对应项可查。
+         * 漏登记的后果与登记错 surface 一样 —— unit_seq 无匹配、
+         * 退到顺序推断、配到别的 surface 上。 */
+        if (held_surf != VA_INVALID_ID &&
+            c->pending_count < DMD_MAX_SURFACES) {
+            int hq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
+            c->pending[hq] = held_surf;
+            c->pending_seq[hq] = c->last_seq;
+            c->pending_poc[hq] = INT32_MAX;
+            c->pending_unit[hq] = ++c->units_submitted;
+            c->pending_count++;
+            dmd_log("sync: 末帧 surface=%u 入队（unit %llu）",
+                    (unsigned)held_surf,
+                    (unsigned long long)c->pending_unit[hq]);
         }
         dmd_log("sync: 冲出暂存的 AV1 末帧（%zu 字节）", held_len);
         av1_dump_sent(held, held_len);
