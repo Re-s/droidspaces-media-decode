@@ -711,8 +711,9 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         err_set(err, DMD_ERR_INVAL, 0, "cfg 为 NULL", 0);
         return NULL;
     }
-    if (cfg->codec < DMD_CODEC_H264 || cfg->codec > DMD_CODEC_VP8) {
-        err_set(err, DMD_ERR_INVAL, 0, "codec 取值非法（应为 0..3）", 0);
+    /* 上界随 DMD_CODEC_* 增长，别写死数字 —— 加 AV1 时就漏改过一次。 */
+    if (cfg->codec < DMD_CODEC_H264 || cfg->codec > DMD_CODEC_AV1) {
+        err_set(err, DMD_ERR_INVAL, 0, "codec 取值非法（应为 0..4）", 0);
         return NULL;
     }
     if (cfg->width < 96 || cfg->height < 96 ||

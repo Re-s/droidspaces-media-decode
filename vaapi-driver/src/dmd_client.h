@@ -53,12 +53,15 @@ enum {
      * 直接把错误抛给调用方（ffmpeg 会立刻看到失败而不是静默软解）。 */
 };
 
-/* daemon 的 codec id，与 decode-daemon.c 的 CodecId 一致 */
+/* daemon 的 codec id，与 decode-daemon.c 的 CodecId 逐值一致。
+ * ⚠️ 跨目录耦合：这些值是线协议的一部分（握手第 4 个字），改一侧必须改另一侧。
+ * 只能在末尾追加，不可重排 —— 数值错配不会报错，会静默解错码。 */
 enum {
     DMD_CODEC_H264 = 0,
     DMD_CODEC_HEVC = 1,
     DMD_CODEC_VP9  = 2,
-    DMD_CODEC_VP8  = 3
+    DMD_CODEC_VP8  = 3,
+    DMD_CODEC_AV1  = 4
 };
 
 /* 帧数据传输模式 */

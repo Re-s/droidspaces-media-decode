@@ -1340,6 +1340,34 @@ static const unsigned char *build_unit(struct dmd_context *c,
         *out_len = c->slice_len;
         return c->slice_data;
 
+    case DMD_CODEC_AV1:
+        /* 同样零重建，但成立的理由与 VP9 不同，值得写清楚。
+         *
+         * AV1 的 slice 粒度是 **tile**，不是帧：va_dec_av1.h:634-646 明确
+         * "should be sent once per tile"、"bit stream in sent to driver in
+         * per tile granularity"，VASliceParameterBufferAV1.slice_data_size
+         * 实际是 tile_data_size。所以一帧可能对应多次 vaRenderPicture。
+         *
+         * 而 MediaCodec 要的是完整 temporal unit。两者靠现有的 slice 累积
+         * 机制自然对齐 —— dmd_append_slice_data（本文件 :1094-1101）把每次
+         * 送来的 slice data 顺序追加进 c->slice_data，vaEndPicture 时
+         * c->slice_len 已是该帧全部 tile 的连续字节。AV1 码流里同一帧的
+         * tile 本来就是连续排列的，所以顺序追加得到的正是原始字节序列，
+         * 不需要按 tile_row/tile_column 重排，也不需要解析 OBU 语法。
+         *
+         * ⚠️ 前提是上层按顺序提交 tile。ffmpeg 的 vaapi_av1.c 是这么做的
+         * （逐 tile group 调 vaRenderPicture）。若某个消费者乱序提交，
+         * 这里会拼出错误字节流 —— 但那种实现也会让所有 VA-API 驱动出错，
+         * 不是本驱动需要兜的场景。
+         *
+         * 关于序列头：AV1 **不需要**像 H.264/HEVC 那样单独合成并下发 csd。
+         * OBU_SEQUENCE_HEADER 就在码流字节里随 temporal unit 一起送达，
+         * MediaCodec 自行解析。daemon 侧 is_param_set() 对 AV1 返回 0
+         * （decode-daemon.c），所以这些字节走普通帧路径而不会被误累积成 CSD，
+         * 这正是需要的行为 —— 与 VP8/VP9 一致。 */
+        *out_len = c->slice_len;
+        return c->slice_data;
+
     case DMD_CODEC_VP8: {
         size_t cap = c->slice_len + 16;
         unsigned char *buf = malloc(cap);

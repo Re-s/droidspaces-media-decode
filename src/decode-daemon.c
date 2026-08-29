@@ -249,15 +249,24 @@ static size_t shm_slot_bytes(int w, int h)
     return sz < 64 * 1024 ? 64 * 1024 : sz;
 }
 
+/* ⚠️ 这些 id 是线协议的一部分，客户端按数值发送（握手第 4 个字）。
+ * 只能在末尾追加，不可重排或复用已废弃的值 —— 改动会静默错配 codec。
+ * 驱动侧的 DMD_CODEC_* 必须与本枚举逐值一致。 */
 typedef enum {
     CODEC_H264 = 0,
     CODEC_HEVC = 1,
     CODEC_VP9  = 2,
     CODEC_VP8  = 3,
+    CODEC_AV1  = 4,
     CODEC_MAX
 } CodecId;
 
-/* 设备硬件支持的解码器（见 doc/verified-platform-facts.md 的能力清单） */
+/* 设备硬件支持的解码器（见 doc/verified-platform-facts.md 的能力清单）。
+ *
+ * 注意本函数只做 id→mime 的静态映射，不代表当前设备真有对应硬件：
+ * AV1 需要 SM8750（骁龙 8 Elite）一级的 Iris 解码器，SM8150 上没有这个单元。
+ * 设备是否支持由 MediaCodec 在 configure 时决定 —— 拿不到解码器会握手失败，
+ * 这是预期行为，不需要在此处按设备分支。 */
 static const char *codec_mime(int id)
 {
     switch (id) {
@@ -265,6 +274,7 @@ static const char *codec_mime(int id)
     case CODEC_HEVC: return "video/hevc";
     case CODEC_VP9:  return "video/x-vnd.on2.vp9";
     case CODEC_VP8:  return "video/x-vnd.on2.vp8";
+    case CODEC_AV1:  return "video/av01";
     default:         return NULL;
     }
 }
@@ -306,6 +316,10 @@ static int is_param_set(int codec_id, const uint8_t *b, size_t len)
         int t = (b[off] >> 1) & 0x3f;
         return (t == 32 || t == 33 || t == 34);
     }
+    /* VP8 / VP9 / AV1 一律返回 0：它们不用 Annex-B start code，参数集不是
+     * 独立的"NALU"。AV1 的序列头是 OBU_SEQUENCE_HEADER，与 tile 数据同在
+     * 一个 temporal unit 里由驱动整体转发（见 vaapi-driver/src/decode.c
+     * 的 DMD_CODEC_AV1 分支），daemon 侧无需单独识别。 */
     return 0;
 }
 

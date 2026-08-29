@@ -63,6 +63,11 @@ int dmd_profile_to_codec(VAProfile profile)
         return DMD_CODEC_VP9;
     case VAProfileVP8Version0_3:
         return DMD_CODEC_VP8;
+    /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
+     * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
+     * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */
+    case VAProfileAV1Profile0:
+        return DMD_CODEC_AV1;
     default:
         return -1;
     }
