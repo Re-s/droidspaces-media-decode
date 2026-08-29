@@ -2485,6 +2485,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 送入从 154 单元掉到 8、收帧从 80 掉到 2。
      * 原因未查明，但方向已否证：不能简单换一个 show 标志。
      * 保留 av1_send_show。 */
+    /* ⚠️ 试过"队列非空即送"（不等 show=1）：ffmpeg 输出掉到 64 帧。
+     * 原因：SEF 会抢在被它引用的那一帧真正解码完之前送出，
+     * 引用一个还没填好的 DPB 槽。必须保留一个"被引用帧已解码"的门。
+     * 现用 av1_send_show 作门 —— 它在 EndPicture 路径只有 5 次为 1，
+     * 所以每次运行只能补出个别 SEF，这是当前的主要限制。 */
     if (c->codec == DMD_CODEC_AV1 && c->av1_send_show &&
         c->av1_sef_count > 0) {
         sef_send_slot = (int)c->av1_sef_slot[c->av1_sef_head];
@@ -2506,28 +2511,39 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                                  pw, ph) != 0)
             rc = DMD_ERR_PROTOCOL;
     }
+    /* SEF 补插：作为**独立单元**在帧数据之前送出。
+     *
+     * 第 65 轮测定源码流的 TU 结构（按 TEMPORAL_DELIMITER 切）：
+     *     70 个 TU 只含一个 SEF，没有任何帧数据
+     *     45 个含 1 帧、15 个含 2 帧、10 个含 3 帧、5 个含 4 帧、5 个含 5 帧
+     *     合计 150 TU、150 个 OBU_FRAME、70 个 SEF
+     * 也就是说 SEF **自己就是一个完整的 temporal unit**，
+     * 而不是附在显示帧后面 —— 我此前三轮都假设错了。
+     * sess3 送 150 单元收 150 帧也吻合：
+     * 80 个含帧 TU 出 80 图 + 70 个纯 SEF TU 出 70 图 = 150。
+     *
+     * 所以这里独立送，且必须前置 TD 让它成为合法 TU。
+     * 与第 62 轮"在 flush 里追加"的区别：那次在等像素的路径上插单元，
+     * 打乱了配对节奏（150→111 帧）；这里是在正常送料点之前送，
+     * 不触碰 flush。 */
+    if (rc == DMD_OK && sef_send_slot >= 0) {
+        unsigned char sefbuf[8];
+        size_t sn = 0;
+        sefbuf[sn++] = (unsigned char)((DMD_OBU_TEMPORAL_DELIMITER << 3) | 0x02);
+        sefbuf[sn++] = 0;                     /* TD 的 obu_size = 0 */
+        size_t hn = dmd_av1_build_show_existing(sefbuf + sn, sizeof(sefbuf) - sn,
+                                                (unsigned)sef_send_slot);
+        if (hn > 0) {
+            sn += hn;
+            if (dmd_session_send_unit(sess, sefbuf, sn) == DMD_OK)
+                c->av1_sef_sent++;
+        }
+    }
+
     if (rc == DMD_OK)
         rc = dmd_session_send_unit(sess, tx, unit_len);
     free(tx);
 
-    /* SEF 补插：本次送出的帧若 show_frame=1，就从待复显队列取一个，
-     * 追加一个 show_existing_frame 头 OBU 作为独立单元。
-     *
-     * 位置依据（150 帧样本，100% 成立）：全部 70 个 SEF 都紧跟在
-     * 一个 show_frame=1 的帧之后。硬件会为每个 SEF 头复显一次，
-     * 实测源码流"送 150 收 150"、剥掉 SEF 后"送 150 收 80"。
-     *
-     * ⚠️ 这些 SEF 单元不进 pending 队列 —— 它们产生的输出帧由
-     * ffmpeg 自己映射到已有 surface，驱动侧无新 surface 要配对。 */
-    if (rc == DMD_OK && sef_send_slot >= 0) {
-        unsigned char sefbuf[4];
-        size_t sn = dmd_av1_build_show_existing(sefbuf, sizeof(sefbuf),
-                                                (unsigned)sef_send_slot);
-        if (sn > 0) {
-            (void)dmd_session_send_unit(sess, sefbuf, sn);
-            c->av1_sef_sent++;
-        }
-    }
 
     pthread_mutex_lock(&drv->lock);
     drv->io_busy[idx] = 0;
