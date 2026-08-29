@@ -2343,6 +2343,34 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     idx = (int)(c - drv->contexts);
 
+    /* ============ AV1 延迟送料：等待前必须先冲出暂存帧 ============
+     *
+     * 延迟一帧机制会把最新合成的帧扣在 c->av1_hold 里，等下一帧到来时
+     * 才反算 refresh 并送出。但上游送完最后一帧后就转为等像素，
+     * 不会再有"下一帧"来把它挤出去。
+     *
+     * 实测后果：一段金字塔 B 帧 GOP 有 6 帧（show_frame 依次
+     * 1,0,0,0,0,1），EndPicture 调 6 次只送出 5 单元，
+     * 第 6 帧 —— 恰是除首帧外唯一 show_frame=1、会产生输出的那帧 ——
+     * 永远压在暂存里。ffmpeg 等 surface=6 的像素，5000ms 超时后
+     * 报 "Failed to read image from surface 0x6"，整个会话只出 1 帧。
+     *
+     * 所以只要开始等帧，就说明上游这一轮不再送料了，
+     * 必须把暂存帧冲出去。它的 refresh 无从反算（没有下一帧的
+     * ref_frame_map 可差分），保持轮转策略给出的值即可 ——
+     * 末帧不被任何后续帧引用，该值不影响解码结果。 */
+    if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session) {
+        unsigned char *held = c->av1_hold;
+        size_t held_len = c->av1_hold_len;
+        c->av1_hold = NULL;
+        c->av1_hold_len = 0;
+        c->av1_hold_bitpos = (size_t)-1;
+        dmd_log("sync: 冲出暂存的 AV1 末帧（%zu 字节）", held_len);
+        av1_dump_sent(held, held_len);
+        (void)dmd_session_send_unit(c->session, held, held_len);
+        free(held);
+    }
+
     int spent = 0;
     /* 本次等待是否已经排空过一次。可逆排空不会改变队列深度，
      * 不加这个闸就会在同一次等待里反复排空（忙循环）。 */
