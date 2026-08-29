@@ -1477,13 +1477,23 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 后者是定位单个错误比特的唯一可行手段 —— 自制解析器不可靠，
          * 曾因其自身偏差与实现错误互相抵消而误判"已对齐"。
          *
-         * 只落首帧：帧头字段最全（含序列头），且避免刷爆磁盘。 */
+         * 默认只落首帧：帧头字段最全（含序列头），且避免刷爆磁盘。
+         * DMD_AV1_DUMP_ALL=1 改为追加**整条**合成流 —— 用于校验多帧序列，
+         * 因为"首帧正确但后续帧让解码器停摆"这类问题只有整流才能暴露：
+         * 把整条流交给 ffmpeg 软解，解出帧数应与源码流一致。 */
         if (getenv("DMD_AV1_DUMP")) {
+            const char *dp = getenv("DMD_AV1_DUMP");
+            const char *all = getenv("DMD_AV1_DUMP_ALL");
+            int dump_all = all && all[0] == '1';
             static int dumped = 0;
-            if (!dumped) {
-                FILE *df = fopen(getenv("DMD_AV1_DUMP"), "wb");
+            if (dump_all) {
+                /* 首次用 "wb" 截断，之后 "ab" 追加，避免残留上次运行的字节。 */
+                FILE *df = fopen(dp, dumped ? "ab" : "wb");
+                if (df) { fwrite(buf, 1, n, df); fclose(df); dumped++; }
+            } else if (!dumped) {
+                FILE *df = fopen(dp, "wb");
                 if (df) { fwrite(buf, 1, n, df); fclose(df); dumped = 1;
-                          dmd_log("已落盘 %zu 字节到 %s", n, getenv("DMD_AV1_DUMP")); }
+                          dmd_log("已落盘 %zu 字节到 %s", n, dp); }
             }
         }
 

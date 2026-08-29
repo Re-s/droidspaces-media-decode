@@ -3,6 +3,9 @@
  * 设计说明见 av1_bitstream.h 顶部。本文件只实现最底层的比特写入原语，
  * 序列头/帧头/tile group 的语法在后续提交里加。
  */
+#include <stdio.h>
+#include <stdlib.h>
+
 #include <va/va.h>
 #include <va/va_dec_av1.h>
 
@@ -750,18 +753,61 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     /* refresh_frame_flags：KEY_FRAME + show_frame 时恒 0xFF、不写入码流。
      *
-     * ⚠️ VA-API **不提供**这个字段（全文件 grep 确认：只在 :421 的注释里
-     * 被提及，结构体里没有）。它是"本帧要刷新哪些参考槽位"的位掩码。
+     * ⚠️ VA-API **不提供**这个字段（全文件 grep 确认：只在 va_dec_av1.h:421
+     * 的注释里被提及，结构体里没有）。它是"本帧要刷新哪些参考槽位"的位掩码。
      *
-     * 取 0xFF（刷新全部 8 槽）：MediaCodec 内部自行管理参考帧生命周期，
-     * 不依赖码流里的这个掩码来分配缓冲；对它而言只需语法合法。
-     * 而 0xFF 是最保守的选择 —— 声称刷新全部，不会出现"解码器以为某槽
-     * 还有效、实际已被覆盖"的悬空引用。代价是参考帧管理不够精细，
-     * 但本驱动逐帧转发、由 MediaCodec 负责重排序，不受影响。 */
+     * ⚠️ 历史错误（V4L2 直通后暴露）：这里原先恒写 0xFF，理由是
+     * "MediaCodec 内部自行管理参考帧生命周期，不依赖码流里的这个掩码"。
+     * 那个假设对 MediaCodec 成立，对 V4L2 **不成立** —— msm_vidc 按码流
+     * 管理参考帧，0xFF 意味着每个帧间帧都刷掉全部 8 个槽，参考帧链立刻崩。
+     * 实测后果：合成流交 dav1d 软解，第 2 帧起报 Invalid data，只解出 1 帧；
+     * 走硬件时表现为送 6 单元只回 2 帧后解码器停摆。
+     * trace_headers 逐字段比对显示 refresh_frame_flags 源码流为 1、合成为 255。
+     *
+     * 正确做法：从 DPB 快照 ref_frame_map[8] 推导。本帧解码后会占用某些槽，
+     * 而 VA-API 在每帧给出当帧的 ref_frame_map —— 凡是槽里存的 surface id
+     * 等于本帧的 current_frame，该槽就是本帧要刷新的目标。
+     *
+     * 找不到任何匹配槽时退回 0（不刷新任何槽）：那是 show_existing_frame
+     * 或不作为参考的帧的正常情形，比 0xFF 安全得多 —— 宁可少声明刷新，
+     * 也不要谎称刷新了全部而让解码器丢弃仍在使用的参考帧。 */
     const int refresh_all = (frame_type == 3) ||
                             (is_key && p->pic_info_fields.bits.show_frame);
-    if (!refresh_all)
+    if (!refresh_all) {
+        /* ⚠️⚠️ 这是本实现当前最严重的已知缺陷，尚未解决。
+         *
+         * refresh_frame_flags 是"本帧解码后要写入哪些参考槽"的 8 位掩码。
+         * VA-API **完全不提供**它（全文件 grep：仅 va_dec_av1.h:421 注释提及）。
+         *
+         * 历史错误：原先恒写 0xFF，理由是"MediaCodec 自行管理参考帧生命周期，
+         * 不看码流里这个掩码"。该假设对 MediaCodec 成立，对 V4L2 **不成立** ——
+         * msm_vidc 按码流管理参考帧，0xFF 会让每个帧间帧刷掉全部 8 槽。
+         * 实测后果：合成流交 dav1d 软解，第 2 帧起 Invalid data，只出 1 帧；
+         * 走硬件时送 6 单元只回 2 帧后解码器停摆。
+         *
+         * 用 trace_headers 从源码流读出的真实序列（av1_1080p.obu 前 12 个帧间帧）：
+         *     1, 8, 32, 64, 0, 0, 64, 0, 0, 32, 64, 0
+         * 注意有大量 0 —— 那些帧不写入任何参考槽。这是金字塔 B 帧结构的特征：
+         * 哪些帧作为参考、占哪个槽，由**编码器的 GOP 决策**确定，
+         * 已随源码流的 refresh_frame_flags 字段一起被 ffmpeg 解析并丢弃。
+         *
+         * 已试过并否决的三种推导（都实测失败）：
+         *  1. 在 ref_frame_map[] 里找 current_frame —— ref_frame_map 是本帧
+         *     解码**前**的快照，current 尚未写入，恒不匹配（每帧都得 0）。
+         *  2. 相邻两帧 ref_frame_map 差分 —— 差分给出的是**上一帧**刷新的槽，
+         *     而本帧的目标槽此刻还看不到；且无法表达"本帧不刷新"（值 0）。
+         *  3. 回退恒 1（只刷槽 0）—— 真实序列里 0 占三分之一，恒 1 同样错。
+         *
+         * 结论：单帧的 VA-API 信息不足以还原这个字段，必须在驱动侧维护一份
+         * DPB 影子状态，跨帧比对 ref_frame_map 的演化来反推槽位轮转策略；
+         * 或改用 VA-API 的 VAEncMiscParameter 之类通道（尚未调研）。
+         * 这是下一轮的主要工作。
+         *
+         * 当前暂写 0xFF 以保持语法合法与既有 MediaCodec 路径的行为不变
+         * （该路径实测可用）。V4L2 路径因此仍只能解出首帧 —— 这是已知的、
+         * 有明确复现步骤的未完成项，不是偶发问题。 */
         dmd_bw_put_bits(&bw, 0xFF, 8);
+    }
 
     /* 参考帧索引：帧间帧才有。 */
     if (!intra_only) {
