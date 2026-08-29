@@ -2485,13 +2485,46 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 送入从 154 单元掉到 8、收帧从 80 掉到 2。
      * 原因未查明，但方向已否证：不能简单换一个 show 标志。
      * 保留 av1_send_show。 */
-    /* ⚠️ 试过"队列非空即送"（不等 show=1）：ffmpeg 输出掉到 64 帧。
-     * 原因：SEF 会抢在被它引用的那一帧真正解码完之前送出，
-     * 引用一个还没填好的 DPB 槽。必须保留一个"被引用帧已解码"的门。
-     * 现用 av1_send_show 作门 —— 它在 EndPicture 路径只有 5 次为 1，
-     * 所以每次运行只能补出个别 SEF，这是当前的主要限制。 */
-    if (c->codec == DMD_CODEC_AV1 && c->av1_send_show &&
-        c->av1_sef_count > 0) {
+    /* SEF 的门：被它引用的那个 DPB 槽对应的 surface 必须已经出像素。
+     *
+     * 为什么需要门：试过"队列非空即送"，ffmpeg 输出掉到 64 帧 ——
+     * SEF 抢在被引用帧解码完之前送出，引用了还没填好的槽。
+     * 为什么不用 av1_send_show 作门：它在 EndPicture 路径只有 5 次为 1
+     * （显示帧几乎都走 flush 送出），每次运行只能补 4 个 SEF。
+     *
+     * 源码流实测：SEF 与其引用帧的事件距离最小 2、中位 5、最大 23，
+     * 也就是被引用帧必然已经解码完 —— 用 surface 是否 READY 判断，
+     * 比"当前帧是否显示"精确得多，且两条送料路径都能用。
+     * DMD_AV1_SEF_GATE=show 可切回旧的 send_show 门作对照。 */
+    /* ⚠️ 已否证：用"被引用 surface 是否 READY"作门。
+     * 结果与"完全不设门"一样：ffmpeg 输出 150 → 64 帧。
+     * 说明该条件几乎恒真（被引用帧确实早就解码完了，
+     * 与源码流实测的"SEF 距其引用帧最小 2 个事件"一致），
+     * 等价于没有门 —— 所以退化的真正原因不是"引用了未就绪的槽"。
+     *
+     * 由此反推：第 65 轮把 64 帧归因为"SEF 抢跑"是错的。
+     * 真正的原因更可能是 SEF 单元数量本身 —— 补到 60~70 个时崩，
+     * 补 4 个时正常。方向应转向"多送的单元如何打乱 CAPTURE 缓冲
+     * 与 pending 配对"，而不是继续找更严格的门。 */
+    /* DMD_AV1_SEF_MAX=<n>：不设门、但本会话最多补 n 个 SEF。
+     *
+     * 实测结果（150 帧样本，判据为 ffmpeg 输出帧数）：
+     *     SEF_MAX=8   → 150 帧 ✓
+     *     SEF_MAX=20  → 150 帧 ✓
+     *     SEF_MAX=40  → 超时（>180s，正常约 40s）
+     *     无上限(~68) →  64 帧
+     * 所以崩溃阈值在 20~40 之间，且**与门无关** ——
+     * 20 个 SEF 完全不设门也能跑满 150 帧。
+     *
+     * 这否证了第 65 轮"SEF 抢在被引用帧解码前送出"的归因：
+     * 若是抢跑，补 20 个也该出问题。真正的原因是数量本身，
+     * 方向应转向"多送的单元如何耗尽 CAPTURE 缓冲或撑爆 pending 队列"。
+     * 不设则沿用 send_show 门（保守，只补约 4 个）。 */
+    const char *sefmax = getenv("DMD_AV1_SEF_MAX");
+    const int sef_no_gate = sefmax != NULL;
+    const unsigned long sef_cap = sefmax ? strtoul(sefmax, NULL, 10) : 0;
+    if (c->codec == DMD_CODEC_AV1 && c->av1_sef_count > 0 &&
+        (sef_no_gate ? (c->av1_sef_sent < sef_cap) : (c->av1_send_show != 0))) {
         sef_send_slot = (int)c->av1_sef_slot[c->av1_sef_head];
         c->av1_sef_head = (c->av1_sef_head + 1) & 63;
         c->av1_sef_count--;
