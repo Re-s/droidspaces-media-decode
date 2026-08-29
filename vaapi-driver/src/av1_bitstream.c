@@ -1403,7 +1403,23 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * DMD_AV1_WARP=m 可复现这个对照。
          *
          * 三帧样本的 VA-API 字段全同（mms=1 err=0 prim=0 gm 全 0），
-         * 唯一差异是 use_ref_frame_mvs，但它不足以解释全部。 */
+         * 唯一差异是 use_ref_frame_mvs，但它不足以解释全部。
+         *
+         * ---- 60 帧样本的完整对照（DMD_AV1_WARP 开关）----
+         * 只有 6 帧到达此写入点（其余 mms=0 或 err_res 被跳过）：
+         *   oh = 16, 24, 28, 46, 54, 58
+         *   va =  1,  1,  0,  1,  1,  0
+         * 三种写法的结果：
+         *   恒 0（现状，最优）  57/61，错帧 [18,30,48,60]
+         *   写 VA-API 值（=v）  57/61，错帧 [2,30,32,60]
+         *   写 use_ref_frame_mvs(=m) 56/61
+         * 恒 0 与转写 VA-API 各修好对方错的那两帧，都是 57/61。
+         * （帧30/60 属另一类缺陷 —— refresh 占位值，与本字段无关。）
+         *
+         * 所以真实规则既不是常量、也不是 VA-API 字段的直接转写，
+         * 而 60 帧样本只提供"不等于"的约束，不足以定出唯一解。
+         * 未查明就不猜 —— 保持恒 0（当前最优），把证据留在这里。
+         * 下一步应查 libaom 编码器侧 allow_warped_motion 的决策条件。 */
         {
             /* 假设待验证：allow_warped_motion 与 use_ref_frame_mvs 相关。
              * 两帧样本吻合（ref_mvs=0→源0、ref_mvs=1→源1），需大样本确认。 */
@@ -1411,6 +1427,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
             const char *ov = getenv("DMD_AV1_WARP");
             if (ov && ov[0] == 'm')
                 wm = (int)p->pic_info_fields.bits.use_ref_frame_mvs;
+            else if (ov && ov[0] == 'v')
+                wm = (int)p->pic_info_fields.bits.allow_warped_motion;
             else if (ov)
                 wm = atoi(ov);
             if (getenv("DMD_AV1_BITS"))
