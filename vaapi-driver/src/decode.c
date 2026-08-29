@@ -709,6 +709,12 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
+    if (c->codec == DMD_CODEC_AV1 && c->av1_sef_visits)
+        dmd_log("SEF 统计: 取槽点执行 %lu 次（其中 send_show=1 %lu 次）"
+                "入队 %lu 丢弃 %lu 追加 %lu\n",
+                c->av1_sef_visits, c->av1_sef_show1,
+                c->av1_sef_enq, c->av1_sef_drop, c->av1_sef_sent);
+
     /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
      * 会话也不能挂死宿主进程的 Terminate 路径。 */
     int idx = (int)(c - drv->contexts);
@@ -1590,14 +1596,17 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * DMD_AV1_NO_SEF=1 关闭，便于与旧行为对照。 */
         if (!getenv("DMD_AV1_NO_SEF") && ft != 0 &&
             !pp->pic_info_fields.bits.show_frame &&
-            pp->pic_info_fields.bits.showable_frame &&
-            c->av1_sef_count < 64) {
-            int t = (c->av1_sef_head + c->av1_sef_count) & 63;
-            c->av1_sef_slot[t] = c->av1_dpb.dpb_next_slot & 7u;
-            c->av1_sef_count++;
-            if (getenv("DMD_VA_LOG"))
-                dmd_log("SEF: 入队 slot=%u（队列 %d）\n",
-                        c->av1_sef_slot[t], c->av1_sef_count);
+            pp->pic_info_fields.bits.showable_frame) {
+            /* ⚠️ 队列满必须留痕：上一轮这里静默 continue，
+             * 丢了 58 次入队却毫无迹象，害我去猜时序问题。 */
+            if (c->av1_sef_count < 64) {
+                int t = (c->av1_sef_head + c->av1_sef_count) & 63;
+                c->av1_sef_slot[t] = c->av1_dpb.dpb_next_slot & 7u;
+                c->av1_sef_count++;
+                c->av1_sef_enq++;
+            } else {
+                c->av1_sef_drop++;
+            }
         }
 
         if (ft == 0 /* KEY_FRAME */) {
@@ -2371,18 +2380,21 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     /* 取一个待复显槽：仅当本次送出的帧自身会显示时才补 SEF。
      *
-     * ⚠️ 未完成：实测入队 8 次（队列满）、出队 0 次。
-     * 20 帧样本里 av1_send_show 在这个时点从不为 1。
-     * 成因：AV1 走延迟一帧送料，本函数取槽时 av1_send_show
-     * 还是上一轮的残值，尚未被本次 build_unit 赋值。
-     * 全量运行也印证：只追加了 4 个 SEF（154-150），
-     * 而 show=0 帧有 70 个、show=1 送出 80 次。
-     * 修法方向：把取槽移到 build_unit 内部、与 av1_send_show
-     * 的赋值同点，或改用 build_unit 返回的显式标志。 */
+     * ⚠️ 未完成。无条件计数器实测（150 帧全量）：
+     *     取槽点执行 75 次（其中 send_show=1 仅 5 次）
+     *     入队 68、丢弃 2、追加 4
+     * 两处对不上：
+     *  (a) 取槽点只执行 75 次，而实际送出 154 单元、
+     *      build_unit 被调 150 次 —— 有路径绕过了这里，位置未定位。
+     *      （已排除 av1_no_output 分支，它不 early-return。）
+     *  (b) send_show=1 只 5 次，而配对成功 80 次。
+     * 在把这两个数字解释清楚之前不要改触发条件 ——
+     * 上一轮换成 av1_hold_show 就把送入从 154 打到 8。 */
     int sef_send_slot = -1;
-    if (getenv("DMD_VA_LOG") && c->codec == DMD_CODEC_AV1)
-        dmd_log("SEF: 取槽点 send_show=%d 队列=%d\n",
-                c->av1_send_show, c->av1_sef_count);
+    if (c->codec == DMD_CODEC_AV1) {
+        c->av1_sef_visits++;
+        if (c->av1_send_show) c->av1_sef_show1++;
+    }
     /* ⚠️ 触发条件用"本次送出的帧是否显示"，而不是当前帧。
      * av1_send_show 因延迟一帧机制反映的正是送出帧 —— 语义是对的，
      * 但实测它在 150 帧里只有 5 次为 1、70 次为 0：
@@ -2433,10 +2445,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         size_t sn = dmd_av1_build_show_existing(sefbuf, sizeof(sefbuf),
                                                 (unsigned)sef_send_slot);
         if (sn > 0) {
-            int src = dmd_session_send_unit(sess, sefbuf, sn);
-            if (getenv("DMD_VA_LOG"))
-                dmd_log("SEF: 追加复显头 map_idx=%d (%zu字节) rc=%d\n",
-                        sef_send_slot, sn, src);
+            (void)dmd_session_send_unit(sess, sefbuf, sn);
+            c->av1_sef_sent++;
         }
     }
 

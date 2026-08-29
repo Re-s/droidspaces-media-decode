@@ -337,6 +337,14 @@ struct dmd_context {
     unsigned       av1_sef_slot[64];
     int            av1_sef_head;
     int            av1_sef_count;
+    /* 无条件计数器。⚠️ 不要用日志行数推断执行次数 ——
+     * 本会话已两次因此误判（第 54 轮把 220 行当 220 次调用，
+     * 第 59 轮把 75 条日志当 75 次执行）。 */
+    unsigned long  av1_sef_visits;   /* 取槽点被执行的次数 */
+    unsigned long  av1_sef_show1;    /* 其中 send_show 为 1 的次数 */
+    unsigned long  av1_sef_enq;      /* 入队次数 */
+    unsigned long  av1_sef_drop;     /* 队列满而丢弃的次数 */
+    unsigned long  av1_sef_sent;     /* 实际追加的 SEF 单元数 */
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */
