@@ -315,6 +315,11 @@ struct dmd_context {
      *   av1_send_surface：build_unit 本次实际送出的那一帧的 surface */
     VASurfaceID    av1_hold_surface;
     VASurfaceID    av1_send_surface;
+    /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
+     * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
+     * 否则队列里多出永远配不上的条目。 */
+    int            av1_hold_show;
+    int            av1_send_show;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */

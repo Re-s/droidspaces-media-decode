@@ -569,6 +569,8 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     c->units_submitted = 0;
     c->av1_hold_surface = VA_INVALID_ID;
     c->av1_send_surface = VA_INVALID_ID;
+    c->av1_hold_show = 0;
+    c->av1_send_show = 0;
     for (int k = 0; k < c->pending_count; k++) {
         int idx = (c->pending_head + k) % DMD_MAX_SURFACES;
         c->pending_unit[idx] = 0;
@@ -1570,6 +1572,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
         if (ft == 0 /* KEY_FRAME */) {
             /* KEY 帧不延迟。此时 av1_hold 必为空（KEY 帧开启新的参考链）。 */
             c->av1_send_surface = c->current_target;
+            c->av1_send_show = 1;   /* KEY 帧必然显示 */
             av1_dump_sent(buf, n);
             *scratch = buf;
             *out_len = n;
@@ -1585,7 +1588,9 @@ static const unsigned char *build_unit(struct dmd_context *c,
                         (unsigned)c->av1_hold_surface, prev_len,
                         (unsigned)c->current_target);
             c->av1_send_surface = c->av1_hold_surface;
+            c->av1_send_show = c->av1_hold_show;
             c->av1_hold_surface = c->current_target;
+            c->av1_hold_show = (int)pp->pic_info_fields.bits.show_frame;
             c->av1_hold = buf;
             c->av1_hold_len = n;
             c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
@@ -1601,6 +1606,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 用 (unit==NULL && unit_len==0 && av1_hold!=NULL) 与
          * "码流重建失败"区分开。 */
         c->av1_hold_surface = c->current_target;
+        c->av1_hold_show = (int)pp->pic_info_fields.bits.show_frame;
         c->av1_hold = buf;
         c->av1_hold_len = n;
         c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
@@ -2020,6 +2026,46 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
     }
+    /* AV1 show_frame=0 的帧不产生输出：解码器实测只对 show_frame=1 的帧吐
+     * CAPTURE 缓冲（送 6 单元收 2 帧，与 dav1d 基线一致）。
+     * 给这类帧登记待配对项，队列里就留下永远配不上的条目 ——
+     * 后续帧的精确配对随之失效，退到顺序推断并配错 surface。
+     *
+     * ⚠️ 但**数据必须照送**：这些帧是后续帧的参考，漏送会毁掉参考链。
+     * 所以只跳过入队，不能在这里 early-return
+     * （送料在下方 dmd_session_send_unit，早退就等于不送 —— 踩过一次）。
+     *
+     * ffmpeg 仍会对其中部分 surface 调 Sync（实测 surface5，show=0 oh=2），
+     * 所以还要给 surface 一个结局，否则它永久停在 PENDING 直到超时。
+     * 标为 READY 且不带像素数据：Sync 立即成功返回。
+     *
+     * ⚠️ 这一步只解决了帧数，**没有解决像素**：
+     *   -f null（不读像素）→ 硬解 150 帧 = dav1d 软解 150 帧 ✓
+     *   hwdownload 读像素   → "Failed to read image from surface 0x8:
+     *                          internal decoding error"，只导出部分帧
+     * 因为 READY 但 s->data 为空，GetImage 无内容可给。
+     *
+     * 正确方向应是让这些 surface 拿到**真实像素**而非空壳：
+     * AV1 里 show_frame=0 的帧内容确实存在（供后续帧参考），
+     * 只是不进显示队列。ffmpeg 读它大概是为了 film grain 的
+     * current_frame / current_display_picture 两路输出
+     * （见 vaapi_av1.c 的注释：VAAPI 对每帧产生 2 个 output）。
+     * 待查：msm_vidc 能否被要求输出这些不显示的帧，
+     * 或驱动应把被引用帧的内容复制给它。 */
+    const int av1_no_output = (c->codec == DMD_CODEC_AV1 &&
+                               !c->av1_send_show &&
+                               c->av1_send_surface != VA_INVALID_ID);
+    if (av1_no_output) {
+        struct dmd_surface *ns = dmd_find_surface_locked(drv,
+                                                        c->av1_send_surface);
+        if (ns) {
+            ns->state = DMD_SURFACE_READY;
+            ns->decode_status = VA_STATUS_SUCCESS;
+        }
+        dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队\n",
+                (unsigned)c->av1_send_surface);
+    }
+
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     /* AV1 延迟一帧：本次送出的是上一帧的数据，登记它的 surface。
      * 其余 codec 送的就是当前帧，直接用 target。 */
@@ -2063,7 +2109,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 注意只有真正送出数据单元的提交才占号，参数集不占（daemon 侧同理：
      * is_param_set 的单元走 CSD 路径，不递增 vcl_in）。 */
     c->pending_unit[qpos] = ++c->units_submitted;
-    c->pending_count++;
+    if (!av1_no_output)
+        c->pending_count++;
     c->have_current_poc = 0;
     c->current_target = VA_INVALID_ID;
 
