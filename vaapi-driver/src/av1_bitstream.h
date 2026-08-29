@@ -146,7 +146,8 @@ struct dmd_av1_dpb {
 void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
-                                size_t prev_len);
+                                size_t prev_len,
+                                size_t prev_bitpos);
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {

@@ -1354,6 +1354,39 @@ static size_t vp8_build_frame(struct dmd_context *c, unsigned char *out,
 /* 组装最终要送给 daemon 的数据单元。
  * 返回要送的缓冲（可能就是 c->slice_data 本身）与长度；失败返回 NULL。
  * scratch 由调用方提供并负责释放。 */
+/* AV1 合成结果落盘（DMD_AV1_DUMP / DMD_AV1_DUMP_ALL）。
+ *
+ * ⚠️ 必须在 refresh_frame_flags 就地改写**之后**、真正送出时才落盘。
+ * 早先放在合成处，落的是改写前的字节，导致 trace_headers 看到的
+ * refresh 恒为轮转值（1）而非反算出的真值，白排查一轮。
+ *
+ * 这是本模块的主要验证手段：合成正确性无法在设备上直接判断
+ * （硬件只会"不出帧"，不告诉你哪一位错了），必须把字节取回来交给
+ * 权威工具：
+ *   ffmpeg -f obu -i <文件> -f null -           （能否解出帧）
+ *   ffmpeg -bsf:v trace_headers ...             （逐字段比对）
+ * 自制解析器不可靠 —— 曾因其自身偏差与实现错误互相抵消而误判"已对齐"。
+ *
+ * 默认只落首帧；DMD_AV1_DUMP_ALL=1 追加整条流，用于校验多帧序列
+ * （"首帧正确但后续帧让解码器停摆"只有整流才能暴露）。 */
+static void av1_dump_sent(const unsigned char *buf, size_t n)
+{
+    const char *dp = getenv("DMD_AV1_DUMP");
+    if (!dp || !buf || n == 0)
+        return;
+    const char *all = getenv("DMD_AV1_DUMP_ALL");
+    int dump_all = all && all[0] == '1';
+    static int dumped = 0;
+    if (dump_all) {
+        FILE *df = fopen(dp, dumped ? "ab" : "wb");
+        if (df) { fwrite(buf, 1, n, df); fclose(df); dumped++; }
+    } else if (!dumped) {
+        FILE *df = fopen(dp, "wb");
+        if (df) { fwrite(buf, 1, n, df); fclose(df); dumped = 1;
+                  dmd_log("已落盘 %zu 字节到 %s", n, dp); }
+    }
+}
+
 static const unsigned char *build_unit(struct dmd_context *c,
                                        unsigned char **scratch, size_t *out_len)
 {
@@ -1481,49 +1514,66 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * DMD_AV1_DUMP_ALL=1 改为追加**整条**合成流 —— 用于校验多帧序列，
          * 因为"首帧正确但后续帧让解码器停摆"这类问题只有整流才能暴露：
          * 把整条流交给 ffmpeg 软解，解出帧数应与源码流一致。 */
-        if (getenv("DMD_AV1_DUMP")) {
-            const char *dp = getenv("DMD_AV1_DUMP");
-            const char *all = getenv("DMD_AV1_DUMP_ALL");
-            int dump_all = all && all[0] == '1';
-            static int dumped = 0;
-            if (dump_all) {
-                /* 首次用 "wb" 截断，之后 "ab" 追加，避免残留上次运行的字节。 */
-                FILE *df = fopen(dp, dumped ? "ab" : "wb");
-                if (df) { fwrite(buf, 1, n, df); fclose(df); dumped++; }
-            } else if (!dumped) {
-                FILE *df = fopen(dp, "wb");
-                if (df) { fwrite(buf, 1, n, df); fclose(df); dumped = 1;
-                          dmd_log("已落盘 %zu 字节到 %s", n, dp); }
-            }
+        /* ============ AV1 延迟一帧送料 ============
+         *
+         * refresh_frame_flags 的正确值只能从**下一帧**的 ref_frame_map 反算：
+         *     第 N 帧 refresh = 第 N+1 帧 map 与第 N 帧 map 的差异位
+         * 实测 4 帧全部命中源码流真实值（1/8/32/64）。
+         *
+         * 已否证的五种"只用本帧字段"的推导 —— 不要再试：
+         *  1. 在本帧 ref_frame_map 里找 current_frame：该数组是解码**前**
+         *     快照，当前帧尚未写入，恒为 0
+         *  2. 本帧 map 与**上**帧 map 差分：方向错，得到的是上一帧的 refresh
+         *  3. 恒 1 或 1<<slot 轮转：结构上无法表达 refresh=0（不占槽的帧），
+         *     真实序列 1,8,32,64,0,0,64,0,0,32,64,0 里这类帧占三分之一
+         *  4. map 中"值仍为初始值且不被 ref_frame_idx 引用的最小槽"：
+         *     仅首帧碰对（实测猜 1/2/2/2 对真值 1/8/32/64）
+         *  5. max(已填槽)+2：实测 0→✓ 3→✗ 5→✓ 6→✗，不成立
+         * 真实写入槽序列 0,3,5,6 是编码器的金字塔层级决策，
+         * 本帧字段里不含这个信息。
+         *
+         * 因此必须延迟一帧。关键前提（上一轮遗漏，导致误判为结构死锁）：
+         *  · KEY 帧的 refresh_frame_flags **不写入码流**（规范推断为全刷），
+         *    无需反算，必须立即送 —— 否则 ffmpeg 拿不到首帧像素就不再送料，
+         *    实测表现为"送入 0 单元, 收到 0 帧"
+         *  · ffmpeg 允许多帧在飞（实测 DMD_PIPELINE_DEPTH=12 时送了 6 帧），
+         *    所以帧间帧延迟一帧不会死锁
+         *
+         * 于是：KEY 帧直接送；帧间帧先入 av1_hold，等下一帧到来时
+         * 反算并就地改写那 8 位，再把它送出。 */
+        dmd_av1_patch_prev_refresh(&c->av1_dpb, pp,
+                                   c->av1_hold, c->av1_hold_len,
+                                   c->av1_hold_bitpos);
+
+        if (ft == 0 /* KEY_FRAME */) {
+            /* KEY 帧不延迟。此时 av1_hold 必为空（KEY 帧开启新的参考链）。 */
+            av1_dump_sent(buf, n);
+            *scratch = buf;
+            *out_len = n;
+            return buf;
         }
 
-        /* ⚠️ AV1 延迟一帧送料：已实现并验证推导正确，但落地失败，暂不启用。
-         *
-         * 推导本身是对的（实测 4 帧全部命中源码流真实值）：
-         *     第 N 帧的 refresh_frame_flags = 第 N+1 帧 ref_frame_map
-         *                                     与第 N 帧 ref_frame_map 的差异位
-         * 因为"本帧写入了哪些槽"正是在下一帧的 DPB 快照里显现的。
-         * dmd_av1_patch_prev_refresh() 实现了它，含就地按位改写。
-         *
-         * 但"延迟一帧再送"会死锁：ffmpeg 送第 1 帧后就等它的像素，
-         * 拿不到就不送第 2 帧；而我们要等第 2 帧才能送第 1 帧。
-         * 实测日志："AV1 首帧入暂存" → "会话结束: 送入 0 单元, 收到 0 帧"。
-         *
-         * 可能的出路（下一轮评估）：
-         *  · 首帧不延迟（其 refresh 由 KEY 帧规则确定为全刷，无需反算），
-         *    只对帧间帧延迟 —— 但同样的死锁会在第 2 帧重现
-         *  · 送两份：先送本帧的乐观值，下一帧算出真值后重送修正帧 ——
-         *    AV1 不允许重复送同一帧
-         *  · 放弃精确值，改为让解码器不依赖 refresh：把每帧都合成为
-         *    intra-only 或 SWITCH 帧 —— 会毁掉帧间预测，画质与码率不可接受
-         *  · 从 VA-API 的其他字段找信息：ref_frame_idx 与 primary_ref_frame
-         *    组合起来可能足以推断哪些槽会被本帧覆盖（未验证）
-         *
-         * 当前保持立即送料 + 轮转策略（已知不正确，V4L2 路径只出首帧）。
-         * 保留 patch 函数与 dpb 字段，供下一轮启用。 */
-        *scratch = buf;
-        *out_len = n;
-        return buf;
+        if (c->av1_hold) {
+            unsigned char *prev = c->av1_hold;
+            size_t prev_len = c->av1_hold_len;
+            c->av1_hold = buf;
+            c->av1_hold_len = n;
+            c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos;
+            av1_dump_sent(prev, prev_len);
+            *scratch = prev;
+            *out_len = prev_len;
+            return prev;
+        }
+
+        /* 第一个帧间帧：只入暂存，本次无数据可送。
+         * 用 (unit==NULL && unit_len==0 && av1_hold!=NULL) 与
+         * "码流重建失败"区分开。 */
+        c->av1_hold = buf;
+        c->av1_hold_len = n;
+        c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos;
+        *scratch = NULL;
+        *out_len = 0;
+        return NULL;
     }
 
     case DMD_CODEC_VP8: {
@@ -1703,6 +1753,19 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     unsigned char *scratch = NULL;
     size_t unit_len = 0;
     const unsigned char *unit = build_unit(c, &scratch, &unit_len);
+
+    /* AV1 延迟一帧送料：第一个帧间帧只入暂存，本次没有数据要送。
+     * 这不是错误 —— 用 unit_len==0 且 av1_hold 非空与"码流重建失败"区分。
+     * surface 保持 PENDING，它会在下一帧把本帧送出后才拿到解码结果。 */
+    if (!unit && unit_len == 0 && c->codec == DMD_CODEC_AV1 && c->av1_hold) {
+        c->current_target = VA_INVALID_ID;
+        c->slice_len = 0;
+        c->av1_tile_count = 0;
+        pthread_mutex_unlock(&drv->lock);
+        free(scratch);
+        dmd_log("EndPicture: AV1 帧入暂存，等下一帧反算 refresh\n");
+        return VA_STATUS_SUCCESS;
+    }
 
     if (!unit) {
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);

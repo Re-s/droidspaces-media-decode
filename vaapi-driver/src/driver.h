@@ -301,6 +301,11 @@ struct dmd_context {
      * 送出后 free）。av1_hold_len 是其长度。 */
     unsigned char *av1_hold;
     size_t         av1_hold_len;
+    /* 暂存帧的 refresh_frame_flags 位偏移。
+     * ⚠️ 不能复用 dpb.last_refresh_bitpos —— 那个字段会被**本帧**的
+     * build_frame 覆盖。实测踩过：日志显示 "bitpos=19 len=655"，
+     * 而 len=655 是新合成帧的长度，暂存帧长 2686，一眼即知拿错了帧。 */
+    size_t         av1_hold_bitpos;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */

@@ -1196,12 +1196,13 @@ size_t dmd_av1_build_frame(const void *pic_v,
 void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
-                                size_t prev_len)
+                                size_t prev_len,
+                                size_t prev_bitpos)
 {
     if (!dpb || !cur_pic || !prev_frame_bytes) return;
     const VADecPictureParameterBufferAV1 *p = cur_pic;
 
-    if (dpb->prev_valid && dpb->last_refresh_bitpos != (size_t)-1) {
+    if (dpb->prev_valid && prev_bitpos != (size_t)-1 && prev_len > 0) {
         /* 本帧 map 与上帧 map 的差异位 = 上一帧实际写入的槽。
          * 实测 4 帧全部命中源码流真实值（1/8/32/64）。 */
         unsigned mask = 0;
@@ -1214,8 +1215,8 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
          * refresh_frame_flags 未必字节对齐，须按位写，MSB first。 */
         if (getenv("DMD_AV1_LOG"))
             fprintf(stderr, "[av1] 反算上帧 refresh=0x%02x (bitpos=%zu len=%zu)\n",
-                    mask, dpb->last_refresh_bitpos, prev_len);
-        size_t bp = dpb->last_refresh_bitpos;
+                    mask, prev_bitpos, prev_len);
+        size_t bp = prev_bitpos;
         if ((bp + 8 + 7) / 8 <= prev_len) {
             for (int k = 0; k < 8; k++) {
                 size_t bit = bp + (size_t)k;
