@@ -317,6 +317,22 @@ struct dmd_context {
     VASurfaceID    av1_send_surface;
     /* 最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接像素。 */
     VASurfaceID    av1_last_ready;
+
+    /* ---- show_existing_frame 补插 ----
+     * 硬件不输出 show_frame=0 的帧（符合规范），源码流靠 70 个 SEF 头
+     * 让它们各复显一次，凑满 150 帧。缺 SEF 头时实测只收 80 帧。
+     *
+     * 位置规律（150 帧样本，100% 成立）：
+     *   全部 70 个 SEF 都紧跟在一个 show_frame=1 的帧之后
+     *   80 个 show=1 的帧里有 70 个带 SEF
+     * 引用规律：SEF 的 map_idx 指向的槽，正是某个 show_frame=0 帧
+     *   最后刷新的那个槽。
+     *
+     * 于是驱动这样推导：show_frame=0 的帧进队（记下它占的 DPB 槽），
+     * 遇到 show_frame=1 的帧送出后，从队首取一个补一个 SEF 头。 */
+    unsigned       av1_sef_slot[8];   /* 待复显帧所占的 DPB 槽，环形 */
+    int            av1_sef_head;
+    int            av1_sef_count;
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */

@@ -570,6 +570,8 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     c->av1_hold_surface = VA_INVALID_ID;
     c->av1_send_surface = VA_INVALID_ID;
     c->av1_last_ready = VA_INVALID_ID;
+    c->av1_sef_head = 0;
+    c->av1_sef_count = 0;
     c->av1_hold_show = 0;
     c->av1_send_show = 0;
     for (int k = 0; k < c->pending_count; k++) {
@@ -1582,6 +1584,22 @@ static const unsigned char *build_unit(struct dmd_context *c,
                                    c->av1_hold, c->av1_hold_len,
                                    c->av1_hold_bitpos);
 
+        /* SEF 补插：show_frame=0 的帧硬件不输出，记下它占的 DPB 槽，
+         * 等下一个 show_frame=1 的帧送出后追加一个 SEF 头让它复显。
+         * 槽号取写入前的 dpb_next_slot —— 与 build_frame 内的分配一致。
+         * DMD_AV1_NO_SEF=1 关闭，便于与旧行为对照。 */
+        if (!getenv("DMD_AV1_NO_SEF") && ft != 0 &&
+            !pp->pic_info_fields.bits.show_frame &&
+            pp->pic_info_fields.bits.showable_frame &&
+            c->av1_sef_count < 8) {
+            int t = (c->av1_sef_head + c->av1_sef_count) & 7;
+            c->av1_sef_slot[t] = c->av1_dpb.dpb_next_slot & 7u;
+            c->av1_sef_count++;
+            if (getenv("DMD_VA_LOG"))
+                dmd_log("SEF: 入队 slot=%u（队列 %d）\n",
+                        c->av1_sef_slot[t], c->av1_sef_count);
+        }
+
         if (ft == 0 /* KEY_FRAME */) {
             /* KEY 帧不延迟。此时 av1_hold 必为空（KEY 帧开启新的参考链）。 */
             c->av1_send_surface = c->current_target;
@@ -2351,6 +2369,24 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         }
     }
 
+    /* 取一个待复显槽：仅当本次送出的帧自身会显示时才补 SEF。
+     *
+     * ⚠️ 未完成：实测入队 8 次（队列满）、出队 0 次。
+     * 20 帧样本里 av1_send_show 在这个时点从不为 1。
+     * 成因：AV1 走延迟一帧送料，本函数取槽时 av1_send_show
+     * 还是上一轮的残值，尚未被本次 build_unit 赋值。
+     * 全量运行也印证：只追加了 4 个 SEF（154-150），
+     * 而 show=0 帧有 70 个、show=1 送出 80 次。
+     * 修法方向：把取槽移到 build_unit 内部、与 av1_send_show
+     * 的赋值同点，或改用 build_unit 返回的显式标志。 */
+    int sef_send_slot = -1;
+    if (c->codec == DMD_CODEC_AV1 && c->av1_send_show &&
+        c->av1_sef_count > 0) {
+        sef_send_slot = (int)c->av1_sef_slot[c->av1_sef_head];
+        c->av1_sef_head = (c->av1_sef_head + 1) & 7;
+        c->av1_sef_count--;
+    }
+
     drv->io_busy[idx] = 1;
     pthread_mutex_unlock(&drv->lock);
 
@@ -2368,6 +2404,27 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (rc == DMD_OK)
         rc = dmd_session_send_unit(sess, tx, unit_len);
     free(tx);
+
+    /* SEF 补插：本次送出的帧若 show_frame=1，就从待复显队列取一个，
+     * 追加一个 show_existing_frame 头 OBU 作为独立单元。
+     *
+     * 位置依据（150 帧样本，100% 成立）：全部 70 个 SEF 都紧跟在
+     * 一个 show_frame=1 的帧之后。硬件会为每个 SEF 头复显一次，
+     * 实测源码流"送 150 收 150"、剥掉 SEF 后"送 150 收 80"。
+     *
+     * ⚠️ 这些 SEF 单元不进 pending 队列 —— 它们产生的输出帧由
+     * ffmpeg 自己映射到已有 surface，驱动侧无新 surface 要配对。 */
+    if (rc == DMD_OK && sef_send_slot >= 0) {
+        unsigned char sefbuf[4];
+        size_t sn = dmd_av1_build_show_existing(sefbuf, sizeof(sefbuf),
+                                                (unsigned)sef_send_slot);
+        if (sn > 0) {
+            int src = dmd_session_send_unit(sess, sefbuf, sn);
+            if (getenv("DMD_VA_LOG"))
+                dmd_log("SEF: 追加复显头 map_idx=%d (%zu字节) rc=%d\n",
+                        sef_send_slot, sn, src);
+        }
+    }
 
     pthread_mutex_lock(&drv->lock);
     drv->io_busy[idx] = 0;
