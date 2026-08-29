@@ -658,6 +658,7 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
  * 这个区别是实测踩出来的：用错会让 tile_group 起始位置偏移，
  * dav1d 报 "Failed to read unit"。 */
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
+                                    struct dmd_av1_dpb *dpb,
                                     const VADecPictureParameterBufferAV1 *p)
 {
     /* struct dmd_bitwriter 是纯值结构：buf 指向调用方的缓冲，其余成员
@@ -773,40 +774,45 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 也不要谎称刷新了全部而让解码器丢弃仍在使用的参考帧。 */
     const int refresh_all = (frame_type == 3) ||
                             (is_key && p->pic_info_fields.bits.show_frame);
+
+    /* ===================== 自洽 DPB（影子参考帧管理）=====================
+     *
+     * 问题：refresh_frame_flags（本帧解码后写入哪些参考槽的 8 位掩码）
+     * VA-API 完全不提供 —— 它随源码流被 ffmpeg 解析后丢弃，因为那是
+     * 编码器的 GOP 决策。源码流实测序列 1,8,32,64,0,0,64,0,0,32,64,0
+     * （三分之一是 0），无法从单帧信息还原。
+     *
+     * 关键洞察：**我不需要还原它。**
+     * ref_frame_idx[] 同样由本函数写入码流。解码器只要求这两者
+     * **互相自洽**：我说本帧存进槽 k，之后引用它时就报槽 k。
+     * 至于原编码器把它放在哪个槽，与解码结果无关。
+     *
+     * 于是自己管一份影子 DPB：
+     *   · 每个非 KEY 帧占用一个槽，8 槽轮转（refresh = 1 << slot）
+     *   · 记录 shadow[slot] = 该槽存的 surface id
+     *   · 写 ref_frame_idx 时，把 VA-API 给的"槽号"先经它的 ref_frame_map
+     *     翻成 surface id，再在影子 DPB 里查出**我的**槽号
+     *
+     * 已用实测数据模拟验证：连续 5 帧的全部引用都能在影子 DPB 中解析到。
+     *
+     * 历史错误（本轮修复的根因）：原先恒写 0xFF，理由是"MediaCodec 自行
+     * 管理参考帧，不看码流里这个掩码"。该假设对 MediaCodec 成立，对 V4L2
+     * 不成立 —— msm_vidc 按码流管理参考帧，0xFF 让每个帧间帧刷掉全部 8 槽，
+     * 参考帧链立刻崩：合成流交 dav1d 软解第 2 帧起 Invalid data。
+     *
+     * 已否决的三种"还原编码器决策"的推导（均实测失败）：
+     *  1. 在 ref_frame_map[] 里找 current_frame —— 该数组是本帧解码**前**的
+     *     快照，current 尚未写入，恒不匹配
+     *  2. 相邻两帧 ref_frame_map 差分 —— 给出的是上一帧刷新的槽，
+     *     且无法表达"本帧不刷新"（值 0）
+     *  3. 取第一个未被引用/仍为初值的空槽 —— 实测 5 帧里只有首帧碰对
+     * ==================================================================== */
+    unsigned refresh_mask = 0;
+    int my_slot = -1;
     if (!refresh_all) {
-        /* ⚠️⚠️ 这是本实现当前最严重的已知缺陷，尚未解决。
-         *
-         * refresh_frame_flags 是"本帧解码后要写入哪些参考槽"的 8 位掩码。
-         * VA-API **完全不提供**它（全文件 grep：仅 va_dec_av1.h:421 注释提及）。
-         *
-         * 历史错误：原先恒写 0xFF，理由是"MediaCodec 自行管理参考帧生命周期，
-         * 不看码流里这个掩码"。该假设对 MediaCodec 成立，对 V4L2 **不成立** ——
-         * msm_vidc 按码流管理参考帧，0xFF 会让每个帧间帧刷掉全部 8 槽。
-         * 实测后果：合成流交 dav1d 软解，第 2 帧起 Invalid data，只出 1 帧；
-         * 走硬件时送 6 单元只回 2 帧后解码器停摆。
-         *
-         * 用 trace_headers 从源码流读出的真实序列（av1_1080p.obu 前 12 个帧间帧）：
-         *     1, 8, 32, 64, 0, 0, 64, 0, 0, 32, 64, 0
-         * 注意有大量 0 —— 那些帧不写入任何参考槽。这是金字塔 B 帧结构的特征：
-         * 哪些帧作为参考、占哪个槽，由**编码器的 GOP 决策**确定，
-         * 已随源码流的 refresh_frame_flags 字段一起被 ffmpeg 解析并丢弃。
-         *
-         * 已试过并否决的三种推导（都实测失败）：
-         *  1. 在 ref_frame_map[] 里找 current_frame —— ref_frame_map 是本帧
-         *     解码**前**的快照，current 尚未写入，恒不匹配（每帧都得 0）。
-         *  2. 相邻两帧 ref_frame_map 差分 —— 差分给出的是**上一帧**刷新的槽，
-         *     而本帧的目标槽此刻还看不到；且无法表达"本帧不刷新"（值 0）。
-         *  3. 回退恒 1（只刷槽 0）—— 真实序列里 0 占三分之一，恒 1 同样错。
-         *
-         * 结论：单帧的 VA-API 信息不足以还原这个字段，必须在驱动侧维护一份
-         * DPB 影子状态，跨帧比对 ref_frame_map 的演化来反推槽位轮转策略；
-         * 或改用 VA-API 的 VAEncMiscParameter 之类通道（尚未调研）。
-         * 这是下一轮的主要工作。
-         *
-         * 当前暂写 0xFF 以保持语法合法与既有 MediaCodec 路径的行为不变
-         * （该路径实测可用）。V4L2 路径因此仍只能解出首帧 —— 这是已知的、
-         * 有明确复现步骤的未完成项，不是偶发问题。 */
-        dmd_bw_put_bits(&bw, 0xFF, 8);
+        my_slot = (int)(dpb->dpb_next_slot & 7u);
+        refresh_mask = 1u << my_slot;
+        dmd_bw_put_bits(&bw, refresh_mask, 8);
     }
 
     /* 参考帧索引：帧间帧才有。 */
@@ -815,8 +821,21 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 显式给出全部 7 个 ref_frame_idx（VA-API 提供的正是这个数组）。 */
         if (enable_order_hint)
             dmd_bw_put_flag(&bw, 0);
-        for (int i = 0; i < 7; i++)
-            dmd_bw_put_bits(&bw, p->ref_frame_idx[i], 3);
+        /* 把 VA-API 的槽号翻成**我的**槽号：
+         * VA-API 的 ref_frame_idx[i] 是它自己 DPB 里的槽号，
+         * 经 ref_frame_map[] 得到真正的 surface id，
+         * 再在影子 DPB 里找该 surface 现在占我的哪个槽。 */
+        for (int i = 0; i < 7; i++) {
+            unsigned va_slot = p->ref_frame_idx[i];
+            unsigned my = 0;
+            if (va_slot < 8) {
+                VASurfaceID want = p->ref_frame_map[va_slot];
+                for (int k = 0; k < 8; k++) {
+                    if (dpb->dpb_shadow[k] == want) { my = (unsigned)k; break; }
+                }
+            }
+            dmd_bw_put_bits(&bw, my, 3);
+        }
         /* frame_id_numbers_present=0，不写 delta_frame_id。 */
     }
 
@@ -1007,11 +1026,12 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
                                      int obu_type,
                                      unsigned char *body, size_t body_cap,
-                                     size_t *body_len_out)
+                                     size_t *body_len_out,
+                                     struct dmd_av1_dpb *dpb)
 {
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, body_cap);
-    put_uncompressed_header(&bw, p);
+    put_uncompressed_header(&bw, dpb, p);
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
@@ -1025,7 +1045,8 @@ static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
 }
 
 size_t dmd_av1_build_frame_header(const void *pic_v,
-                                  unsigned char *out, size_t out_cap)
+                                  unsigned char *out, size_t out_cap,
+                                  struct dmd_av1_dpb *dpb)
 {
     const VADecPictureParameterBufferAV1 *p = pic_v;
     if (!p || !out || out_cap < 8)
@@ -1034,7 +1055,7 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
     unsigned char body[512];
     size_t body_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME_HEADER,
-                              body, sizeof(body), &body_len) == 0)
+                              body, sizeof(body), &body_len, dpb) == 0)
         return 0;
 
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME_HEADER,
@@ -1048,7 +1069,8 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
 
 size_t dmd_av1_build_frame(const void *pic_v,
                            const struct dmd_av1_tile *tiles, int num_tiles,
-                           unsigned char *out, size_t out_cap)
+                           unsigned char *out, size_t out_cap,
+                           struct dmd_av1_dpb *dpb)
 {
     const VADecPictureParameterBufferAV1 *p = pic_v;
     if (!p || !out || !tiles || num_tiles <= 0 || out_cap < 16)
@@ -1058,7 +1080,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
     unsigned char fh[512];
     size_t fh_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME,
-                              fh, sizeof(fh), &fh_len) == 0)
+                              fh, sizeof(fh), &fh_len, dpb) == 0)
         return 0;
 
     /* tile_group_obu()（规范 5.11.1）的 payload：
@@ -1115,6 +1137,23 @@ size_t dmd_av1_build_frame(const void *pic_v,
         for (size_t k = 0; k < tiles[i].len; k++)
             *q++ = tiles[i].data[k];
     }
+    /* 帧已合成成功 —— 把本帧登记进影子 DPB，供后续帧的 ref_frame_idx 查询。
+     * 必须在成功路径的末尾做：合成失败时不能污染 DPB 状态，
+     * 否则后续帧会引用一个从未真正写入解码器的槽。 */
+    if (dpb) {
+        const VADecPictureParameterBufferAV1 *pp = pic_v;
+        int is_key_frame = (pp->pic_info_fields.bits.frame_type == 0);
+        if (is_key_frame && pp->pic_info_fields.bits.show_frame) {
+            /* KEY + show 帧刷新全部 8 槽（规范如此，字段不写入码流）。 */
+            for (int k = 0; k < 8; k++) dpb->dpb_shadow[k] = pp->current_frame;
+            dpb->dpb_next_slot = 0;
+        } else {
+            unsigned sl = dpb->dpb_next_slot & 7u;
+            dpb->dpb_shadow[sl] = pp->current_frame;
+            dpb->dpb_next_slot = (sl + 1u) & 7u;
+        }
+    }
+
     return hdr + payload_len;
 }
 

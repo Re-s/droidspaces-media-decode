@@ -1455,7 +1455,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
         }
 
         const size_t fn = dmd_av1_build_frame(pp, tiles, c->av1_tile_count,
-                                              buf + n, cap - n);
+                                              buf + n, cap - n, &c->av1_dpb);
         if (fn == 0) {
             dmd_log("EndPicture: AV1 OBU_FRAME 合成失败（tile=%d, 载荷=%zu）",
                     c->av1_tile_count, tile_bytes);

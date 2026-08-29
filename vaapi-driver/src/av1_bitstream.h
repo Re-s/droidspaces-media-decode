@@ -96,6 +96,23 @@ size_t dmd_av1_build_sequence_header(const void *pic,
 
 /* --------------------------------------------- OBU_FRAME 组装（3/4 + 4/4） */
 
+/*
+ * 自洽 DPB 状态（影子参考帧管理）。
+ *
+ * 为什么需要它：refresh_frame_flags 与 ref_frame_idx 都由本模块写入码流，
+ * 而 VA-API 不提供 refresh_frame_flags（那是编码器的 GOP 决策，随源码流
+ * 被解析后丢弃）。解决办法不是去还原编码器的选择，而是自己维护一套
+ * **自洽**的槽位分配：我说本帧存进槽 k，之后引用它时就报槽 k。
+ * 解码器只要求两者一致，不要求与原编码器相同。
+ *
+ * 由调用方（每个解码 context）持有一份，跨帧保持。
+ * 新建 context 时整体清零即为初始状态。
+ */
+struct dmd_av1_dpb {
+    VASurfaceID dpb_shadow[8];   /* 槽 -> 该槽当前存的 surface id */
+    unsigned    dpb_next_slot;   /* 下一个要写入的槽，8 槽轮转 */
+};
+
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {
     const unsigned char *data;
@@ -117,7 +134,8 @@ struct dmd_av1_tile {
  * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
 size_t dmd_av1_build_frame(const void *pic,
                            const struct dmd_av1_tile *tiles, int num_tiles,
-                           unsigned char *out, size_t out_cap);
+                           unsigned char *out, size_t out_cap,
+                           struct dmd_av1_dpb *dpb);
 
 /* ------------------------------------------------------- 帧头合成（3/4） */
 
@@ -129,7 +147,8 @@ size_t dmd_av1_build_frame(const void *pic,
  *
  * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
 size_t dmd_av1_build_frame_header(const void *pic,
-                                  unsigned char *out, size_t out_cap);
+                                  unsigned char *out, size_t out_cap,
+                                  struct dmd_av1_dpb *dpb);
 
 /* obu_header() + obu_size（AV1 规范 5.3.1/5.3.2）。
  *

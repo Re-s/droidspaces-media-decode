@@ -21,6 +21,8 @@
 #include "dmd_client.h"
 #include "stubs.h"
 
+#include "av1_bitstream.h"
+
 /* 驱动版本，随 vendor 串一起被消费者看到。
  * 注意 ffmpeg 按 vendor 串匹配 vaapi_driver_quirks 名单；我们不在名单内，
  * 走 standard behaviour，即要求语义标准。 */
@@ -281,6 +283,12 @@ struct dmd_context {
     VADecPictureParameterBufferAV1 av1_pic_param;
     VASliceParameterBufferAV1 av1_tile_param[512];
     int    av1_tile_count;
+
+    /* AV1 自洽 DPB：refresh_frame_flags 与 ref_frame_idx 都由我们写入码流，
+     * 而 VA-API 不提供前者（那是编码器的 GOP 决策，随源码流被丢弃）。
+     * 故自己维护一套槽位分配，保证写入码流的两者互相自洽。
+     * 详见 av1_bitstream.h 的 struct dmd_av1_dpb 说明。 */
+    struct dmd_av1_dpb av1_dpb;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
