@@ -1767,6 +1767,39 @@ size_t dmd_av1_build_frame(const void *pic_v,
     return hdr + payload_len;
 }
 
+size_t dmd_av1_build_show_existing(unsigned char *buf, size_t cap,
+                                   unsigned map_idx)
+{
+    if (!buf || cap < 4)
+        return 0;
+
+    /* 载荷：show_existing_frame(1)=1、frame_to_show_map_idx(3)，
+     * 随后 trailing_bits（规范 5.3.4：先写一个 1，再零填充到字节边界）。
+     * 4 位有效数据 + 停止位 1 + 3 个 0 = 恰好 1 字节。 */
+    struct dmd_bitwriter bw;
+    unsigned char payload[2];
+    dmd_bw_init(&bw, payload, sizeof(payload));
+    dmd_bw_put_flag(&bw, 1);                 /* show_existing_frame */
+    dmd_bw_put_bits(&bw, map_idx & 7u, 3);   /* frame_to_show_map_idx */
+    dmd_av1_trailing_bits(&bw);
+    if (bw.overflow)
+        return 0;
+
+    const size_t plen = bw.byte_pos + (bw.bit_pos ? 1 : 0);
+
+    /* OBU 头：forbidden(1)=0 type(4)=3 extension(1)=0 has_size(1)=1
+     * reserved(1)=0 → (3 << 3) | 0x02 = 0x1a，与源码流实测一致。 */
+    size_t n = 0;
+    buf[n++] = (unsigned char)((DMD_OBU_FRAME_HEADER << 3) | 0x02);
+    /* leb128 的 obu_size；plen 恒为 1，单字节足够。 */
+    if (plen >= 0x80)
+        return 0;
+    buf[n++] = (unsigned char)plen;
+    for (size_t i = 0; i < plen; i++)
+        buf[n++] = payload[i];
+    return n;
+}
+
 void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,

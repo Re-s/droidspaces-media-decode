@@ -143,6 +143,24 @@ struct dmd_av1_dpb {
  * prev_frame_bytes 指向上一帧帧头所在的缓冲（调用方保存），
  * 该缓冲必须在本次调用时仍然有效且尚未送入解码器。
  */
+/* 合成一个 show_existing_frame 帧头 OBU（规范 5.9.2）。
+ *
+ * 硬件不输出 show_frame=0 的帧（符合规范），但会为每个 SEF 头复显一次。
+ * 源码流正是这么做的：150 个 OBU_FRAME 里只有 80 个 show_frame=1，
+ * 另外 70 帧靠 70 个 SEF 头复显，合计 150 帧输出。
+ * 实测源码流直喂硬件是"送 150 收 150"，而缺 SEF 头的合成流只收 80。
+ *
+ * 结构极简（实测源码流的 SEF 全是 2 字节）：
+ *     OBU 头 0x1a（type=3 FRAME_HEADER, has_size=1）
+ *     leb128 size = 1
+ *     载荷 1 字节：show_existing_frame(1)=1 + frame_to_show_map_idx(3)
+ *                  + trailing_bits
+ * 例：map_idx=6 → 载荷 0xe8；map_idx=5 → 0xd8；map_idx=3 → 0xb8。
+ *
+ * buf 至少 4 字节。返回写入长度，失败返回 0。 */
+size_t dmd_av1_build_show_existing(unsigned char *buf, size_t cap,
+                                   unsigned map_idx);
+
 void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
