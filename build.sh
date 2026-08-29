@@ -84,6 +84,7 @@ if [ "$USE_HOST_CLANG" = 0 ]; then
         -O2 -Wall -Wextra \
         -o "$OUT_DIR/decode-daemon" \
         "$REPO_DIR/src/decode-daemon.c" \
+        "$REPO_DIR/src/v4l2_backend.c" \
         -lmediandk -llog -landroid
 else
     SYSROOT="$TOOLCHAIN/sysroot"
@@ -98,10 +99,14 @@ else
     clang --target="${TARGET}${API}" --sysroot="$SYSROOT" \
         -c -O2 -Wall -Wextra -DNDEBUG -fPIE \
         -o "$OUT_DIR/decode-daemon.o" "$REPO_DIR/src/decode-daemon.c"
+    clang --target="${TARGET}${API}" --sysroot="$SYSROOT" \
+        -c -O2 -Wall -Wextra -DNDEBUG -fPIE \
+        -o "$OUT_DIR/v4l2_backend.o" "$REPO_DIR/src/v4l2_backend.c"
     "$LD" -pie --sysroot="$SYSROOT" -L"$LIBDIR" \
         -dynamic-linker /system/bin/linker64 \
         -o "$OUT_DIR/decode-daemon" \
         "$LIBDIR/crtbegin_dynamic.o" "$OUT_DIR/decode-daemon.o" \
+        "$OUT_DIR/v4l2_backend.o" \
         -lmediandk -llog -landroid -lc -lm -ldl \
         "$RTDIR/libclang_rt.builtins-aarch64-android.a" \
         "$LIBDIR/crtend_android.o"

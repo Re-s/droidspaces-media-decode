@@ -44,6 +44,8 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 
+#include "v4l2_backend.h"
+
 #define MAX_FRAME          (8*1024*1024)
 /* 目录模式下的 socket 文件名。驱动侧的 DMD_DEFAULT_SOCK 必须与此一致。 */
 #define DAEMON_SOCK_NAME "decode.sock"
@@ -426,6 +428,10 @@ typedef struct {
      * SPS+PPS 量级很小，256 字节足够（实测 1080p 为 31+9）。 */
     uint8_t          csd_keep[256];
     size_t           csd_keep_len;
+
+    /* V4L2 直通后端。非 NULL 表示本会话走 V4L2 而非 MediaCodec。
+     * 指向 run_session_v4l2 栈上的对象，生命周期覆盖两个工作线程。 */
+    struct dmd_v4l2_dec *v4l2;
 } Session;
 
 /*
@@ -1222,6 +1228,240 @@ static void *output_thread(void *arg)
     return NULL;
 }
 
+/* ==================================================================== */
+/*                          V4L2 直通会话                                */
+/* ==================================================================== */
+/*
+ * 为什么另写一套而不在原线程里插分支：MediaCodec 的调用面有 30 多处
+ * （dequeue/get/queue/release/flush/getOutputFormat…），逐点分支会把两套
+ * 生命周期语义搅在一起。V4L2 是完全不同的模型 —— 显式 DMABUF、两阶段
+ * 分辨率协商、poll 驱动的事件流。分开写，各自清晰。
+ *
+ * 复用的部分：握手、线路协议、SHM 传输、格式描述块、PTS 配对规则
+ * 全部与 MediaCodec 路径共用同一套函数，所以客户端（VA-API 驱动）
+ * 完全不需要知道 daemon 内部走的是哪个后端。
+ */
+
+/* 把 V4L2 协商出的几何信息写进 Session，供 send_format_desc 使用。 */
+static void v4l2_publish_format(Session *s, struct dmd_v4l2_dec *d)
+{
+    s->w = d->crop_w > 0 ? d->crop_w : d->w;
+    s->h = d->crop_h > 0 ? d->crop_h : d->h;
+    s->stride = d->stride;
+    s->slice_height = d->slice_height;
+    /* V4L2 的 G_SELECTION 已经给出有效区域，等价于 MediaCodec 的
+     * display crop。这里换算成同样的 l/t/r/b 表示（右下为闭区间）。 */
+    s->crop_l = 0;
+    s->crop_t = 0;
+    s->crop_r = s->w - 1;
+    s->crop_b = s->h - 1;
+}
+
+/*
+ * V4L2 output 线程：poll 收帧，按现有协议回传。
+ *
+ * 与 MediaCodec 版的关键差异：分辨率协商由 recv 内部完成（首次
+ * SOURCE_CHANGE），所以格式描述块要在拿到第一帧之前、cap_ready 变 1
+ * 之后立刻发。
+ */
+static void *v4l2_output_thread(void *arg)
+{
+    Session *s = arg;
+    struct dmd_v4l2_dec *d = s->v4l2;
+    int published = 0;
+
+    while (!s->stop) {
+        uint8_t *fdata = NULL;
+        size_t flen = 0;
+        uint64_t fpts = 0;
+        int fidx = -1;
+
+        int r = dmd_v4l2_recv(d, &fdata, &flen, &fpts, &fidx, 200);
+
+        /* 协商一完成就发格式描述块：客户端必须先拿到几何信息再收帧。 */
+        if (!published && d->cap_ready) {
+            v4l2_publish_format(s, d);
+            if (send_format_desc(s) == 0) {
+                published = 1;
+                s->fmt_changes++;
+                dlog(1, "[%d] V4L2 格式: %dx%d stride=%d slice=%d",
+                     s->id, s->w, s->h, s->stride, s->slice_height);
+            }
+        }
+
+        if (r < 0) {
+            dlog(0, "[%d] V4L2 收帧出错", s->id);
+            break;
+        }
+        if (r == 2) {                     /* EOS */
+            dlog(2, "[%d] V4L2 收到 EOS", s->id);
+            if (s->drain_req != s->drain_done)
+                s->drain_done = s->drain_req;
+            if (s->input_done) break;
+            continue;
+        }
+        if (r == 0) {                     /* 超时无帧 */
+            if (s->input_done && d->draining) {
+                /* 排空已请求且再无帧到达，收尾。 */
+                static int idle = 0;
+                if (++idle > 25) break;   /* 25 × 200ms = 5s */
+            }
+            continue;
+        }
+
+        /* r == 1：拿到一帧 */
+        if (flen == 0 || !fdata) {
+            dmd_v4l2_release(d, fidx);
+            continue;
+        }
+
+        /* PTS 语义与 MediaCodec 路径完全一致：送料时写入的是
+         * vcl_in * PTS_UNIT_SCALE 微秒，这里除回去得到输入单元序号，
+         * 驱动据此精确配对 surface。 */
+        uint32_t tag = (uint32_t)(fpts / PTS_UNIT_SCALE);
+
+        int rc;
+        if (s->xfer == XFER_SHM) {
+            rc = send_frame_shm(s, fdata, flen, tag);
+        } else {
+            uint32_t hdr[4] = {
+                htonl((uint32_t)s->w),
+                htonl((uint32_t)s->h),
+                htonl((uint32_t)flen),
+                htonl(tag)
+            };
+            rc = send_all(s->fd, hdr, sizeof(hdr));
+            size_t off = 0, rem = flen;
+            while (rc == 0 && rem > 0) {
+                size_t ch = rem > SEND_CHUNK ? SEND_CHUNK : rem;
+                rc = send_all(s->fd, fdata + off, ch);
+                if (rc != 0) break;
+                off += ch; rem -= ch;
+            }
+        }
+
+        /* 帧数据已拷走（SHM 槽或 socket），可以立刻还给驱动。 */
+        dmd_v4l2_release(d, fidx);
+
+        if (rc == SEND_PEER_GONE) {
+            s->frames_dropped_at_exit++;
+            s->peer_gone = 1;
+            s->stop = 1;
+            break;
+        }
+        if (rc != 0) {
+            dlog(0, "[%d] V4L2 发送帧失败", s->id);
+            s->stop = 1;
+            break;
+        }
+        s->frames_out++;
+    }
+
+    s->stop = 1;
+    return NULL;
+}
+
+/*
+ * V4L2 input 线程：读线路上的访问单元，喂给 V4L2。
+ *
+ * 与 MediaCodec 版的差异：
+ * - 背压表现为 send 返回 1，此时让出 CPU 重试（output 线程取走帧后
+ *   输入缓冲会被回收）。语义与那边"输入缓冲暂满必须重试、绝不丢单元"
+ *   完全一致 —— 丢任何一个单元都会毁掉参考帧链。
+ * - 长度 0 是带内排空请求，转成 DECODER_CMD(STOP)。
+ */
+static void *v4l2_input_thread(void *arg)
+{
+    Session *s = arg;
+    struct dmd_v4l2_dec *d = s->v4l2;
+    uint8_t *buf = malloc(MAX_FRAME);
+    if (!buf) { s->stop = 1; s->input_done = 1; return NULL; }
+
+    while (!s->stop) {
+        uint32_t nlen;
+        if (recv_all(s->fd, &nlen, 4) != 0) break;
+        uint32_t sz = ntohl(nlen);
+
+        if (sz == 0) {
+            /* 带内排空请求。V4L2 的 DECODER_CMD(STOP) 会让驱动吐完
+             * 流水线里的帧并给出 LAST 标记，output 线程据此推进
+             * drain_done。 */
+            s->drain_req++;
+            dmd_v4l2_drain(d);
+            dlog(2, "[%d] V4L2 排空请求 #%d", s->id, (int)s->drain_req);
+            continue;
+        }
+        if (sz > MAX_FRAME) {
+            dlog(0, "[%d] 单元过大: %u", s->id, sz);
+            break;
+        }
+        if (recv_all(s->fd, buf, sz) != 0) break;
+
+        s->nalu_in++;
+        s->vcl_in++;
+
+        /* 送料：返回 1 表示无空闲输入缓冲，属背压，必须重试而非丢弃。 */
+        int tries = 0;
+        for (;;) {
+            int r = dmd_v4l2_send(d, buf, sz,
+                                  (uint64_t)s->vcl_in * PTS_UNIT_SCALE);
+            if (r == 0) break;
+            if (r < 0) { dlog(0, "[%d] V4L2 送料失败", s->id); goto done; }
+            if (s->stop) goto done;
+            /* 背压：等 output 线程回收缓冲。5ms × 2000 = 10s 上限，
+             * 足够覆盖任何正常背压（Chrome 会一次投数百个请求）。 */
+            if (++tries > 2000) {
+                dlog(1, "[%d] V4L2 输入缓冲持续不可用，放弃", s->id);
+                goto done;
+            }
+            usleep(5000);
+        }
+    }
+
+done:
+    free(buf);
+    s->input_done = 1;
+    /* 告知驱动没有更多数据，逼出流水线尾帧。 */
+    dmd_v4l2_drain(d);
+    return NULL;
+}
+
+/*
+ * V4L2 会话主流程。返回 0 表示已按 V4L2 路径处理完毕，
+ * -1 表示该 codec 走不了 V4L2（调用方可回退或直接失败）。
+ */
+static int run_session_v4l2(Session *s)
+{
+    struct dmd_v4l2_dec dec;
+
+    if (dmd_v4l2_open(&dec, s->codec_id, s->w, s->h) < 0) {
+        dlog(0, "[%d] V4L2 打开失败 (codec_id=%d)", s->id, s->codec_id);
+        return -1;
+    }
+    s->v4l2 = &dec;
+
+    pthread_t tin, tout;
+    int have_in = (pthread_create(&tin, NULL, v4l2_input_thread, s) == 0);
+    if (!have_in) { dlog(0, "[%d] 无法创建 V4L2 input 线程", s->id); s->stop = 1; }
+    int have_out = (pthread_create(&tout, NULL, v4l2_output_thread, s) == 0);
+    if (!have_out) { dlog(0, "[%d] 无法创建 V4L2 output 线程", s->id); s->stop = 1; }
+
+    if (have_in)  pthread_join(tin, NULL);
+    if (have_out) pthread_join(tout, NULL);
+
+    if (s->peer_gone)
+        dlog(1, "[%d] V4L2 会话结束(客户端正常关闭): 收到 %ld 单元, "
+                "回传 %ld 帧, 尾帧 %ld 未发送",
+             s->id, s->nalu_in, s->frames_out, s->frames_dropped_at_exit);
+    else
+        dlog(1, "[%d] V4L2 会话结束: 收到 %ld 单元, 回传 %ld 帧",
+             s->id, s->nalu_in, s->frames_out);
+
+    dmd_v4l2_close(&dec);
+    s->v4l2 = NULL;
+    return 0;
+}
+
 /* ------------------------------------------------------- 并发客户端计数 */
 static int client_count = 0;
 static pthread_mutex_t count_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1242,6 +1482,18 @@ static void *session_thread(void *arg)
 
     /* 握手必须在配置解码器之前完成：它决定 mime 与初始分辨率 */
     if (do_handshake(s) < 0) goto out_fd;
+
+    /* 后端选择。V4L2 直通是首选 —— 它绕开 Codec2，AV1 只有这条路能走
+     * （c2.qti.av1.decoder 在组件创建阶段就失败），H264/HEVC/VP9 走它也
+     * 省掉 binder 往返。probe 只做 ENUM_FMT，代价极低。
+     *
+     * VP8 没有 V4L2 格式（msm_vidc 不支持），probe 会返回 0。 */
+    if (dmd_v4l2_probe(s->codec_id)) {
+        dlog(1, "[%d] 走 V4L2 直通后端 (codec_id=%d)", s->id, s->codec_id);
+        if (run_session_v4l2(s) == 0)
+            goto out_fd;
+        dlog(0, "[%d] V4L2 路径失败，回退 MediaCodec", s->id);
+    }
 
     AMediaFormat *fmt = AMediaFormat_new();
     if (!fmt) { dlog(0, "[%d] AMediaFormat_new 失败", s->id); goto out_fd; }

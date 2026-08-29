@@ -32,7 +32,8 @@ LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
-           $(SRCDIR)/dmd_client.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
+           $(SRCDIR)/dmd_v4l2_session.c \
+          $(SRCDIR)/v4l2_backend.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
            $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c \
            $(SRCDIR)/av1_bitstream.c
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
@@ -42,7 +43,8 @@ DEPS    := $(OBJECTS:.o=.d)
 # 它只链 dmd_client.c，不碰 libva，也不需要 driver 的其余部分。
 TESTDIR   := tests
 TESTBIN   := $(BUILD)/test_dmd_client
-TEST_SRCS := $(TESTDIR)/test_dmd_client.c $(SRCDIR)/dmd_client.c
+TEST_SRCS := $(TESTDIR)/test_dmd_client.c $(SRCDIR)/dmd_v4l2_session.c \
+          $(SRCDIR)/v4l2_backend.c
 # 裸协议探针：不链客户端库，独立验证 daemon 的 SHM 降级行为
 PROBEBIN  := $(BUILD)/probe_shm_fallback
 

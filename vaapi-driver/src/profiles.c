@@ -32,6 +32,7 @@ static const VAProfile dmd_profiles[] = {
     VAProfileH264High,
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
+    VAProfileAV1Profile0,
     VAProfileVP8Version0_3,
 };
 
