@@ -37,7 +37,7 @@ Android MediaCodec 硬件解码代理服务，为 Linux 容器提供视频硬解
   `DMD_WANT_SHM=0` 可显式关闭；非 Unix socket（TCP）模式恒为内联 —— memfd 交接
   走另开的 abstract socket，属 net namespace，**NAT 型容器必然降级**。
   这条路已在真实消费者环境端到端实测通过（驱动被 `dlopen` 进 ffmpeg、走
-  `/run/dmd/decode.sock`，daemon 日志确认 `共享内存已交接: 4 槽 x 3133440 字节`
+  `/run/dmd/decode.sock`，daemon 日志确认 `共享内存已交接: 8 槽 x 3133440 字节`
   与 `握手成功: video/hevc 1280x720 帧回传=SHM`，解码结果与内联一致 150/150 帧，
   daemon CPU 降低约 19%）。daemon 侧交接失败会自动退回内联，开启无硬失败风险。
   浏览器沙箱收 `SCM_RIGHTS` 已真机实测可行：Firefox RDD 与 Chrome GPU 进程
@@ -158,6 +158,37 @@ DroidSpaces 自己的显示通道就是这个模式：宿主
 > "143 帧 ÷ 5 秒内容时长"当成实时播放帧率，真实只有 6.4 fps。
 详见 [性能实测与优化路线](doc/performance-and-roadmap.md)。
 
+### 能效口径：硬解不省电，价值在并发
+
+文档别处说的"加速"只指吞吐，**不代表省电或省 CPU**。系统级口径实测
+（宿主 `/proc/stat`，真实内容 High profile 27.2 Mbps，满速 300 帧）：
+
+| 口径 | 硬解 | 软解 | 差异 |
+|------|------|------|------|
+| 系统 CPU 时间 | 57.70 ms/帧 | 57.40 ms/帧 | +0.5%，在噪声内 |
+| 墙钟 | 3557 ms | 2366 ms | 硬解**慢 50%** |
+
+整机功耗（屏幕开，放电状态）：空闲 1208 mA / 4.59 W / 43% CPU，
+软解 1524 mA / 5.74 W / 52%，硬解 **1630 mA / 6.12 W / 68%**。
+
+**结论：单路硬解不省电、不省系统级 CPU。** 三个原因：
+
+1. 调速器不因硬解降频 —— prime 核 2841 MHz residency 硬解反而更高；
+2. 负载摊到 CPU + Venus + socket 唤醒 —— irq+softirq 是软解的 5 倍；
+3. daemon 那约 4.4 ms/帧落在宿主账上，不在容器进程里。
+
+**硬解的真实价值是并发**：4K 单路 2.46x 实时；3 路 1080p 各 2.99/3.05/2.72x
+（合计 8.76x）；6 路 1080p 各 1.35~1.61x，全部 >1x（合计 8.75x）。
+3 路与 6 路合计相同，说明 **8.8x 是 Venus 硬件吞吐上限，会话数不是瓶颈**。
+且与 Android 侧 MediaCodec **不互斥**：占住 `/dev/video32` 并 STREAMON 25 秒期间，
+对侧 MediaCodec 照常 6.89x 解完 300 帧。
+
+> ⚠️ 两个**不可引用**的错口径数字，见到请直接丢弃：
+> - 进程级口径的硬解 7.90 ms/帧 vs 软解 35.63 ms/帧 —— 看着像省 78%，
+>   但它只统计容器进程，把 daemon 与内核的开销漏在账外；
+> - 合成 testsrc 码流（0.16 Mbps）的硬解 36.77 / 软解 19.80 ms/帧 ——
+>   码率太低，不代表真实内容。
+
 ### 通信协议
 
 - **输入格式**：`[4字节 NALU 长度 (大端)][NALU 数据]`，NALU 需带起始码（3 字节 `00 00 01` 或 4 字节 `00 00 00 01` 均可）
@@ -170,7 +201,8 @@ DroidSpaces 自己的显示通道就是这个模式：宿主
     旧 daemon 不发，客户端按 3 字段解析。
   - 共享内存模式对应地在 `[槽位][长度]` 之后多一个同义字段。
 - **最大单元大小 8MB 只约束上行**：`MAX_FRAME` 仅用于校验客户端送来的数据单元
-  （`src/decode-daemon.c:579` 的 `sz > MAX_FRAME`），**下行帧大小没有任何上限检查**。
+  （`src/decode-daemon.c` 里 `MAX_FRAME` 的校验处，`sz > MAX_FRAME`），
+  **下行帧大小没有任何上限检查**。
   客户端不要拿 8MB 去校验下行 —— 4K NV12 单帧 12441600 字节就已超过它，
   照 8MB 判定会把正常的 4K 流误判成协议错误。
 - **格式描述块的能力位**：块头第 2 个字（原为保留的 0）声明 daemon 能力，
@@ -261,10 +293,12 @@ TCP 模式每帧要经过两次内核拷贝（发送进 socket 缓冲、接收�
 驱动在走 Unix socket 时默认请求 SHM，`DMD_WANT_SHM=0` 可显式关闭；
 TCP 模式恒为内联（memfd 交接走 abstract socket，属 net namespace）。
 
-SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
+SHM 模式把帧数据放进 `memfd`，socket 只传 24 字节控制消息
+（`src/decode-daemon.c` 的 `uint32_t msg[6]`，6 个 32 位字：
+`[宽][高][SHM 哨兵][槽位][长度][PTS]`）：
 
 ```
-[4B 宽][4B 高][4B 0xFFFFFFFE][4B 槽位号][4B 数据长度]
+[4B 宽][4B 高][4B 0xFFFFFFFE][4B 槽位号][4B 数据长度][4B 输入单元序号(PTS)]
 ```
 
 握手响应里的名字是一个 **abstract socket**（形如 `dmd-shm-<pid>-<会话id>`），
@@ -281,21 +315,29 @@ SHM 模式把帧数据放进 `memfd`，socket 只传 20 字节控制消息：
 池布局与归还协议：
 
 ```
-[控制区 4096 字节][槽位 0][槽位 1][槽位 2][槽位 3]
+[控制区 4096 字节][槽位 0][槽位 1][槽位 2]…[槽位 6][槽位 7]
 ```
 
 控制区开头每个槽位一个 32 位状态字。daemon 写完数据置 1，
-**客户端处理完必须置 0 归还**，否则池耗尽后 daemon 等约 1 秒判定客户端卡死并结束会话。
+**客户端处理完必须置 0 归还**，否则池耗尽后 daemon 最多等 15 秒
+（`SHM_SLOT_WAIT_MS`）才判定客户端卡死并结束会话。
 归还走共享内存而非 socket，不与上行 NALU 流交织。
 
-两个超时不要混淆：**槽位等待约 1 秒**（客户端不归还），
+**池满时 daemon 等待是正常背压，不是故障。** 等待期间每 2000 次自旋打一条
+level 2 日志 `槽位全忙，已等 N ms（客户端消费慢，正常背压）`，
+只有真的等满 15 秒才结束会话。这个上限**必须大于客户端的
+`DMD_FRAME_TIMEOUT_MS`（5000 ms）**：旧版本硬编码 1000 ms，比客户端的等待意愿还短，
+daemon 会在客户端仍在等的时候先放弃并杀掉会话 —— 4K 加慢消费者场景 10/10 丢帧
+（300 帧只拿到 238 帧）。v0.3.7 起改为 15000 ms。
+
+两个超时不要混淆：**槽位等待最多 15 秒**（客户端不归还），
 **memfd 交接等待 3 秒**（客户端拿到名字后不来 connect，实测降级发生在 3.0~3.5 s）。
 
 槽位按 **adaptive-playback 上限**（`max(声明宽,1920) × max(声明高,1088)`）计算，
 而不是按握手声明的实际分辨率。原因：只按当前分辨率开槽时，
 流中途分辨率变大（480p→720p）会超出槽位，SHM 会话被迫终止 ——
 同一码流 TCP 解满 120 帧、SHM 只有 60 帧，是实测到的功能退化。
-代价是 720p 流也按 1080p 占池（4 × 3133440 ≈ 12 MB），用内存换正确性。
+代价是 720p 流也按 1080p 占池（8 × 3133440 ≈ 24 MB），用内存换正确性。
 
 仍存在的边界：分辨率超过 adaptive-playback 声明的上限时依然会终止会话
 （报 `帧 N 字节超出槽位 M，需重建池`），但不会越界写、不影响其他会话。
@@ -358,7 +400,7 @@ stride 与 crop，否则后续帧会整体错位。
 
 ### 环境要求
 
-- Android NDK r27c 或更高版本
+- Android NDK r26d 或更高版本（CI 使用 r26d 验证；r27c 亦可）
 - 支持 ARM64 架构的编译环境
 - Android API Level 21+ (MediaCodec NDK 支持)
 
@@ -366,10 +408,10 @@ stride 与 crop，否则后续帧会整体错位。
 
 1. **设置 NDK 环境**
    ```bash
-   # 下载 Android NDK r27c
+   # 下载 Android NDK r26d 或更高
    # https://developer.android.com/ndk/downloads
    
-   export NDK=/path/to/android-ndk-r27c
+   export NDK=/path/to/android-ndk-r26d
    export TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
    export TARGET=aarch64-linux-android
    export API=21
@@ -403,6 +445,21 @@ API=29 ./build.sh                    # 覆盖目标 API level
 ```
 
 产物为 `build/decode-daemon`（aarch64 PIE 可执行文件）。
+
+### 在 ARM64 主机上构建（`USE_HOST_CLANG` 回退）
+
+Google 只发布 x86_64 主机版 NDK，所以在 aarch64 主机上 NDK 自带的 clang
+根本跑不起来。`build.sh` 为此提供 `USE_HOST_CLANG` 回退路径：用系统 clang
+配 NDK sysroot 编译，再用 `aarch64-linux-gnu-ld` 链接。
+
+```bash
+USE_HOST_CLANG=1 ./build.sh
+```
+
+NDK sysroot 本身是纯数据（头文件与 `.so` stub），换编译器照样能用。
+**编译与链接必须分成两步**（`clang -c` 出目标文件，再单独 `ld`）：
+clang 19 在自己驱动链接时会去找它自带的 `libclang_rt.builtins`，
+在这条组合路径下找不到，直接调用 `aarch64-linux-gnu-ld` 可以绕开。
 
 ## 部署：由 DroidSpace 平台托管
 
@@ -516,7 +573,7 @@ RESULT: 20 frames decoded from /root/decode-test/test1080.h264
 
 注意两处容易误解的地方：
 
-- **输出是 1920x1088，不是 1920x1080**。高通 Venus 解码器的高度按 16 对齐，每帧 `1920*1088*1.5 = 3133440` 字节 NV12。客户端必须以返回的 w/h 为准，按实际显示尺寸裁剪。
+- **输出是 1920x1088，不是 1920x1080**。高通 Venus 解码器的高度按 32 对齐（`DMD_HEIGHT_ALIGN`，宽按 128），每帧 `1920*1088*1.5 = 3133440` 字节 NV12。客户端必须以返回的 w/h 为准，按实际显示尺寸裁剪。
 - **发送的 NALU 数与收到的帧数不相等**。解码器有排队与重排序延迟，且 SPS/PPS 不产出帧；客户端发完需 `shutdown(SHUT_WR)` 触发 flush 才能取全剩余帧。
 
 详见 [平台实测事实](doc/verified-platform-facts.md)。

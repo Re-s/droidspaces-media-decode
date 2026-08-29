@@ -3,11 +3,13 @@
 本文只记录**在真机上实测确认**的事实，用于替代文档中的推测性描述。
 每条都标注取证方式。未经验证的内容不写入本文。
 
-- 测试设备：小米平板 5（代号 `nabu`），骁龙 865（SM8150 / Adreno 640）
+- 测试设备：小米平板 5（代号 `nabu`），骁龙 855（SM8150 / Adreno 640）
 - Android 13（SDK 33），内核 `4.14.336-Kuugo-v1.0-260728`，aarch64
 - Root：KernelSU `ksud 3.3.0`，daemon 运行于 SELinux context `u:r:ksu:s0`
 - 容器：DroidSpaces 内的 Debian 13 (trixie) aarch64
-- 验证日期：2026-08-22（§1.4 的 SHM 部分为 2026-08-26 复测更新）
+- 验证日期：主体 2026-08-22；§1.4 的 SHM 部分为 2026-08-26 复测更新；
+  §1.1.5、§6.5、§9 为后续追加，各节在小节内单独标注验证日期，
+  不受本行日期覆盖
 
 ---
 
@@ -30,10 +32,10 @@
 | `127.0.0.1:20003` 连宿主 | 可达 | **不可达** |
 | abstract socket 可见数 | 31（与宿主一致） | **0** |
 | mnt / pid / uts / ipc / cgroup | 均独立 | 均独立 |
+| `/dev/dri/renderD128` | 有 | 需平台透传（可配置） |
 
 > **pid ns 独立 ≠ 互不可见**：宿主能看到容器进程，反之不行。
 > 这是宿主侧监控方案成立的根据，详见 §1.1.5。
-| `/dev/dri/renderD128` | 有 | 需平台透传（可配置） |
 
 宿主侧 `ds-br0`（`172.28.0.1/16`）加 veth 对承载 NAT 型容器的网络，
 桥本身在宿主 netns 上，所以 NAT 容器能经网关访问宿主服务 ——
@@ -138,7 +140,7 @@ cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
 `/run/dmd/decode.sock`），daemon 日志：
 
 ```
-[167] 共享内存已交接: 4 槽 x 3133440 字节 (共 12537856)
+[167] 共享内存已交接: 8 槽 x 3133440 字节 (共 25067520)
 [167] 握手成功: video/hevc 1280x720 帧回传=SHM
 ```
 
@@ -171,6 +173,9 @@ cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
 
 实测这次拷贝：3133440 字节单帧 **0.227 ms**（13137 MB/s，300 次测量、
 预热 30 次），按 1080p 峰值 194 fps 折算约占 **4.4% 的单核 CPU**。
+其中 194 fps 是 **TCP 内联模式的峰值口径**（与
+`doc/performance-and-roadmap.md:256-264` 的勘误一致），不是 SHM 模式或
+真实高码率内容的稳定帧率，折算结果只作上界参考。
 要消除它必须拿到输出缓冲的 dmabuf fd，而 NDK 公开 API 没有这个入口
 （`AHardwareBuffer_lock` 只返回 CPU 指针，`sendHandleToUnixSocket`
 实测跨容器不可用），只能依赖 `libui` / gralloc 私有符号，绑死特定
@@ -258,7 +263,7 @@ RESULT: 20 frames decoded from /root/decode-test/test1080.h264
 
 输入 1920x1080 的 H.264 流，解码器返回 **1920x1088**，每帧 `3133440` 字节（= 1920 × 1088 × 1.5，NV12）。
 
-高度按 16 对齐是高通 Venus 解码器的规范行为，设备自身的 `/vendor/etc/media_codecs.xml` 里也直接以 `1920x1088` 作为性能点标注：
+高度按 32 对齐（宽按 128 对齐）是高通 Venus 解码器的规范行为，设备自身的 `/vendor/etc/media_codecs.xml` 里也直接以 `1920x1088` 作为性能点标注：
 
 ```xml
 <Limit name="performance-point-1920x1088" range="480" />
@@ -299,7 +304,8 @@ H.264 / HEVC 解码器规格（两者一致）：
 - 分辨率：`96x96` 至 `8192x4320`
 - 帧率上限：480fps；性能点 3840x2160@120、4096x2304@60
 - 码率上限：220 Mbps
-- 并发实例：最多 16
+- 并发实例：最多 16 —— 但**会话数不是瓶颈**，实测 3 路与 6 路 1080p 的
+  总吞吐都停在约 8.8x（Venus 硬件吞吐上限，详见 §9）
 - 支持 `adaptive-playback`（流内动态分辨率切换）
 
 结论：**扩展 HEVC/VP9 支持不受硬件限制**，仅是服务端 MIME 配置与客户端协议协商的工作量。
@@ -312,15 +318,78 @@ H.264 / HEVC 解码器规格（两者一致）：
 |------|--------|------|------|
 | `/dev/video0`、`video1` | — | — | 打开返回 `EBUSY`，已被占用 |
 | `/dev/video2` | `sde_rotator` | `sde_rotator` | 显示旋转器，非编解码 |
-| `/dev/video32` | `msm_vidc_driver` | `msm_vidc_vdec` | **解码器**，caps `0x84203000` |
+| `/dev/video32` | `msm_vidc_driver` | `msm_vidc_vdec` | **解码器**，`capabilities` `0x84203000` / `device_caps` `0x04203000` |
 | `/dev/video33` | `msm_vidc_driver` | `msm_vidc_venc` | 编码器 |
 | `/dev/video34` | — | — | `VIDIOC_QUERYCAP` 返回 `EINVAL` |
 
-节点存在不等于可用，实测结论见 `doc/` 下 V4L2 可行性报告。
+`/dev/video32` 的 caps 位含义（两个数值自洽，差的就是
+`V4L2_CAP_DEVICE_CAPS` = `0x80000000`：它只出现在 `capabilities` 里，
+表示 `device_caps` 字段有效）：
+
+| 位 | 宏 | 出现在 |
+|---|---|---|
+| `0x80000000` | `V4L2_CAP_DEVICE_CAPS` | 仅 `capabilities` |
+| `0x04000000` | `V4L2_CAP_STREAMING` | 两者 |
+| `0x00200000` | `V4L2_CAP_VIDEO_CAPTURE_MPLANE` | 两者 |
+| `0x00002000` | `V4L2_CAP_VIDEO_OUTPUT_MPLANE` | 两者 |
+| `0x00001000` | `V4L2_CAP_EXT_PIX_FORMAT` | 两者 |
+
+**关键含义**：既没有 `V4L2_CAP_VIDEO_M2M_MPLANE`（`0x4000`）也没有
+`V4L2_CAP_VIDEO_M2M`（`0x8000`）—— 它把解码器暴露成一对独立的
+capture / output mplane 队列，而不是一个 mem2mem 设备，属于
+**pre-M2M 时代的 downstream 实现**。因此依赖 `V4L2_CAP_VIDEO_M2M*`
+探测 m2m 解码器的通用用户态（含部分 ffmpeg / GStreamer 路径）
+会直接认不出这个节点。
+
+节点存在不等于可用。**容器内直接走 V4L2 喂码流会"成功但无解码"，
+根因已由设备真实内核源码（`MiCode/Xiaomi_Kernel_OpenSource` 分支
+`nabu-r-oss`）定位到状态机而非权限**：
+
+```c
+// msm_vidc_common.c:4444  msm_comm_qbuf()
+if (inst->state != MSM_VIDC_START_DONE) {
+    mbuf->flags |= MSM_VIDC_FLAG_DEFERRED;
+    print_vidc_buffer(VIDC_DBG, "qbuf deferred", inst, mbuf);
+    return 0;                    /* 静默丢弃却报成功 */
+}
+```
+
+即会话状态机未达到 `MSM_VIDC_START_DONE` 时，入队缓冲被打上
+`MSM_VIDC_FLAG_DEFERRED` 后丢弃，而 `msm_comm_qbuf()` 仍返回 0（成功）；
+唯一的提示走 `VIDC_DBG` 级别日志，默认关闭 —— 所以用户态看到的是
+"每次 `VIDIOC_QBUF` 都成功、但一帧也出不来"。
+
+分阶段 IRQ 实测与此吻合（每阶段 20 秒，vidc IRQ 号 510）：
+
+| 阶段 | 净增 IRQ/s |
+|---|---|
+| 空闲基线 | 4.30（基线本身） |
+| `open` / `S_FMT` / `REQBUFS` | 0 |
+| 双队列 `STREAMON` | **+1.55** |
+| 喂 199KB 码流 | **+1.65**（只比上一阶段多 0.10，落在噪声内） |
+| 对照：MediaCodec 真解码 | **+6.20** |
+
+`STREAMON` 让固件动了一点，而**喂数据对固件毫无贡献** —— 码流从未到达固件。
+
+**归因边界（重要）**：通读
+`msm_vidc_streamon → vb2_streamon → msm_vidc_start_streaming →
+start_streaming → msm_comm_try_state(START_DONE)` 整条链，源码中
+**不存在任何 uid / pid / pid namespace / SELinux / TrustZone 判断**。
+因此"权限限制""vendor 独占""TrustZone 授权"这类归因都是错的
+（`doc/why-not-v4l2.md` 里 TrustZone / `subsys-pil-tz` /
+pid namespace 隐式依赖的说法已被上述源码证伪，勿再引用）。
+SELinux 也已实测排除：宿主 root `u:r:ksu:s0` 与容器
+`u:r:droidspacesd:s0` 表现完全一致，无 avc denial。
 
 其他相关设备节点：`/dev/ion`、`/dev/kgsl-3d0`、`/dev/binder`、`/dev/hwbinder`、`/dev/vndbinder`、`/dev/ashmem` 均存在；**`/dev/dma_heap` 不存在**（内核 4.14 时代仍用旧式 ION 分配器）。
 
-容器内 `vainfo` 无法初始化（缺 display，且 `msm_drm_drv_video.so` 打不开）——VA-API 路径当前不通。
+容器内 `vainfo` 无法加载**厂商的** `msm_drm_drv_video.so`（缺 display，
+且该 so 打不开）——**厂商 VA-API 驱动这条路径不通**。
+
+但这不等于 VA-API 整条路径不通：**本项目的自制 VA-API 驱动已走通该路径**
+（同名 `msm_drm_drv_video.so`，自行实现，把请求代理给 Android 侧
+MediaCodec），容器内 `vainfo` 可正常报出驱动版本与 6 个 VLD profile，
+验收项见 `doc/platform-integration-contract.md:425`。
 
 ## 6.5 `msm_vidc` 中断计数可作帧级硬解证据（外部无侵入判据）
 
@@ -344,6 +413,12 @@ H.264 / HEVC 解码器规格（两者一致）：
 | 1080p | 607 | 2.02 | 110 | 6 |
 | 4K | 611 | 2.04 | **37** | 21 |
 | 看护探活（新探针，5 帧） | 23~30 | — | 30 | **1** |
+
+**本表的码流参数（profile / 码率）未记录**，只能确定是 H.264 yuv420p。
+它的耗时量级与 2026-08-28 真实内容基线（High profile、27.2 Mbps，
+1080p 硬解 **57.70 ms/帧**，见 §9）相差约 10 倍，说明标定用的极可能是
+低码率合成或轻量码流。因此**本表只用于判据形态（IRQ/帧 恒定、连续性
+优于幅度），不可当作性能基准或适用性依据**。
 
 两条结论：
 
@@ -381,7 +456,17 @@ codec 实例创建/销毁**，与帧无关 —— 一度让人以为"IRQ 只反�
 
 ## 7. 服务端稳定性
 
-跨 3 次客户端连接后：`VmRSS 42488 kB`、`Threads 2`、打开的 fd 数 10。无泄漏迹象。会话断开后能正确重新 `accept`，服务端不退出。
+跨 3 次客户端连接后，**在最后一个会话结束、进程回到静止态时采样**：
+`VmRSS 42488 kB`、`Threads 2`、打开的 fd 数 10。会话断开后能正确重新
+`accept`，服务端不退出。
+
+两点限定，别过度解读这组数字：
+
+- **采样时刻必须是会话结束后的静止态**。会话进行中每路会话实际有
+  **3 个线程**（`src/decode-daemon.c:1291`、`:1293`、`:1675`），
+  所以 `Threads 2` / `fd 10` 只可能是静止态读数，不能拿来推断运行期占用。
+- 3 次连接的样本量支撑不起"无泄漏"的结论。准确表述是
+  **3 次连接未见 RSS / 线程 / fd 增长，样本量不足以断言无泄漏**。
 
 ## 8. 构建
 
@@ -391,4 +476,54 @@ codec 实例创建/销毁**，与帧无关 —— 一度让人以为"IRQ 只反�
 -lmediandk -llog -landroid
 ```
 
-`libmediandk` 同时提供 `AMediaCodec_*` 与 `AMediaFormat_*` 符号。使用 NDK r27c、API 29 交叉编译验证通过，产物为 aarch64 PIE 可执行文件。用 `./build.sh` 一键构建。
+`libmediandk` 同时提供 `AMediaCodec_*` 与 `AMediaFormat_*` 符号。CI 使用 NDK r26d、API 29 交叉编译验证通过（r27c 亦可），产物为 aarch64 PIE 可执行文件。用 `./build.sh` 一键构建。
+
+## 9. 能效实测：单路硬解不省电，价值在并发
+
+验证日期：2026-08-28。测试内容为**真实高码率片源**（H.264 High profile、
+27.2 Mbps、1080p），满速解 300 帧。
+
+### 9.1 单路：与软解打平，功耗更高
+
+系统级口径（宿主 `/proc/stat`，覆盖 daemon + Android codec 服务 + 容器侧消费者）：
+
+| 口径 | 硬解 | 软解 | 差异 |
+|---|---|---|---|
+| 每帧耗时 | **57.70 ms** | 57.40 ms | 0.5%，在噪声内 |
+| 墙钟总时长 | 3557 ms | 2366 ms | 硬解**慢 50%** |
+
+整机功耗（屏幕开、放电状态下读电流）：
+
+| 场景 | 电流 | 功率 | CPU |
+|---|---|---|---|
+| 空闲 | 1208 mA | 4.59 W | 43% |
+| 软解 | 1524 mA | 5.74 W | 52% |
+| 硬解 | **1630 mA** | **6.12 W** | **68%** |
+
+**结论：单路硬解既不省电、也不省系统级 CPU。** 跨边界代理本身要花掉
+CPU 与内存带宽，抵消了 Venus 的能效优势。
+
+### 9.2 硬解的真实价值是并发吞吐
+
+| 场景 | 相对实时倍速 |
+|---|---|
+| 4K 单路 | 2.46x |
+| 3 路 1080p 合计 | 8.76x |
+| 6 路 1080p 合计 | 8.75x |
+
+3 路与 6 路合计吞吐几乎相同 → **8.8x 是 Venus 的吞吐上限，会话数不是瓶颈**
+（硬件上限 16 实例，见 §5）。
+
+另一条实测：**与 Android 侧 MediaCodec 不互斥** —— 容器侧占住
+`/dev/video32` 并保持 `STREAMON` 25 秒期间，Android 侧 MediaCodec
+照常以 6.89x 解完 300 帧。
+
+### 9.3 两个不可引用的错口径数字
+
+以下两组数据仍会在旧记录里出现，**都不能用来论证能效**：
+
+- **进程级口径**：硬解 7.90 ms/帧 vs 软解 35.63 ms/帧（看着像省 78%）。
+  它只统计了容器侧消费者进程，把 daemon 与 Android codec 服务的开销
+  全漏在测量之外，所以"省"出来的是记账口径而非真实功耗。
+- **合成 testsrc 码流**（0.16 Mbps）：硬解 36.77 ms/帧 vs 软解 19.80 ms/帧。
+  码率低到软解几乎不花钱，量级与真实内容差两个数量级，结论不可外推。

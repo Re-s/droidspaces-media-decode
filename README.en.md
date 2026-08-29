@@ -27,7 +27,7 @@ This project provides a MediaCodec hardware decode daemon that runs on an Androi
   the memfd handover goes over a separate abstract socket, which belongs to a net namespace,
   so **a NAT-mode container will necessarily be downgraded**.
   This path has been verified end to end in a real consumer environment (the driver `dlopen`ed into ffmpeg over
-  `/run/dmd/decode.sock`; the daemon log confirms `共享内存已交接: 4 槽 x 3133440 字节` and
+  `/run/dmd/decode.sock`; the daemon log confirms `共享内存已交接: 8 槽 x 3133440 字节` and
   `握手成功: video/hevc 1280x720 帧回传=SHM`, the decode result matches the inline path 150/150 frames,
   and daemon CPU drops by about 19%). A failed handover on the daemon side falls back to inline automatically,
   so enabling it carries no risk of hard failure.
@@ -154,6 +154,41 @@ supported (4 streams total about 253 fps).
 > "143 frames ÷ 5 seconds of content duration" for a real-time playback frame rate; the real figure was only 6.4 fps.
 See [Performance measurements and roadmap](doc/performance-and-roadmap.md) for details.
 
+### Power and efficiency: hardware decode does not save power, its value is concurrency
+
+The "acceleration" mentioned elsewhere in this documentation refers to throughput only, and **does not mean
+lower power or lower CPU use**. Measured with system-level accounting (host `/proc/stat`, real content High
+profile 27.2 Mbps, 300 frames at full speed):
+
+| Accounting | Hardware decode | Software decode | Difference |
+|------|------|------|------|
+| System CPU time | 57.70 ms/frame | 57.40 ms/frame | +0.5%, within noise |
+| Wall clock | 3557 ms | 2366 ms | hardware decode is **50% slower** |
+
+Whole-device power (screen on, discharging): idle 1208 mA / 4.59 W / 43% CPU,
+software decode 1524 mA / 5.74 W / 52%, hardware decode **1630 mA / 6.12 W / 68%**.
+
+**Conclusion: single-stream hardware decode saves neither power nor system-level CPU.** Three causes:
+
+1. the governor does not downclock for hardware decode — prime-core 2841 MHz residency is actually higher
+   with hardware decode;
+2. the load spreads across CPU + Venus + socket wakeups — irq+softirq is 5× that of software decode;
+3. the daemon's roughly 4.4 ms/frame lands on the host's account, not in the container process.
+
+**Hardware decode's real value is concurrency**: 4K single stream at 2.46x realtime; 3× 1080p at
+2.99/3.05/2.72x (8.76x total); 6× 1080p at 1.35–1.61x, all above 1x (8.75x total).
+The 3-stream and 6-stream totals being equal means **about 8.8x is the Venus hardware throughput ceiling
+and the session count is not the bottleneck**. It is also **not mutually exclusive** with MediaCodec on the
+Android side: while `/dev/video32` was held with STREAMON for 25 s, MediaCodec on the other side decoded
+300 frames at 6.89x as usual.
+
+> Two figures from wrong accounting that are **not citable** — discard them on sight:
+> - process-level accounting of hardware decode 7.90 ms/frame vs software decode 35.63 ms/frame — it looks
+>   like a 78% saving, but it only counts the container process and leaves the daemon and kernel overhead
+>   off the books;
+> - the synthetic testsrc stream (0.16 Mbps) at hardware decode 36.77 / software decode 19.80 ms/frame —
+>   the bitrate is far too low to represent real content.
+
 ### Wire protocol
 
 - **Input format**: `[4-byte NALU length (big endian)][NALU data]`; the NALU must carry a start code (either the 3-byte `00 00 01` or the 4-byte `00 00 00 01`)
@@ -190,15 +225,22 @@ The client must complete the handshake before sending any data, declaring the co
 The daemon and the client are released together, and no compatibility path without a handshake is kept:
 
 ```
-[4B magic 0x444D4400][4B version=2][4B codec][4B width][4B height][4B transport mode]   24 bytes total
+[4B magic 0x444D4400][4B version=3][4B codec][4B width][4B height][4B transport mode]   24 bytes total
 ```
 
 `codec` values: `0`=H.264 `1`=HEVC `2`=VP9 `3`=VP8.
 Transport mode: `0`=TCP, `1`=shared memory (see the next section).
 
-**The version must be exactly 2**: the daemon tests for strict equality (`ver != HELLO_VERSION` at
-`src/decode-daemon.c:409`),
-does not accept a lower version number, and on mismatch immediately replies `status=1` and disconnects.
+**Version negotiation (since v3)**: the daemon accepts a **range**, not a single value. It rejects
+`ver < 2 || ver > HELLO_VERSION` (`HELLO_VERSION` is 3 in `src/decode-daemon.c`), so 2 and 3 are both
+accepted and the daemon uses `min(3, client version)`. A v2 client gets a response that is byte-for-byte
+identical to the historical one; a request for a higher version gets `status=1` and a disconnect.
+
+v0.3.2 and earlier tested for strict equality, which meant the daemon and the driver had to be upgraded
+together. A v3 client talking to one of those old daemons therefore gets `status=1` — **clients must
+tolerate that**; the clients in this repository reconnect and retry as v2 (which also skips the inode
+check described below), because the daemon is shipped by the platform while the driver updates
+independently, so a mismatch is the normal case rather than the exception.
 
 Different codecs split data units differently, and the client must send data according to the matching rule:
 
@@ -212,11 +254,37 @@ Adding an Annex B start code to VP8/VP9 data corrupts the frame content and the 
 The server response is variable length:
 
 ```
-[4B status][4B transport mode actually used][4B name length n][n bytes of name]
+[4B status][4B transport mode actually used][4B name length n (bit31 = v3 extension flag)]
+[v3 extension: 16 bytes of endpoint dev/ino (only when status=0 and the client version is ≥ 3)]
+[n bytes of name]
 ```
 
 `status`: `0`=accepted, `1`=version not supported, `2`=codec not supported,
-`3`=resolution outside the hardware range (96×96 ~ 8192×4320), `4`=handshake missing. On a non-zero status the connection is then closed.
+`3`=resolution outside the hardware range (96×96 ~ 8192×4320), `4`=handshake missing. On a non-zero status the connection is then closed,
+and an error response is always a bare 12 bytes.
+
+**Endpoint extension (new in v3, inode verification)**: `bit31` of the name length field is used as the
+flag (a real name length is far below 2³¹), and the 16 bytes are appended after that word and **before**
+the name bytes: `[u32 dev_hi][u32 dev_lo][u32 ino_hi][u32 ino_lo]`, each in network byte order. They are
+the `st_dev`/`st_ino` the daemon gets from `stat()` on **its own listening path**
+(`src/decode-daemon.c:546`), each split into a high and a low u32. TCP mode and abstract-namespace mode
+fill in 0.
+
+A client that ignores bit31 reads `0x80000018` as a plain name length and the protocol parse breaks
+immediately, so the flag is not optional to handle.
+
+The client must reconcile those values against a `stat()` of **the path it used to connect** (note that
+`fstat()` on the connected fd will not do — that is the socket's anonymous inode). A mismatch means the
+connection succeeded but **the peer is not the endpoint you thought it was**: a forked mount view, a
+mismatched endpoint path, or crosstalk between multiple instances all land here, and all of them used to
+stay silent until a corrupt frame showed up. The client now reports the error and refuses the connection
+(both client implementations in this repository do this) instead of carrying on in a broken state.
+
+> Note the distinction: when the platform bind-mounts a single socket file rather than a directory, the
+> container side holds a dead reference once the daemon restarts with a new inode — that class of failure
+> **is caught by the kernel with `ECONNREFUSED` at `connect()`** (measured on device), never reaches the
+> handshake, and is covered by the connection error rather than by inode verification. Mounting at the
+> directory level is the correct fix.
 
 A request for SHM may be downgraded to TCP (out of memory, handover timeout, and so on). In TCP mode the name length is 0.
 
@@ -235,11 +303,17 @@ A 1080p NV12 frame is 3 MB, which at 60 fps means 180 MB/s of extra memory bandw
 The driver requests SHM by default whenever it goes over a Unix socket; `DMD_WANT_SHM=0` turns it off explicitly.
 TCP mode is always inline (the memfd handover goes over an abstract socket, which belongs to a net namespace).
 
-SHM mode puts the frame data into a `memfd` and the socket carries only a 20-byte control message:
+SHM mode puts the frame data into a `memfd` and the socket carries only a 24-byte control message
+(`uint32_t msg[6]`):
 
 ```
-[4B width][4B height][4B 0xFFFFFFFE][4B slot number][4B data length]
+[4B width][4B height][4B 0xFFFFFFFE][4B slot number][4B data length][4B input-unit seq (PTS)]
 ```
+
+The 6th word is sent **unconditionally** — the `CAP_FRAME_PTS` capability bit in the format
+descriptor only *announces* the field, it is not a send switch. A client that reads just
+5 words will start parsing the next frame at the PTS word and the stream desynchronises
+from there on.
 
 The name in the handshake response is an **abstract socket** (of the form `dmd-shm-<pid>-<session id>`),
 named by the daemon and listened on in advance. The client connects to it and the daemon hands over the memfd
@@ -255,22 +329,29 @@ guess the name inevitably leads to crosstalk or a failed connection — this is 
 Pool layout and the return protocol:
 
 ```
-[control area 4096 bytes][slot 0][slot 1][slot 2][slot 3]
+[control area 4096 bytes][slot 0][slot 1][slot 2]…[slot 6][slot 7]
 ```
 
 The control area begins with one 32-bit status word per slot. The daemon sets it to 1 after writing data, and
-**the client must set it back to 0 to return the slot**, otherwise, once the pool is exhausted, the daemon waits about
-1 second, decides the client is stuck and ends the session.
+**the client must set it back to 0 to return the slot**, otherwise, once the pool is exhausted, the daemon waits at most
+15 seconds (`SHM_SLOT_WAIT_MS`) before it decides the client is stuck and ends the session.
 Returning slots goes through shared memory rather than the socket, so it does not interleave with the upstream NALU flow.
 
-Do not confuse the two timeouts: **the slot wait is about 1 second** (the client does not return a slot), and
+**A full pool that makes the daemon wait is normal backpressure, not a fault.** While waiting, every 2000 spins it
+emits a level 2 log line `槽位全忙，已等 N ms（客户端消费慢，正常背压）` ("slots all busy, waited N ms (slow consumer,
+normal backpressure)"), and only a full 15 seconds of waiting ends the session. That limit **must exceed the client's
+`DMD_FRAME_TIMEOUT_MS` (5000 ms)**: the old build hardcoded 1000 ms, which was shorter than the client's own
+willingness to wait, so the daemon gave up and killed the session while the client was still waiting — 10/10 frame loss
+in the 4K plus slow-consumer case (only 238 of 300 frames arrived). Since v0.3.7 the limit is 15000 ms.
+
+Do not confuse the two timeouts: **the slot wait is at most 15 seconds** (the client does not return a slot), and
 **the memfd handover wait is 3 seconds** (the client got the name but never comes to connect; the downgrade was measured to happen at 3.0~3.5 s).
 
 Slots are sized by the **adaptive-playback limit** (`max(declared width,1920) × max(declared height,1088)`)
 rather than by the actual resolution declared in the handshake. The reason: if slots are allocated for the current
 resolution only, a mid-stream resolution increase (480p→720p) exceeds the slot and the SHM session is forced to terminate —
 for the same bitstream TCP decoded a full 120 frames while SHM produced only 60, a functional regression measured on device.
-The cost is that a 720p stream also occupies a 1080p-sized pool (4 × 3133440 ≈ 12 MB), trading memory for correctness.
+The cost is that a 720p stream also occupies a 1080p-sized pool (8 × 3133440 = 25067520 bytes ≈ 24 MB), trading memory for correctness.
 
 A boundary that remains: if the resolution exceeds the declared adaptive-playback limit the session is still terminated
 (reporting `帧 N 字节超出槽位 M，需重建池`), but there is no out-of-bounds write and other sessions are unaffected.
@@ -335,7 +416,7 @@ this removes the compatibility fork, so the frame path contains no format-checki
 
 ### Requirements
 
-- Android NDK r27c or newer
+- Android NDK r26d or newer (CI verifies with r26d; r27c also works)
 - A build environment that supports the ARM64 architecture
 - Android API Level 21+ (for MediaCodec NDK support)
 
@@ -343,10 +424,10 @@ this removes the compatibility fork, so the frame path contains no format-checki
 
 1. **Set up the NDK environment**
    ```bash
-   # Download Android NDK r27c
+   # Download Android NDK r26d or newer
    # https://developer.android.com/ndk/downloads
    
-   export NDK=/path/to/android-ndk-r27c
+   export NDK=/path/to/android-ndk-r26d
    export TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
    export TARGET=aarch64-linux-android
    export API=21
@@ -384,10 +465,10 @@ The output is `build/decode-daemon` (an aarch64 PIE executable).
 ## Deployment: supervised by the DroidSpace platform
 
 > **Change note**: the early plan was to implement start-on-boot with a KSU/Magisk module, and the
-> `magisk-module/` directory is a product of that approach. **That approach has been abandoned** — starting,
+> `ksu-module/` directory is a product of that approach. **That approach has been abandoned** — starting,
 > restarting, supervising and log collection for the daemon are all handled by the DroidSpace platform,
 > and this project no longer ships its own process management.
-> `magisk-module/` is kept for reference, is no longer maintained, and is not a delivery form.
+> `ksu-module/` is no longer maintained and is not a delivery form.
 
 ### The role of the daemon
 
@@ -428,6 +509,25 @@ crash restart, log collection and health checks. **The integration contract is d
 — that document lists the three things the platform must provide (a bind mount directory, starting with the correct
 SELinux domain, and pass-through of `/dev/dri/renderD128`), the measured evidence and verification command for each,
 and the one current blocker (`droidspacesd` is missing an allow rule for accessing Codec2).
+
+## Enabling hardware decode in a browser (Chrome / Firefox)
+
+The complete method for making a browser inside the container use this hardware decode backend, the
+required launch flags, the profile configuration and the verification steps are all
+**documented in [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)**.
+The short version:
+
+- **Chrome must run in Wayland mode**: decoded frames are submitted over the linux-dmabuf protocol, and
+  under X11 the decoder is created but then idles with zero traffic (the dmd log signature is a successful
+  handshake with 0 NALUs)
+- **Chrome must be given `--render-node-override=/dev/dri/renderD128`**: Chromium only enumerates DRM
+  devices on the PCI bus and skips ARM platform devices, and this flag bypasses that allowlist
+- **Firefox needs `MOZ_DISABLE_RDD_SANDBOX=1`** plus the four VA-API prefs in user.js; note that the real
+  profile has to be found via the Default entry in `installs.ini`
+- For watching HEVC, Firefox is currently the recommendation (Chrome has a platform-level compatibility
+  problem on the anland display bridge where presentation feedback is missing; see "Known limitations" in
+  the guide)
+- One-shot health check: `bash tools/check-browser-vaapi.sh`
 
 ## Testing
 
@@ -480,7 +580,7 @@ RESULT: 20 frames decoded from /root/decode-test/test1080.h264
 
 Two things here are easy to misread:
 
-- **The output is 1920x1088, not 1920x1080.** The height of the Qualcomm Venus decoder is aligned to 16, so each NV12 frame is `1920*1088*1.5 = 3133440` bytes. The client must trust the returned w/h and crop to the actual display size.
+- **The output is 1920x1088, not 1920x1080.** The height of the Qualcomm Venus decoder is aligned to 32 (`DMD_HEIGHT_ALIGN`; width to 128), so each NV12 frame is `1920*1088*1.5 = 3133440` bytes. The client must trust the returned w/h and crop to the actual display size.
 - **The number of NALUs sent does not equal the number of frames received.** The decoder has queuing and reordering latency, and SPS/PPS produce no frames; after sending everything the client must `shutdown(SHUT_WR)` to trigger a flush in order to collect all remaining frames.
 
 See [Verified platform facts](doc/verified-platform-facts.md) for details.
@@ -687,7 +787,7 @@ For the detailed accounting and the corrected UBWC conclusion, see `doc/performa
 - [Performance measurements and roadmap](doc/performance-and-roadmap.md) - benchmark data, bottleneck attribution, zero-copy feasibility and hard constraints
 - [Why not use V4L2 directly](doc/why-not-v4l2.md) - the forensic conclusion that `/dev/video32` is measurably unusable inside the container
 - [VAAPI proxy architecture research report](doc/vaapi-mediacodec-proxy-research.md) - a detailed implementation plan for the VA-API proxy driver
-- [Magisk module documentation](magisk-module/README.md) - ⚠️ an abandoned approach, kept for reference
+- [KSU module documentation](ksu-module/README.md) - an abandoned approach, no longer maintained
 
 ## License
 
