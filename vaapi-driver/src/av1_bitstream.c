@@ -1024,6 +1024,25 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 所以 md5 对不上软解的原因要往"surface 内容"方向找，
      * 不是"少合成了 70 个 SEF 帧"。
      *
+     * ---- 上面这段结论错了一半，本轮用隔离测试推翻 ----
+     * 把源码流原封不动喂硬件（/tmp/sess3 绕过整个驱动）：
+     *     session API: 送 150 单元, 收 150 帧
+     * 硬件能吐满 150 帧！而驱动合成流只能收 80 帧。
+     * 两条流的 OBU 构成差异只有一项：
+     *     源码流   SEQ_HDR 5  TD 150  FRAME 150  FRAME_HDR 70（全是 SEF）
+     *     合成流   SEQ_HDR 5  TD 150  FRAME 150  FRAME_HDR  0
+     * 所以"硬件不吐 show_frame=0 的帧"是对的，
+     * 但"因此拿不到那 70 帧"是错的 —— 硬件会为每个 SEF 头
+     * 复显一次，只要码流里有那个头。缺的正是这 70 个 SEF 头。
+     *
+     * ---- 驱动能否推导出 SEF ----
+     * 驱动收不到 SEF（150 次 BeginPicture 全是真实帧），
+     * 但可以推导：show_frame=0 && showable=1 的帧日后必被 SEF 引用，
+     * 插入时机由 order_hint（显示序）决定。实测这两个字段齐备：
+     *     oh=16 show=0 showable=1   ← 将被 SEF 复显
+     *     oh=1  show=1 showable=1   ← 自身即显示
+     * 下一步：在合成流里按显示序补插 SEF FRAME_HEADER。
+     *
      * （frame_id_numbers_present=0 时该字段仍存在，只是后续不读 frame_id。） */
     dmd_bw_put_flag(&bw, 0);
 
