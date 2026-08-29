@@ -1580,6 +1580,10 @@ static const unsigned char *build_unit(struct dmd_context *c,
             unsigned char *prev = c->av1_hold;
             size_t prev_len = c->av1_hold_len;
             /* 本次送出的是上一帧，配对要用它的 surface。 */
+            if (getenv("DMD_VA_LOG"))
+                dmd_log("送出: 暂存帧(surface=%u, %zu字节) 当前帧surface=%u\n",
+                        (unsigned)c->av1_hold_surface, prev_len,
+                        (unsigned)c->current_target);
             c->av1_send_surface = c->av1_hold_surface;
             c->av1_hold_surface = c->current_target;
             c->av1_hold = buf;
@@ -1806,6 +1810,35 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     size_t unit_len = 0;
     const unsigned char *unit = build_unit(c, &scratch, &unit_len);
 
+    /* ================================================================
+     * AV1 当前的阻塞点：ffmpeg 对 show_frame=0 的 surface 也要求像素
+     * ================================================================
+     * 实测的 surface → 数据 映射（DMD_VA_LOG 的"送出"日志，按字节数认帧）：
+     *   surface1  19258B  oh= 0  show=1
+     *   surface2   2688B  oh=16  show=0
+     *   surface3    649B  oh= 8  show=0
+     *   surface4    245B  oh= 4  show=0
+     *   surface5    183B  oh= 2  show=0
+     *   surface6     87B  oh= 1  show=1
+     * 登记与送出完全一致，无双重登记（曾怀疑此项，实测否证）。
+     *
+     * ffmpeg 实测只 Sync 了 surface 1、6、5 三个：
+     *   surface1（show=1）配对成功 ✓
+     *   surface6（show=1）配对成功 ✓
+     *   surface5（show=0）—— 它仍要像素，而该帧本就不产生输出
+     * 于是报 "Failed to read image from surface 0x5: internal decoding error"，
+     * 硬解停在 2 帧（等于 dav1d 对同段码流的基线，说明解码本身没错）。
+     *
+     * 也就是说：msm_vidc 只对 show_frame=1 的帧吐 CAPTURE 缓冲（正确行为），
+     * 而 ffmpeg 的 VA-API 后端会对部分 show_frame=0 的 surface 调 Sync 并读像素。
+     * 驱动目前让这类 surface 永久停在 PENDING，直到超时。
+     *
+     * 待定的修法（需先确认 ffmpeg VA-API 侧的确切期望，不要凭猜实现）：
+     *   a) 把 show_frame=0 的 surface 标为已完成但无像素
+     *   b) 让它复用所引用帧的内容（AV1 的 show_existing_frame 语义）
+     *   c) 在 EndPicture 阶段就识别 show_frame=0 并不为其登记 pending
+     * ================================================================ */
+
     /* AV1 延迟一帧送料：第一个帧间帧只入暂存，本次没有数据要送。
      * 这不是错误 —— 用 unit_len==0 且 av1_hold 非空与"码流重建失败"区分。
      * surface 保持 PENDING，它会在下一帧把本帧送出后才拿到解码结果。 */
@@ -1993,6 +2026,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     c->pending[qpos] = (c->codec == DMD_CODEC_AV1 &&
                         c->av1_send_surface != VA_INVALID_ID)
                      ? c->av1_send_surface : target;
+    /* ⚠️ 这里**不要**打印 c->av1_pic_param 的 show_frame/order_hint：
+     * 那是当前帧的参数，而登记的 surface 属于上一帧（延迟一帧送料）。
+     * 我据此误读过一次，得出"send=5 对应 show=1"的错误结论。 */
+    if (c->codec == DMD_CODEC_AV1 && getenv("DMD_VA_LOG"))
+        dmd_log("登记: target=%u → pending[%d]=%u（送出帧的 surface）\n",
+                (unsigned)target, qpos, (unsigned)c->pending[qpos]);
     /* 记下本帧 POC 供按显示序配对，并带上"序列号"。
      *
      * ⚠️ POC 只在**同一个 coded video sequence 内**单调，每个 IDR 都会把它
