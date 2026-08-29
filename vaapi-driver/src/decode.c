@@ -569,6 +569,7 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     c->units_submitted = 0;
     c->av1_hold_surface = VA_INVALID_ID;
     c->av1_send_surface = VA_INVALID_ID;
+    c->av1_last_ready = VA_INVALID_ID;
     c->av1_hold_show = 0;
     c->av1_send_show = 0;
     for (int k = 0; k < c->pending_count; k++) {
@@ -2091,6 +2092,23 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
          * 权衡后仍标 READY —— 帧数与流程优先，
          * 空白帧的问题留给"给这些 surface 填真实像素"来解决。 */
         if (ns) {
+            /* 这些 surface 拿不到硬件像素：show_frame=0 的帧按 AV1 语义
+             * 不该输出，V4L2 侧确实不吐（实测送入 39 单元只回 20 帧，
+             * 20 + 19 次空壳标记 = 39，硬件行为符合规范）。
+             * 但 ffmpeg 仍会对每个 surface 调 GetImage，
+             * data 为空就导出全零帧（实测 30 帧里 9 个全零）。
+             *
+             * 折中：复制最近一个已就绪 surface 的像素。
+             * 这不是该帧真正的画面，但比全零接近 —— 且不改变流程。
+             * DMD_AV1_NO_CARRY=1 可关掉，退回全零行为便于对照。 */
+            if (!getenv("DMD_AV1_NO_CARRY") && ns->data &&
+                c->av1_last_ready != VA_INVALID_ID &&
+                c->av1_last_ready != c->av1_send_surface) {
+                struct dmd_surface *src =
+                    dmd_find_surface_locked(drv, c->av1_last_ready);
+                if (src && src->data && src->data_size == ns->data_size)
+                    memcpy(ns->data, src->data, ns->data_size);
+            }
             ns->state = DMD_SURFACE_READY;
             ns->decode_status = VA_STATUS_SUCCESS;
         }
@@ -2481,6 +2499,8 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
 
 found:
     VASurfaceID head = c->pending[pick];
+    /* 记下最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接。 */
+    c->av1_last_ready = head;
     dmd_log("配对: 帧 -> surface %u (unit %llu seq %u POC %d, 队列剩 %d)\n",
             (unsigned)head, (unsigned long long)c->pending_unit[pick],
             c->pending_seq[pick], (int)c->pending_poc[pick],

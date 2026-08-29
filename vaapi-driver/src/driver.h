@@ -315,6 +315,8 @@ struct dmd_context {
      *   av1_send_surface：build_unit 本次实际送出的那一帧的 surface */
     VASurfaceID    av1_hold_surface;
     VASurfaceID    av1_send_surface;
+    /* 最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接像素。 */
+    VASurfaceID    av1_last_ready;
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */
