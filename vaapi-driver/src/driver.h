@@ -63,12 +63,20 @@
  * 取 6（滞后 4 再留 2 的余量）—— 太小会退回死锁，太大会让队列变长、
  * 增加延迟且浪费 surface。
  *
- * ⚠️ 跨目录耦合：daemon 侧的 SHM_SLOTS（src/decode-daemon.c）必须
- * >= 本值。本值决定驱动会放行多少帧不取，池装不下就会撞"槽位全忙"。
- * 历史事故：SHM_SLOTS=4 < 本值 6，第 5 帧必然撞池满，daemon 在
+ * ⚠️ 跨目录耦合（历史，socket 架构时期）：daemon 侧的 SHM_SLOTS 必须
+ * >= 本值。历史事故：SHM_SLOTS=4 < 本值 6，第 5 帧必然撞池满，daemon 在
  * 1 秒后判死并杀掉会话 —— 4K + 慢消费者场景 10/10 丢帧（238/300）。
- * 调大本值时必须同步检查 SHM_SLOTS。 */
-#define DMD_PIPELINE_DEPTH 6
+ * V4L2 直通架构下这条耦合消失了（没有 SHM 池），但约束换成了
+ * V4L2 的 CAPTURE 缓冲数（DMD_V4L2_MAX_CAP，实测驱动给 24）。
+ *
+ * 取值 12 的依据（V4L2 直通实测）：msm_vidc 的输出滞后比 MediaCodec 深。
+ * 原值 6 是按 MediaCodec 的实测滞后（有 B 帧时 4）定的，换到 V4L2 后
+ * 表现为：ffmpeg 送 6 单元即停下等帧，而解码器此时只吐了 2 帧，
+ * SyncSurface 等 2000ms 超时 → 触发排空 → 会话终结 → 4 帧待配对，
+ * ffmpeg 报 internal decoding error。
+ * 而直连后端实测送 10 单元可稳定解出 10 帧，故取 12（10 再留 2 余量），
+ * 且 12 < 24 不会撞 CAPTURE 缓冲上限。 */
+#define DMD_PIPELINE_DEPTH 12
 
 /* 队列满时为腾空位收一帧的等待上限。
  *

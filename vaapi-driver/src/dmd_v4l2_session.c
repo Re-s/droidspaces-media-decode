@@ -232,6 +232,39 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
                               (uint64_t)(s->units_sent + 1) * 1000ULL);
         if (r == 0) {
             s->units_sent++;
+
+            /* ⚠️ 送完必须顺手推一次收帧，哪怕调用方还没来取。
+             *
+             * msm_vidc 要求及时 DQBUF 才会继续解码：CAPTURE 缓冲一直挂在
+             * 驱动手里不取回，它就停在那里不再出帧。
+             *
+             * 实测对照（tools 侧的 nodrain 试验）：送料后立刻循环收帧，
+             * 送 6 单元收 6 帧、送 10 收 10，零滞后；而只在背压时才收，
+             * 表现为送 6 单元只收 2 帧后彻底停住 —— 上层随即误判为互等，
+             * 触发排空并终结会话，ffmpeg 报 internal decoding error。
+             *
+             * 收到的帧进待取队列，next_frame 会优先从队列取，帧序不乱。
+             *
+             * ⚠️ 超时不能用 0：poll(timeout=0) 立即返回，几乎永远拿不到帧，
+             * 这个循环就形同虚设 —— 实测表现与"完全不收"一样（送 6 收 2）。
+             * 对照 tools/pattern 试验：用 50~100ms 时两种送料节奏都 6/6。
+             * 取 5ms 是折中：足够让已解好的帧被 DQBUF 取到，又不明显拖慢
+             * 送料路径（真正的等待仍在 next_frame）。 */
+            for (;;) {
+                if (s->pend_count >= DMD_V4L2_MAX_CAP - 1) break;
+                uint8_t *pd = NULL; size_t pl = 0; uint64_t pp = 0; int pi = -1;
+                int pr = dmd_v4l2_recv(&s->dec, &pd, &pl, &pp, &pi, 5);
+                if (pr == 1) {
+                    if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
+                    if (pend_push(s, pd, pl, pp, pi) < 0) {
+                        dmd_v4l2_release(&s->dec, pi);
+                        break;
+                    }
+                    continue;
+                }
+                if (pr == 2) { s->eos = 1; break; }
+                break;                    /* 0 = 暂无就绪帧，正常 */
+            }
             return 0;
         }
         if (r < 0) {
@@ -288,13 +321,30 @@ int dmd_session_finish_input(struct dmd_session *s)
 int dmd_session_drain(struct dmd_session *s)
 {
     if (!s) return DMD_ERR_INVAL;
-    /* 语义与 daemon 版一致：请求解码器吐出已积压的帧。
-     * V4L2 用 DECODER_CMD(STOP) 表达，收到带 LAST 标记的缓冲即结束。 */
-    if (dmd_v4l2_drain(&s->dec) < 0) {
-        set_err(s, DMD_ERR_IO, "排空失败");
-        return DMD_ERR_IO;
-    }
-    return 0;
+
+    /* 语义说明：上层（decode.c 的 SyncSurface）在等帧超时时调本函数，
+     * 想要"催出积压帧但会话仍可用"。它按返回值分流：
+     *   DMD_OK   → 认为可逆，置 drained_once，继续送料
+     *   非 DMD_OK → 退回不可逆的 finish_input，会话就此收尾
+     *
+     * msm_vidc 上这两条路都不能走真正的 DECODER_CMD：
+     *   · STOP 会把会话推进 DRAIN 子状态，之后 CMD_START 被拒
+     *     （dmesg: "av1D: msm_vidc_streaming_state: (CMD_START) not allowed,
+     *      sub_state (DRAIN)"），此后**永久不再出帧**
+     *   · 故 V4L2 规范的 drain-and-resume（STOP+START）在本平台不可用，
+     *     实测 START 返回 EBUSY
+     *
+     * 而返回失败同样有害：上层会立刻 finish_input 终结流。
+     *
+     * 所以这里返回成功的 no-op —— 不动解码器，让上层以为"已排空、可继续"。
+     * 这是安全的：本实现的 send_unit 每次送料都顺手 DQBUF 收帧
+     * （msm_vidc 要求及时归还 CAPTURE 缓冲才继续解码），积压帧本来就会
+     * 被及时取走，不需要额外的排空动作来催。
+     *
+     * 真正结束时走 finish_input，那里才发不可逆的 STOP。 */
+    (void)s;
+    sess_log(s, "排空请求：V4L2 直通无需动作（送料路径已持续收帧）");
+    return DMD_OK;
 }
 
 /* -------------------------------------------------------------------- 收帧 */
@@ -396,8 +446,26 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
 
         /* r == 0：本片超时无帧 */
         waited += slice;
-        if (waited >= budget)
+        if (waited >= budget) {
+            {
+                int q = 0, h = 0;
+                for (int i = 0; i < s->dec.n_cap; i++)
+                    if (s->dec.cap[i].queued) q++;
+                for (int i = 0; i < DMD_V4L2_MAX_CAP; i++)
+                    if (s->held[i]) h++;
+                sess_log(s, "next_frame 超时 %d ms（队列 %d, 已送 %llu, 已收 %llu, "
+                            "CAPTURE 在驱动 %d/%d, 调用方持有 %d）",
+                         budget, s->pend_count,
+                         (unsigned long long)s->units_sent,
+                         (unsigned long long)s->frames_recv,
+                         q, s->dec.n_cap, h);
+                int oq = 0;
+                for (int i = 0; i < s->dec.n_out; i++)
+                    if (s->dec.out[i].queued) oq++;
+                sess_log(s, "  OUTPUT 在驱动 %d/%d", oq, s->dec.n_out);
+            }
             return DMD_ERR_TIMEOUT;
+        }
     }
 }
 

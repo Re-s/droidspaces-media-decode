@@ -501,6 +501,37 @@ int dmd_v4l2_drain(struct dmd_v4l2_dec *d)
     return 0;
 }
 
+int dmd_v4l2_drain_reversible(struct dmd_v4l2_dec *d)
+{
+    if (d->fd < 0) return -1;
+    if (!d->cap_ready) return -1;      /* 还没协商完，无从排空 */
+
+    /* 第一步：STOP 让解码器把流水线里的帧全部吐出来。 */
+    struct v4l2_decoder_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd = V4L2_DEC_CMD_STOP;
+    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &cmd) < 0) {
+        V4L2_LOG("可逆排空: DECODER_CMD(STOP) 失败: %s", strerror(errno));
+        return -1;
+    }
+
+    /* 第二步：立刻 START 恢复。
+     *
+     * 不等 LAST 标记就 START —— 已吐出的帧仍会正常从 CAPTURE 队列取到，
+     * 调用方的收帧循环会拿到它们。若在这里同步等 LAST，会与调用方的
+     * recv 争抢同一批缓冲，反而丢帧。 */
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd = V4L2_DEC_CMD_START;
+    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &cmd) < 0) {
+        V4L2_LOG("可逆排空: DECODER_CMD(START) 失败: %s，流已不可续", strerror(errno));
+        d->draining = 1;               /* 退化为不可逆，让上层据此收尾 */
+        return -1;
+    }
+
+    V4L2_LOG("可逆排空完成（STOP+START）");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ close */
 
 void dmd_v4l2_close(struct dmd_v4l2_dec *d)
