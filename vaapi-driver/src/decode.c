@@ -717,7 +717,9 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
                 c->av1_sef_enq, c->av1_sef_drop, c->av1_sef_sent),
         dmd_log("SEF 统计2: 入暂存时当前帧show=1 %lu, send_show被赋1 %lu, "
                 "flush送出 %lu\n",
-                c->av1_hold_show1, c->av1_sendset1, c->av1_flushed);
+                c->av1_hold_show1, c->av1_sendset1, c->av1_flushed),
+        dmd_log("SEF 统计3: EndPicture送出中show=1 %lu, flush送出中show=1 %lu\n",
+                c->av1_ep_show1, c->av1_flush_show1);
 
     /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
      * 会话也不能挂死宿主进程的 Terminate 路径。 */
@@ -1863,7 +1865,12 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (c->codec == DMD_CODEC_AV1) c->av1_ep_enter++;
     const unsigned char *unit = build_unit(c, &scratch, &unit_len);
     if (c->codec == DMD_CODEC_AV1) {
-        if (unit) c->av1_ep_unit++; else c->av1_ep_null++;
+        if (unit) {
+            c->av1_ep_unit++;
+            if (c->av1_send_show) c->av1_ep_show1++;
+        } else {
+            c->av1_ep_null++;
+        }
     }
 
     /* ================================================================
@@ -2832,6 +2839,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
     if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session &&
         hold_is_target && !getenv("DMD_AV1_NO_FLUSH")) {
         unsigned char *held = c->av1_hold;
+        const int held_show = c->av1_hold_show;
         size_t held_len = c->av1_hold_len;
         size_t held_bitpos = c->av1_hold_bitpos;
         const VASurfaceID held_surf = c->av1_hold_surface;
@@ -2925,6 +2933,20 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         av1_dump_sent(held, held_len);
         (void)dmd_session_send_unit(c->session, held, held_len);
         c->av1_flushed++;
+        if (held_show) c->av1_flush_show1++;
+
+        /* ⚠️ 已否证：在 flush 路径追加 SEF。
+         *
+         * 动机很强：实测 150 帧里
+         *   EndPicture 送出 75 帧，其中 show=1 只有 5 个
+         *   flush     送出 75 帧，其中 show=1 有 **75** 个
+         * 会显示的帧几乎全部走 flush，所以看起来这里才是主战场。
+         *
+         * 但实测结果是退化：ffmpeg 输出从 150 帧掉到 111 帧，
+         * 且运行明显变慢（同命令从约 40s 涨到超 180s 超时）。
+         * 成因推测（未证实）：flush 是在等像素的路径上被调用的，
+         * 在这里追加单元会打乱正在进行的配对与缓冲归还节奏。
+         * 结论：SEF 不能在 flush 路径上追加。 */
         free(held);
     }
 

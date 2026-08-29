@@ -351,6 +351,8 @@ struct dmd_context {
     unsigned long  av1_hold_show1;   /* 入暂存时当前帧 show=1 的次数 */
     unsigned long  av1_sendset1;     /* av1_send_show 被赋 1 的次数 */
     unsigned long  av1_flushed;      /* sync flush 送出暂存帧的次数 */
+    unsigned long  av1_flush_show1;  /* flush 送出的帧里 show=1 的次数 */
+    unsigned long  av1_ep_show1;     /* EndPicture 送出的帧里 show=1 的次数 */
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */
