@@ -1,7 +1,10 @@
 /* profile / entrypoint / config 查询与 config 对象管理
  *
  * 声明的能力严格对应 Android 侧 decode-daemon 能提供的解码器：
- * 协议 codec 取值 0=H.264 1=HEVC 2=VP9 3=VP8，四者均已真机端到端验证。
+ * 协议 codec 取值 0=H.264 1=HEVC 2=VP9 3=VP8(已废弃) 4=AV1。
+ * V4L2 直通下已真机端到端验证：H.264 300/300、HEVC 12/12、VP9 P0 50/50
+ * （均逐字节等于软解）。AV1 帧数一致但像素未通过，详见 doc/av1-v4l2-status.md。
+ * VP8 已放弃：msm_vidc 的 V4L2 层没有 VP80 格式。
  * 高位深（HEVC Main10、VP9 Profile2、H.264 High10）未验证，因此不声明 ——
  * 谎报能力会让消费者选中我们然后失败，比不报更糟。
  */
@@ -19,7 +22,9 @@
  * 那时声明它属于虚报，Firefox 的 vaapitest 探针会读成 CODEC_HW_HEVC
  * （GfxInfo.h:63 的 1<<8）。现在 hevc_bitstream.c 已实现 VPS/SPS/PPS 合成
  * 并真机验证（1080p/4K/720p 逐字节一致、长流 1500 帧、seek 全通），
- * 所以重新声明；探针输出 368 = H264|VP8|VP9|HEVC 这次名实相符。
+ * 所以重新声明。
+ * （那句"探针输出 368 = H264|VP8|VP9|HEVC 名实相符"已过时：
+ *   VP8 声明已移除，探针位图不再包含 CODEC_HW_VP8。）
  *
  * ⚠️ HEVC 有一类码流无法支持：SPS 里带 st_ref_pic_set 的
  * （num_short_term_ref_pic_sets > 0）。VA-API 只给个数不给内容，
@@ -33,7 +38,18 @@ static const VAProfile dmd_profiles[] = {
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
     VAProfileAV1Profile0,
-    VAProfileVP8Version0_3,
+    /* ⚠️ VP8 已移除声明（V4L2 直通改造的一部分）。
+     *
+     * 理由是硬件层面的事实：msm_vidc 的 V4L2 层**没有 VP80 格式**
+     * （v4l2_backend.c 的 codec 映射对 VP8 返回 0，调用方据此拒绝）。
+     * 改用 V4L2 直通后 VP8 没有任何硬件路径可走，
+     * 继续声明它就是虚报 —— Firefox 的 vaapitest 探针会据此
+     * 报告 CODEC_HW_VP8 并把解码任务交过来，然后失败。
+     *
+     * 协议 codec 编号 3 保留不复用（见 dmd_client.h:63、
+     * v4l2_backend.h:46），以免与旧 daemon 的线协议撞号。
+     * dmd_profile_to_codec 里的映射也一并移除：
+     * 留着会让 vaCreateConfig 对 VP8 返回成功。 */
 };
 
 #define DMD_NUM_PROFILES ((int)(sizeof(dmd_profiles) / sizeof(dmd_profiles[0])))
@@ -62,8 +78,7 @@ int dmd_profile_to_codec(VAProfile profile)
         return DMD_CODEC_HEVC;
     case VAProfileVP9Profile0:
         return DMD_CODEC_VP9;
-    case VAProfileVP8Version0_3:
-        return DMD_CODEC_VP8;
+    /* VP8 不再映射：msm_vidc 无 VP80 格式，无硬件路径（详见上方声明表注释）。 */
     /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
      * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
      * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */
