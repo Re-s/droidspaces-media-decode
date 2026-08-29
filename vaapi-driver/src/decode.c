@@ -1591,8 +1591,8 @@ static const unsigned char *build_unit(struct dmd_context *c,
         if (!getenv("DMD_AV1_NO_SEF") && ft != 0 &&
             !pp->pic_info_fields.bits.show_frame &&
             pp->pic_info_fields.bits.showable_frame &&
-            c->av1_sef_count < 8) {
-            int t = (c->av1_sef_head + c->av1_sef_count) & 7;
+            c->av1_sef_count < 64) {
+            int t = (c->av1_sef_head + c->av1_sef_count) & 63;
             c->av1_sef_slot[t] = c->av1_dpb.dpb_next_slot & 7u;
             c->av1_sef_count++;
             if (getenv("DMD_VA_LOG"))
@@ -2380,10 +2380,24 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 修法方向：把取槽移到 build_unit 内部、与 av1_send_show
      * 的赋值同点，或改用 build_unit 返回的显式标志。 */
     int sef_send_slot = -1;
+    if (getenv("DMD_VA_LOG") && c->codec == DMD_CODEC_AV1)
+        dmd_log("SEF: 取槽点 send_show=%d 队列=%d\n",
+                c->av1_send_show, c->av1_sef_count);
+    /* ⚠️ 触发条件用"本次送出的帧是否显示"，而不是当前帧。
+     * av1_send_show 因延迟一帧机制反映的正是送出帧 —— 语义是对的，
+     * 但实测它在 150 帧里只有 5 次为 1、70 次为 0：
+     * 送出的帧绝大多数是 show=0 的暂存帧。
+     * 而 SEF 必须紧跟"会显示的帧"，两者对不上。
+     * 改用 av1_hold_show —— 它是刚入暂存的当前帧的 show 值，
+     * 与"这一轮 ffmpeg 提交的帧是否显示"一致。 */
+    /* ⚠️ 试过改用 av1_hold_show（当前帧的 show 值）—— 严重退化：
+     * 送入从 154 单元掉到 8、收帧从 80 掉到 2。
+     * 原因未查明，但方向已否证：不能简单换一个 show 标志。
+     * 保留 av1_send_show。 */
     if (c->codec == DMD_CODEC_AV1 && c->av1_send_show &&
         c->av1_sef_count > 0) {
         sef_send_slot = (int)c->av1_sef_slot[c->av1_sef_head];
-        c->av1_sef_head = (c->av1_sef_head + 1) & 7;
+        c->av1_sef_head = (c->av1_sef_head + 1) & 63;
         c->av1_sef_count--;
     }
 

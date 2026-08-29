@@ -330,7 +330,11 @@ struct dmd_context {
      *
      * 于是驱动这样推导：show_frame=0 的帧进队（记下它占的 DPB 槽），
      * 遇到 show_frame=1 的帧送出后，从队首取一个补一个 SEF 头。 */
-    unsigned       av1_sef_slot[8];   /* 待复显帧所占的 DPB 槽，环形 */
+    /* 待复显帧所占的 DPB 槽，环形。容量取 64：实测 8 太小 ——
+     * 金字塔 B 结构下 show_frame=0 的帧会连续到来，
+     * 150 帧样本里队列长期处于满状态，入队被丢弃了 58 次
+     * （只入队 12 次，而 show=0 帧有 70 个）。 */
+    unsigned       av1_sef_slot[64];
     int            av1_sef_head;
     int            av1_sef_count;
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
