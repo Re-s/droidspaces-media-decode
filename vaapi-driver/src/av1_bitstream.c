@@ -206,8 +206,8 @@ static void put_color_config(struct dmd_bitwriter *bw,
 
 /* tile_info()，AV1 规范 5.9.15。
  *
- * ⚠️ tile_size_bytes_minus_1 写死 1（即 2 字节，与源码流 trace_headers
- *    实测值一致），第 4 步的
+ * ⚠️ tile_size_bytes_minus_1 按 max(tile_len) 动态计算（曾写死，见下），
+ *    第 4 步的
  * tile_group 必须用同样宽度写 tile_size_minus_1 —— 两处不一致会让
  * 解码器按错误宽度读 tile 长度，从第二个 tile 起全部错位。 */
 /* tile_info()，AV1 规范 5.9.15。
@@ -230,9 +230,9 @@ static void put_color_config(struct dmd_bitwriter *bw,
  *   v == max → 写 (max-min) 个 1，**不写停止位**
  *   否则     → 写 (v-min) 个 1，再写一个 0
  *
- * ⚠️ tile_size_bytes_minus_1 写死 1（2 字节），第 4 步 tile_group 里写
+ * ⚠️ tile_size_bytes_minus_1 动态计算，第 4 步 tile_group 里写
  * tile_size_minus_1 必须用同样宽度 —— 两处不一致会从第二个 tile 起全错位。 */
-static void put_tile_info(struct dmd_bitwriter *bw,
+static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
                           const VADecPictureParameterBufferAV1 *p,
                           uint32_t mi_cols, uint32_t mi_rows)
 {
@@ -319,13 +319,17 @@ static void put_tile_info(struct dmd_bitwriter *bw,
     if (cols_log2 + rows_log2 > 0) {
         dmd_bw_put_bits(bw, p->context_update_tile_id,
                         (int)(cols_log2 + rows_log2));
-        /* tile_size_bytes_minus_1 = 1（2 字节）。
-         * 依据：VA-API 给的 tile offset 之间恰好各差 2 字节
-         * （实测 tile[0] off=2、tile[1] off=前一个末尾+2 …… 共 7 个间隙），
-         * 那 2 字节就是原始码流里的 tile_size 字段。跟随源码流宽度可让
-         * 合成结果与原始 payload 长度一致，也避免无谓放大。
-         * ⚠️ 必须与 dmd_av1_build_frame() 里写 tile_size_minus_1 的宽度一致。 */
-        dmd_bw_put_bits(bw, 1, 2);
+        /* tile_size_bytes_minus_1：按各 tile 的**实际长度**决定，不能写死。
+         *
+         * ⚠️ 曾写死 1（2 字节），理由是"VA-API 给的 tile offset 之间恰好
+         * 各差 2 字节"。该推断是错的 —— 实测源码流 trace_headers 此处为 0
+         * （即 1 字节）。写死 2 字节会让每个 tile 间隙多 1 字节，
+         * 7 个间隙共多 6~7 字节，位流从此整体偏移，
+         * 解码器随后读到的字段全部错位（表现为 zero_bit out of range）。
+         *
+         * 正确做法：取 max(tile_len) 所需的最小字节数。tile_group 里写
+         * tile_size_minus_1 时必须用同一宽度，故由调用方算好后传入。 */
+        dmd_bw_put_bits(bw, (unsigned)(tile_size_bytes - 1), 2);
     }
 }
 
@@ -718,7 +722,7 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
  * dav1d 报 "Failed to read unit"。 */
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     struct dmd_av1_dpb *dpb,
-                                    const VADecPictureParameterBufferAV1 *p)
+                                    const VADecPictureParameterBufferAV1 *p, int tile_size_bytes)
 {
     /* struct dmd_bitwriter 是纯值结构：buf 指向调用方的缓冲，其余成员
      * 都是计数器。所以"拷入 → 写 → 拷回"是安全的，函数体内得以保留
@@ -1020,7 +1024,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     const uint32_t mi_cols = 2 * ((width  + 7) >> 3);
     const uint32_t mi_rows = 2 * ((height + 7) >> 3);
 
-    put_tile_info(&bw, p, mi_cols, mi_rows);
+    put_tile_info(&bw, tile_size_bytes, p, mi_cols, mi_rows);
     put_quantization_params(&bw, p);
     put_segmentation_params(&bw, p, primary_ref_none);
 
@@ -1112,7 +1116,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
  *   DMD_OBU_FRAME        → byte_alignment（规范 5.10.1），之后紧跟 tile_group
  * 返回写入 out 的字节数（含 OBU 头），失败返回 0。
  * tail_out 回传 payload 的位长度，供 OBU_FRAME 继续拼 tile_group。 */
-static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
+static size_t build_frame_header_obu(int tile_size_bytes,
+                                    const VADecPictureParameterBufferAV1 *p,
                                      int obu_type,
                                      unsigned char *body, size_t body_cap,
                                      size_t *body_len_out,
@@ -1120,7 +1125,7 @@ static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
 {
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, body_cap);
-    put_uncompressed_header(&bw, dpb, p);
+    put_uncompressed_header(&bw, dpb, p, tile_size_bytes);
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
@@ -1143,7 +1148,8 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
 
     unsigned char body[512];
     size_t body_len = 0;
-    if (build_frame_header_obu(p, DMD_OBU_FRAME_HEADER,
+    /* 独立 FRAME_HEADER OBU 不带 tile 数据，宽度取最小值 1。 */
+    if (build_frame_header_obu(1, p, DMD_OBU_FRAME_HEADER,
                               body, sizeof(body), &body_len, dpb) == 0)
         return 0;
 
@@ -1165,10 +1171,24 @@ size_t dmd_av1_build_frame(const void *pic_v,
     if (!p || !out || !tiles || num_tiles <= 0 || out_cap < 16)
         return 0;
 
+    /* tile_size_bytes：取最大 tile 长度所需的最小字节数。
+     * 帧头的 tile_size_bytes_minus_1 与 tile_group 里 tile_size_minus_1
+     * 的宽度必须一致，故先算出来再合成帧头。
+     * 注意写入的是 len-1（tile_size_minus_1），故按 max_len-1 取位宽。 */
+    size_t max_tile = 0;
+    for (int i = 0; i + 1 < num_tiles; i++)
+        if (tiles[i].len > max_tile) max_tile = tiles[i].len;
+    int tile_size_bytes = 1;
+    if (max_tile > 0) {
+        size_t v = max_tile - 1;
+        while (v >> (tile_size_bytes * 8)) tile_size_bytes++;
+    }
+    if (tile_size_bytes > 4) tile_size_bytes = 4;
+
     /* 帧头（结尾 byte_alignment，不是 trailing_bits）。 */
     unsigned char fh[512];
     size_t fh_len = 0;
-    if (build_frame_header_obu(p, DMD_OBU_FRAME,
+    if (build_frame_header_obu(tile_size_bytes, p, DMD_OBU_FRAME,
                               fh, sizeof(fh), &fh_len, dpb) == 0)
         return 0;
 
@@ -1201,7 +1221,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
             return 0;
         payload_len += tiles[i].len;
         if (i + 1 < num_tiles)
-            payload_len += 2;         /* tile_size_minus_1，le(2) */
+            payload_len += (size_t)tile_size_bytes;  /* tile_size_minus_1 */
     }
 
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME, payload_len,
@@ -1229,13 +1249,13 @@ size_t dmd_av1_build_frame(const void *pic_v,
         *q++ = tg_hdr[i];
     for (int i = 0; i < num_tiles; i++) {
         if (i + 1 < num_tiles) {
-            /* le(2)：宽度必须等于帧头 tile_size_bytes_minus_1 + 1 = 2。
-             * 单 tile 上限 64KB —— 实测 1080p 最大 tile 约 4KB，
-             * 而 VA-API 源码流本身就用 2 字节，跟随它即可。
-             * ⚠️ 若将来遇到 >64KB 的单 tile，这里和帧头要一起加宽。 */
+            /* le(tile_size_bytes)：宽度必须与帧头写的
+             * tile_size_bytes_minus_1 + 1 一致，否则从第二个 tile 起全错位。
+             * 该宽度由上面按 max(tile_len) 算出，不再写死 —— 曾写死 2 字节，
+             * 而源码流实际用 1 字节，每个间隙多 1 字节导致位流整体偏移。 */
             const uint32_t v = (uint32_t)(tiles[i].len - 1);
-            *q++ = (unsigned char)(v & 0xFF);
-            *q++ = (unsigned char)((v >> 8) & 0xFF);
+            for (int b = 0; b < tile_size_bytes; b++)
+                *q++ = (unsigned char)((v >> (8 * b)) & 0xFF);
         }
         for (size_t k = 0; k < tiles[i].len; k++)
             *q++ = tiles[i].data[k];
