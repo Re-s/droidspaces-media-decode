@@ -1244,6 +1244,18 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                  *
                  * KEY 帧会重置 order_hint 序列，用 frame_type 判新序列：
                  * frame_type 0=KEY，与 H.264 的 frame_num==0 同义。 */
+                if (getenv("DMD_AV1_SEFPROBE")) {
+                    const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
+                    fprintf(stderr, "[sef] oh=%u ft=%u show=%u showable=%u "
+                            "target=%u anchor=%u tiles=%ux%u\n",
+                            q->order_hint,
+                            q->pic_info_fields.bits.frame_type,
+                            q->pic_info_fields.bits.show_frame,
+                            q->pic_info_fields.bits.showable_frame,
+                            (unsigned)c->current_target,
+                            (unsigned)q->current_frame,
+                            q->tile_cols, q->tile_rows);
+                }
                 c->current_poc =
                     (int32_t)c->av1_pic_param.order_hint;
                 c->current_frame_num =

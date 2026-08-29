@@ -1002,6 +1002,28 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     /* --- uncompressed_header()，AV1 规范 5.9.2 --- */
 
     /* show_existing_frame：本驱动逐帧转发真实帧，不复用已解码帧，恒 0。
+     *
+     * ---- 这正是像素帧数差距的根源（本轮测定）----
+     * 源码流 av1_1080p.obu 的 OBU 构成：
+     *     TD 150、OBU_FRAME 150、独立 FRAME_HEADER 70、SEQ_HDR 5
+     *     150 个 OBU_FRAME 里 show_frame=1 的只有 80 个
+     *     70 个独立 FRAME_HEADER **全部**是 show_existing_frame=1
+     *     80 真实显示 + 70 复显 = 150 = 软解输出帧数
+     *
+     * 而硬件侧：送入 150 单元、收到 80 帧 —— 与 show_frame=1 的数量
+     * 精确吻合，硬件行为完全正确，一帧不少。
+     * 缺的 70 帧是 SEF 复显帧，本驱动从未合成。
+     *
+     * 但 SEF 帧无法在此合成：实测 BeginPicture 恰好被调 150 次
+     * （= OBU_FRAME 数），SEF 帧**不经过** VA-API 解码路径
+     * （探针显示 150 次调用全是真实帧，anchor == target）。
+     * 解码侧 VA-API 也没有 show_existing_frame 字段
+     * （只有 va_enc_av1.h 提到它，属编码侧）。
+     * 结论：SEF 复显由 ffmpeg 在 VA-API 之上自行完成，
+     * 驱动只需保证被引用的 surface 里有正确像素即可。
+     * 所以 md5 对不上软解的原因要往"surface 内容"方向找，
+     * 不是"少合成了 70 个 SEF 帧"。
+     *
      * （frame_id_numbers_present=0 时该字段仍存在，只是后续不读 frame_id。） */
     dmd_bw_put_flag(&bw, 0);
 
