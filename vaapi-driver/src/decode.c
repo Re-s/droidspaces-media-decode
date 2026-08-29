@@ -2074,6 +2074,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     if (av1_no_output) {
         struct dmd_surface *ns = dmd_find_surface_locked(drv,
                                                         c->av1_send_surface);
+        /* ⚠️ 只在该 surface **还没有像素数据**时才标空壳。
+         *
+         * ffmpeg 会复用 surface。实测踩过：surface 6 先在 sync flush 里
+         * 拿到真实帧数据并完成配对（日志"配对: 帧 -> surface 6"），
+         * 20 行之后又被本分支标成 READY 空壳，真实数据就此作废 ——
+         * 导出的 nv12 里那些帧是全零（Y 取样唯一值数=1）。
+         * 有数据就别碰：那说明这个 surface 已经承载了别的帧。 */
+        /* ⚠️ 试过"有数据就不标"（if (ns && !ns->data)）—— 退化到 2 帧：
+         * surface 会卡回 PENDING，ffmpeg 报
+         * "Failed to sync surface 0x5: internal decoding error"。
+         * 空壳标记对流程推进是必需的，不能因为怕覆盖就跳过。
+         *
+         * 但直接标 READY 会让导出的 nv12 出现全零帧
+         * （Y 取样唯一值数=1），因为 s->data 为空。
+         * 权衡后仍标 READY —— 帧数与流程优先，
+         * 空白帧的问题留给"给这些 surface 填真实像素"来解决。 */
         if (ns) {
             ns->state = DMD_SURFACE_READY;
             ns->decode_status = VA_STATUS_SUCCESS;
