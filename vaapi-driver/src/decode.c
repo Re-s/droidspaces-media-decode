@@ -2244,6 +2244,24 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
      * （回传值无重复、是送入编号的有效排列），只是出帧顺序≠送入顺序。
      * 真正的问题从来不在 timestamp，而在两侧编号不同源。
      *
+     * ⚠️ AV1 另有一处**尚未修复**的同类失效：延迟一帧机制打乱编号节奏。
+     * 实测（合成流已 6/6 逐字节正确的前提下）：
+     *   配对: 帧 -> surface 1 (unit 1 seq 0 POC 0, 队列剩 0)
+     *   配对: unit_seq=6 无匹配项，回退顺序推断（队列 4）
+     *   配对: 帧 -> surface 3 (unit 2 seq 0 POC 8, 队列剩 3)
+     * 第二帧回传 unit_seq=6 却找不到对应项，退到顺序推断后配给 surface 3；
+     * 而 ffmpeg 正等 surface 6 的像素 → 2000ms 超时 → flush → 会话终结，
+     * 整段码流只出 1 帧。
+     *
+     * 成因：AV1 帧间帧要等下一帧才能反算 refresh_frame_flags，
+     * EndPicture 里不立即送料（帧入 av1_hold）。驱动侧 pending_unit 在
+     * EndPicture 递增、session 侧 units_sent 在真正 send_unit 时递增，
+     * 节奏被暂存机制错开；末帧又走 sync flush 的第三条路径送出。
+     * 与上面 HEVC 参数集占号是同类问题（两侧编号不同源），成因不同。
+     *
+     * 修法方向：AV1 的 pending_unit 改为真正 send_unit 时回填，
+     * 或给暂存帧单独记录它实际发出时的编号。
+     *
      * 首选：按提交序号精确配对。
      *
      * daemon 把每个输入单元的序号当 PTS 送给 MediaCodec，解码器原样回传到
