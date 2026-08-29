@@ -1301,10 +1301,10 @@ static void *session_thread(void *arg)
     if (!s->codec) { dlog(0, "[%d] 无可用解码器: %s", s->id, s->mime); goto out_fmt; }
 
     media_status_t st = AMediaCodec_configure(s->codec, fmt, NULL, NULL, 0);
-    if (st != AMEDIA_OK) { dlog(0, "[%d] configure 失败: %d", s->id, st); goto out_codec; }
+    if (st != AMEDIA_OK) { dlog(0, "[%d] configure 失败: %d", s->id, st); goto out_started; }
 
     st = AMediaCodec_start(s->codec);
-    if (st != AMEDIA_OK) { dlog(0, "[%d] start 失败: %d", s->id, st); goto out_codec; }
+    if (st != AMEDIA_OK) { dlog(0, "[%d] start 失败: %d", s->id, st); goto out_started; }
 
     pthread_t tin, tout;
     int have_in = (pthread_create(&tin, NULL, input_thread, s) == 0);
@@ -1326,8 +1326,29 @@ static void *session_thread(void *arg)
         dlog(1, "[%d] 会话结束: 收到 %ld NALU, 回传 %ld 帧",
              s->id, s->nalu_in, s->frames_out);
 
+out_started:
+    /* ⚠️ configure / start 失败也必须先 stop 再 delete。
+     *
+     * 曾经这里是 out_codec 标签、失败路径直接 delete，**实测会让整个
+     * daemon SIGABRT**：
+     *   FORTIFY: pthread_mutex_lock called on a destroyed mutex
+     *   Fatal signal 6 (SIGABRT) in tid NNNN (CodecLooper)
+     *
+     * 原因：AMediaCodec_createDecoderByType 一旦成功，Codec2 就已经起了
+     * CodecLooper 回调线程。configure 失败并不会停掉它，此时直接 delete
+     * 会销毁它正在用的 mutex —— 崩的是 Codec2 内部线程，不是本进程的锁，
+     * 所以 daemon 里搜不到任何 pthread_mutex_destroy 也一样会崩。
+     *
+     * 后果远超"一个会话失败"：watchdog 连重启 5 次进入冷却，
+     * 整台设备的硬解全部不可用，连本来正常的 H.264 也用不了。
+     * 触发条件是任何 configure 失败 —— 在 SM8750 上加 AV1 时暴露
+     * （高通 QC2VppFilterCaps 不认 c2.qti.av1.decoder），
+     * 但这个缺陷在此之前就一直存在，只是没有触发条件。
+     *
+     * stop 对未 start 的 codec 是安全的：NDK 允许在 Configured 状态调用，
+     * 返回错误码而不崩；这里刻意忽略返回值，目的只是让 Codec2 把回调
+     * 线程收干净。 */
     AMediaCodec_stop(s->codec);
-out_codec:
     AMediaCodec_delete(s->codec);
 out_fmt:
     AMediaFormat_delete(fmt);
