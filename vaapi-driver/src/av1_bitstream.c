@@ -632,7 +632,31 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  * 附带纠正：1154 行用 reference_select 当门是对的（规范 5.9.22 里
  * skipModeAllowed 的前置就含 reference_select），上一轮把它列为嫌疑属误判。
  *
- * ---- 帧6 缺陷：另一个字段，位 21 ----
+ * ---- 帧6 缺陷已定位：末帧的 refresh_frame_flags 从未被改写 ----
+ *
+ * 位 21 落在 refresh_frame_flags（实测 @19，占 19..26 位）内。
+ * 落盘流与源码流逐帧对比：
+ *   帧2 源0x01 合成0x01 ✓   帧3 源0x08 合成0x08 ✓
+ *   帧4 源0x20 合成0x20 ✓   帧5 源0x40 合成0x40 ✓
+ *   帧6 源0x00 合成0x20 ✗
+ * 前四帧完全正确 —— "延迟一帧就地改写"机制本身工作正常
+ * （DMD_AV1_LOG 实测依次给出 refresh=0x01/0x08/0x20/0x40）。
+ *
+ * 帧6 是样本里的**最后一帧**，没有"下一帧"来触发改写，
+ * 于是停在 `1 << slot` 的占位值 0x20，而源码流该帧真值是 0x00。
+ * 这是本会话修过的"暂存末帧从不送出"的姊妹缺陷：
+ * 那次漏的是数据发送，这次漏的是数值改写。
+ *
+ * 修法方向：sync_surface_locked 里 flush 暂存帧时，除了送出数据，
+ * 还要给它一个 refresh 值。末帧无后继可比，但可用
+ * "本帧之后没有任何帧会引用它" 推出 0 —— 需确认这是通用规则
+ * 还是仅本码流如此（不能拿一条码流的末帧值当常量）。
+ *
+ * ⚠️ 注意 DMD_AV1_BITS 打印的 refresh_mask 是**改写前**的占位值
+ * （0x01,0x02,0x04,0x08,0x10 的简单轮转），不是最终写入码流的值。
+ * 判断 refresh 正确性必须看落盘流（DMD_AV1_DUMP），不要看这个探针。
+ *
+ * ---- 帧6 原始记录：位 21 ----
  * 帧6 差异在偏移 2（位 16..23），合成在位 21 多写 1 位。
  * 该位置在 tile_info(@55) 之前，属 uncompressed_header 开头段 ——
  * frame_type / show_frame / refresh_frame_flags / order_hint 一带，
@@ -947,6 +971,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * （frame_id_numbers_present=0 时该字段仍存在，只是后续不读 frame_id。） */
     dmd_bw_put_flag(&bw, 0);
 
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "frame_type", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_bits(&bw, frame_type, 2);
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.show_frame);
     if (!p->pic_info_fields.bits.show_frame)
@@ -959,8 +984,12 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      *   否则 flag(error_resilient_mode) */
     const int er_inferred = (frame_type == 3) ||
                             (is_key && p->pic_info_fields.bits.show_frame);
-    if (!er_inferred)
+    if (!er_inferred) {
+        if (getenv("DMD_AV1_BITS"))
+            fprintf(stderr, "[bits] err_res @ %zu\n",
+                    bw.byte_pos * 8 + bw.bit_pos);
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.error_resilient_mode);
+    }
 
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.disable_cdf_update);
 
@@ -992,8 +1021,12 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 7.20 说此时 RefreshFrameFlags 取 allFrames 只是**解码器侧的推导值**，
      * 而 5.9.2 的判据针对的是**语法变量**。实测 libaom 的行为表明该判据
      * 在此不成立，即照写 order_hint。 */
-    if (enable_order_hint)
+    if (enable_order_hint) {
+        if (getenv("DMD_AV1_BITS"))
+            fprintf(stderr, "[bits] order_hint @ %zu\n",
+                    bw.byte_pos * 8 + bw.bit_pos);
         dmd_bw_put_bits(&bw, p->order_hint, order_hint_bits);
+    }
 
     /* primary_ref_frame：帧内帧或 error_resilient 时不写。 */
     /* err_res 是**生效值**：被 infer 的场合恒 1，否则取 VA-API 给的。
@@ -1075,6 +1108,9 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 正确的 refresh 值要等下一帧的 ref_frame_map 才能算出（见
          * dmd_av1_dpb 说明），而那时本帧已经合成完毕。 */
         dpb->last_refresh_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
+        if (getenv("DMD_AV1_BITS"))
+            fprintf(stderr, "[bits] refresh_mask=0x%02x @ %zu\n",
+                    refresh_mask, bw.byte_pos * 8 + bw.bit_pos);
         dmd_bw_put_bits(&bw, refresh_mask, 8);
     }
 
