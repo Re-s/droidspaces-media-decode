@@ -1607,7 +1607,17 @@ static const unsigned char *build_unit(struct dmd_context *c,
          * 等下一个 show_frame=1 的帧送出后追加一个 SEF 头让它复显。
          * 槽号取写入前的 dpb_next_slot —— 与 build_frame 内的分配一致。
          * DMD_AV1_NO_SEF=1 关闭，便于与旧行为对照。 */
-        if (!getenv("DMD_AV1_NO_SEF") && ft != 0 &&
+        /* ⚠️ 默认关闭：SEF 补插会污染像素（第 68 轮实测）。
+         * 30 帧样本、同一份二进制：
+         *     关 SEF  → 不同画面 16 个（第 55 轮基线 17，属正常抖动）
+         *     开 SEF  → 不同画面  8 个
+         * 只补了 4 个 SEF 就让不同画面数腰斩，说明这些复显帧
+         * 覆盖了别的 surface 的内容 —— 驱动侧没有为它们登记 pending，
+         * ffmpeg 却按自己的映射去取，取到了错的 surface。
+         * 帧数与合成正确率都察觉不到这个退化（都是 150 / 145）,
+         * 所以它在第 65~67 轮一直隐藏着。
+         * DMD_AV1_SEF=1 显式开启以继续调试。 */
+        if (getenv("DMD_AV1_SEF") && ft != 0 &&
             !pp->pic_info_fields.bits.show_frame &&
             pp->pic_info_fields.bits.showable_frame) {
             /* ⚠️ 队列满必须留痕：上一轮这里静默 continue，
@@ -2294,6 +2304,13 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 与 daemon 的 vcl_in 对齐 —— 两侧都从 1 开始、每个数据单元加 1。
      * 注意只有真正送出数据单元的提交才占号，参数集不占（daemon 侧同理：
      * is_param_set 的单元走 CSD 路径，不递增 vcl_in）。 */
+    /* ⚠️ 已否证：这里也改用 session 同源编号。
+     * 回退次数没有进一步下降（仍 64），但像素严重退化：
+     *     不同画面 17 → 5 个（精确命中 21 → 24，只是巧合改善）
+     * 因为本函数登记时 AV1 帧可能入暂存、尚未 send，
+     * session 计数还没推进，同源反而算错。
+     * flush 那一处不同：那里数据紧接着就送出，+1 是准的。
+     * 判据教训：不同画面数比精确命中数更能反映真实质量。 */
     c->pending_unit[qpos] = ++c->units_submitted;
     if (!av1_no_output)
         c->pending_count++;
@@ -3004,6 +3021,21 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             c->pending[hq] = held_surf;
             c->pending_seq[hq] = c->last_seq;
             c->pending_poc[hq] = INT32_MAX;
+            /* ⚠️ 已否证：改用 session 同源编号（units_sent + 1）。
+             *
+             * 动机充分：回传的 unit_seq 来自 session 的 units_sent，
+             * 而这里登记的是 ++units_submitted（按 EndPicture 计数），
+             * 实测登记 6,7,9,10,13,14 而回传 1,2,3,4,6,7，
+             * 150 帧里回退 79 次 —— 编号确实不同源。
+             * 改后回退 79→64、精确命中 21→26/30，看起来在改善。
+             *
+             * 但像素质量severely退化：不同画面 17 → 4 个。
+             * 回退路径按顺序推断，反而给出了更合理的配对；
+             * "精确匹配"匹配到的是错的帧。
+             * 说明编号不同源只是表象，真正的错位在别处 ——
+             * 在没搞清之前不要用同源编号强行对齐。
+             *
+             * 判据教训：精确命中数会误导，不同画面数才反映真实质量。 */
             c->pending_unit[hq] = ++c->units_submitted;
             c->pending_count++;
             dmd_log("sync: 末帧 surface=%u 入队（unit %llu）",
