@@ -599,6 +599,34 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  * 也就是说：VA-API 的 mode_control_fields.bits.skip_mode_present 在本帧
  * **不可直接转写**。规范 5.9.22 的 skipModeAllowed 要比较参考帧 order hint
  * （需找出前向/后向最近的两个参考），VA-API 给的结论在此帧与 libaom 不符。
+ * ---- 实测结论：skip_mode_present 与 allow_warped_motion **两个都要改** ----
+ *
+ * 加 DMD_AV1_SKIP / DMD_AV1_WARP 覆盖开关穷举组合，与源逐帧比对：
+ *   skip=1 warp=0 → 帧2 ✓ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
+ *   skip=1 warp=- → 帧2 ✗ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
+ *   skip=- warp=0 → 帧2 ✗ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
+ * （✓ = 与源逐字节完全相同；- = 用 VA-API 原值）
+ * 单改任一个都不够，两个必须同时改，帧2 才逐字节正确。
+ *
+ * 逐位实测（帧2 偏移18，144..152 位）：
+ *   位147 源1 合成0  skip_mode_present
+ *   位148 源0 合成1  allow_warped_motion
+ * 两侧总位数相同（都到 header_end@157），所以**不是移位**，是两个值都反。
+ *
+ * VA-API 侧的参考帧状况（DMD_AV1_BITS 实测）解释了 skip_mode_present：
+ *   帧2 oh=16 idx=[2,2,2,2,2,2,2] ref_oh=[0,0,0,0,0,0,0]
+ * 七个参考全指向同一 slot，只有一个可用参考 —— 按规范 5.9.22
+ * skipModeAllowed 需要前向+后向两个不同参考，故 VA-API 报 0 是"讲道理"的，
+ * 但 libaom 编码时写的是 1。所以此处不能照抄 VA-API 结论。
+ *
+ * ⚠️ 已确认**不是**位域读取错位：va_dec_av1.h:545-576 的
+ * mode_control_fields 位域声明里 skip_mode_present 是独立字段，
+ * 读取无误（曾怀疑此项，已排除）。
+ *
+ * 待解决：这两个字段的正确取值规则是什么。当前只知道本码流
+ * 全部 5 个 inter 帧的源值都是 skip=1，而 warp 需按帧判断
+ * （帧2 源为 0）。不能直接写死常量 —— 那只是拟合这一条码流。
+ *
  * 下一步要么按规范自行推导 skipModeAllowed，要么找出 VA-API 该值的正确解释。
  *
  * 附带纠正：1154 行用 reference_select 当门是对的（规范 5.9.22 里
@@ -1250,16 +1278,37 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     /* skip_mode_params()（5.9.22）：skipModeAllowed 的完整推导需要参考帧
      * order hint 比较，VA-API 已给出结论 skip_mode_present，直接用。
      * 帧内帧或 reference_select=0 时 skipModeAllowed=0、不写入。 */
-    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "skipmode", bw.byte_pos*8+bw.bit_pos);
-    if (!intra_only && p->mode_control_fields.bits.reference_select)
-        dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.skip_mode_present);
+    if (getenv("DMD_AV1_BITS")) {
+        fprintf(stderr, "[skip] oh=%u va_skip=%u refsel=%u ref_oh=[",
+                p->order_hint,
+                p->mode_control_fields.bits.skip_mode_present,
+                p->mode_control_fields.bits.reference_select);
+        for (int i = 0; i < 7; i++)
+            fprintf(stderr, "%u%s", dpb ? dpb->dpb_order_hint[
+                        p->ref_frame_idx[i] & 7] : 0, i < 6 ? "," : "");
+        fprintf(stderr, "] idx=[");
+        for (int i = 0; i < 7; i++)
+            fprintf(stderr, "%d%s", p->ref_frame_idx[i], i < 6 ? "," : "");
+        fprintf(stderr, "]\n");
+    }
+    if (!intra_only && p->mode_control_fields.bits.reference_select) {
+        int sm = (int)p->mode_control_fields.bits.skip_mode_present;
+        const char *ov = getenv("DMD_AV1_SKIP");
+        if (ov) sm = atoi(ov);
+        dmd_bw_put_flag(&bw, sm);
+    }
 
     /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
      * 且序列级 enable_warped_motion（我们写 1）。 */
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "warp", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only &&
         p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
-        dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_warped_motion);
+    {
+        int wm = (int)p->pic_info_fields.bits.allow_warped_motion;
+        const char *ov = getenv("DMD_AV1_WARP");
+        if (ov) wm = atoi(ov);
+        dmd_bw_put_flag(&bw, wm);
+    }
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
