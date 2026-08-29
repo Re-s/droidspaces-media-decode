@@ -2629,6 +2629,21 @@ VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface)
     }
     VAStatus status = sync_surface_locked(drv, context, surface,
                                          DMD_FRAME_TIMEOUT_MS);
+
+    /* DMD_VA_TOLERATE_MISSING=1：取不到帧时也报成功（像素为预置内容）。
+     *
+     * 纯诊断开关，默认关闭。用途：AV1 码流合成的正确性只能靠"把整条合成流
+     * 交给权威软解"来判断，但若驱动在首帧就阻塞，ffmpeg 就不再送料，
+     * 我们只能采到 6 帧样本 —— 不足以暴露后续帧的问题。
+     * 打开它可让 ffmpeg 跑完整条流，把完整合成结果落盘（配合
+     * DMD_AV1_DUMP + DMD_AV1_DUMP_ALL）。
+     *
+     * ⚠️ 打开后画面必然是错的，绝不能用于功能验证，只用于采样。 */
+    if (status == VA_STATUS_ERROR_TIMEDOUT) {
+        const char *tol = getenv("DMD_VA_TOLERATE_MISSING");
+        if (tol && tol[0] == '1')
+            status = VA_STATUS_SUCCESS;
+    }
     pthread_mutex_unlock(&drv->lock);
     return status;
 }

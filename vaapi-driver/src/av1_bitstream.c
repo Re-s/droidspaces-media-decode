@@ -206,7 +206,8 @@ static void put_color_config(struct dmd_bitwriter *bw,
 
 /* tile_info()，AV1 规范 5.9.15。
  *
- * ⚠️ tile_size_bytes_minus_1 在这里写死 3（即 4 字节），第 4 步的
+ * ⚠️ tile_size_bytes_minus_1 写死 1（即 2 字节，与源码流 trace_headers
+ *    实测值一致），第 4 步的
  * tile_group 必须用同样宽度写 tile_size_minus_1 —— 两处不一致会让
  * 解码器按错误宽度读 tile 长度，从第二个 tile 起全部错位。 */
 /* tile_info()，AV1 规范 5.9.15。
@@ -229,7 +230,7 @@ static void put_color_config(struct dmd_bitwriter *bw,
  *   v == max → 写 (max-min) 个 1，**不写停止位**
  *   否则     → 写 (v-min) 个 1，再写一个 0
  *
- * ⚠️ tile_size_bytes_minus_1 写死 3（4 字节），第 4 步 tile_group 里写
+ * ⚠️ tile_size_bytes_minus_1 写死 1（2 字节），第 4 步 tile_group 里写
  * tile_size_minus_1 必须用同样宽度 —— 两处不一致会从第二个 tile 起全错位。 */
 static void put_tile_info(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
@@ -1111,7 +1112,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
      *   最后一个 tile 不写长度（由 OBU 剩余长度隐含）
      *
      * tile_size_minus_1 用 le(4)，宽度必须与帧头 tile_info 里写的
-     * tile_size_bytes_minus_1 = 3 一致 —— 两处不符会从第二个 tile 起全错位。 */
+     * tile_size_bytes_minus_1 = 1（即 2 字节）一致 ——
+     * 两处不符会从第二个 tile 起全错位。 */
     const uint32_t tile_total =
         (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
 
