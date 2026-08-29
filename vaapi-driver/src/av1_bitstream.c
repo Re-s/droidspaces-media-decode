@@ -478,6 +478,29 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  * ⚠️ 曾长期误用"送 6 收 6"作基线 —— 那是 6 个 TU 共 9 帧的结果，
  *    与"6 帧"不是同一量级，据此判断合成质量会得出错误结论。
  *
+ * ---- 金字塔 B 帧结构：多数帧 show_frame=0，不产生输出 ----
+ * VA-API 提供 show_frame（va_dec_av1.h:425），但不提供 show_existing_frame。
+ * 实测 ffmpeg 送来的前 6 帧：
+ *   ft=0 show=1 oh=0    ← KEY，显示
+ *   ft=1 show=0 oh=16   ← 参考帧，不显示
+ *   ft=1 show=0 oh=8
+ *   ft=1 show=0 oh=4
+ *   ft=1 show=0 oh=2
+ *   ft=1 show=1 oh=1    ← 显示
+ * 只有首帧与末帧 show_frame=1。源码流 trace_headers 的 show_frame 序列
+ * (1 | 0,0,0,0,1) 与 VA-API 给的完全一致，show_existing_frame 恒 0，
+ * 且 TU2 内 5 个 OBU_FRAME 都带完整帧头 —— 故合成结构本身正确。
+ *
+ * ⚠️ 由此推翻"合成流比源码流少出帧"的结论。决定性对照：
+ *   源码流 帧1+帧2 → dav1d 1 帧、硬件 送 2 收 1
+ *   合成流 帧1+帧2 → dav1d 1 帧、硬件 送 2 收 1
+ * 完全相同。帧 2 的 show_frame=0，本就不产生输出，
+ * 拿"送 N 收 N-1"去要求它出帧是错的。
+ *
+ * ⚠️ trace_headers 不是多帧判据：它对源码流同样只解析首帧
+ *    （-c copy 下 bsf 遇到后续 OBU 会停），实测源与合成的字段序列
+ *    尾部完全相同。多帧正确性只能靠 dav1d 解出的帧数判断。
+ *
  * ---- 两种 TU 分组各自触发不同报错（实测，用于区分症状来源）----
  * 把合成的 5 帧按不同方式分组喂给 dav1d：
  *   每帧独立一个 TU（驱动原本的输出方式）
