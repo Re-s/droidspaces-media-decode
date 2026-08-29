@@ -11,6 +11,10 @@ int main(int argc,char**argv){
      * 上一轮定界发现：合成流按帧切分送料只出 1 帧，而源码流一个
      * temporal unit 含多帧。需要能测"多帧一单元"才能证实该假设。 */
     int whole = (argc>3 && argv[3][0]=='w');
+    /* argv[3]=frame：按 OBU_FRAME 切单元（每帧一单元），而非按 TD 切。
+     * 源码流一个 TU 常含多帧，按 TD 切会把多帧塞进一个单元。
+     * 需要区分"单元=TU"与"单元=单帧"两种送料方式。 */
+    int perframe = (argc>3 && argv[3][0]=='f');
     FILE*f=fopen(argv[1],"rb");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
     uint8_t*d=malloc(sz);fread(d,1,sz,f);fclose(f);
     long offs[64],lens[64];int nu=0;long i=0;
@@ -31,6 +35,35 @@ int main(int argc,char**argv){
     if(!s){printf("create 失败: %s\n",err.msg);return 1;}
 
     int sent=0,got=0;
+    if(perframe){
+        /* 逐 OBU 扫描，每遇 OBU_FRAME(6) 就连同其前的 TD/SEQ 作为一个单元送出。 */
+        long i=0, ustart=0; int nu2=0;
+        while(i<sz){
+            unsigned char h=d[i]; int t=(h>>3)&0xF; long j=i+1;
+            long osz=0; int shf=0;
+            if((h>>1)&1){ while(j<sz){ unsigned char b=d[j++]; osz|=(long)(b&0x7F)<<shf; shf+=7; if(!(b&0x80))break; } }
+            else osz=sz-j;
+            long e=j+osz; if(e>sz)break;
+            if(t==6){
+                int rc=dmd_session_send_unit(s,d+ustart,(size_t)(e-ustart));
+                if(rc==0){
+                    sent++; nu2++;
+                    struct dmd_frame fr; memset(&fr,0,sizeof(fr));
+                    if(dmd_session_next_frame(s,&fr,300)==0){got++;dmd_session_release_frame(s,&fr);}
+                }
+                ustart=e;
+            }
+            i=e;
+        }
+        for(int loop=0;loop<100;loop++){
+            struct dmd_frame fr; memset(&fr,0,sizeof(fr));
+            int r=dmd_session_next_frame(s,&fr,200);
+            if(r==0){got++;dmd_session_release_frame(s,&fr);}
+            else if(r==1)break;
+        }
+        printf("session API: 送 %d 单元, 收 %d 帧\n",sent,got);
+        dmd_session_destroy(s);return 0;
+    }
     if(whole){
         int rc=dmd_session_send_unit(s,d,sz);
         printf("整块送入 %ld 字节 rc=%d\n",sz,rc);
