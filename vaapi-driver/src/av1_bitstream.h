@@ -94,6 +94,18 @@ void dmd_av1_trailing_bits(struct dmd_bitwriter *bw);
 size_t dmd_av1_build_sequence_header(const void *pic,
                                      unsigned char *out, size_t out_cap);
 
+/* ------------------------------------------------------- 帧头合成（3/4） */
+
+/* 从 VADecPictureParameterBufferAV1 合成一个完整的 OBU_FRAME_HEADER
+ * （含 OBU 头 + payload + trailing_bits）。
+ *
+ * tile_cols/tile_rows 取自 pic 参数；tile_size_bytes 固定 4 字节，
+ * 与第 4 步 tile_group 里写 tile_size_minus_1 的宽度必须一致。
+ *
+ * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+size_t dmd_av1_build_frame_header(const void *pic,
+                                  unsigned char *out, size_t out_cap);
+
 /* obu_header() + obu_size（AV1 规范 5.3.1/5.3.2）。
  *
  * 位布局（共 1 字节，无 extension 时）：
