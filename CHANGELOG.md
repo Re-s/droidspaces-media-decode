@@ -45,9 +45,29 @@ vainfo: Driver version: DroidSpaces MediaCodec VA-API driver 0.3.3
 而项目已到 v0.3.7，用户按此报 bug 会指向错误版本。已改为 0.3.7
 并在 `driver.h` 补发版同步清单（本文件、`module.prop`、`CHANGELOG.md`）。
 
-⚠️ 踩坑记录：`vaapi-driver/Makefile` **不跟踪头文件依赖**，
+⚠️ 踩坑记录：`vaapi-driver/Makefile` 此前**不跟踪头文件依赖**，
 改了 `driver.h` 后直接 `make` 产物里仍是旧版本串，必须 `make clean`。
-根治要给 Makefile 加 `-MMD -MP`，本次未做。
+**已根治**，见下一条。
+
+### 🔧 `vaapi-driver/Makefile` 补头文件依赖跟踪
+
+编译规则只写 `$(BUILD)/%.o: $(SRCDIR)/%.c`，不含头文件依赖，
+所以改任何 `.h` 后 `make` 都认为目标是最新的。这类静默失败比编译错误
+更危险 —— 构建"成功"了，装上去的却是旧行为。
+
+标准三件套：`CFLAGS` 加 `-MMD -MP`、`DEPS := $(OBJECTS:.o=.d)`、
+末尾 `-include $(DEPS)`。
+
+实测验证：
+
+```
+clean 重建          → 10 个 .d 全部生成，0 error/warning
+无改动再 make       → "对 all 无需做任何事"（增量仍然有效）
+touch src/driver.h  → 重编译 9 个 .o（修复前是 0 个）
+改版本串为 9.9.9    → 直接 make 即进产物，无需 clean（原踩坑场景）
+```
+
+daemon 侧不受影响：`src/` 只有一个 `.c`，`build.sh` 每次全量编译。
 
 ### 📝 补齐 v0.3.7 只做了一半的跨目录耦合注释
 
@@ -68,9 +88,18 @@ v0.3.7 的变更表声称「注释写明跨目录依赖，改一侧须查另一�
   已漂移到 `:1000` —— v0.3.7 新增常量把它推后了 51 行。文字描述本身正确。
   文档引用源码位置**应改用函数名/宏名而非行号**：全仓库三处行号引用
   已全部失效，靠人工同步不现实。
-- 本轮文档审计另查出多份文档的过时常量与失效事实（SHM 4 槽 / 1 秒等待 /
-  20 字节控制消息 / NDK r27c 下限 / 英文版协议版本写成 2 /
-  `doc/why-not-v4l2.md` 整份归因错误），尚未修改。
+- ~~本轮文档审计另查出多份文档的过时常量与失效事实，尚未修改。~~
+  **已全部修完**（`73a0685` / `8923bb3` / `556c2ce`）：SHM 4→8 槽、
+  1 秒→15 秒槽位等待、20→24 字节控制消息、NDK 下限 r27c→r26d、
+  英文版协议版本 2→3 并补 bit31/endpoint 扩展、高度对齐 16→32、
+  `doc/why-not-v4l2.md` 整份重写、SoC 865→855、新增能效小节、
+  撤除 −28.6% 这个来源不可信的口径。共 8 份文档 + 2 处源码注释。
+
+尚未审计的文档：`doc/vaapi-mediacodec-proxy-research.md`（707 行）、
+`doc/browser-vaapi-guide.md`（291 行）、`ksu-module/README.md`、
+`doc/release-v0.3.4-notes.md`、`dshmon/README.md`。
+另 `vaapi-driver/README.md` 的 dmabuf 导出描述（说"多一次 CPU 拷贝"，
+被 `export.c` 证伪且与同文件后文自相矛盾）也待修。
 
 ## v0.3.7
 
