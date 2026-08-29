@@ -251,6 +251,19 @@ struct dmd_context {
     int have_vp8_pic_param;
     VAPictureParameterBufferVP8 vp8_pic_param;
 
+    /* AV1：合成 OBU 需要两样东西 ——
+     *   1) pic param 的结构化字段：序列头与帧头**只存在于这里**，
+     *      VASliceDataBuffer 里仅有 tile 载荷、不含任何 OBU 封装
+     *      （va_dec_av1.h:643-645 明确说明码流按 per-tile 粒度传入）
+     *   2) 每个 tile 的长度：tile_group 要逐 tile 写 tile_size_minus_1，
+     *      而 slice_data 是连成一片累积的，tile 边界会丢失
+     * 512 项足以覆盖 8K/多 tile 场景（规范 MAX_TILE_COLS×MAX_TILE_ROWS
+     * 名义上 64×64，实际受 MAX_TILE_AREA 约束远小于此）。 */
+    int have_av1_pic_param;
+    VADecPictureParameterBufferAV1 av1_pic_param;
+    size_t av1_tile_len[512];
+    int    av1_tile_count;
+
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
      * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
     int have_h264_pic_param;

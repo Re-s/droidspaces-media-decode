@@ -31,6 +31,7 @@
 #include <drm/drm.h>
 
 #include "driver.h"
+#include "av1_bitstream.h"
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
@@ -1099,6 +1100,15 @@ static int slice_append_locked(struct dmd_context *c, const void *data,
     }
     memcpy(c->slice_data + c->slice_len, data, len);
     c->slice_len += len;
+
+    /* AV1 要逐 tile 记长度：VASliceDataBuffer 按 per-tile 粒度传入
+     * （va_dec_av1.h:643-645），一次追加就是一个 tile。连成一片之后
+     * 边界就找不回来了，而 tile_group 必须逐 tile 写 tile_size_minus_1。 */
+    if (c->codec == DMD_CODEC_AV1 &&
+        c->av1_tile_count < (int)(sizeof(c->av1_tile_len) /
+                                  sizeof(c->av1_tile_len[0])))
+        c->av1_tile_len[c->av1_tile_count++] = len;
+
     return 0;
 }
 
@@ -1129,6 +1139,7 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
 
     c->current_target = render_target;
     c->slice_len = 0;
+    c->av1_tile_count = 0;   /* tile 边界随帧重置，与 slice_len 同生命周期 */
     c->have_vp8_slice_param = 0;
     c->have_vp8_pic_param = 0;
 
@@ -1201,6 +1212,14 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
             break;
 
         case VAPictureParameterBufferType:
+            /* AV1：序列头与帧头的全部字段都在这里，是合成 OBU 的唯一来源。 */
+            if (c->codec == DMD_CODEC_AV1 &&
+                b->size >= sizeof(VADecPictureParameterBufferAV1)) {
+                memcpy(&c->av1_pic_param, b->data,
+                       sizeof(VADecPictureParameterBufferAV1));
+                c->have_av1_pic_param = 1;
+                break;
+            }
             /* VP8 的 key_frame / version / show_frame 相关位在这里。 */
             if (c->codec == DMD_CODEC_VP8 &&
                 b->size >= sizeof(VAPictureParameterBufferVP8)) {
@@ -1340,35 +1359,102 @@ static const unsigned char *build_unit(struct dmd_context *c,
         *out_len = c->slice_len;
         return c->slice_data;
 
-    case DMD_CODEC_AV1:
-        /* ⚠️ 未实现：AV1 需要 OBU 重建，不能像 VP9 那样直接转发。
+    case DMD_CODEC_AV1: {
+        /* AV1 必须反向合成 OBU —— 不能像 VP9 那样直接转发。
          *
-         * 曾以为可以零重建（"slice data 顺序追加即原始字节序"），
-         * **实测证伪**：把累积后的 c->slice_data 原样送给 MediaCodec，
-         * 落盘检查首字节是 0xd0 —— forbidden_bit=1、OBU 类型 10（保留值），
-         * 根本不是 OBU 头；ffprobe 也报 "Failed to read obu /
-         * No sequence header available"。MediaCodec 因此一帧都解不出
-         * （送入 1 单元、取回 0 帧）。
+         * 为什么：VASliceDataBufferType 里只有 tile 的**载荷**，不含任何
+         * OBU 封装（va_dec_av1.h:643-645 明确说"host decoder 负责解析出
+         * per-tile 信息，码流按 per-tile 粒度送入驱动"）。序列头与帧头
+         * 只存在于 VADecPictureParameterBufferAV1 的结构化字段里。
          *
-         * 原因：VASliceDataBufferType 里只有 tile 的**载荷**，不含 OBU 封装。
-         * 序列头与帧头都在 VAPictureParameterBufferAV1 的结构化字段里
-         * （va_dec_av1.h 的 VADecPictureParameterBufferAV1），需要驱动
-         * 反向合成成 OBU 才能喂给 MediaCodec。
+         * 曾以为可以零重建，实测证伪：原样转发时首字节是 0xd0
+         * （forbidden_bit=1、OBU 类型 10 保留值），ffprobe 报
+         * "Failed to read obu / No sequence header available"，
+         * MediaCodec 送入 1 单元取回 0 帧。VP9 的情形不同——它的
+         * slice data 本身就是完整帧（va_dec_vp9.h:274-284）。
          *
-         * 这与 VP9 的情形完全不同：VP9 的 slice data 本身就是完整帧
-         * （va_dec_vp9.h:274-284），所以那条路零重建成立。
+         * 组装出的 temporal unit：
+         *   OBU_TEMPORAL_DELIMITER
+         *   OBU_SEQUENCE_HEADER   （仅关键帧，序列参数不会帧间变化）
+         *   OBU_FRAME             （帧头 + byte_alignment + tile_group）
          *
-         * 要做的事（类似 hevc_bitstream.c 对 VPS/SPS/PPS 的反向合成）：
-         *   1) 从 VAPictureParameterBufferAV1 合成 OBU_SEQUENCE_HEADER
-         *   2) 合成 OBU_FRAME_HEADER
-         *   3) 给每个 tile group 加 OBU_TILE_GROUP 头
-         *   4) 按 temporal unit 组装，必要时加 OBU_TEMPORAL_DELIMITER
-         * 工作量与 hevc_bitstream.c 同级，需要 AV1 规范 5.5/5.9/5.11 节。
-         *
-         * 在此之前返回 NULL，让 vaEndPicture 报 UNIMPLEMENTED，
-         * 上层干净回落软解 —— 这也是为什么 VAProfileAV1Profile0
-         * **不在 dmd_profiles[] 声明表里**。 */
-        return NULL;
+         * 用 OBU_FRAME(6) 而非分离的 FRAME_HEADER(3)+TILE_GROUP(4)：
+         * 实测 dav1d 对分离形式报 "Failed to read unit"，libaom 生成的
+         * 真实码流用的也是 OBU_FRAME。 */
+        if (!c->have_av1_pic_param || c->av1_tile_count <= 0) {
+            dmd_log("EndPicture: AV1 缺少 %s，无法合成 OBU",
+                    c->have_av1_pic_param ? "tile 数据" : "pic param");
+            return NULL;
+        }
+
+        const VADecPictureParameterBufferAV1 *pp = &c->av1_pic_param;
+        const uint32_t want_tiles =
+            (uint32_t)pp->tile_cols * (uint32_t)pp->tile_rows;
+        if (want_tiles == 0 || (uint32_t)c->av1_tile_count != want_tiles) {
+            /* tile 数量与帧头声明不符会让解码器从第二个 tile 起全部错位，
+             * 与其送出去让 MediaCodec 解出花屏，不如干净回落软解。 */
+            dmd_log("EndPicture: AV1 tile 数不符（收到 %d，帧头声明 %u），放弃硬解",
+                    c->av1_tile_count, want_tiles);
+            return NULL;
+        }
+
+        /* tile 描述表：slice_data 是连续累积的，用记下的长度切分。 */
+        struct dmd_av1_tile tiles[512];
+        size_t off = 0;
+        for (int i = 0; i < c->av1_tile_count; i++) {
+            tiles[i].data = c->slice_data + off;
+            tiles[i].len  = c->av1_tile_len[i];
+            off += c->av1_tile_len[i];
+        }
+        if (off != c->slice_len) {
+            dmd_log("EndPicture: AV1 tile 长度累加 %zu != slice_len %zu",
+                    off, c->slice_len);
+            return NULL;
+        }
+
+        /* 输出缓冲：tile 载荷 + 每 tile 4 字节长度 + 头部余量。 */
+        const size_t cap = c->slice_len + (size_t)c->av1_tile_count * 4 + 1024;
+        unsigned char *buf = malloc(cap);
+        if (!buf)
+            return NULL;
+
+        size_t n = 0;
+        n += dmd_av1_obu_header(DMD_OBU_TEMPORAL_DELIMITER, 0, buf + n, cap - n);
+
+        /* 序列头只在关键帧前发：AV1 允许重复发送，但每帧都发是浪费；
+         * 而序列级参数（尺寸、profile、能力位）在一个 session 内不变，
+         * 变了本驱动会重建 session。 */
+        const uint32_t ft = pp->pic_info_fields.bits.frame_type;
+        if (ft == 0 /* KEY_FRAME */) {
+            const size_t sn = dmd_av1_build_sequence_header(pp, buf + n, cap - n);
+            if (sn == 0) {
+                dmd_log("EndPicture: AV1 序列头合成失败");
+                free(buf);
+                return NULL;
+            }
+            n += sn;
+        }
+
+        const size_t fn = dmd_av1_build_frame(pp, tiles, c->av1_tile_count,
+                                              buf + n, cap - n);
+        if (fn == 0) {
+            dmd_log("EndPicture: AV1 OBU_FRAME 合成失败（tile=%d, slice=%zu）",
+                    c->av1_tile_count, c->slice_len);
+            free(buf);
+            return NULL;
+        }
+        n += fn;
+
+        dmd_log("EndPicture: AV1 合成 %zu 字节（%s%d tile，载荷 %zu）",
+                n, ft == 0 ? "含序列头，" : "", c->av1_tile_count, c->slice_len);
+
+        /* 走既有的 scratch 机制：调用方在发送后 free。这与 H264/HEVC/VP8
+         * 分支是同一套所有权约定（本函数头注释：scratch 由调用方提供并
+         * 负责释放），不必新增字段。 */
+        *scratch = buf;
+        *out_len = n;
+        return buf;
+    }
 
     case DMD_CODEC_VP8: {
         size_t cap = c->slice_len + 16;
@@ -1556,6 +1642,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         }
         c->current_target = VA_INVALID_ID;
         c->slice_len = 0;
+        c->av1_tile_count = 0;
         int codec = c->codec;
         pthread_mutex_unlock(&drv->lock);
         free(scratch);
@@ -1640,6 +1727,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             }
             c->current_target = VA_INVALID_ID;
             c->slice_len = 0;
+            c->av1_tile_count = 0;
             pthread_mutex_unlock(&drv->lock);
             free(scratch);
             return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -1763,6 +1851,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         memcpy(tx, unit, unit_len);
     }
     c->slice_len = 0;
+    c->av1_tile_count = 0;
 
     /* 串行化同 context 的 IO。 */
     while (drv->io_busy[idx]) {
