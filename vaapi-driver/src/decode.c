@@ -2598,7 +2598,38 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
      * ffmpeg 报 "Failed to read image from surface 0x8"）。
      *
      * input_finished 由上方 finish_input 路径置位，那才是流真结束的信号。 */
-    if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session) {
+    /* ================================================================
+     * flush 与 refresh 反算的死结（本轮量化，尚未解开）
+     * ================================================================
+     * 60 帧样本对照（DMD_AV1_NO_FLUSH 开关，逐字节比对为判据）：
+     *   开 flush（现状）  合成 61 帧，56/61 逐字节正确
+     *   关 flush          合成  5 帧， 5/5  逐字节正确，但 -f null 只出 1 帧
+     *
+     * 也就是说：flush 是**全部**剩余合成缺陷的根源，
+     * 但关掉它会让帧被永久扣住 —— ffmpeg 拿不到像素就停止送料，
+     * 会话在"送入 5 单元, 收到 1 帧"处停摆。两边都不能要。
+     *
+     * 成因：refresh_frame_flags 的正确值要靠"下一帧的 ref_frame_map
+     * 与本帧的差分"反算（dmd_av1_patch_prev_refresh，机制本身已验证正确）。
+     * flush 在下一帧到来**之前**就把暂存帧发了出去，
+     * 那一刻无从差分，只能写占位值，且发出后再也改不了。
+     *
+     * 为什么现状还能到 56/61：实测源码流 39 个帧间帧里有 18 个
+     * refresh 本来就是 0，flush 写 0 在近半数情况下恰好命中。
+     * 这是巧合而非正确 —— 60 帧里 flush 触发了 30 次。
+     *
+     * 已试过并否证的两种改法：
+     *   给改写加 input_finished 门 → 总数从 56 掉到 28（更差，已撤销）
+     *   完全不 flush              → 5/5 但会话停摆（见上）
+     *
+     * 可能的出路（下一轮验证）：把 flush 推迟到下一次 BeginPicture
+     * 拿到新 ref_frame_map 之后再发，这样既能差分出正确 refresh，
+     * 又不会让帧被无限期扣住。
+     *
+     * 诊断开关：DMD_AV1_NO_FLUSH=1 完全不冲出暂存帧。
+     * ================================================================ */
+    if (c->codec == DMD_CODEC_AV1 && c->av1_hold && c->session &&
+        !getenv("DMD_AV1_NO_FLUSH")) {
         unsigned char *held = c->av1_hold;
         size_t held_len = c->av1_hold_len;
         size_t held_bitpos = c->av1_hold_bitpos;
@@ -2617,6 +2648,15 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          *
          * 所以只在输入确实结束后才改写。未结束时保留轮转占位值：
          * 那个值虽不等于源码流，但至少不会把该帧从参考槽里抹掉。 */
+        /* ⚠️ 只在输入确实结束后才把 refresh 改写为 0。
+         *
+         * 60 帧样本实测：不加这个条件，帧30/帧60 的 refresh
+         * 应为 0x10 却被写成 0x00（相邻帧 28/29/31/59/61 全对）——
+         * 它们根本不是末帧，是被 ffmpeg 的短超时轮询触发的 flush 误改的。
+         *
+         * 第 43 轮加过同样的门又撤销了，因为当时看"像素导出帧数"从 6 掉到 3。
+         * 但那个判据本身不稳定（同配置重复测量在 3~8 帧之间浮动），
+         * 不足以评判任何改动。本轮改用逐字节比对这个稳定判据重做。 */
         if (held_bitpos != (size_t)-1) {
             int patched = 1;
             for (int i = 0; i < 8; i++) {
