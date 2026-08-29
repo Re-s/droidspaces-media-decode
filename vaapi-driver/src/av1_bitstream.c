@@ -164,14 +164,15 @@ static void put_color_config(struct dmd_bitwriter *bw,
     if (p->profile != 1)
         dmd_bw_put_flag(bw, (int)mono);            /* mono_chrome */
 
-    /* color_description_present_flag 置 1 并显式给出三个描述符：
-     * VA-API 只提供 matrix_coefficients（va_dec_av1.h:263-264），
-     * 另两个填 UNSPECIFIED(2)。若置 0，规范会把三者都当 UNSPECIFIED，
-     * 那就丢掉了 VA-API 明确给出的 matrix_coefficients。 */
-    dmd_bw_put_flag(bw, 1);
-    dmd_bw_put_bits(bw, 2, 8);                     /* color_primaries          */
-    dmd_bw_put_bits(bw, 2, 8);                     /* transfer_characteristics */
-    dmd_bw_put_bits(bw, p->matrix_coefficients, 8);
+    /* color_description_present_flag = 0。
+     *
+     * ⚠️ 曾置 1 并显式写三个描述符（想保住 VA-API 给的
+     * matrix_coefficients），实测与真实码流不符：libaom 置 0，
+     * 于是三者都取 UNSPECIFIED(2)。多写会让序列头长 3 字节。
+     *
+     * 代价可接受：matrix_coefficients 只影响色彩转换矩阵的选择，
+     * 不影响能否解出帧；而本驱动输出 NV12 给上层，色彩解释由上层负责。 */
+    dmd_bw_put_flag(bw, 0);
 
     if (mono) {
         dmd_bw_put_flag(bw, (int)p->seq_info_fields.fields.color_range);
@@ -191,8 +192,11 @@ static void put_color_config(struct dmd_bitwriter *bw,
     /* chroma_sample_position 仅 4:2:0 时出现。VA-API 的同名字段已标
      * va_deprecated（:285），故写 UNKNOWN(0)：它只影响色度插值相位假设，
      * 不影响能否解出帧。 */
+    /* chroma_sample_position = 1（CSP_VERTICAL）。真实码流用 1；
+     * VA-API 的同名字段已标 va_deprecated（:285）故不可信。
+     * 该值只影响色度插值的相位假设，不影响能否解出帧。 */
     if (sub_x && sub_y)
-        dmd_bw_put_bits(bw, 0, 2);
+        dmd_bw_put_bits(bw, 1, 2);
 
     dmd_bw_put_flag(bw, 0);                        /* separate_uv_delta_q */
 }
@@ -202,99 +206,122 @@ static void put_color_config(struct dmd_bitwriter *bw,
  * ⚠️ tile_size_bytes_minus_1 在这里写死 3（即 4 字节），第 4 步的
  * tile_group 必须用同样宽度写 tile_size_minus_1 —— 两处不一致会让
  * 解码器按错误宽度读 tile 长度，从第二个 tile 起全部错位。 */
+/* tile_info()，AV1 规范 5.9.15。
+ *
+ * ⚠️ 本函数的边界值算错过两次，最终以 ffmpeg 的 CBS 实现为准逐行校对
+ * （libavcodec/cbs_av1_syntax_template.c 的 tile_info()）。两个坑：
+ *
+ *   1) 位移量是 sb_size = sb_shift + 2，**不是** sb_shift。CBS 原文：
+ *        sb_size = sb_shift + 2;
+ *        max_tile_width_sb = AV1_MAX_TILE_WIDTH >> sb_size;
+ *      用 sb_shift 会让 max_tile_width_sb 大 4 倍 → min_log2_tile_cols
+ *      偏小 → 一元码起点就错。
+ *
+ *   2) min_log2_tiles 要对 min_log2_tile_cols 取 max。CBS 原文：
+ *        min_log2_tiles = FFMAX(min_log2_tile_cols,
+ *                    cbs_av1_tile_log2(max_tile_area_sb, sb_rows*sb_cols));
+ *      漏掉会让 min_log2_tile_rows 偏小 → 行方向多写若干个 1。
+ *
+ * increment(v, min, max) 的编码规则（cbs_av1_write_increment）：
+ *   v == max → 写 (max-min) 个 1，**不写停止位**
+ *   否则     → 写 (v-min) 个 1，再写一个 0
+ *
+ * ⚠️ tile_size_bytes_minus_1 写死 3（4 字节），第 4 步 tile_group 里写
+ * tile_size_minus_1 必须用同样宽度 —— 两处不一致会从第二个 tile 起全错位。 */
 static void put_tile_info(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
                           uint32_t mi_cols, uint32_t mi_rows)
 {
     const int sb_shift = p->seq_info_fields.fields.use_128x128_superblock ? 5 : 4;
-    const int sb_size  = 1 << sb_shift;
+    const int sb_size  = sb_shift + 2;
 
-    /* sbCols/sbRows：以超级块为单位的画面尺寸（规范 5.9.15 的推导）。 */
-    const uint32_t sb_cols = (mi_cols + sb_size - 1) >> sb_shift;
-    const uint32_t sb_rows = (mi_rows + sb_size - 1) >> sb_shift;
+    const uint32_t sb_cols = p->seq_info_fields.fields.use_128x128_superblock
+                           ? ((mi_cols + 31) >> 5) : ((mi_cols + 15) >> 4);
+    const uint32_t sb_rows = p->seq_info_fields.fields.use_128x128_superblock
+                           ? ((mi_rows + 31) >> 5) : ((mi_rows + 15) >> 4);
+
+    const uint32_t MAX_TILE_COLS = 64, MAX_TILE_ROWS = 64;
+    const uint32_t max_tile_width_sb = 4096u >> sb_size;
+    const uint32_t max_tile_area_sb  = (4096u * 2304u) >> (2 * sb_size);
+
+    uint32_t max_log2_tile_cols = 0;
+    while ((1u << max_log2_tile_cols) <
+           (sb_cols < MAX_TILE_COLS ? sb_cols : MAX_TILE_COLS))
+        max_log2_tile_cols++;
+    uint32_t max_log2_tile_rows = 0;
+    while ((1u << max_log2_tile_rows) <
+           (sb_rows < MAX_TILE_ROWS ? sb_rows : MAX_TILE_ROWS))
+        max_log2_tile_rows++;
+
+    uint32_t min_log2_tile_cols = 0;
+    while ((max_tile_width_sb << min_log2_tile_cols) < sb_cols)
+        min_log2_tile_cols++;
+    uint32_t min_log2_area = 0;
+    while ((max_tile_area_sb << min_log2_area) < sb_rows * sb_cols)
+        min_log2_area++;
+    const uint32_t min_log2_tiles = (min_log2_tile_cols > min_log2_area)
+                                  ? min_log2_tile_cols : min_log2_area;
+
+    /* VA-API 给的是 tile_cols/tile_rows（个数），先反推 log2。 */
+    uint32_t cols_log2 = 0;
+    while ((1u << cols_log2) < p->tile_cols)
+        cols_log2++;
+    uint32_t rows_log2 = 0;
+    while ((1u << rows_log2) < p->tile_rows)
+        rows_log2++;
+
 
     dmd_bw_put_flag(bw, (int)p->pic_info_fields.bits.uniform_tile_spacing_flag);
 
     if (p->pic_info_fields.bits.uniform_tile_spacing_flag) {
-        /* 均匀间隔：写 increment_tile_cols_log2 的一元码。
-         * VA-API 给的是 tile_cols 而非 log2，先反推。
-         * va_dec_av1.h:385-387 说明此模式下 width_in_sbs_minus_1[] 应忽略，
-         * 由驱动依 tile_cols/tile_rows 自行生成 —— 正是这里做的事。 */
-        uint32_t cols_log2 = 0;
-        while ((1u << cols_log2) < p->tile_cols)
-            cols_log2++;
-        uint32_t rows_log2 = 0;
-        while ((1u << rows_log2) < p->tile_rows)
-            rows_log2++;
-
-        /* 一元码的停止位条件必须用规范的 maxLog2 上界，不能写死常数 ——
-         * 写死 6 会让解码器在 cols_log2 已达上界时仍去读一位停止位，
-         * 从而把后面的字段读偏（实测表现为 tile 布局解析成 3x2 而非 2x4）。
-         *
-         * 规范 5.9.15 的推导（tile_log2(blkSize, target) = 最小的 k
-         * 使 blkSize << k >= target）：
-         *   maxLog2TileCols = tile_log2(1, min(sbCols, MAX_TILE_COLS))
-         *   maxLog2TileRows = tile_log2(1, min(sbRows, MAX_TILE_ROWS))
-         *   minLog2TileCols = tile_log2(MAX_TILE_WIDTH_SB, sbCols)
-         *   minLog2TileRows = max(minLog2Tiles - cols_log2, 0)
-         * 其中 minLog2Tiles = tile_log2(MAX_TILE_AREA_SB, sbRows*sbCols)。 */
-        const uint32_t MAX_TILE_COLS = 64, MAX_TILE_ROWS = 64;
-        const uint32_t max_tile_width_sb = 4096 >> sb_shift;
-        const uint32_t max_tile_area_sb  = (4096 * 2304) >> (2 * sb_shift);
-
-        uint32_t max_log2_tile_cols = 0;
-        while ((1u << max_log2_tile_cols) <
-               (sb_cols < MAX_TILE_COLS ? sb_cols : MAX_TILE_COLS))
-            max_log2_tile_cols++;
-        uint32_t max_log2_tile_rows = 0;
-        while ((1u << max_log2_tile_rows) <
-               (sb_rows < MAX_TILE_ROWS ? sb_rows : MAX_TILE_ROWS))
-            max_log2_tile_rows++;
-
-        uint32_t min_log2_tile_cols = 0;
-        while ((max_tile_width_sb << min_log2_tile_cols) < sb_cols)
-            min_log2_tile_cols++;
-        uint32_t min_log2_tiles = 0;
-        while ((max_tile_area_sb << min_log2_tiles) < sb_rows * sb_cols)
-            min_log2_tiles++;
-
+        /* increment(tile_cols_log2, min_log2_tile_cols, max_log2_tile_cols)
+         * 先夹到合法区间：CBS 的写入侧对越界直接报错拒绝。 */
+        if (cols_log2 < min_log2_tile_cols) cols_log2 = min_log2_tile_cols;
+        if (cols_log2 > max_log2_tile_cols) cols_log2 = max_log2_tile_cols;
         for (uint32_t i = min_log2_tile_cols; i < cols_log2; i++)
-            dmd_bw_put_flag(bw, 1);       /* increment_tile_cols_log2 */
-        if (cols_log2 < max_log2_tile_cols)
-            dmd_bw_put_flag(bw, 0);       /* 停止位 */
+            dmd_bw_put_flag(bw, 1);
+        if (cols_log2 != max_log2_tile_cols)
+            dmd_bw_put_flag(bw, 0);
 
         const uint32_t min_log2_tile_rows =
             (min_log2_tiles > cols_log2) ? (min_log2_tiles - cols_log2) : 0;
+        if (rows_log2 < min_log2_tile_rows) rows_log2 = min_log2_tile_rows;
+        if (rows_log2 > max_log2_tile_rows) rows_log2 = max_log2_tile_rows;
         for (uint32_t i = min_log2_tile_rows; i < rows_log2; i++)
-            dmd_bw_put_flag(bw, 1);       /* increment_tile_rows_log2 */
-        if (rows_log2 < max_log2_tile_rows)
+            dmd_bw_put_flag(bw, 1);
+        if (rows_log2 != max_log2_tile_rows)
             dmd_bw_put_flag(bw, 0);
     } else {
         /* 非均匀：逐 tile 写 width_in_sbs_minus_1 / height_in_sbs_minus_1，
-         * 用 ns(n) 编码（规范 5.9.15）。 */
+         * 用 ns(n) 编码。上界是"剩余 sb 数"与 max_tile_*_sb 的较小者。 */
         uint32_t start_sb = 0;
         for (int i = 0; i < p->tile_cols && start_sb < sb_cols; i++) {
-            uint32_t max_w = sb_cols - start_sb;
-            dmd_av1_put_ns(bw, p->width_in_sbs_minus_1[i], max_w);
+            const uint32_t rest = sb_cols - start_sb;
+            const uint32_t lim = rest < max_tile_width_sb ? rest
+                                                          : max_tile_width_sb;
+            dmd_av1_put_ns(bw, p->width_in_sbs_minus_1[i], lim);
             start_sb += p->width_in_sbs_minus_1[i] + 1;
         }
         start_sb = 0;
         for (int i = 0; i < p->tile_rows && start_sb < sb_rows; i++) {
-            uint32_t max_h = sb_rows - start_sb;
-            dmd_av1_put_ns(bw, p->height_in_sbs_minus_1[i], max_h);
+            dmd_av1_put_ns(bw, p->height_in_sbs_minus_1[i],
+                           sb_rows - start_sb);
             start_sb += p->height_in_sbs_minus_1[i] + 1;
         }
     }
 
-    /* TileCols/TileRows > 1 时才写 context_update_tile_id 与 tile_size_bytes。 */
-    const uint32_t tile_total = (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
-    if (tile_total > 1) {
-        uint32_t cols_log2 = 0, rows_log2 = 0;
-        while ((1u << cols_log2) < p->tile_cols) cols_log2++;
-        while ((1u << rows_log2) < p->tile_rows) rows_log2++;
+    /* TileCols*TileRows > 1 时写 context_update_tile_id 与 tile_size_bytes。
+     * 位宽用**上面夹取修正后**的 log2 值，不能再按 tile_cols 重算。 */
+    if (cols_log2 + rows_log2 > 0) {
         dmd_bw_put_bits(bw, p->context_update_tile_id,
                         (int)(cols_log2 + rows_log2));
-        dmd_bw_put_bits(bw, 3, 2);   /* tile_size_bytes_minus_1 = 3 → 4 字节 */
+        /* tile_size_bytes_minus_1 = 1（2 字节）。
+         * 依据：VA-API 给的 tile offset 之间恰好各差 2 字节
+         * （实测 tile[0] off=2、tile[1] off=前一个末尾+2 …… 共 7 个间隙），
+         * 那 2 字节就是原始码流里的 tile_size 字段。跟随源码流宽度可让
+         * 合成结果与原始 payload 长度一致，也避免无谓放大。
+         * ⚠️ 必须与 dmd_av1_build_frame() 里写 tile_size_minus_1 的宽度一致。 */
+        dmd_bw_put_bits(bw, 1, 2);
     }
 }
 
@@ -465,10 +492,9 @@ static void put_lr_params(struct dmd_bitwriter *bw,
     const uint32_t rcb = p->loop_restoration_fields.bits.cbframe_restoration_type;
     const uint32_t rcr = p->loop_restoration_fields.bits.crframe_restoration_type;
 
-    /* 序列头里 enable_restoration 是按"三者任一非零"写的，两处必须一致：
-     * 若全为 0，序列头写了 enable_restoration=0，解码器就不会来读这段。 */
-    if (!ry && !rcb && !rcr)
-        return;
+    /* 序列头 enable_restoration 恒写 1，所以这一段**总要写**——
+     * 即使三个 lr_type 全为 0（那正是"本帧不做 restoration"的正规表达）。
+     * 早先这里按"全 0 就提前返回"，与序列头不一致，导致帧头短 6 位。 */
 
     /* lr_type 用 f(2)，取值顺序与 VA-API 的 restoration_type 枚举一致
      * （0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE）。 */
@@ -521,10 +547,15 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
                                 * 单一 operating point：本驱动不做可扩展层，
                                 * 与 OBU 头 extension_flag 恒 0 相一致。 */
     dmd_bw_put_bits(&bw, 0, 12);          /* operating_point_idc[0] */
-    dmd_bw_put_bits(&bw, 0, 5);           /* seq_level_idx[0] = 2.0
-                                           * VA-API 不提供 level；MediaCodec
-                                           * 按实际分辨率分配资源，不用它校验。
-                                           * seq_level_idx <= 7 时不写 seq_tier。 */
+    /* seq_level_idx[0] = 8（level 4.0）+ seq_tier[0] = 0。
+     *
+     * ⚠️ 曾写 0（level 2.0），实测与真实码流不符：libaom 对 1080p 输出 8。
+     * 关键不只是数值 —— seq_level_idx > 7 时**必须紧跟 seq_tier**（f(1)），
+     * 写 0 会少这一位，导致序列头后续所有字段偏移 1 位。
+     * VA-API 不提供 level，取 8 跟随真实码流；MediaCodec 按实际分辨率
+     * 分配资源，不用这个字段校验。 */
+    dmd_bw_put_bits(&bw, 8, 5);           /* seq_level_idx[0] */
+    dmd_bw_put_flag(&bw, 0);              /* seq_tier[0]（因 idx > 7） */
 
     /* frame_width_bits 取实际所需位宽而不写死 16 位。
      * frame_width_minus1 按 va_dec_av1.h:332-334 是**上采样后**分辨率，
@@ -581,14 +612,20 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
      * 这两个**必须如实反映**，与 warped_motion 的处理不同 —— 它们会改变
      * 帧头的语法结构（多读或少读字段），置错会直接让帧头错位。 */
     const int use_superres = (int)p->pic_info_fields.bits.use_superres;
-    const int any_restoration =
-        (p->loop_restoration_fields.bits.yframe_restoration_type  != 0) ||
-        (p->loop_restoration_fields.bits.cbframe_restoration_type != 0) ||
-        (p->loop_restoration_fields.bits.crframe_restoration_type != 0);
 
     dmd_bw_put_flag(&bw, use_superres);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_cdef);
-    dmd_bw_put_flag(&bw, any_restoration);
+    /* enable_restoration 恒 1。
+     *
+     * ⚠️ 曾按"三个 frame_restoration_type 是否全为 0"来推导，实测错误：
+     * trace_headers 显示真实码流 enable_restoration=1，且帧头位 204 起
+     * **确实写了 lr_type[0..2] 共 6 位**（值恰好全为 0）。
+     * 也就是说"本帧不用 restoration"是通过 lr_type=0 表达的，而不是通过
+     * 序列级 enable_restoration=0 —— 后者会让整个 lr_params 段消失，
+     * 帧头因此短 6 位，tile_group 起始位置随之前移，解码器读到错位数据。
+     *
+     * 取 1 是安全侧：它只是允许，具体每帧仍由 lr_type 决定。 */
+    dmd_bw_put_flag(&bw, 1);
 
     put_color_config(&bw, p);
 
@@ -658,7 +695,13 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.showable_frame);
 
     /* error_resilient_mode：KEY_FRAME 且 show_frame 时恒 1、不写入。 */
-    if (!(is_key && p->pic_info_fields.bits.show_frame))
+    /* error_resilient_mode（CBS 原文）：
+     *   frame_type == SWITCH || (frame_type == KEY && show_frame)
+     *     → infer 1（不写入码流）
+     *   否则 flag(error_resilient_mode) */
+    const int er_inferred = (frame_type == 3) ||
+                            (is_key && p->pic_info_fields.bits.show_frame);
+    if (!er_inferred)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.error_resilient_mode);
 
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.disable_cdf_update);
@@ -695,10 +738,14 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         dmd_bw_put_bits(&bw, p->order_hint, order_hint_bits);
 
     /* primary_ref_frame：帧内帧或 error_resilient 时不写。 */
-    const int primary_ref_none = intra_only ||
-        p->pic_info_fields.bits.error_resilient_mode ||
+    /* err_res 是**生效值**：被 infer 的场合恒 1，否则取 VA-API 给的。
+     * 后续 primary_ref_frame / use_ref_frame_mvs / allow_warped_motion
+     * 的条件都要用这个生效值，用原始字段会判错。 */
+    const int err_res = er_inferred
+                      ? 1 : (int)p->pic_info_fields.bits.error_resilient_mode;
+    const int primary_ref_none = intra_only || err_res ||
         (p->primary_ref_frame == 7 /* PRIMARY_REF_NONE */);
-    if (!intra_only && !p->pic_info_fields.bits.error_resilient_mode)
+    if (!intra_only && !err_res)
         dmd_bw_put_bits(&bw, p->primary_ref_frame, 3);
 
     /* refresh_frame_flags：KEY_FRAME + show_frame 时恒 0xFF、不写入码流。
@@ -711,7 +758,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 而 0xFF 是最保守的选择 —— 声称刷新全部，不会出现"解码器以为某槽
      * 还有效、实际已被覆盖"的悬空引用。代价是参考帧管理不够精细，
      * 但本驱动逐帧转发、由 MediaCodec 负责重排序，不受影响。 */
-    const int refresh_all = (is_key && p->pic_info_fields.bits.show_frame);
+    const int refresh_all = (frame_type == 3) ||
+                            (is_key && p->pic_info_fields.bits.show_frame);
     if (!refresh_all)
         dmd_bw_put_bits(&bw, 0xFF, 8);
 
@@ -746,14 +794,44 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     dmd_bw_put_flag(&bw, 0);
 
     /* allow_intrabc（规范 5.9.2）：条件是 allow_screen_content_tools &&
-     * UpscaledWidth == FrameWidth（即无 superres 上采样），**与
-     * allow_screen_content_tools 的取值无关地出现在 intra 分支里**。
+     * UpscaledWidth == FrameWidth。以 ffmpeg CBS 的原文为准：
+     *   if (allow_screen_content_tools && upscaled_width == frame_width)
+     *       flag(allow_intrabc);
+     *   else
+     *       infer(allow_intrabc, 0);
      *
-     * 与真实码流逐位对照确认：libaom 生成的 1080p KEY_FRAME 在第 8 位
-     * 就是 allow_intrabc（此时 allow_screen_content_tools=0 却仍写了该位）。
-     * 早先误加 allow_screen_content_tools 作为前置条件，导致少写 1 位、
-     * dav1d 报 trailing_one_bit 错位。 */
-    if (intra_only && !p->pic_info_fields.bits.use_superres)
+     * upscaled_width == frame_width 等价于"无 superres 上采样"——
+     * superres_params 里只有 use_superres 时才把 frame_width 按 denom 缩小。
+     *
+     * ⚠️ 这个条件错过两次：先漏 upscaled 判据，后又把
+     * allow_screen_content_tools 整个去掉（误读真实码流某一位所致）。
+     * 两个条件**都要**，缺一个就多写或少写 1 位。 */
+    /* ⚠️ 这里 CBS 源码与 libaom 的实际输出不一致，以**真实码流**为准。
+     *
+     * CBS（cbs_av1_syntax_template.c）写的是条件读：
+     *   if (allow_screen_content_tools && upscaled_width == frame_width)
+     *       flag(allow_intrabc); else infer 0
+     *
+     * 但用位级解析器逐字段核对 libaom 生成的 1080p KEY_FRAME：该帧
+     * allow_screen_content_tools=0，若按 CBS 的条件跳过这一位，整个帧头
+     * 会错位、读到末尾 trailing_one_bit=0；无条件读这一位才能得到
+     * trailing_one_bit=1（位数精确闭合）。
+     *
+     * 结论：实际编码器无条件写该位。判据是"能否让真实码流闭合"，
+     * 而不是源码怎么写 —— 我们要喂的是真实解码器，不是 CBS。 */
+    /* allow_intrabc：以 ffmpeg trace_headers 对真实码流的逐位输出为准。
+     * 实测 libaom 生成的 1080p KEY_FRAME（allow_screen_content_tools=0）：
+     *   位 46  render_and_frame_size_different
+     *   位 47  disable_frame_end_update_cdf     ← allow_intrabc **不存在**
+     *   位 48  uniform_tile_spacing_flag
+     * 即 CBS 的条件读成立：asct=0 时该位不写入码流。
+     *
+     * ⚠️ 曾据自己写的解析器"位数闭合"推断成无条件写，那是错的 ——
+     * 解析器本身在此处有偏差，两个错误互相抵消才显得闭合。
+     * 教训：验证工具必须先用 trace_headers 这类权威输出校准，
+     * 不能拿未校准的自制解析器当基准。 */
+    if (intra_only && p->pic_info_fields.bits.allow_screen_content_tools &&
+        !p->pic_info_fields.bits.use_superres)
         dmd_bw_put_flag(&bw, (int)allow_intrabc);
 
     if (!intra_only) {
@@ -771,7 +849,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
             (int)p->pic_info_fields.bits.is_motion_mode_switchable);
         /* use_ref_frame_mvs 需 enable_ref_frame_mvs（序列头写 1）、
          * 非 error_resilient、且 enable_order_hint。 */
-        if (!p->pic_info_fields.bits.error_resilient_mode && enable_order_hint)
+        if (!err_res && enable_order_hint)
             dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.use_ref_frame_mvs);
     }
 
@@ -818,8 +896,23 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     /* read_tx_mode()（5.9.21）：CodedLossless 时 tx_mode 恒 ONLY_4X4、
      * 不写入；否则写 tx_mode_select f(1)。VA-API 的 tx_mode 取值
      * 2 = TX_MODE_LARGEST, 3 = TX_MODE_SELECT。 */
-    if (!coded_lossless)
-        dmd_bw_put_flag(&bw, p->mode_control_fields.bits.tx_mode == 3);
+    /* read_tx_mode（CBS 原文）：
+     *   coded_lossless → infer(tx_mode, ONLY_4X4)，不写入
+     *   否则 increment(tx_mode, TX_MODE_LARGEST=1, TX_MODE_SELECT=2)
+     *
+     * ⚠️ 曾误当成 f(1) 标志写 `tx_mode == 3`，两处都错：
+     *   - 编码方式不是单个标志位，而是 increment（range [1,2]）
+     *   - VA-API 的 tx_mode 值域是 [0..2]（va_dec_av1.h:560-563），
+     *     直接就是规范枚举值，不存在 3
+     * increment 在 range_max 时写 (max-min)=1 个 1 且无停止位，
+     * 在 range_min 时只写一个 0。 */
+    if (!coded_lossless) {
+        const uint32_t tm = p->mode_control_fields.bits.tx_mode;
+        if (tm >= 2)
+            dmd_bw_put_flag(&bw, 1);   /* TX_MODE_SELECT：写 1，无停止位 */
+        else
+            dmd_bw_put_flag(&bw, 0);   /* TX_MODE_LARGEST：停止位 */
+    }
 
     /* frame_reference_mode()（5.9.23）：帧间帧写 reference_select。 */
     if (!intra_only)
@@ -834,8 +927,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
      * 且序列级 enable_warped_motion（我们写 1）。 */
     if (!intra_only &&
-        p->pic_info_fields.bits.is_motion_mode_switchable &&
-        !p->pic_info_fields.bits.error_resilient_mode)
+        p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_warped_motion);
 
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
@@ -951,7 +1043,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
             return 0;
         payload_len += tiles[i].len;
         if (i + 1 < num_tiles)
-            payload_len += 4;         /* tile_size_minus_1，le(4) */
+            payload_len += 2;         /* tile_size_minus_1，le(2) */
     }
 
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME, payload_len,
@@ -966,11 +1058,13 @@ size_t dmd_av1_build_frame(const void *pic_v,
         *q++ = tg_hdr[i];
     for (int i = 0; i < num_tiles; i++) {
         if (i + 1 < num_tiles) {
+            /* le(2)：宽度必须等于帧头 tile_size_bytes_minus_1 + 1 = 2。
+             * 单 tile 上限 64KB —— 实测 1080p 最大 tile 约 4KB，
+             * 而 VA-API 源码流本身就用 2 字节，跟随它即可。
+             * ⚠️ 若将来遇到 >64KB 的单 tile，这里和帧头要一起加宽。 */
             const uint32_t v = (uint32_t)(tiles[i].len - 1);
             *q++ = (unsigned char)(v & 0xFF);
             *q++ = (unsigned char)((v >> 8) & 0xFF);
-            *q++ = (unsigned char)((v >> 16) & 0xFF);
-            *q++ = (unsigned char)((v >> 24) & 0xFF);
         }
         for (size_t k = 0; k < tiles[i].len; k++)
             *q++ = tiles[i].data[k];

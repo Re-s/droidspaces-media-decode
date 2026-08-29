@@ -1101,14 +1101,6 @@ static int slice_append_locked(struct dmd_context *c, const void *data,
     memcpy(c->slice_data + c->slice_len, data, len);
     c->slice_len += len;
 
-    /* AV1 要逐 tile 记长度：VASliceDataBuffer 按 per-tile 粒度传入
-     * （va_dec_av1.h:643-645），一次追加就是一个 tile。连成一片之后
-     * 边界就找不回来了，而 tile_group 必须逐 tile 写 tile_size_minus_1。 */
-    if (c->codec == DMD_CODEC_AV1 &&
-        c->av1_tile_count < (int)(sizeof(c->av1_tile_len) /
-                                  sizeof(c->av1_tile_len[0])))
-        c->av1_tile_len[c->av1_tile_count++] = len;
-
     return 0;
 }
 
@@ -1193,6 +1185,25 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
             break;
 
         case VASliceParameterBufferType:
+            /* AV1：每个 tile 一份 slice param（va_dec_av1.h:635），
+             * 它是 tile 边界的唯一可靠来源 —— slice data 可能整帧打包在
+             * 一个 buffer 里，数追加次数会得到 1 而非真实 tile 数。
+             * 一个 buffer 可携带多个元素（num_elements），要全部收下。 */
+            if (c->codec == DMD_CODEC_AV1 &&
+                b->element_size >= sizeof(VASliceParameterBufferAV1)) {
+                const int cap = (int)(sizeof(c->av1_tile_param) /
+                                      sizeof(c->av1_tile_param[0]));
+                for (unsigned int k = 0; k < b->num_elements; k++) {
+                    if (c->av1_tile_count >= cap)
+                        break;
+                    const unsigned char *src =
+                        (const unsigned char *)b->data +
+                        (size_t)k * b->element_size;
+                    memcpy(&c->av1_tile_param[c->av1_tile_count++], src,
+                           sizeof(VASliceParameterBufferAV1));
+                }
+                break;
+            }
             /* VP8 需要 partition_size[0] 与 macroblock_offset 来推导
              * first_part_size，其余 codec 当前不需要 slice 参数。 */
             if (c->codec == DMD_CODEC_VP8 &&
@@ -1398,22 +1409,30 @@ static const unsigned char *build_unit(struct dmd_context *c,
             return NULL;
         }
 
-        /* tile 描述表：slice_data 是连续累积的，用记下的长度切分。 */
+        /* tile 描述表：用每个 tile 自己的 slice_data_offset/slice_data_size
+         * 在累积缓冲里定位（va_dec_av1.h:649-658）。不能靠"追加次数"——
+         * 实机上 ffmpeg 把整帧 8 个 tile 打包在一个 slice data buffer 里。 */
         struct dmd_av1_tile tiles[512];
-        size_t off = 0;
         for (int i = 0; i < c->av1_tile_count; i++) {
+            const VASliceParameterBufferAV1 *tp = &c->av1_tile_param[i];
+            const size_t off = tp->slice_data_offset;
+            const size_t len = tp->slice_data_size;
+            if (len == 0 || off > c->slice_len || off + len > c->slice_len) {
+                dmd_log("EndPicture: AV1 tile[%d] 越界（off=%zu len=%zu，"
+                        "缓冲 %zu），放弃硬解", i, off, len, c->slice_len);
+                return NULL;
+            }
             tiles[i].data = c->slice_data + off;
-            tiles[i].len  = c->av1_tile_len[i];
-            off += c->av1_tile_len[i];
-        }
-        if (off != c->slice_len) {
-            dmd_log("EndPicture: AV1 tile 长度累加 %zu != slice_len %zu",
-                    off, c->slice_len);
-            return NULL;
+            tiles[i].len  = len;
         }
 
-        /* 输出缓冲：tile 载荷 + 每 tile 4 字节长度 + 头部余量。 */
-        const size_t cap = c->slice_len + (size_t)c->av1_tile_count * 4 + 1024;
+        /* 输出缓冲：tile 载荷实际总长 + 每 tile 4 字节 tile_size + 头部余量。
+         * 用 tile 长度之和而非 slice_len —— 两者可能不等（buffer 里允许有
+         * 未被任何 tile 引用的间隙）。 */
+        size_t tile_bytes = 0;
+        for (int i = 0; i < c->av1_tile_count; i++)
+            tile_bytes += tiles[i].len;
+        const size_t cap = tile_bytes + (size_t)c->av1_tile_count * 4 + 1024;
         unsigned char *buf = malloc(cap);
         if (!buf)
             return NULL;
@@ -1438,15 +1457,35 @@ static const unsigned char *build_unit(struct dmd_context *c,
         const size_t fn = dmd_av1_build_frame(pp, tiles, c->av1_tile_count,
                                               buf + n, cap - n);
         if (fn == 0) {
-            dmd_log("EndPicture: AV1 OBU_FRAME 合成失败（tile=%d, slice=%zu）",
-                    c->av1_tile_count, c->slice_len);
+            dmd_log("EndPicture: AV1 OBU_FRAME 合成失败（tile=%d, 载荷=%zu）",
+                    c->av1_tile_count, tile_bytes);
             free(buf);
             return NULL;
         }
         n += fn;
 
         dmd_log("EndPicture: AV1 合成 %zu 字节（%s%d tile，载荷 %zu）",
-                n, ft == 0 ? "含序列头，" : "", c->av1_tile_count, c->slice_len);
+                n, ft == 0 ? "含序列头，" : "", c->av1_tile_count, tile_bytes);
+
+        /* DMD_AV1_DUMP=<路径>：把首帧合成结果落盘，供离线校验。
+         *
+         * 这是本模块的主要验证手段，值得长期保留：合成正确性无法在设备上
+         * 直接判断（MediaCodec 只会"不出帧"，不告诉你哪一位错了），必须把
+         * 字节取回来交给权威工具。实测有效的判据是
+         *   ffmpeg -f obu -i <落盘文件> -f null -        （能否解出帧）
+         *   ffmpeg -bsf:v trace_headers ...              （逐字段比对位偏移）
+         * 后者是定位单个错误比特的唯一可行手段 —— 自制解析器不可靠，
+         * 曾因其自身偏差与实现错误互相抵消而误判"已对齐"。
+         *
+         * 只落首帧：帧头字段最全（含序列头），且避免刷爆磁盘。 */
+        if (getenv("DMD_AV1_DUMP")) {
+            static int dumped = 0;
+            if (!dumped) {
+                FILE *df = fopen(getenv("DMD_AV1_DUMP"), "wb");
+                if (df) { fwrite(buf, 1, n, df); fclose(df); dumped = 1;
+                          dmd_log("已落盘 %zu 字节到 %s", n, getenv("DMD_AV1_DUMP")); }
+            }
+        }
 
         /* 走既有的 scratch 机制：调用方在发送后 free。这与 H264/HEVC/VP8
          * 分支是同一套所有权约定（本函数头注释：scratch 由调用方提供并

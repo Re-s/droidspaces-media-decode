@@ -1274,7 +1274,11 @@ static void *session_thread(void *arg)
      * 既不用抬高构建 API，也不引入弱符号判空。
      * 低于 API 30 的设备上 MediaCodec 会忽略未知 key —— 退化为原有行为，
      * 不会失败。 */
-    AMediaFormat_setInt32(fmt, "low-latency", 1);
+    /* DMD_NO_LOW_LATENCY=1 可关掉这个键，用于隔离"某解码器是否因它失败"。
+     * 缘由：c2.qti.av1.decoder 会报 "Few parameters failed to configure"，
+     * 要逐键对照才能定位是哪个键不被接受。默认不设该变量，行为不变。 */
+    if (!getenv("DMD_NO_LOW_LATENCY"))
+        AMediaFormat_setInt32(fmt, "low-latency", 1);
 
     /* 让解码器按**解码顺序**输出，而不是攒够重排缓冲再按显示顺序吐。
      *
@@ -1295,7 +1299,9 @@ static void *session_thread(void *arg)
      *
      * 用字面量：这是高通 vendor 扩展，NDK 头文件里没有定义。
      * 非高通平台会忽略未知键，退化为原有行为，不会失败。 */
-    AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
+    /* DMD_NO_PICTURE_ORDER=1 可关掉这个键（同上，用于逐键隔离）。 */
+    if (!getenv("DMD_NO_PICTURE_ORDER"))
+        AMediaFormat_setInt32(fmt, "vendor.qti-ext-dec-picture-order.enable", 1);
 
     s->codec = AMediaCodec_createDecoderByType(s->mime);
     if (!s->codec) { dlog(0, "[%d] 无可用解码器: %s", s->id, s->mime); goto out_fmt; }

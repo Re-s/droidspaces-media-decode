@@ -255,13 +255,23 @@ struct dmd_context {
      *   1) pic param 的结构化字段：序列头与帧头**只存在于这里**，
      *      VASliceDataBuffer 里仅有 tile 载荷、不含任何 OBU 封装
      *      （va_dec_av1.h:643-645 明确说明码流按 per-tile 粒度传入）
-     *   2) 每个 tile 的长度：tile_group 要逐 tile 写 tile_size_minus_1，
-     *      而 slice_data 是连成一片累积的，tile 边界会丢失
+     *   2) 每个 tile 在码流缓冲里的偏移与长度：tile_group 必须逐 tile 写
+     *      tile_size_minus_1，而 slice_data 是连成一片累积的。
+     *
+     * ⚠️ 边界来源必须是 VASliceParameterBufferAV1，**不能**数
+     * VASliceDataBuffer 的追加次数。实机实测：ffmpeg 每帧只调一次
+     * vaRenderPicture 送 slice data，却在同一帧声明 8 个 tile ——
+     * 即整帧 tile 打包在一个 buffer 里，靠追加次数只会得到 1。
+     * 正确来源是每 tile 一份的 slice param（va_dec_av1.h:635 "should be
+     * sent once per tile"），其 slice_data_size/slice_data_offset 分别是
+     * tile 字节数与在缓冲内的偏移（:649-658，注释明确说 slice_data_size
+     * "actually means tile_data_size"）。
+     *
      * 512 项足以覆盖 8K/多 tile 场景（规范 MAX_TILE_COLS×MAX_TILE_ROWS
      * 名义上 64×64，实际受 MAX_TILE_AREA 约束远小于此）。 */
     int have_av1_pic_param;
     VADecPictureParameterBufferAV1 av1_pic_param;
-    size_t av1_tile_len[512];
+    VASliceParameterBufferAV1 av1_tile_param[512];
     int    av1_tile_count;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
