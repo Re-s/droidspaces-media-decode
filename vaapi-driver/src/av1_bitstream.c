@@ -1199,10 +1199,25 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 size_t prev_len,
                                 size_t prev_bitpos)
 {
-    if (!dpb || !cur_pic || !prev_frame_bytes) return;
+    /* ⚠️ 不能因 prev_frame_bytes 为空就提前返回。
+     *
+     * 那样 KEY 帧与第一个帧间帧（此时还没有暂存帧）都会跳过末尾的
+     * map 快照，使 prev_valid 迟一拍置位。实测后果：算出的序列是
+     * —,8,32,64 而真值为 1,8,32,64 —— 首个值 1 丢失，其余整体错位
+     * 赋给了前一帧，改写因此全部落在错误的帧上。
+     * 无论本次是否有帧可改写，都必须保存 map 作为下一次差分的基准。 */
+    if (!dpb || !cur_pic) return;
     const VADecPictureParameterBufferAV1 *p = cur_pic;
 
-    if (dpb->prev_valid && prev_bitpos != (size_t)-1 && prev_len > 0) {
+    /* ⚠️ prev_valid 必须在 KEY 帧那次调用就置位。
+     *
+     * 差分需要"上一帧的 map"，而 KEY 帧本身不写 refresh（无需改写），
+     * 但它的 map 是后续第一个帧间帧做差分的基准。若只在真正执行改写时
+     * 才置位，整个序列会晚一拍：实测算出 —,8,32,64 而真值是 1,8,32,64，
+     * 首个值 1 丢失，且 8/32/64 被错位赋给了前一帧。
+     * 所以本函数无论是否改写，末尾都保存 map 并置 prev_valid。 */
+    if (dpb->prev_valid && prev_frame_bytes &&
+        prev_bitpos != (size_t)-1 && prev_len > 0) {
         /* 本帧 map 与上帧 map 的差异位 = 上一帧实际写入的槽。
          * 实测 4 帧全部命中源码流真实值（1/8/32/64）。 */
         unsigned mask = 0;
