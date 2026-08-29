@@ -1358,16 +1358,40 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * ⚠️⚠️ 但恒 0 也是错的 —— 那只拟合了前 6 帧！
          * 把样本扩到 24 帧后实测：23/24 逐字节相同，唯独帧18 差 1 位，
          * 正是位 148 这一位（源 1、合成 0）。
-         * 所以 allow_warped_motion 逐帧变化，必须找出真正的取值规则。 */
+         * 所以 allow_warped_motion 逐帧变化，必须找出真正的取值规则。
+         *
+         * ---- 60 帧样本上的实测（本轮）----
+         * 恒 0                       → 56/61 相同，错帧 [18,26,30,48,60]
+         * 写 use_ref_frame_mvs       → 56/61 相同，错帧 [26,30,32,56,60]
+         * 后者修好了 18/48 却弄坏 32/56，所以 use_ref_frame_mvs
+         * **不是**正确规则（虽然在帧2/帧18 两个样本上恰好吻合 ——
+         * 又一次小样本巧合，别再上钩）。
+         * DMD_AV1_WARP=m 可复现这个对照。
+         *
+         * 三帧样本的 VA-API 字段全同（mms=1 err=0 prim=0 gm 全 0），
+         * 唯一差异是 use_ref_frame_mvs，但它不足以解释全部。 */
         {
+            /* 假设待验证：allow_warped_motion 与 use_ref_frame_mvs 相关。
+             * 两帧样本吻合（ref_mvs=0→源0、ref_mvs=1→源1），需大样本确认。 */
             int wm = 0;
             const char *ov = getenv("DMD_AV1_WARP");
-            if (ov) wm = atoi(ov);
+            if (ov && ov[0] == 'm')
+                wm = (int)p->pic_info_fields.bits.use_ref_frame_mvs;
+            else if (ov)
+                wm = atoi(ov);
             if (getenv("DMD_AV1_BITS"))
-                fprintf(stderr, "[warp] oh=%u va=%u mms=%u 写入=%d\n",
+                fprintf(stderr, "[warp] oh=%u va=%u mms=%u ref_mvs=%u "
+                        "intra=%u err=%d prim=%u gm=[%u,%u,%u,%u,%u,%u,%u]\n",
                         p->order_hint,
                         p->pic_info_fields.bits.allow_warped_motion,
-                        p->pic_info_fields.bits.is_motion_mode_switchable, wm);
+                        p->pic_info_fields.bits.is_motion_mode_switchable,
+                        p->pic_info_fields.bits.use_ref_frame_mvs,
+                        p->pic_info_fields.bits.frame_type == 0 ||
+                        p->pic_info_fields.bits.frame_type == 2,
+                        err_res, p->primary_ref_frame,
+                        p->wm[0].wmtype, p->wm[1].wmtype, p->wm[2].wmtype,
+                        p->wm[3].wmtype, p->wm[4].wmtype, p->wm[5].wmtype,
+                        p->wm[6].wmtype);
             dmd_bw_put_flag(&bw, wm);
         }
 
