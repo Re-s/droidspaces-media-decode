@@ -527,10 +527,39 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  * 所以这三个零不是防竞争字节，而是某个字段的真实内容。
  * 按该偏移位置，嫌疑落在 delta_q / segmentation 一带。
  *
- * 下一步：既然位宽与字段序列都相同、却整整差 8 位，说明**源写了一个
- * 合成完全没写的字段**（trace 对两侧都不报告它，故 diff 看不见）。
- * 应逐字段核对 AV1 规范 5.9.2 在 delta_q_params / segmentation_params
- * 一带的条件分支，找出 trace_headers 不打印但规范要求写的项。
+ * 字节级对位（已确证，比任何位偏移推断可靠）：
+ *   源   [10:26] = 00 00 0a 17 9f 00 03 00 | 00 00 0a 89 77 44 58 bb
+ *   合成 [10:26] = 00 00 0a 17 9f 00 03    | 00 00 0a 89 77 44 58 bb
+ * 已知 tile 层完全相同（第一个 tile_size=0x00 表示 size=1，其后 1 字节
+ * tile 数据 0x00，再往后 0x0a 起是第二个 tile）。据此对齐可得：
+ *   源   帧头 = [0..17]，末字节 [17]=0x00
+ *   合成 帧头 = [0..16]，末字节 [16]=0x03
+ * 且 **[0..16] 十七个字节两侧逐字节相同**。
+ *
+ * ★ 结论：合成写的每一位都是对的，只是在帧头**最末**少写了 1~8 位零，
+ *   导致 byte_align 少补一整字节。要找的字段满足三个条件：
+ *     (a) 值为 0   (b) 长度 1~8 位   (c) 位于 uncompressed_header 末尾
+ *
+ * 本轮已逐行核对并确认正确的分支（不必再查）：
+ *   · put_tile_info 全段，含 context_update_tile_id 与 tile_size_bytes_minus_1
+ *   · put_quantization_params —— separate_uv_delta_q=0（实测），
+ *     故不写 diff_uv_delta、U/V 共用一组 delta，代码处理正确
+ *   · delta_q_params / delta_lf_params（1104-1120）—— 与规范 5.9.17/5.9.18 一致，
+ *     实测 delta_q_present=1、delta_q_res=0
+ *   · tx_mode（increment 编码）、reference_select、reduced_tx_set_used
+ *
+ * 剩余嫌疑（按位置从后往前）：
+ *   · skip_mode_present 的**门条件**：代码用 `reference_select` 当门（1154 行），
+ *     而规范 5.9.22 的 skipModeAllowed 推导并不含该项。实测
+ *     reference_select=1 故本帧仍写了，但门条件本身仍需按规范复核。
+ *   · allow_warped_motion 的 is_motion_mode_switchable 门
+ *   · reduced_tx_set_used 之后是否还有规范要求、代码完全未写的字段
+ *
+ * ⚠️ 方法教训（本轮再次踩到）：trace_headers 输出的位置是**流内累计位置**，
+ * 不是帧内偏移；且输出里**没有** obu_forbidden_bit 行，
+ * 所以"按 obu_forbidden_bit 分段取第 N 个 OBU"这种做法无效 ——
+ * 本轮据此做的几组"两侧相同"比较全部作废。
+ * 可靠判据只有两条：字节级穷举插入、以及单帧独立流的字段序列 diff。
  *
  * ⚠️ 本轮一度又犯"跨帧比对"的老错：trace_headers 对含多帧的流会把各帧
  * 字段混在一起输出，我据此得出"位 168 是 tile_start_and_end_present_flag"，
