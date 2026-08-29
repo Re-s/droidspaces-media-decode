@@ -1229,6 +1229,22 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->av1_pic_param, b->data,
                        sizeof(VADecPictureParameterBufferAV1));
                 c->have_av1_pic_param = 1;
+                /* AV1 的显示顺序就是 order_hint（规范 6.8.2），
+                 * 作用与 H.264/HEVC 的 POC 相同：解码器按显示序吐帧，
+                 * 而 ffmpeg 按解码序提交，配对回退路径需要它。
+                 *
+                 * 此前 AV1 完全不登记 POC，pending_poc 恒为 INT32_MAX
+                 * （实测日志 "POC 2147483647"），一旦 unit_seq 精确配对
+                 * 失败就只能盲目按顺序推断，把帧配到错误的 surface 上。
+                 *
+                 * KEY 帧会重置 order_hint 序列，用 frame_type 判新序列：
+                 * frame_type 0=KEY，与 H.264 的 frame_num==0 同义。 */
+                c->current_poc =
+                    (int32_t)c->av1_pic_param.order_hint;
+                c->current_frame_num =
+                    (c->av1_pic_param.pic_info_fields.bits.frame_type == 0)
+                        ? 0 : 1;
+                c->have_current_poc = 1;
                 break;
             }
             /* VP8 的 key_frame / version / show_frame 相关位在这里。 */
