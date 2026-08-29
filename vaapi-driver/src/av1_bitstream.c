@@ -508,9 +508,29 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  *     tile_start_and_end_present_flag 确实写了，byte_align 后正好 1 字节
  *   · byte_align 在已对齐时不补 —— 代码正确（规范 5.3.5 纯补零）
  *
- * 所以差的 1 字节在 uncompressed_header 内部，且**不改变字段序列**——
- * 只能是某个字段的位宽少写了 8 位，或某处 byte_align 该补一整字节却没补。
- * 下一步：逐字段打印两侧的位宽（不是值），找位宽不等的那一项。
+ * 所以差的 1 字节在 uncompressed_header 内部，且**不改变字段序列**。
+ *
+ * 本轮又排除了三项：
+ *   · 字段位宽 —— 267 项逐项比对 length($3)，**零差异**
+ *   · leb128 编码 —— 两侧 obu_size 都用 2 字节，644 vs 643 是结果非原因
+ *   · film_grain / apply_grain —— 序列头 film_grain_params_present=0，
+ *     两侧都不写该位，trace 各报 2 处一致
+ *
+ * 精确定位（穷举插入法，比任何推断都可靠）：
+ *   在合成帧的偏移 17/18/19 任一处插入一个 0x00，结果与源**逐字节完全相同**。
+ *   源   [10:26] = 00000a179f00030000000a89774458bb
+ *   合成 [10:26] = 00000a179f000300000a89774458bb44
+ *   即源此处是 00 00 00（三个零），合成只有 00 00（两个零）。
+ * 反推帧头长度：源 17B（136 位），合成 16B（128 位），差整 8 位。
+ *
+ * 注意 AV1 **不使用** EBSP 转义（那是 H.264/HEVC 的机制），
+ * 所以这三个零不是防竞争字节，而是某个字段的真实内容。
+ * 按该偏移位置，嫌疑落在 delta_q / segmentation 一带。
+ *
+ * 下一步：既然位宽与字段序列都相同、却整整差 8 位，说明**源写了一个
+ * 合成完全没写的字段**（trace 对两侧都不报告它，故 diff 看不见）。
+ * 应逐字段核对 AV1 规范 5.9.2 在 delta_q_params / segmentation_params
+ * 一带的条件分支，找出 trace_headers 不打印但规范要求写的项。
  *
  * ⚠️ 本轮一度又犯"跨帧比对"的老错：trace_headers 对含多帧的流会把各帧
  * 字段混在一起输出，我据此得出"位 168 是 tile_start_and_end_present_flag"，
