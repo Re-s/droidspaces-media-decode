@@ -229,6 +229,50 @@ void dmd_session_destroy(struct dmd_session *s)
  * 与真帧逐字节相同，只有下半的动态渐变带露馅。 */
 static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
 {
+    /* AV1：show_existing_frame 单元不推进单元序号。
+     *
+     * 这类单元是 TD + 一个 SEF 帧头（共 3~4 字节），不含任何 tile 数据，
+     * 硬件会为它复显一个已解码帧。驱动侧的 pending 队列只为真实帧登记，
+     * 所以它**不能**占用一个 unit_seq —— 否则其后所有真实帧的 PTS
+     * 都偏移一位，配对全部落到回退路径上。
+     *
+     * 这与 HEVC 参数集是同一类问题：第 b86ab9f 次提交修的就是
+     * "units_submitted 按帧递增、units_sent 按 send_unit 递增"导致的错位。
+     *
+     * 判据：长度 <= 8，且首个 OBU 是 TD、第二个是 FRAME_HEADER，
+     * 或首个直接就是 FRAME_HEADER。
+     *
+     * ⚠️ 范围说明：这个修复是必要的（不修则 SEF 之后所有真实帧的
+     * PTS 偏移一位、配对全部落到回退路径），但它**不是**
+     * "SEF 数量超过 20 就崩"的原因 —— 修完再测 SEF_MAX=40 仍然超时。
+     * 那个上限另有成因，尚未定位。 */
+    if (codec == DMD_CODEC_AV1) {
+        if (len > 8 || len < 2)
+            return 0;
+        size_t i = 0;
+        /* 可选的 TD（type=2, obu_size=0） */
+        if (((d[i] >> 3) & 0xF) == 2) {
+            if ((d[i] >> 1) & 1) {
+                if (i + 1 >= len || d[i + 1] != 0)
+                    return 0;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if (i >= len)
+            return 0;
+        /* 随后必须是 FRAME_HEADER（type=3），且载荷首位 show_existing_frame=1 */
+        if (((d[i] >> 3) & 0xF) != 3)
+            return 0;
+        size_t pl = i + 1;
+        if ((d[i] >> 1) & 1)
+            pl = i + 2;             /* 跳过 leb128 obu_size（此处恒 1 字节） */
+        if (pl >= len)
+            return 0;
+        return (d[pl] >> 7) & 1;    /* show_existing_frame */
+    }
+
     if (codec != DMD_CODEC_H264 && codec != DMD_CODEC_HEVC)
         return 0;
     size_t i = 0;
