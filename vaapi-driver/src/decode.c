@@ -2676,30 +2676,6 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    /* ⚠️ IDLE = 从未提交过解码，缓冲里是未初始化内容（或上一帧的残留）。
-     *
-     * 曾经在这里与 READY 一并放行，后果实测如下：ffmpeg 在提交任何
-     * EndPicture 之前先对 surface 1 调一次 DeriveImage 探测能力，
-     * 于是拿到一块陌生内存并当成第 1 帧输出。
-     * 表现极具误导性 —— 1920x1080 的 testsrc 上半 797 行是静态图案，
-     * 与真帧恰好一致，只有下半 283 行的动态渐变带露出破绽；
-     * 而且每次运行拿到的内容不同（实测两次分别精确匹配软解第 7 帧与第 5 帧，
-     * 平均差 0.00），一度被误判为色彩范围转换或空间位移问题。
-     *
-     * IDLE 必须报错：调用方读一个从未解码过的 surface 是它自己的时序错误，
-     * 我们不能拿垃圾数据冒充画面。READY 才是真正可读。
-     *
-     * ⚠️ 已加此检查但**尚未生效**：实测 ffmpeg 那次超前的 DeriveImage
-     * 并未触发本分支（日志里"拒绝读取"0 次），导出结果与修复前 md5 相同。
-     * 说明该时刻 surface 1 的 state 既不是 IDLE、也没走到这里 ——
-     * 下一步要在 dmd_DeriveImage 入口直接打印 s->state 实测，
-     * 而不是从状态机代码推断。 */
-    if (s->state == DMD_SURFACE_IDLE) {
-        pthread_mutex_unlock(&drv->lock);
-        dmd_log("surface_wait: surface %u 从未提交解码，拒绝读取\n",
-                (unsigned)surface);
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
     if (s->state != DMD_SURFACE_PENDING) {
         VAStatus st = s->decode_status;
         pthread_mutex_unlock(&drv->lock);
@@ -2780,6 +2756,25 @@ VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface)
     struct dmd_surface *s = dmd_find_surface_locked(drv, surface);
     if (!s) {
         pthread_mutex_unlock(&drv->lock);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    /* ⚠️ IDLE = 从未提交过解码，缓冲里是未初始化内容（或上一帧的残留），
+     * 绝不能当画面交出去。
+     *
+     * 实测：ffmpeg 在提交任何 EndPicture **之前**先对 surface 1 调一次
+     * DeriveImage 探测能力（DMD_VA_LOG 实测 state=0）。若在此放行，
+     * 它就拿到一块陌生内存并当成第 1 帧输出。
+     *
+     * 这个 bug 的伪装性极强：1920x1080 testsrc 上半 797 行是静态图案、
+     * 与真帧逐字节相同，只有下半 283 行的动态渐变带露馅；且每次运行
+     * 拿到的内容不同（两次分别精确匹配软解第 7 帧与第 5 帧，平均差 0.00）。
+     * 若测试素材是静态图，这会被误报为"通过"。
+     *
+     * IDLE 报错是正确行为：读一个从未解码的 surface 是调用方的时序错误。 */
+    if (s->state == DMD_SURFACE_IDLE) {
+        pthread_mutex_unlock(&drv->lock);
+        dmd_log("surface_wait: surface %u 从未提交解码，拒绝读取\n",
+                (unsigned)surface);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     if (s->state != DMD_SURFACE_PENDING) {
