@@ -1353,8 +1353,23 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 实测帧2 VA-API 给 1 而源码流写 0，与 skip_mode_present
          * 恰好方向相反（两者相邻，位 147/148）。
          * 两个字段必须同时修正，单改任一个都无法与源逐字节一致
-         * （穷举验证：skip=1&warp=0 → 帧2..5 全对；只改一个 → 帧2 错）。 */
-        dmd_bw_put_flag(&bw, 0);
+         * （穷举验证：skip=1&warp=0 → 帧2..5 全对；只改一个 → 帧2 错）。
+         *
+         * ⚠️⚠️ 但恒 0 也是错的 —— 那只拟合了前 6 帧！
+         * 把样本扩到 24 帧后实测：23/24 逐字节相同，唯独帧18 差 1 位，
+         * 正是位 148 这一位（源 1、合成 0）。
+         * 所以 allow_warped_motion 逐帧变化，必须找出真正的取值规则。 */
+        {
+            int wm = 0;
+            const char *ov = getenv("DMD_AV1_WARP");
+            if (ov) wm = atoi(ov);
+            if (getenv("DMD_AV1_BITS"))
+                fprintf(stderr, "[warp] oh=%u va=%u mms=%u 写入=%d\n",
+                        p->order_hint,
+                        p->pic_info_fields.bits.allow_warped_motion,
+                        p->pic_info_fields.bits.is_motion_mode_switchable, wm);
+            dmd_bw_put_flag(&bw, wm);
+        }
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);

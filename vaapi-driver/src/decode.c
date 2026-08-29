@@ -2758,6 +2758,12 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
 
         if (!c->input_finished && !drained_once &&
             (wait_is_futile || spent >= flush_after_ms)) {
+            dmd_log("flush 触发: futile=%d(recv=%llu has_seq=%d pend=%d) "
+                    "spent=%d/%d\n",
+                    wait_is_futile,
+                    (unsigned long long)dmd_session_frames_received(c->session),
+                    c->daemon_has_unit_seq, c->pending_count,
+                    spent, flush_after_ms);
             struct dmd_session *fs = c->session;
             /* 优先用可逆排空：daemon 送 EOS 催出帧后 flush 复位并重送 CSD，
              * 会话仍可用 —— 于是不必重建，省掉 connect+握手+configure。
