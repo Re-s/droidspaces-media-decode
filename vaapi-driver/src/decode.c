@@ -1621,6 +1621,27 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return buf;
     }
 
+    /* ============ HEVC 驱动内 V4L2 直通实机验证结果 ============
+     * 设备 SM8750 / msm_vidc /dev/video32，容器内无 root，2026-08。
+     * 素材 1920x1080 25fps HEVC Main yuv420p(tv) 12 帧（14281 字节）。
+     *
+     * 帧数：硬解 12 / 软解 12，三次复现全部 12/12。
+     * 送料：送入 15 单元收到 12 帧 —— 多出的 3 个单元是 VPS/SPS/PPS
+     *       参数集 NAL，本身不产生图像，属正常。
+     * 日志可见 SOURCE_CHANGE 与 S_FMT(OUTPUT) 1920x1088
+     *       （V4L2 按 16 对齐，1080→1088），协商正常。
+     *
+     * ⚠️ 首帧像素**未通过**逐点校验，原因未定：
+     *   Y 平面前 797 行与软解逐字节相同，第 797~1079 行（283 行）存在差异，
+     *   渐变区最大差 40（例：行 900 hw=0x70 sw=0x52）；UV 平面亦有差异。
+     *   已排除：tv→full 色彩范围转换（按 (v-16)*255/219 预测不匹配，
+     *   且差值有正有负、后段反转）、水平/垂直空间位移（最佳匹配落在
+     *   搜索边界 ±40，是单调渐变造成的假匹配而非真位移）。
+     *   注意 hwdownload 导出必须加 -hwaccel_output_format vaapi，
+     *   否则输出 0 字节 —— 这是 ffmpeg 用法问题，不是驱动缺陷。
+     *   待查方向：CAPTURE 面 NV12 stride/UV 偏移在非 16 倍高度下的处理，
+     *   以及 1088 对齐高度裁回 1080 时 COMPOSE 选区是否漏了色度面。
+     */
     case DMD_CODEC_HEVC: {
         /* 与 H.264 完全同构：VASliceParameterBufferHEVC 里有
          * slice_data_byte_offset，说明 slice header 原样在 buffer 里，
