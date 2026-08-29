@@ -1341,32 +1341,34 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return c->slice_data;
 
     case DMD_CODEC_AV1:
-        /* 同样零重建，但成立的理由与 VP9 不同，值得写清楚。
+        /* ⚠️ 未实现：AV1 需要 OBU 重建，不能像 VP9 那样直接转发。
          *
-         * AV1 的 slice 粒度是 **tile**，不是帧：va_dec_av1.h:634-646 明确
-         * "should be sent once per tile"、"bit stream in sent to driver in
-         * per tile granularity"，VASliceParameterBufferAV1.slice_data_size
-         * 实际是 tile_data_size。所以一帧可能对应多次 vaRenderPicture。
+         * 曾以为可以零重建（"slice data 顺序追加即原始字节序"），
+         * **实测证伪**：把累积后的 c->slice_data 原样送给 MediaCodec，
+         * 落盘检查首字节是 0xd0 —— forbidden_bit=1、OBU 类型 10（保留值），
+         * 根本不是 OBU 头；ffprobe 也报 "Failed to read obu /
+         * No sequence header available"。MediaCodec 因此一帧都解不出
+         * （送入 1 单元、取回 0 帧）。
          *
-         * 而 MediaCodec 要的是完整 temporal unit。两者靠现有的 slice 累积
-         * 机制自然对齐 —— dmd_append_slice_data（本文件 :1094-1101）把每次
-         * 送来的 slice data 顺序追加进 c->slice_data，vaEndPicture 时
-         * c->slice_len 已是该帧全部 tile 的连续字节。AV1 码流里同一帧的
-         * tile 本来就是连续排列的，所以顺序追加得到的正是原始字节序列，
-         * 不需要按 tile_row/tile_column 重排，也不需要解析 OBU 语法。
+         * 原因：VASliceDataBufferType 里只有 tile 的**载荷**，不含 OBU 封装。
+         * 序列头与帧头都在 VAPictureParameterBufferAV1 的结构化字段里
+         * （va_dec_av1.h 的 VADecPictureParameterBufferAV1），需要驱动
+         * 反向合成成 OBU 才能喂给 MediaCodec。
          *
-         * ⚠️ 前提是上层按顺序提交 tile。ffmpeg 的 vaapi_av1.c 是这么做的
-         * （逐 tile group 调 vaRenderPicture）。若某个消费者乱序提交，
-         * 这里会拼出错误字节流 —— 但那种实现也会让所有 VA-API 驱动出错，
-         * 不是本驱动需要兜的场景。
+         * 这与 VP9 的情形完全不同：VP9 的 slice data 本身就是完整帧
+         * （va_dec_vp9.h:274-284），所以那条路零重建成立。
          *
-         * 关于序列头：AV1 **不需要**像 H.264/HEVC 那样单独合成并下发 csd。
-         * OBU_SEQUENCE_HEADER 就在码流字节里随 temporal unit 一起送达，
-         * MediaCodec 自行解析。daemon 侧 is_param_set() 对 AV1 返回 0
-         * （decode-daemon.c），所以这些字节走普通帧路径而不会被误累积成 CSD，
-         * 这正是需要的行为 —— 与 VP8/VP9 一致。 */
-        *out_len = c->slice_len;
-        return c->slice_data;
+         * 要做的事（类似 hevc_bitstream.c 对 VPS/SPS/PPS 的反向合成）：
+         *   1) 从 VAPictureParameterBufferAV1 合成 OBU_SEQUENCE_HEADER
+         *   2) 合成 OBU_FRAME_HEADER
+         *   3) 给每个 tile group 加 OBU_TILE_GROUP 头
+         *   4) 按 temporal unit 组装，必要时加 OBU_TEMPORAL_DELIMITER
+         * 工作量与 hevc_bitstream.c 同级，需要 AV1 规范 5.5/5.9/5.11 节。
+         *
+         * 在此之前返回 NULL，让 vaEndPicture 报 UNIMPLEMENTED，
+         * 上层干净回落软解 —— 这也是为什么 VAProfileAV1Profile0
+         * **不在 dmd_profiles[] 声明表里**。 */
+        return NULL;
 
     case DMD_CODEC_VP8: {
         size_t cap = c->slice_len + 16;
