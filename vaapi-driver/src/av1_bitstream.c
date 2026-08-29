@@ -581,6 +581,35 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
  * 这解释了为什么补位让 3 帧变正确、硬件解码帧数却仍是 1。
  * 修复顺序应当是 帧2 → 帧6，而非先追帧数。
  *
+ * ---- 帧2 缺陷已定位：skip_mode_present（新增 DMD_AV1_BITS 开关测得）----
+ *
+ * DMD_AV1_BITS=1 打印帧头各段起始位位置，帧2（第一个 inter 帧）实测：
+ *   tile_info@55 quant@66 seg@78 lf@83 cdef@111 lr@139
+ *   txmode@145 refsel@146 skipmode@147 warp@148 redtx@149 header_end@157
+ * 而字节比对给出的差异位正是 **147** —— 即 skip_mode_present。
+ *
+ * 各帧的 VA-API 取值 vs 源码流实际写入（按上述位位置逐位反解源字节）：
+ *   帧2  VA-API skip_mode_present=0   源=1   ← 不一致
+ *   帧3  VA-API 1                     源=1
+ *   帧4  VA-API 1                     源=1
+ *   帧5  VA-API 1                     源=1
+ *   帧6  VA-API 1                     源=1
+ * 源码流全部 5 个 inter 帧都是 1，只有帧2 的 VA-API 值与源不符。
+ *
+ * 也就是说：VA-API 的 mode_control_fields.bits.skip_mode_present 在本帧
+ * **不可直接转写**。规范 5.9.22 的 skipModeAllowed 要比较参考帧 order hint
+ * （需找出前向/后向最近的两个参考），VA-API 给的结论在此帧与 libaom 不符。
+ * 下一步要么按规范自行推导 skipModeAllowed，要么找出 VA-API 该值的正确解释。
+ *
+ * 附带纠正：1154 行用 reference_select 当门是对的（规范 5.9.22 里
+ * skipModeAllowed 的前置就含 reference_select），上一轮把它列为嫌疑属误判。
+ *
+ * ---- 帧6 缺陷：另一个字段，位 21 ----
+ * 帧6 差异在偏移 2（位 16..23），合成在位 21 多写 1 位。
+ * 该位置在 tile_info(@55) 之前，属 uncompressed_header 开头段 ——
+ * frame_type / show_frame / refresh_frame_flags / order_hint 一带，
+ * 与 skip_mode_present 无关，需单独定位。
+ *
  * 剩余嫌疑（按位置从后往前）：
  *   · skip_mode_present 的**门条件**：代码用 `reference_select` 当门（1154 行），
  *     而规范 5.9.22 的 skipModeAllowed 推导并不含该项。实测
@@ -1158,8 +1187,11 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     const uint32_t mi_cols = 2 * ((width  + 7) >> 3);
     const uint32_t mi_rows = 2 * ((height + 7) >> 3);
 
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "tile_info", bw.byte_pos*8+bw.bit_pos);
     put_tile_info(&bw, tile_size_bytes, p, mi_cols, mi_rows);
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "quant", bw.byte_pos*8+bw.bit_pos);
     put_quantization_params(&bw, p);
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "seg", bw.byte_pos*8+bw.bit_pos);
     put_segmentation_params(&bw, p, primary_ref_none);
 
     /* delta_q_params()（5.9.17）：base_qindex > 0 时才有 delta_q_present。 */
@@ -1181,8 +1213,11 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         }
     }
 
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "lf", bw.byte_pos*8+bw.bit_pos);
     put_loop_filter_params(&bw, p, coded_lossless, (int)allow_intrabc);
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "cdef", bw.byte_pos*8+bw.bit_pos);
     put_cdef_params(&bw, p, coded_lossless, (int)allow_intrabc);
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "lr", bw.byte_pos*8+bw.bit_pos);
     put_lr_params(&bw, p, all_lossless, (int)allow_intrabc);
 
     /* read_tx_mode()（5.9.21）：CodedLossless 时 tx_mode 恒 ONLY_4X4、
@@ -1198,6 +1233,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      *     直接就是规范枚举值，不存在 3
      * increment 在 range_max 时写 (max-min)=1 个 1 且无停止位，
      * 在 range_min 时只写一个 0。 */
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "txmode", bw.byte_pos*8+bw.bit_pos);
     if (!coded_lossless) {
         const uint32_t tm = p->mode_control_fields.bits.tx_mode;
         if (tm >= 2)
@@ -1207,21 +1243,25 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     }
 
     /* frame_reference_mode()（5.9.23）：帧间帧写 reference_select。 */
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "refsel", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reference_select);
 
     /* skip_mode_params()（5.9.22）：skipModeAllowed 的完整推导需要参考帧
      * order hint 比较，VA-API 已给出结论 skip_mode_present，直接用。
      * 帧内帧或 reference_select=0 时 skipModeAllowed=0、不写入。 */
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "skipmode", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only && p->mode_control_fields.bits.reference_select)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.skip_mode_present);
 
     /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
      * 且序列级 enable_warped_motion（我们写 1）。 */
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "warp", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only &&
         p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_warped_motion);
 
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
 
     /* global_motion_params()（5.9.24）：帧间帧逐参考帧写 is_global。
@@ -1271,6 +1311,10 @@ static size_t build_frame_header_obu(int tile_size_bytes,
                 dmd_bw_put_flag(&bw, 0);
         }
     }
+
+    if (getenv("DMD_AV1_BITS"))
+        fprintf(stderr, "[bits] header_end @ %zu\n",
+                bw.byte_pos * 8 + bw.bit_pos);
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
