@@ -36,7 +36,8 @@
 
 /* 与 decode-daemon.c 的 CodecId 对应（wire id，追加式，不可重排）。
  *
- * VP8 不在此列且不再支持：msm_vidc 的 V4L2 层没有 VP80 格式，
+ * VP8 不在此列：驱动侧缺码流重建实现。
+ * ⚠️ 第 80 轮实测更正：硬件**支持** VP80（ENUM_FMT 列出 MPG2/H264/HEVC/VP80/VP90），
  * Android 上它一直是靠 c2.android.vp8.decoder 软解。既然整体切到 V4L2，
  * VP8 就没有硬件路径可走，明确放弃。 */
 enum {

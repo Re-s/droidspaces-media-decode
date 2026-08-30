@@ -4,7 +4,9 @@
  * 协议 codec 取值 0=H.264 1=HEVC 2=VP9 3=VP8(已废弃) 4=AV1。
  * V4L2 直通下已真机端到端验证：H.264 300/300、HEVC 12/12、VP9 P0 50/50
  * （均逐字节等于软解）。AV1 帧数一致但像素未通过，详见 doc/av1-v4l2-status.md。
- * VP8 已放弃：msm_vidc 的 V4L2 层没有 VP80 格式。
+ * VP8 未实现：驱动侧缺 VP8 的码流重建（RFC 6386 uncompressed chunk 合成）。
+ * ⚠️ 注意不是硬件不支持 —— 实测 /dev/video32 的 OUTPUT 格式确实含 VP80，
+ * 见本文件下方声明表的更正说明。
  * 高位深（HEVC Main10、VP9 Profile2、H.264 High10）未验证，因此不声明 ——
  * 谎报能力会让消费者选中我们然后失败，比不报更糟。
  */
@@ -69,11 +71,23 @@ static const VAProfile dmd_profiles[] = {
      *
      * ⚠️ VP8 已移除声明（V4L2 直通改造的一部分）。
      *
-     * 理由是硬件层面的事实：msm_vidc 的 V4L2 层**没有 VP80 格式**
-     * （v4l2_backend.c 的 codec 映射对 VP8 返回 0，调用方据此拒绝）。
-     * 改用 V4L2 直通后 VP8 没有任何硬件路径可走，
-     * 继续声明它就是虚报 —— Firefox 的 vaapitest 探针会据此
-     * 报告 CODEC_HW_VP8 并把解码任务交过来，然后失败。
+     * ⚠️⚠️ 更正（第 80 轮实测）：此前这里写"msm_vidc 的 V4L2 层没有
+     * VP80 格式"，**那是错的**。在本机 /dev/video32 上用
+     * VIDIOC_ENUM_FMT 枚举 OUTPUT 侧格式，实测输出：
+     *     MPG2  H264  HEVC  VP80  VP90
+     * VP80 明确在列，硬件路径是存在的。
+     * （节点身份已核实：driver=msm_vidc_driver card=msm_vidc_vdec，
+     *   不是枚举失败或探测了错的节点。）
+     *
+     * 真正不声明 VP8 的理由是**驱动侧没实现它的码流重建**：
+     * VA-API 只给 partition 数据，缺 RFC 6386 §9.1 的 uncompressed chunk，
+     * 需要像 h264/hevc/av1 那样单独写一个合成器，目前没写。
+     * v4l2_backend.c 的 codec 映射对 VP8 返回 0 是这个决定的结果，
+     * 不是硬件能力的反映 —— 此前把它当成了硬件事实，属于因果倒置。
+     *
+     * 所以在实现合成器之前仍不声明（声明了会虚报，Firefox 的 vaapitest
+     * 探针会据此报告 CODEC_HW_VP8 并把任务交过来，然后失败），
+     * 但这是**待实现**而非**不可能**。
      *
      * 协议 codec 编号 3 保留不复用（见 dmd_client.h:63、
      * v4l2_backend.h:46），以免与旧 daemon 的线协议撞号。
@@ -107,7 +121,7 @@ int dmd_profile_to_codec(VAProfile profile)
         return DMD_CODEC_HEVC;
     case VAProfileVP9Profile0:
         return DMD_CODEC_VP9;
-    /* VP8 不再映射：msm_vidc 无 VP80 格式，无硬件路径（详见上方声明表注释）。 */
+    /* VP8 不映射：缺码流重建实现（硬件本身支持 VP80，详见上方更正说明）。 */
     /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
      * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
      * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */

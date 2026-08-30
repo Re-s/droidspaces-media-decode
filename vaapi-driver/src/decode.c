@@ -388,126 +388,35 @@ static struct dmd_session *session_open(int codec, unsigned int width,
     cfg.height = (int)height;
     cfg.io_timeout_ms = DMD_FRAME_TIMEOUT_MS;
 
-    /* 端点选择：Unix socket 优先，TCP 兜底。
+    /* 端点：固定 /dev/video32，没有可选项。
      *
-     * DMD_ENDPOINT 可显式指定：
-     *   unix:/run/dmd.sock   连该路径的 Unix socket
-     *   tcp:20003            连 127.0.0.1 的该端口
-     * 不设时按 DMD_DEFAULT_SOCK → TCP 的顺序自动探测。
+     * 0.3.x 这里有约 130 行注释与代码讲端点选择（Unix socket 优先、TCP 兜底、
+     * DMD_ENDPOINT 解析 unix:/tcp: 前缀、netns 对 abstract socket 的影响、
+     * want_shm 与 SCM_RIGHTS 的关系、以及若干条对 SHM 归因的勘误）。
+     * 会话改为直接打开 /dev/video32 后这些全部失效，已在 0.4.0 删除 ——
+     * 包括那段"Unix socket 连不上就退回 TCP"的重试：它只会再失败一次，
+     * 而日志里那句"退回 TCP"会把真正的失败原因挤到后面。第 80 轮在本机
+     * 排查 dma_heap 缺失时就被它带偏过。
      *
-     * 为什么 Unix socket 优先：它**不属于 net namespace**，平台把宿主上的
-     * socket 文件 bind mount 进容器即可，两类容器都通；而 TCP 127.0.0.1
-     * 只在共享 net namespace 时可达 —— 实测 DroidSpaces 的 NAT 型容器
-     * netns 独立（4026535650 vs 宿主 4026531937），TCP loopback 与
-     * abstract socket 都不通，只有路径式 Unix socket 这条路。
-     *
-     * ⚠️ 勘误：这里一度写着"能连上 Unix socket 就意味着 SCM_RIGHTS 可用，
-     * 于是可以请求 SHM 传输"。**那个推论是错的。**
-     *
-     * SHM 的 memfd 交接并不走这条控制通道，而是 daemon 另开一个
-     * **abstract** socket（decode-daemon.c 里 sun_path[0] = 0 那处），
-     * 驱动再去连它。abstract socket 属于 net namespace ——
-     * 于是 NAT 型容器（netns 独立）根本连不上那个交接通道，
-     * 请求 SHM 在那里必然交接失败再降级，每建一次会话白等一次超时。
-     * 这正是下方 want_shm 判定要用 `use_sock ? ... : 0` 的原因 ——
-     * 只有走上路径式 Unix socket（即 host 型容器）才请求 SHM。
-     *
-     * 换句话说：**控制通道跨 netns 的能力，不等于 SHM 交接通道也跨得过去。**
-     * 要让零拷贝在 NAT 容器可用，得把 memfd 交接也改走这条路径式
-     * Unix socket（同一个连接上传 SCM_RIGHTS 即可，不必另开 socket），
-     * 那是一项独立改动，尚未做。 */
-    const char *ep = getenv("DMD_ENDPOINT");
-    char sockbuf[256];
-    const char *use_sock = NULL;
+     * DMD_ENDPOINT / DMD_WANT_SHM 两个环境变量因此不再有任何作用。
+     * 历史设计的完整记录见 CHANGELOG.md 的 0.3.x 段落。 */
 
-    if (ep && strncmp(ep, "unix:", 5) == 0) {
-        snprintf(sockbuf, sizeof(sockbuf), "%s", ep + 5);
-        use_sock = sockbuf;
-    } else if (ep && strncmp(ep, "tcp:", 4) == 0) {
-        int p = atoi(ep + 4);
-        if (p > 0 && p < 65536)
-            cfg.port = (uint16_t)p;
-    } else if (!ep) {
-        /* 未显式指定：默认路径存在且是 socket 就用它 */
-        struct stat st;
-        if (stat(DMD_DEFAULT_SOCK, &st) == 0 && S_ISSOCK(st.st_mode))
-            use_sock = DMD_DEFAULT_SOCK;
-    }
-
-    cfg.sock_path = use_sock;
-    /* SHM（memfd 零拷贝）在 Unix socket 模式下**默认开启**（2026-08-26 起）。
-     * 设 DMD_WANT_SHM=0 可显式关闭（排查用）。
-     *
-     * 端到端实测依据：驱动被 dlopen 进 ffmpeg 进程、走 /run/dmd/decode.sock，
-     * daemon 侧日志确认
-     *   共享内存已交接: 8 槽 x 3133440 字节 (共 25067520)
-     *   握手成功: video/hevc 1280x720 帧回传=SHM
-     * （槽位数 v0.3.7 由 4 改为 8，见 src/decode-daemon.c 的 SHM_SLOTS；
-     *  上面这条 hevc 日志是当时的取证样例，HEVC 路径本身尚未系统验证。）
-     * 且解码结果与内联模式一致（150/150 帧）。
-     *
-     * 收益（固定 1500 帧工作量，三组交替对照，daemon 侧 CPU jiffies）：
-     *   内联  493 / 500 / 489   中位数 493
-     *   SHM   400 / 367 / 410   中位数 400   → 降低约 19%
-     * 省下的正是每帧 1.38MB(720p) 经 socket 的那次拷贝。
-     *
-     * ⚠️ 注意"零拷贝"只描述 memfd → 消费者进程这一段。MediaCodec 的输出
-     * 缓冲由 gralloc 分配，daemon 只能 getOutputBuffer 拿到 CPU 指针后
-     * memcpy 进 memfd（decode-daemon.c 的 send_frame_shm）。解码器到 memfd
-     * 那次拷贝仍在，消除它要走 dmabuf，而那条路因需依赖私有符号已被否决。
-     *
-     * 保守的部分：只在 use_sock 时请求 —— SHM 交接走 abstract socket
-     * （属 net namespace），所以**NAT 型容器必然降级**。daemon 侧交接失败
-     * 会自动退回内联，因此默认开启没有硬失败风险。
-     *
-     * ── 以下是历史顾虑，均已被实测解决，保留供参考 ──
-     *
-     * 曾长期默认关闭（cfg.want_shm 硬编码为 0），理由是这条路"驱动侧从未
-     * 真正启用过"：只有 tests/test_dmd_client.c 走过，那是独立测试程序，
-     * 不是驱动被 dlopen 进消费者进程的真实环境。这个顾虑本身是对的 ——
-     * 文档一度据那组数字声称 SHM 有 +17% 吞吐，而真实路径从未执行过。
-     * 教训：判断某能力是否生效，要先确认它的开关是开的。
-     *
-     * 曾担心浏览器沙箱收不了 SCM_RIGHTS（Firefox RDD / Chrome GPU 都有
-     * seccomp 过滤）。实测可行。本项目在这类判断上有先例 —— 一份源码级结论
-     * 说 RDD 沙箱对 SYS_SOCKET 一律返回 EACCES，实测却跑通了 713 帧。
-     * 这类事只能靠实测，读源码推不出来。
-     *
-     * ⚠️ 勘误：此处一度写着"SHM 帧交付路径有 bug、daemon 在 memfd 交接后
-     * 不再服务、根因未定位"。**那个归因是错的**。那些 0 帧现象的真实原因是
-     * SELinux domain 权限 —— daemon 以 runcon u:r:droidspacesd:s0 启动时能建
-     * socket，但无权访问 hwservicemanager/Codec2，于是在 CCodec::allocate 处
-     * SIGABRT（tombstone 栈顶 Codec2Client::GetServiceNames，
-     * "Hardware service manager is not running"）。与 SHM 无关 ——
-     * 当时日志里的传输模式其实是 TCP。三组对照实验：
-     *   u:r:ksu:s0          + TCP         → 正常解码（但该 domain 无权 bind）
-     *   u:r:droidspacesd:s0 + TCP         → 同样 SIGABRT（与传输方式无关）
-     *   u:r:droidspacesd:s0 + Unix socket + SELinux permissive → 正常解码
-     * 结论：Unix socket 通道本身是正确的，缺的只是一条 allow 规则。 */
-    const char *wantshm = getenv("DMD_WANT_SHM");
-    cfg.want_shm = use_sock ? (wantshm ? (*wantshm == '1') : 1) : 0;
 
     memset(&err, 0, sizeof(err));
     struct dmd_session *s = dmd_session_create(&cfg, &err);
 
-    /* Unix socket 连不上就退回 TCP —— 平台没挂载时仍能工作。 */
-    if (!s && use_sock) {
-        dmd_log("Unix socket %s 连接失败（%s），退回 TCP\n",
-                use_sock, err.msg);
-        cfg.sock_path = NULL;
-        cfg.want_shm = 0;
-        memset(&err, 0, sizeof(err));
-        s = dmd_session_create(&cfg, &err);
-    }
+    /* ⚠️ 这里曾有一段"Unix socket 连不上就退回 TCP"的重试。
+     * V4L2 直通下它是死代码 —— dmd_session_create 打开的是 /dev/video32，
+     * 与 sock_path / want_shm 都无关，重试一次只会再失败一次，
+     * 而日志里那句"退回 TCP"会把真正的失败原因（打开 V4L2 解码器失败）
+     * 挤到后面，误导排查。第 80 轮在本机排查时就被它带偏过。已删除。 */
 
     if (!s)
         dmd_log("会话建立失败: code=%d handshake=%d %s\n", err.code,
                 err.handshake_status, err.msg);
     else
-        dmd_log("会话已建立: codec=%d %ux%u 端点=%s xfer=%d\n", codec,
-                width, height,
-                cfg.sock_path ? cfg.sock_path : "tcp/127.0.0.1",
-                dmd_session_xfer_mode(s));
+        dmd_log("会话已建立: codec=%d %ux%u 端点=/dev/video32\n",
+                codec, width, height);
     return s;
 }
 
@@ -2249,12 +2158,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              * 但实测送 150 收 80、与 show_frame=1 的数量精确吻合，
              * 说明 msm_vidc 严格按 AV1 语义不输出它们。
              *
-             * 下一步只有两个方向（都未验证）：
+             * 下一步的两个方向：
              *   A. 让驱动改写这些帧的 show_frame 位为 1，骗硬件吐出来，
              *      再自行决定不把它们计入输出序列。风险：改写 uncompressed
-             *      header 会影响 refresh_frame_flags 的位偏移。
-             *   B. 查 msm_vidc 是否有"输出全部帧含不显示帧"的 V4L2 控制项
-             *      （类似 V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY 那类）。
+             *      header 会影响 refresh_frame_flags 的位偏移。**尚未验证。**
+             *
+             *   B. ❌ **已否证（第 80 轮实测）**：查 msm_vidc 是否有
+             *      "输出全部帧含不显示帧"的 V4L2 控制项。
+             *      用 VIDIOC_QUERYCTRL + V4L2_CTRL_FLAG_NEXT_CTRL 遍历
+             *      /dev/video32，结果是 **0 项** —— 这个驱动一个控制项都不暴露。
+             *      定向探测 DEC_DISPLAY_DELAY / DEC_DISPLAY_DELAY_ENABLE /
+             *      AV1_PROFILE / AV1_LEVEL 也全部 EINVAL。
+             *      （节点身份已核实：driver=msm_vidc_driver card=msm_vidc_vdec，
+             *        且能正常 ENUM_FMT 列出 5 种格式，所以 0 项是真实结果
+             *        而非枚举失败或探错了节点。）
+             *      探针见 tools/probe_v4l2_ctrls.c。
+             *      结论：没有控制项可调，方向 B 不存在。
              * 保留承接代码但它只是止损（避免全零），不是解法。
              *
              * DMD_AV1_NO_CARRY=1 关掉承接，退回全零便于对照。

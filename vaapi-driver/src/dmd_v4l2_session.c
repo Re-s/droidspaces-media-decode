@@ -181,7 +181,8 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
     s->codec = cfg->codec;
     s->io_timeout_ms = cfg->io_timeout_ms > 0 ? cfg->io_timeout_ms : 5000;
 
-    /* VP8 已不支持：msm_vidc 的 V4L2 层没有 VP80 格式。
+    /* VP8 未实现：驱动侧缺码流重建。
+     * ⚠️ 硬件支持 VP80（第 80 轮实测枚举确认），此前注释说"没有 VP80 格式"是错的。
      * 这里给出明确错误而不是静默失败，便于上层定位。 */
     if (!dmd_v4l2_probe(cfg->codec)) {
         set_err(s, DMD_ERR_REJECTED, "V4L2 解码器不支持该 codec");
