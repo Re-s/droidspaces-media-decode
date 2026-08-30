@@ -102,16 +102,16 @@ int main(int argc, char **argv)
     f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     f.fmt.pix_mp.width = 1920;
     f.fmt.pix_mp.height = 1080;
-    f.fmt.pix_mp.pixelformat = v4l2_fourcc('A', 'V', '1', 'F');
+    f.fmt.pix_mp.pixelformat = v4l2_fourcc('A', 'V', '1', '0');
     f.fmt.pix_mp.num_planes = 1;
     f.fmt.pix_mp.plane_fmt[0].sizeimage = 8 << 20;
     if (ioctl(fd, VIDIOC_S_FMT, &f) < 0) {
-        printf("  S_FMT(AV1F) 失败: %s\n", strerror(errno));
+        printf("  S_FMT(AV10) 失败: %s\n", strerror(errno));
         printf("  → 该设备的 msm_vidc 可能不支持 AV1；用 v4l2_enum_fmt 确认\n");
         close(fd); free(data); return 1;
     }
     const size_t isz = f.fmt.pix_mp.plane_fmt[0].sizeimage;
-    printf("  S_FMT(OUTPUT/AV1F) ok，sizeimage=%zu\n", isz);
+    printf("  S_FMT(OUTPUT/AV10) ok，sizeimage=%zu\n", isz);
 
     struct v4l2_requestbuffers rb;
     const unsigned mems[] = { V4L2_MEMORY_DMABUF, V4L2_MEMORY_USERPTR,

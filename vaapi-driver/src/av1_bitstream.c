@@ -1789,11 +1789,59 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
     if (dpb->prev_valid && prev_frame_bytes &&
         prev_bitpos != (size_t)-1 && prev_len > 0) {
         /* 本帧 map 与上帧 map 的差异位 = 上一帧实际写入的槽。
-         * 实测 4 帧全部命中源码流真实值（1/8/32/64）。 */
+         * 实测 4 帧全部命中源码流真实值（1/8/32/64）。
+         *
+         * ⚠️ 但**本帧是 KEY/INTRA_ONLY 全刷帧时不能做这个差分**（第 94 轮实机定位）。
+         * 规范 7.20：帧内帧的 RefreshFrameFlags 取 allFrames 是**解码器侧的
+         * 推导值**，不写入码流。全刷会把 ref_frame_map 八个槽一次性换掉，
+         * 于是差分算出 0xff —— 而这个 0xff 会被赋给**上一个帧间帧**，
+         * 覆盖它真正的 refresh 值。
+         *
+         * 实机症状（150 帧样本，oh=30 处是 KEY 帧）：
+         *     反算序列 ... 0x00 0xff 0xff 0x01 0x08 ...
+         *     源码流真值 ... 0x00 0x08 0x01 0x08 0x20 ...
+         * 前 28 项完全一致，第 28 项起插入两个 0xff，导致其后整体错位一项，
+         * 全序列 104 项里 49 项不符。而 refresh 错位会让参考帧全盘错，
+         * 表现为"帧数对、画面数对，但从第 1 帧起像素就不一致"。
+         *
+         * 正确做法：全刷帧不参与差分，直接跳到末尾更新基准 map。
+         * 上一个帧间帧的 refresh 保持它自己合成时的轮转占位值 —— 那个值
+         * 未必等于源真值，但至少不会被 0xff 污染，也不会造成序列错位。
+         *
+         * ⚠️ 只挡住全刷帧本身还不够（这是第一版修复漏掉的一半）。
+         * 全刷帧把基准 map 整体换掉之后，**紧跟它的那一帧**拿这份新基准
+         * 做差分，照样会算出接近满位的 mask。实测第一版把不一致从 49 降到
+         * 29，但第 28 项仍是 0xff —— 正是全刷帧的后继帧。
+         * 所以全刷帧除了跳过差分，还必须让基准失效一拍（prev_valid=0），
+         * 让后继帧也跳过一次，从它之后重新建立差分基准。 */
+        /* ⚠️ 判据必须与 dmd_av1_build_frame 里的 refresh_all 完全一致
+         * （规范 7.20 / 5.9.2）：SWITCH 帧，或 show_frame=1 的 KEY 帧。
+         *
+         * 第一版我写成 `frame_type==0 || frame_type==2` —— 两处都错：
+         *   · 漏了 show_frame：KEY 帧只在 show_frame=1 时才全刷
+         *   · 多算了 INTRA_ONLY(2)：它不全刷，照常写 refresh_frame_flags
+         * 单元测试当场抓住（用例以 memset 构造 pic，frame_type 落在 0，
+         * 被误判成全刷而跳过差分，两项断言归零）。
+         * 教训：同一个语义在两处实现就一定会走偏，这里直接抄 refresh_all 的式子。 */
+        const unsigned cur_ft = p->pic_info_fields.bits.frame_type;
+        int cur_is_intra = (cur_ft == 3) ||
+                           (cur_ft == 0 && p->pic_info_fields.bits.show_frame);
         unsigned mask = 0;
         for (int i = 0; i < 8; i++) {
             if (p->ref_frame_map[i] != dpb->prev_ref_map[i])
                 mask |= (1u << i);
+        }
+        if (cur_is_intra) {
+            if (getenv("DMD_AV1_LOG"))
+                fprintf(stderr, "[av1] 本帧是全刷帧(ft=%u show=%u)，跳过差分"
+                                "（否则会算出 0x%02x 污染上一帧）\n",
+                        cur_ft, p->pic_info_fields.bits.show_frame, mask);
+            mask = 0;
+            /* 保存新基准，但标记为"不可用于差分" —— 后继帧跳过一次，
+             * 由它自己的 map 重新建立基准。 */
+            for (int i = 0; i < 8; i++) dpb->prev_ref_map[i] = p->ref_frame_map[i];
+            dpb->prev_valid = 0;
+            return;
         }
 
         /* 就地改写上一帧帧头里那 8 位。
