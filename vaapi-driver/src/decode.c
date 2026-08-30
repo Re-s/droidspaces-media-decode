@@ -2220,19 +2220,83 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              * surface 装上它自己那一帧的真实像素。
              * 但硬件不吐这些帧（送 150 收 80，与 show_frame=1 数量吻合），
              * 需要另找途径拿到它们 —— 这是下一步的问题。 */
-            if (!getenv("DMD_AV1_NO_CARRY") && ns->data &&
-                c->av1_last_ready != VA_INVALID_ID &&
-                c->av1_last_ready != c->av1_send_surface) {
-                struct dmd_surface *src =
-                    dmd_find_surface_locked(drv, c->av1_last_ready);
-                if (src && src->data && src->data_size == ns->data_size)
-                    memcpy(ns->data, src->data, ns->data_size);
+            /* ---- 本轮的修法：按 DPB 槽取源，而不是"最近就绪的那张" ----
+             *
+             * 上面的分析已经定位到：SEF 引用的是 show_frame=0 的帧，
+             * 也就是这些空壳 surface。而"承接最近就绪帧"之所以无效
+             * （开关两侧都是 17 个不同画面），是因为它拷的是**错的源**。
+             *
+             * 但驱动其实知道正确的源：show_frame=0 的帧在 build_unit 里
+             * 被记入 av1_dpb.dpb_shadow[slot]，slot 就是它占的 DPB 槽。
+             * 该槽此刻装的 surface 正是"这一帧的内容应该长什么样"的
+             * 唯一可得近似 —— 若该槽此前被一个有像素的帧刷新过，
+             * 拷它就比拷"最近就绪"更接近真实画面。
+             *
+             * ⚠️⚠️ 本轮实测：**这条路整体走不通，不是策略选得不好。**
+             *
+             * 加了诊断计数器（源前 256 字节是否全零）后测得：
+             *     DPB 承接累计 19 次，**其中源本身全零 13 次**
+             * 也就是说 show_frame=0 的帧互相引用，绝大多数源头**也是空壳**。
+             *
+             * 三种策略的实测结果因此完全一致（30 帧样本）：
+             *     按 DPB 槽取源   17 个不同画面
+             *     最近就绪帧      16 个
+             *     全零对照        17 个
+             * 换源没有任何效果 —— **要拷的信息从一开始就不存在**。
+             *
+             * 结论：任何"从别的 surface 拷像素"的方案都无法解决这个问题。
+             * 唯一出路是让 show_frame=0 的帧真正拿到硬件解码结果。
+             * 但实测送 150 收 80、与 show_frame=1 的数量精确吻合，
+             * 说明 msm_vidc 严格按 AV1 语义不输出它们。
+             *
+             * 下一步只有两个方向（都未验证）：
+             *   A. 让驱动改写这些帧的 show_frame 位为 1，骗硬件吐出来，
+             *      再自行决定不把它们计入输出序列。风险：改写 uncompressed
+             *      header 会影响 refresh_frame_flags 的位偏移。
+             *   B. 查 msm_vidc 是否有"输出全部帧含不显示帧"的 V4L2 控制项
+             *      （类似 V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY 那类）。
+             * 保留承接代码但它只是止损（避免全零），不是解法。
+             *
+             * DMD_AV1_NO_CARRY=1 关掉承接，退回全零便于对照。
+             * DMD_AV1_CARRY=last 切回旧的"最近就绪"策略作 A/B。 */
+            if (!getenv("DMD_AV1_NO_CARRY") && ns->data) {
+                const char *mode = getenv("DMD_AV1_CARRY");
+                VASurfaceID src_id = VA_INVALID_ID;
+
+                if (mode && strcmp(mode, "last") == 0) {
+                    src_id = c->av1_last_ready;
+                } else {
+                    /* 该帧刚刚占用的 DPB 槽（build_unit 里已更新 shadow）。
+                     * dpb_next_slot 指向下一个待用槽，所以本帧占的是它的前一个。 */
+                    unsigned slot = (c->av1_dpb.dpb_next_slot + 7u) & 7u;
+                    src_id = c->av1_dpb.dpb_shadow[slot];
+                    if (src_id == VA_INVALID_ID ||
+                        src_id == c->av1_send_surface)
+                        src_id = c->av1_last_ready;   /* 该槽还没内容，退回旧策略 */
+                }
+
+                if (src_id != VA_INVALID_ID && src_id != c->av1_send_surface) {
+                    struct dmd_surface *src =
+                        dmd_find_surface_locked(drv, src_id);
+                    if (src && src->data && src->data_size == ns->data_size) {
+                        /* 诊断：源是否本身就是空壳（全零）。
+                         * 只查前 256 字节，够区分全零与有内容。 */
+                        int src_blank = 1;
+                        for (size_t z = 0; z < 256 && z < src->data_size; z++)
+                            if (src->data[z]) { src_blank = 0; break; }
+                        memcpy(ns->data, src->data, ns->data_size);
+                        c->av1_carry_dpb++;
+                        if (src_blank) c->av1_carry_blank++;
+                    }
+                }
             }
             ns->state = DMD_SURFACE_READY;
             ns->decode_status = VA_STATUS_SUCCESS;
         }
-        dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队\n",
-                (unsigned)c->av1_send_surface);
+        dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队"
+                "（DPB承接累计 %lu，其中源全零 %lu）\n",
+                (unsigned)c->av1_send_surface, c->av1_carry_dpb,
+                c->av1_carry_blank);
     }
 
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;

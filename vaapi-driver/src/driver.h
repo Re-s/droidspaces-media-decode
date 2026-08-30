@@ -345,6 +345,8 @@ struct dmd_context {
      * 第 59 轮把 75 条日志当 75 次执行）。 */
     unsigned long  av1_sef_visits;   /* 取槽点被执行的次数 */
     unsigned long  av1_sef_show1;    /* 其中 send_show 为 1 的次数 */
+    unsigned long  av1_carry_dpb;    /* 按 DPB 槽承接像素的成功次数 */
+    unsigned long  av1_carry_blank;  /* 其中源本身是全零的次数 */
     unsigned long  av1_sef_enq;      /* 入队次数 */
     unsigned long  av1_sef_drop;     /* 队列满而丢弃的次数 */
     unsigned long  av1_sef_sent;     /* 实际追加的 SEF 单元数 */
