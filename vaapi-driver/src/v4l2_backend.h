@@ -18,12 +18,26 @@
  *    offset 无法 mmap（ENODEV）。必须先拿到 DMABUF fd 再以
  *    V4L2_MEMORY_DMABUF 传入。
  *
- *    缓冲来源按设备分两条（第 81 轮实测，见 v4l2_backend.c 的 heap_open）：
- *      /dev/dma_heap/system   较新内核，优先
+ *    缓冲来源按设备分两条（见 v4l2_backend.c 的 heap_open）：
+ *      /dev/dma_heap/system   内核 5.x，优先
  *      /dev/ion               内核 4.14 一类的老设备只有这个
- *    ⚠️ 小米平板 5 / nabu 两条都用不了：没有 dma_heap，而 ION 的
- *    modern 接口 ENODEV、legacy 接口 EINVAL，分配不出缓冲。
- *    那台设备因此无法用本驱动解码 —— 属内核限制，不是驱动缺陷。
+ *
+ *    ⚠️ 第 81 轮曾断言"nabu 的 ION 也不可用"，**那是错的**（第 84 轮更正）。
+ *    当时把 heap_id_mask 从 1 逐位试到 0x80，而 nabu 的 system heap id 是
+ *    **25**，不在试探范围。用 ION_IOC_HEAP_QUERY 问内核即可拿到：
+ *      9 个 heap，id=25 name=system type=0
+ *    用它分配 1080p NV12 一帧（3133440 字节）成功且可 mmap，
+ *    Android 侧 root 与容器内普通用户结果一致。
+ *
+ * 1b. ⚠️ **但缓冲类型本身也是设备相关的**（第 84 轮实测，nabu）：
+ *      REQBUFS OUTPUT_MPLANE + MMAP    → EINVAL
+ *      REQBUFS OUTPUT_MPLANE + DMABUF  → EINVAL
+ *      REQBUFS OUTPUT_MPLANE + USERPTR → **成功**，count=4
+ *    也就是说 nabu 这块 msm_vidc 只接受 USERPTR，与上面"只接受 DMABUF"
+ *    的约束**正好相反** —— 那条是另一台设备（有 dma_heap 的那台）的事实。
+ *    所以 ION 虽然通了，nabu 上仍走不到出帧：当前实现固定用
+ *    V4L2_MEMORY_DMABUF。要支持 nabu 需要再加一条 USERPTR 路径。
+ *    这是尚未完成的工作，不要以为 ION 通了就等于 nabu 能解码。
  *
  * 2. 必须两阶段 stateful 流程，不能双向一起 STREAMON：
  *      S_FMT(OUTPUT) → REQBUFS/STREAMON(OUTPUT) → 送含序列头的单元
@@ -69,6 +83,7 @@ struct dmd_v4l2_dec {
     int      fd;                              /* /dev/videoN */
     int      heap_fd;                         /* dma_heap 或 /dev/ion 的 fd */
     int      heap_kind;                       /* 见 v4l2_backend.c 的 HEAP_* */
+    unsigned ion_mask;                        /* ION system heap 的 mask */
 
     int      w, h;                            /* 协商后的对齐尺寸 */
     int      crop_w, crop_h;                  /* 有效显示区域 */

@@ -91,37 +91,93 @@ static int xioctl(int fd, unsigned long req, void *arg, const char *name)
 
 /* ------------------------------------------------------------ dmabuf 分配 */
 
-/* DMABUF 来源：dma-heap 优先，legacy ION 兜底。
+/* DMABUF 来源：dma-heap 优先，ION 兜底。
  *
- * 为什么需要两条路（第 81 轮实测）：
- *   有 dma-heap 的设备（较新内核）    → /dev/dma_heap/system 可用
- *   小米平板 5 / nabu（内核 4.14）    → **没有 /dev/dma_heap**，只有 /dev/ion
- * 此前代码硬依赖 dma-heap，在 nabu 上 dmd_v4l2_open 直接失败，
- * 表现为驱动加载正常但"打开 V4L2 解码器失败"、0 帧。
+ * 为什么需要两条路（第 81~84 轮实测）：
+ *   有 dma-heap 的设备（内核 5.x）  → /dev/dma_heap/system
+ *   小米平板 5 / nabu（内核 4.14）  → **没有 dma_heap 子系统**
+ *                                     （/sys/class/dma_heap/ 都不存在）
+ *                                     只有 /dev/ion
  *
- * ⚠️ nabu 的 ION 实测两种接口都分配不出来（modern ENODEV / legacy EINVAL），
- * 所以这条兜底路径在 nabu 上仍然拿不到缓冲 —— 加它不是为了救 nabu，
- * 而是为了让**别的只有 ION 且 ION 可用**的设备能跑，
- * 并且把失败原因说清楚（区分"没有 heap 设备"与"heap 存在但分配失败"）。
- * nabu 的结论是硬件/内核限制，不是驱动缺陷。 */
+ * ⚠️ 第 81 轮我判定"nabu 的 ION 也不可用"，那个结论是**错的**。
+ * 当时的做法是把 heap_id_mask 从 1 逐位试到 0x80 —— 而这台设备的
+ * system heap id 是 **25**（mask = 1<<25），压根不在试探范围里。
+ * 正确做法是先用 ION_IOC_HEAP_QUERY 问内核有哪些 heap。
+ *
+ * 实测（Android 侧 root 与容器内 master 用户结果完全一致）：
+ *     heap 数量 = 9
+ *     id=27 qsecom          id=26 user_contig     id=25 system
+ *     id=22 adsp            id=19 qsecom_ta       id=14 secure_carveout
+ *     id=13 spss            id=10 secure_display  id=9  secure_heap
+ * 用 id=25 分配 3133440 字节（1080p NV12 一帧）成功，且可 mmap。
+ *
+ * 教训：ENODEV 与 EINVAL 的区别是有信息的 —— modern ABI 返回 ENODEV
+ * （内核认识这个 ioctl，只是没有匹配的 heap），legacy ABI 返回 EINVAL
+ * （ABI 布局不对）。我当时把两者都当成"不支持"，丢掉了这条线索。 */
 
-enum { HEAP_NONE = 0, HEAP_DMA_HEAP, HEAP_ION_MODERN, HEAP_ION_LEGACY };
+enum { HEAP_NONE = 0, HEAP_DMA_HEAP, HEAP_ION };
 
-/* legacy ION（内核 4.14 及更早）：先 ALLOC 拿 handle，再 SHARE 换 dmabuf fd。 */
-struct ion_alloc_legacy {
-    size_t len; size_t align; unsigned int heap_id_mask;
-    unsigned int flags; int handle;
+/* ION 的 modern ABI（4.12 起的统一接口，nabu 的 4.14 用的就是这个）。 */
+struct ion_alloc_data {
+    uint64_t len;
+    uint32_t heap_id_mask;
+    uint32_t flags;
+    uint32_t fd;
+    uint32_t unused;
 };
-struct ion_fd_data { int handle; int fd; };
-#define ION_IOC_ALLOC_LEGACY _IOWR('I', 0, struct ion_alloc_legacy)
-#define ION_IOC_SHARE_LEGACY _IOWR('I', 4, struct ion_fd_data)
+#define ION_IOC_ALLOC_MODERN _IOWR('I', 0, struct ion_alloc_data)
 
-/* modern ION（4.19+）：一步返回 dmabuf fd。 */
-struct ion_alloc_modern {
-    uint64_t len; uint32_t heap_id_mask; uint32_t flags;
-    uint32_t fd; uint32_t unused;
+struct ion_heap_data {
+    char     name[32];
+    uint32_t type;
+    uint32_t heap_id;
+    uint32_t reserved0, reserved1, reserved2;
 };
-#define ION_IOC_ALLOC_MODERN _IOWR('I', 0, struct ion_alloc_modern)
+struct ion_heap_query_data {
+    uint32_t cnt;
+    uint32_t reserved0;
+    uint64_t heaps;          /* 指向 ion_heap_data 数组的用户态地址 */
+    uint32_t reserved1, reserved2;
+};
+#define ION_IOC_HEAP_QUERY _IOWR('I', 8, struct ion_heap_query_data)
+
+/* 问内核要 system heap 的 mask。失败返回 0。 */
+static uint32_t ion_system_mask(int fd)
+{
+    struct ion_heap_query_data q;
+    memset(&q, 0, sizeof(q));
+    if (ioctl(fd, ION_IOC_HEAP_QUERY, &q) != 0 || q.cnt == 0 || q.cnt > 64) {
+        V4L2_LOG("ION HEAP_QUERY 失败或数量异常(%u): %s", q.cnt,
+                 strerror(errno));
+        return 0;
+    }
+
+    struct ion_heap_data hd[64];
+    memset(hd, 0, sizeof(hd));
+    q.heaps = (uint64_t)(uintptr_t)hd;
+    if (ioctl(fd, ION_IOC_HEAP_QUERY, &q) != 0) {
+        V4L2_LOG("ION HEAP_QUERY 取数据失败: %s", strerror(errno));
+        return 0;
+    }
+
+    /* ION_HEAP_TYPE_SYSTEM == 0。优先按类型认，名字只作兜底 ——
+     * 类型是 ABI 的一部分，名字是厂商起的。 */
+    for (unsigned i = 0; i < q.cnt; i++) {
+        if (hd[i].type == 0) {
+            V4L2_LOG("ION system heap: id=%u name=%s", hd[i].heap_id,
+                     hd[i].name);
+            return 1u << (hd[i].heap_id & 31u);
+        }
+    }
+    for (unsigned i = 0; i < q.cnt; i++) {
+        if (strncmp(hd[i].name, "system", sizeof(hd[i].name)) == 0) {
+            V4L2_LOG("ION system heap(按名字): id=%u", hd[i].heap_id);
+            return 1u << (hd[i].heap_id & 31u);
+        }
+    }
+    V4L2_LOG("ION 有 %u 个 heap，但没有 system 类型的", q.cnt);
+    return 0;
+}
 
 static int heap_open(struct dmd_v4l2_dec *d)
 {
@@ -137,10 +193,16 @@ static int heap_open(struct dmd_v4l2_dec *d)
 
     d->heap_fd = open("/dev/ion", O_RDONLY | O_CLOEXEC);
     if (d->heap_fd >= 0) {
-        /* 两种 ION 接口的 ALLOC 号相同，靠试探区分。此处只记下待定，
-         * 由 dmabuf_alloc 首次分配时确定并缓存。 */
-        d->heap_kind = HEAP_ION_MODERN;
-        V4L2_LOG("无 dma_heap（%s），回退 /dev/ion", strerror(dh_errno));
+        d->ion_mask = ion_system_mask(d->heap_fd);
+        if (d->ion_mask == 0) {
+            close(d->heap_fd);
+            d->heap_fd = -1;
+            V4L2_LOG("ION 无可用 system heap");
+            return -1;
+        }
+        d->heap_kind = HEAP_ION;
+        V4L2_LOG("缓冲来源: /dev/ion mask=0x%x（无 dma_heap: %s）",
+                 d->ion_mask, strerror(dh_errno));
         return 0;
     }
 
@@ -165,40 +227,16 @@ static int dmabuf_alloc(struct dmd_v4l2_dec *d, size_t len)
         return (int)a.fd;
     }
 
-    /* ION：heap_id_mask 因设备而异，逐位试。system heap 通常是低位之一。 */
-    if (d->heap_kind == HEAP_ION_MODERN) {
-        for (unsigned mask = 1; mask <= 0x80u; mask <<= 1) {
-            struct ion_alloc_modern m;
-            memset(&m, 0, sizeof(m));
-            m.len = len;
-            m.heap_id_mask = mask;
-            if (ioctl(d->heap_fd, ION_IOC_ALLOC_MODERN, &m) == 0) {
-                V4L2_LOG("ION(modern) 分配成功: mask=0x%x", mask);
-                return (int)m.fd;
-            }
-        }
-        d->heap_kind = HEAP_ION_LEGACY;   /* 换 legacy 再试一轮 */
+    struct ion_alloc_data a;
+    memset(&a, 0, sizeof(a));
+    a.len = len;
+    a.heap_id_mask = d->ion_mask;
+    if (ioctl(d->heap_fd, ION_IOC_ALLOC_MODERN, &a) < 0) {
+        V4L2_LOG("ION 分配 %zu 字节失败(mask=0x%x): %s", len, d->ion_mask,
+                 strerror(errno));
+        return -1;
     }
-
-    for (unsigned mask = 1; mask <= 0x80u; mask <<= 1) {
-        struct ion_alloc_legacy l;
-        memset(&l, 0, sizeof(l));
-        l.len = len;
-        l.heap_id_mask = mask;
-        if (ioctl(d->heap_fd, ION_IOC_ALLOC_LEGACY, &l) != 0)
-            continue;
-        struct ion_fd_data sh;
-        memset(&sh, 0, sizeof(sh));
-        sh.handle = l.handle;
-        if (ioctl(d->heap_fd, ION_IOC_SHARE_LEGACY, &sh) == 0) {
-            V4L2_LOG("ION(legacy) 分配成功: mask=0x%x", mask);
-            return sh.fd;
-        }
-    }
-
-    V4L2_LOG("ION 分配 %zu 字节失败（modern 与 legacy 全 mask 均不成功）: %s",
-             len, strerror(errno));
-    return -1;
+    return (int)a.fd;
 }
 
 static void bufs_free(struct dmd_v4l2_buf *b, int n)
@@ -305,6 +343,7 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     d->fd = -1;
     d->heap_fd = -1;
     d->heap_kind = HEAP_NONE;
+    d->ion_mask = 0;
     for (int i = 0; i < DMD_V4L2_MAX_OUT; i++) d->out[i].dbuf_fd = -1;
     for (int i = 0; i < DMD_V4L2_MAX_CAP; i++) d->cap[i].dbuf_fd = -1;
 
