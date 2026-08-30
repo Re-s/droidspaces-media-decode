@@ -1,6 +1,85 @@
 # 更新日志
 
-## 未发布
+## v0.4.0
+
+**架构性重写：解码改为驱动内 V4L2 直通，整条 Android 侧链路删除。**
+
+### 💥 不兼容变更
+
+0.3.x：`容器 ffmpeg → unix socket → Android 侧 decode-daemon → MediaCodec`
+0.4.0：`容器 ffmpeg → libva 驱动 .so → /dev/video32`
+
+解码全程在容器进程内完成。**升级只需换掉容器里的 `.so`**，
+并可以卸载 `dmd_watchdog` 模块 —— Android 侧不再有本项目的任何进程或文件。
+
+删除项（约 -9400 行）：
+
+- `ksu-module/` 整个目录：看护启动、daemon 状态面板、探活循环、
+  `dmd-probe`（690KB 探活二进制）、部署脚本、SELinux 规则
+- `src/decode-daemon.c`（90KB，MediaCodec 实现）与 `build.sh`（NDK 交叉编译）
+- `vaapi-driver/src/dmd_client.c`（1168 行，unix socket + SHM 槽位池 + 握手）
+- `client/`：自述"验证 daemon 协议"的参考实现，它验证的协议已不存在
+- `src/v4l2_backend.{c,h}`：daemon 时代的旧副本（532 行），
+  驱动自带的是更新的 590 行版本 —— 两份 md5 不同，留着是误导源
+- CI 从三个产物收缩到一个（删 daemon job 与模块打包 job）
+
+删除前逐项取证，不是凭印象：`sepolicy.rule` 里**没有**任何 `/dev/video32` 或
+`droidspaces-gpu` 规则（节点组权限由平台侧给，删它不影响硬解）；
+产物中 `connect`/`socket`/`shm_open`/`dmd_session_open` 四个符号均为 0。
+
+### ✨ V4L2 stateful decoder 直通
+
+msm_vidc 要求**两段式协商**，这是 0.3.x 判定"V4L2 不可用"时踩空的地方：
+
+1. 先只配 OUTPUT 格式并 STREAMON，喂入第一个序列头
+2. 等 `V4L2_EVENT_SOURCE_CHANGE` 事件
+3. **然后**才配 CAPTURE 格式并 STREAMON
+
+两个队列一起 STREAMON 再喂数据，固件永远到不了 `START_DONE`，
+零帧输出且每一步都返回成功 —— 这正是 `doc/why-not-v4l2.md` 当年测到的现象。
+
+其它必需细节：CAPTURE 必须**显式**设 NV12（默认是 QCOM `Q08C`）；
+缓冲只接受 dma-heap DMABUF（mmap 与 query offset 都返回 `ENODEV`）；
+必须及时 DQBUF，否则解码器停住不再出帧。
+
+### 🎬 编解码器支持
+
+| 编解码器 | 状态 | 验证 |
+|---|---|---|
+| H.264 | ✅ | 300/300 帧，md5 `6b09e455` 与软解一致 |
+| HEVC Main | ✅ | 12/12 帧，md5 `237fed06` 与软解一致 |
+| VP9 Profile 0 | ✅ | 50/50 帧，md5 `3237a718` 与软解一致 |
+| AV1 Profile 0 | 🚧 | 帧数与 dav1d 一致（150），**像素未通过**（30 帧仅 17 个不同画面） |
+| VP8 | ❌ 移除 | msm_vidc 的 V4L2 层没有 VP80 格式，无硬件路径 |
+
+AV1 默认**不声明** —— 像素未通过时声明它就是虚报，
+Firefox / ffmpeg 会据此把任务交过来，得到重复帧与花屏，比回落软解更糟。
+开发调试用 `-DDMD_ENABLE_AV1` 编译。遗留缺陷（flush 死锁、
+70 个 `show_existing_frame` 未复现）见 `doc/av1-v4l2-status.md`。
+
+VP8 的协议 codec 编号 3 **保留不复用**，以免与旧线协议撞号。
+
+### 🔧 其它
+
+- `DMD_VENDOR_STRING` 去掉 "MediaCodec" 字样（它描述的是已不存在的路径）
+- 修好 `make tests`（此前长期 exit 2，因为两个测试要连 daemon 的 TCP 20003），
+  现改为编译并直接运行 AV1 bitstream 单元测试，并纳入 CI
+- `doc/why-not-v4l2.md` 加显著标注：其"V4L2 不可用（BLOCKED_HARD, certain）"
+  的结论已被本版推翻。保留原文，因为探测结果表、源码定位、IRQ 数据仍准确 ——
+  错在把"我这样调用不工作"写成了"这条路不通"
+
+### ⚠️ 未测量项
+
+- **性能**：0.3.x 的数字（1080p 峰值 194 fps 等）全部作废，
+  V4L2 直通的吞吐与延迟尚未测量，也没有与旧架构的 A/B 对照
+- **能效**：0.3.x 的功耗数据里"daemon 约 4.4 ms/帧落在宿主账上"一项已不存在，
+  需要重新测量。定性结论（单路硬解不省电）预计仍成立
+
+## v0.3.7 之后、v0.4.0 之前（daemon 架构的最后一批修复）
+
+> ℹ️ 这一段记录的是 **0.3.x daemon 架构**下的修复，其中涉及的
+> `client/`、`src/decode-daemon.c` 等文件已在 v0.4.0 删除。
+> 保留此段是为了历史可追溯，不代表当前代码里还有这些路径。
 
 文档审计的连带修复。三处都是审计时交叉核实发现的，与文档本身无关。
 
