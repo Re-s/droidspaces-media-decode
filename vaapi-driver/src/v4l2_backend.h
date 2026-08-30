@@ -76,6 +76,28 @@
  *                    仍无 SOURCE_CHANGE —— 不是"切块不是完整 NALU"的问题
  *      控制项        QUERYCTRL 0 项、S_CTRL EINVAL（G_CTRL 不可信，见下）
  *
+ *    第 87 轮又排除两项，并拿到决定性观测：
+ *
+ *      物理连续内存    从 ION user_contig(id=26, type=DMA) 与
+ *                      system(id=25) 各分配 4x4MB 并 mmap，
+ *                      两者表现**完全相同** —— 连续性不是原因
+ *      两侧同时 STREAMON  STREAMON(CAPTURE) 直接 EINVAL，
+ *                      证实两段式协商是强制的，不能提前
+ *
+ *    ⚠️ 决定性观测：**缓冲有去无回**
+ *      QBUF 4 个 NALU（SPS/PPS/SEI/IDR）全部返回 0
+ *      第 5 个 QBUF 返回 EINVAL —— 队列满了
+ *      随后 5 次 poll(POLLOUT|POLLPRI|POLLIN, 1s) 全部 revents=0
+ *      5 次 VIDIOC_DQBUF 全部 EAGAIN
+ *    也就是驱动把 4 个缓冲全吞下、一个都不归还、poll 永不就绪。
+ *    这与 doc/why-not-v4l2.md 记录的源码行为精确吻合：
+ *    会话状态机未达 MSM_VIDC_START_DONE 时缓冲被标 DEFERRED 后丢弃，
+ *    而 QBUF 仍返回 0（唯一提示走默认关闭的 VIDC_DBG）。
+ *
+ *    所以卡点已定位到"会话没到 START_DONE"，而非任何用户态调用细节。
+ *    结合第 86 轮的 IRQ 对照（编码器 753 / 解码器 ~0），
+ *    结论是：**这台设备的解码会话根本没启动固件**。
+ *
  *    尚未排除、留给后续的方向：
  *      · Codec2/OMX HAL 在 open 后可能还设了一批 msm_vidc 私有控制项
  *        （V4L2_CID_MPEG_VIDC_*），那些 id 不在标准头里，需要从
