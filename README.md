@@ -82,23 +82,132 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
   -hwaccel_output_format vaapi -i in.mp4 -f null -
 ```
 
-> ⚠️ **不要用 `vainfo` 测试** —— 它在本平台会挂住，即使指定不存在的驱动名也一样，
-> 因此它挂住不代表驱动有问题。用上面的 ffmpeg 命令。
+`vainfo` 也能用（0.3.x 时代它会挂在 daemon socket 上，0.4.0 起没有 socket 了）：
+
+```
+vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.1
+      VAProfileH264High               : VAEntrypointVLD
+      VAProfileHEVCMain               : VAEntrypointVLD
+      VAProfileVP9Profile0            : VAEntrypointVLD
+```
+
+但它只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧 ——
+验真实解码用上面的 ffmpeg 命令。
+
+不想装进系统目录可以用 `LIBVA_DRIVERS_PATH` 指向 `.so` 所在目录：
+
+```sh
+LIBVA_DRIVERS_PATH=/path/to/vaapi-driver/build vainfo
+```
 
 调试日志：`DMD_VA_LOG=1`。
 
-## 浏览器接入硬解
+## 容器内浏览器调用 VA-API
 
-完整方法、启动参数、profile 配置与验证步骤见
-[`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)。要点：
+先确认后端能出帧（上一节的 ffmpeg 自检），**这一步不通就别碰浏览器**。
 
-- **Chrome 必须 Wayland 模式**：解码帧经 linux-dmabuf 提交，X11 下解码器创建后零流量空转
-- **Chrome 必带 `--render-node-override=/dev/dri/renderD128`**：
-  Chromium 只枚举 PCI 总线 DRM 设备，ARM 平台设备会被跳过
-- **Firefox 需 `MOZ_DISABLE_RDD_SANDBOX=1`** + user.js 开 VA-API 四件套；
-  按 `installs.ini` 的 Default 找真实 profile
-- HEVC 观看推荐 Firefox（Chrome 在 anland 显示桥上有呈现反馈缺失的平台级问题）
-- 一键体检：`bash tools/check-browser-vaapi.sh`
+一键体检：`bash tools/check-browser-vaapi.sh`
+更多背景与排障见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)。
+
+### Chrome / Chromium
+
+两个参数缺一不可，原因是平台限制而非偏好：
+
+```sh
+google-chrome \
+  --ozone-platform=wayland \
+  --disable-vulkan \
+  --render-node-override=/dev/dri/renderD128 \
+  --ignore-gpu-blocklist \
+  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+```
+
+| 参数 | 为什么不能省 |
+|---|---|
+| `--ozone-platform=wayland` | 解码帧经 linux-dmabuf 提交。X11 下解码器能创建，之后零流量空转 —— 看着像在硬解，实际一帧不走 |
+| `--disable-vulkan` | ozone wayland 与 Vulkan 不兼容（Chrome 硬性检查），必须显式关 |
+| `--render-node-override` | Chromium `vaapi_wrapper.cc` 只枚举 PCI 总线 DRM 设备，ARM 平台设备被 `if (device->bustype != DRM_BUS_PCI) continue;` 跳过。此开关走 `LoadDrmFD()` 绕过白名单 |
+| `--ignore-gpu-blocklist` | ARM GPU 在 Chrome 的软件渲染黑名单里 |
+| `--enable-features=...` | Linux VA-API 解码总开关（DMABUF / GL 两路都开） |
+
+容器里通常还需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
+
+固化到桌面图标（参数紧跟在可执行文件后）：
+
+```sh
+sudo sed -i 's|^Exec=/usr/bin/google-chrome-stable|Exec=env DMD_VA_LOG=1 MESA_LOADER_DRIVER_OVERRIDE=msm /usr/bin/google-chrome-stable --ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL|' \
+  /usr/share/applications/google-chrome.desktop
+```
+
+`DMD_VA_LOG=1` 可选，加上才能在 stderr 看到驱动日志。指南里有幂等版脚本
+（重复执行不叠加参数），批量改多个 `Exec=` 行建议用那个。
+
+### Firefox ESR
+
+配置写进 profile 的 `user.js`。profile 路径按 `installs.ini` 里的 `Default=` 找，
+别猜目录名：
+
+```sh
+P=~/.mozilla/firefox/$(grep -m1 '^Default=' ~/.mozilla/firefox/installs.ini | cut -d= -f2)
+cat >> "$P/user.js" << 'EOF'
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true);
+user_pref("media.rdd-ffmpeg.enabled", true);
+user_pref("media.gpu-process-decoding", true);
+user_pref("media.vaapi-dmabuf-textures.enabled", true);
+EOF
+```
+
+第五项 `media.vaapi-dmabuf-textures.enabled` 容易被当成可选项漏掉：
+缺了它硬解照跑，但每帧都要拷回内存再做 CPU 软件转色，
+内容进程能吃掉半个到多个核心 —— 表现为"开了硬解 CPU 反而更高"。
+
+还需要关掉 RDD 沙箱，否则解码进程打不开 `/dev/video32`：
+
+```sh
+sudo sed -i 's|^Exec=/usr/lib/firefox-esr/firefox-esr |Exec=env MOZ_DISABLE_RDD_SANDBOX=1 /usr/lib/firefox-esr/firefox-esr |' \
+  /usr/share/applications/firefox-esr.desktop
+```
+
+容器里没有 sudo 就从宿主侧改
+`/mnt/Droidspaces/<容器名>/usr/share/applications/firefox-esr.desktop`。
+手动启动同理：`env MOZ_DISABLE_RDD_SANDBOX=1 firefox <地址>`。
+
+### 验证
+
+```sh
+# ① GPU 进程加载了驱动栈（两个数字都应 > 0）
+for p in $(pgrep -f "type=gpu-process"); do
+  grep -c libva /proc/$p/maps; grep -c drv_video /proc/$p/maps; done
+
+# ② 页面侧帧计数在增长（DevTools console，播放中执行两次比较）
+#    document.querySelector('video').getVideoPlaybackQuality().totalVideoFrames
+```
+
+驱动日志（需 `DMD_VA_LOG=1`）出现这两行才是固件真的在解码：
+
+```
+[v4l2] PORT_SETTINGS(SUFFICIENT): h=1088 w=1920
+[v4l2] 已发 SESSION_CONTINUE
+```
+
+> ⚠️ 别拿 `[v4l2] 收到 SOURCE_CHANGE` 当判据 —— **那行永远不会出现。**
+> msm_vidc 从不发标准 `V4L2_EVENT_SOURCE_CHANGE`，它发的是私有事件
+> `0x08001002`。0.3.x/0.4.0 的文档写错了这一点，会导致误判成"没在硬解"。
+
+### 选哪个浏览器
+
+**HEVC 观看推荐 Firefox。** Chrome 在 anland 显示桥上有呈现反馈缺失的平台级
+问题（不是本驱动的缺陷）。H.264 两者都正常。
+
+### 已知限制
+
+- **video32 解码会话一次只能有一个。** Android 侧 HAL 占用时驱动上报的
+  `MIN_BUFFERS` 会从 6/14 降到 4/12，两边会争这个节点 ——
+  容器里放视频的同时 Android 侧也在播，会有一方起不来。
+- **4K 需约 287MB ION 内存**（24 个 CAPTURE 缓冲）。测试机 `MemAvailable`
+  2.2GB 时正常，内存紧张下的行为未测。
+- AV1 帧数与 dav1d 一致但像素未通过，浏览器里遇到 AV1 会回落软解。
 
 ## 能效口径：硬解不省电，价值在并发
 

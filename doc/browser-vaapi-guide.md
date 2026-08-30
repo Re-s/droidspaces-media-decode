@@ -7,8 +7,23 @@
 前置：驱动已按 README 部署完成，且 `ffmpeg -hwaccel vaapi` 解码正常。
 若这一步不通，先解决后端，别碰浏览器。
 
-> ⚠️ **不要用 `vainfo` 做前置检查** —— 它在本平台会挂住，
-> 即使指定不存在的驱动名也一样。用下面的 ffmpeg 命令代替。
+> ⚠️ **0.4.1 更正：`vainfo` 现在可以正常用。** 本文原写"它在本平台会挂住，
+> 即使指定不存在的驱动名也一样"—— 那是 0.3.x daemon 架构下的现象
+> （`vainfo` 初始化时会去连 socket，daemon 没起来就卡在那里）。
+> 0.4.0 起没有 daemon 与 socket，`vainfo` 直接打开 `/dev/video32`，
+> 正常返回：
+>
+> ```
+> vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.1
+>       VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+>       VAProfileH264Main               : VAEntrypointVLD
+>       VAProfileH264High               : VAEntrypointVLD
+>       VAProfileHEVCMain               : VAEntrypointVLD
+>       VAProfileVP9Profile0            : VAEntrypointVLD
+> ```
+>
+> 但**它只证明驱动能加载、profile 列表是静态声明的**，不证明能出帧。
+> 要验真实解码仍用下面的 ffmpeg 命令。
 
 ---
 
@@ -112,13 +127,24 @@ for p in $(pgrep -f "type=gpu-process"); do
   grep -c libva /proc/$p/maps; grep -c drv_video /proc/$p/maps; done
 
 # ② 驱动侧出现真实解码会话
-#    0.4.0 没有 daemon 日志了；驱动日志走 stderr，需要以 DMD_VA_LOG=1
+#    0.4.0 起没有 daemon 日志了；驱动日志走 stderr，需要以 DMD_VA_LOG=1
 #    启动浏览器才能看到（.desktop 里 Exec=env DMD_VA_LOG=1 ...）
-#    期望看到：
-#      [dmd-va] init: ... vendor=DroidSpaces V4L2 VA-API driver 0.4.0
-#      [dmd-va] 会话已建立: codec=0 1280x720 端点=/dev/video32
-#      [v4l2] 收到 SOURCE_CHANGE          ← 有这行才是固件真的在解码
-#    只有 init 而没有"会话已建立"，说明浏览器没把解码交给本驱动
+#    期望看到（0.4.1 实测输出）：
+#      [dmd-va] init: ... vendor=DroidSpaces V4L2 VA-API driver 0.4.1
+#      [v4l2] S_FMT(OUTPUT) OK: 1920x1088 sizeimage=16588800
+#      [v4l2] 缓冲来源: /dev/ion mask=0x2000000（无 dma_heap: ...）
+#      [v4l2] CAPTURE 就绪: 1920x1088（有效 1920x1088）stride=1920 slice_h=1088
+#      [v4l2] 会话就绪: OUTPUT 8 x 16588800 字节, CAPTURE 24 x 3137536 字节
+#      [v4l2] PORT_SETTINGS(SUFFICIENT): h=1088 w=1920 ← 固件解析出序列参数
+#      [v4l2] 已发 SESSION_CONTINUE                    ← 有这两行才真在解码
+#
+#    ⚠️ 0.4.1 更正：本文原写"[v4l2] 收到 SOURCE_CHANGE ← 有这行才是固件
+#    真的在解码"。那行**永远不会出现** —— msm_vidc 从不发标准
+#    V4L2_EVENT_SOURCE_CHANGE，它发的是私有事件 0x08001002
+#    (PORT_SETTINGS_CHANGED_SUFFICIENT)。拿 SOURCE_CHANGE 当判据会
+#    误判成"没在硬解"。
+#
+#    只有 init 而没有"会话就绪"，说明浏览器没把解码交给本驱动
 
 # ③ 页面侧帧计数增长
 video.getVideoPlaybackQuality().totalVideoFrames
