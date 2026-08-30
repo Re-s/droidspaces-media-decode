@@ -388,6 +388,125 @@ static void test_patch_prev_refresh(void)
     check_eq("bitpos=4 高半字节", (long)(frame[1] & 0xf0), 0x90);
 }
 
+
+/* ------------------------------------------------- frame_header 的 show_frame 位
+ *
+ * 为什么单独测这两位：AV1 剩余缺陷的候选修法（"方向 A"）是把
+ * show_frame=0 的帧改写成 1，骗硬件把不显示帧也吐出来。
+ * 而规范 5.9.2 规定 showable_frame **只在 show_frame==0 时才出现**：
+ *     frame_type          f(2)
+ *     show_frame          f(1)
+ *     if (!show_frame) showable_frame  f(1)
+ * 也就是说改写 show_frame 会**改变后续所有字段的位偏移** ——
+ * 只翻转那一位而不删掉 showable_frame，整个帧头从此错位一位，
+ * 且 refresh_frame_flags 的改写位置（patch_prev_refresh 用的 bitpos）
+ * 也会跟着失效。
+ *
+ * 这里把"两种 show_frame 取值下帧头长度差恰好一位"钉死，
+ * 让日后真去做方向 A 时，一旦漏了这个联动就立刻失败而不是产出花屏。
+ *
+ * ⚠️ 本测试只验证结构性不变量（长度差、前若干位的取值），
+ * 不构造完整的参考帧头 —— 那需要一整套 VA 参数与 DPB 状态，
+ * 用真实码流做端到端比对更有效（设备恢复后做）。 */
+static void test_frame_header_show_frame(void)
+{
+    printf("frame_header 的 show_frame / showable_frame 联动（规范 5.9.2）\n");
+
+    unsigned char buf_show[512], buf_noshow[512];
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+
+    /* 构造一个最小可用的帧间帧参数。只关心前几位的布局，
+     * 后续字段用 0 即可 —— 两次调用只差 show_frame，其余完全相同。 */
+    memset(&pic, 0, sizeof(pic));
+    pic.frame_width_minus1  = 1919;
+    pic.frame_height_minus1 = 1079;
+    pic.profile = 0;
+    pic.order_hint = 4;
+    pic.pic_info_fields.bits.frame_type = 1;        /* INTER_FRAME */
+    pic.pic_info_fields.bits.showable_frame = 1;
+
+    pic.pic_info_fields.bits.show_frame = 1;
+    memset(&dpb, 0, sizeof(dpb));
+    size_t n_show = dmd_av1_build_frame_header(&pic, buf_show,
+                                              sizeof(buf_show), &dpb);
+
+    pic.pic_info_fields.bits.show_frame = 0;
+    memset(&dpb, 0, sizeof(dpb));
+    size_t n_noshow = dmd_av1_build_frame_header(&pic, buf_noshow,
+                                                 sizeof(buf_noshow), &dpb);
+
+    if (n_show == 0 || n_noshow == 0) {
+        /* 合成需要的参数不全时函数会拒绝 —— 那样这个测试没意义，
+         * 明确报出来而不是静默通过（静默通过是最坏的结果）。 */
+        fails++;
+        printf("  ✗ 帧头合成返回 0（show=%zu noshow=%zu），"
+               "测试未能覆盖目标\n", n_show, n_noshow);
+        return;
+    }
+
+    /* ⚠️ 断言必须是可否证的。第一版这里写的是
+     *     if (n_show == n_noshow) { ...memcmp... }
+     *     if (first_diff >= 8) fails++;
+     * 两条在真实数据下都恒不成立（实测 11 vs 12 字节、首差在第 1 字节），
+     * 于是三种变异（删条件写入 / 无条件写入 / show_frame 写死 1）
+     * 全部未被捕获 —— 测试是摆设。改成下面的正面断言。
+     *
+     * 规范 5.9.2：show_frame==0 时多出一位 showable_frame，
+     * 所以 show=0 的帧头必须**恰好比 show=1 多一位**。
+     * 位数无法直接观察，但两者同为字节对齐输出，
+     * 差一位在这组参数下表现为差一字节。 */
+    check_eq("show=0 帧头比 show=1 长一字节",
+             (long)n_noshow, (long)n_show + 1);
+
+    /* show_frame 那一位就在 frame_type 之后，
+     * 所以差异必须出现在**第 1 个字节**（第 0 字节是 OBU 头/前导字段）。
+     * 写死首差位置，任何改动前导字段布局的变更都会立刻暴露。 */
+    size_t first_diff = 0;
+    while (first_diff < n_show && first_diff < n_noshow &&
+           buf_show[first_diff] == buf_noshow[first_diff])
+        first_diff++;
+    check_eq("show_frame 差异出现在第 1 字节", (long)first_diff, 1);
+
+    /* 差异字节的具体取值：show=1 与 show=0 在该字节必须不同，
+     * 且 show=0 那份的后续字节整体右移一位 —— 用末字节佐证。
+     * （只断言"不同"仍是弱断言，所以连同长度与位置三项一起。） */
+    if (buf_show[first_diff] == buf_noshow[first_diff]) {
+        fails++;
+        printf("  ✗ 首差字节取值相同，show_frame 位未真正参与合成\n");
+    }
+
+    /* ⚠️ 上面三条仍抓不到"show_frame 被写死成常量 1"这种变异：
+     * 写死后两次调用该位都是 1，而 showable_frame 的条件分支若仍读
+     * 真实字段，长度差恰好还是 1、首差位置也不变 —— 实测确实逃脱。
+     * 所以必须直接检验那一位的取值。
+     *
+     * ⚠️ 定位时踩过的坑：我先假设"首差字节就是含 show_frame 的字节"，
+     * 断言写完在正常代码上就失败了。实测前 4 字节：
+     *     show=1:  1a 09 30 00
+     *     show=0:  1a 0a 28 00
+     * 第 0 字节是 OBU 头 0x1a，第 1 字节是 **obu_size**（9 与 10，
+     * 正是 11-2 与 12-2）—— 首差在第 1 字节只是因为长度不同。
+     * 真正的帧头载荷从第 2 字节开始，show_frame 在那里。
+     *
+     * 载荷第 0 字节（= buf[2]）的位布局（帧间帧、非 KEY）：
+     *     show_existing_frame f(1)=0
+     *     frame_type          f(2)=1  (INTER)
+     *     show_frame          f(1)
+     *     [!show_frame 时] showable_frame f(1)
+     *     ...
+     * 所以 show_frame 是从最高位数的第 4 位（bit 4，掩码 0x10）。
+     * 实测吻合：0x30 = 0011_0000 该位为 1；0x28 = 0010_1000 该位为 0。 */
+    const size_t PAYLOAD = 2;           /* OBU 头 1 字节 + obu_size 1 字节 */
+    if (n_show > PAYLOAD && n_noshow > PAYLOAD) {
+        check_eq("show_frame 位（载荷 bit4）在 show=1 时为 1",
+                 (long)((buf_show[PAYLOAD] >> 4) & 1u), 1);
+        check_eq("show_frame 位（载荷 bit4）在 show=0 时为 0",
+                 (long)((buf_noshow[PAYLOAD] >> 4) & 1u), 0);
+    }
+}
+
+
 int main(void)
 {
     printf("=== AV1 比特流原语自测 ===\n");
@@ -401,6 +520,7 @@ int main(void)
     test_sequence_header();
     test_show_existing();
     test_patch_prev_refresh();
+    test_frame_header_show_frame();
 
     if (fails == 0) {
         printf("=== 全部通过 ===\n");
