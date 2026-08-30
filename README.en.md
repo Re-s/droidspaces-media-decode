@@ -150,6 +150,7 @@ spread across CPU plus Venus.
 |---|---|
 | [`vaapi-driver/README.md`](vaapi-driver/README.md) | Driver internals, V4L2 negotiation details |
 | [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) | Full survey of the AV1 defects and method lessons |
+| [`doc/platform-integration-contract.en.md`](doc/platform-integration-contract.en.md) | What the platform must provide (0.4.0: device-node permissions only) |
 | [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) | Browser setup |
 | [`doc/verified-platform-facts.md`](doc/verified-platform-facts.md) | Platform facts established by testing |
 | [`doc/why-not-v4l2.md`](doc/why-not-v4l2.md) | ⚠️ Historical document whose conclusion has been overturned; kept for its investigation and method lessons |

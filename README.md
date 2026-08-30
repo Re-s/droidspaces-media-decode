@@ -135,6 +135,7 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
 |---|---|
 | [`vaapi-driver/README.md`](vaapi-driver/README.md) | 驱动内部实现、V4L2 协商细节 |
 | [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) | AV1 遗留缺陷的完整测绘与方法教训 |
+| [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) | 平台侧需要提供什么（0.4.0 只剩设备节点权限一项） |
 | [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) | 浏览器接入 |
 | [`doc/verified-platform-facts.md`](doc/verified-platform-facts.md) | 平台取证事实 |
 | [`doc/why-not-v4l2.md`](doc/why-not-v4l2.md) | ⚠️ 结论已被推翻的历史文档，保留其取证过程与方法教训 |
