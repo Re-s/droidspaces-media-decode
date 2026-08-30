@@ -10,29 +10,43 @@ ok()   { echo "  ✓ $1"; PASS=$((PASS+1)); }
 bad()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 hint() { echo "    → $1"; }
 
-echo "== [1/5] decode-daemon 后端连通性 =="
-# 驱动的探测顺序是 Unix socket 优先、TCP 兜底，所以两条都要看：
-# 只检 TCP 会在 socket 模式下误报"后端不可达"（实测踩过）。
-SOCK=/run/dmd/decode.sock
-EP=""
-if [ -S "$SOCK" ]; then
-    ok "Unix socket 可用: $SOCK (inode $(stat -c %i "$SOCK" 2>/dev/null))"
-    EP="unix"
+echo "== [1/5] 设备节点可用性 =="
+# 0.4.0 起驱动直接打开 /dev/video32，没有 daemon 也没有端点探测。
+# 需要：解码器节点 + 一个 DMABUF 来源（dma_heap 或 ion，二者任一）。
+if [ -r /dev/video32 ] && [ -w /dev/video32 ]; then
+    ok "/dev/video32 可读写"
 else
-    hint "Unix socket 不存在: $SOCK (平台未挂载 /run/dmd?)"
+    bad "/dev/video32 不可读写"
+    hint "需要 root:<容器可见组> 660，并把当前用户加入该组"
+    hint "当前用户组: $(id -Gn 2>/dev/null)"
 fi
-if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/20003' 2>/dev/null; then
-    ok "TCP 127.0.0.1:20003 可达"
-    [ -z "$EP" ] && EP="tcp"
+HEAP=""
+[ -w /dev/dma_heap/system ] && HEAP="/dev/dma_heap/system"
+[ -z "$HEAP" ] && [ -w /dev/ion ] && HEAP="/dev/ion"
+if [ -n "$HEAP" ]; then
+    ok "DMABUF 来源: $HEAP"
 else
-    hint "TCP 20003 不可达 (socket 模式下属正常)"
+    bad "无可用 DMABUF 来源（dma_heap 与 ion 都不可写）"
+    hint "内核 5.x 用 /dev/dma_heap/system，4.14 一类用 /dev/ion"
 fi
-if [ -z "$EP" ]; then
-    bad "两种端点都不可用 — 解码必然失败"
-    hint "宿主侧启动 socket 模式: decode-daemon --sock /data/local/Droidspaces/dmd/run"
-    hint "或 TCP 模式: decode-daemon 20003 (需 ksu 域)"
-else
-    ok "驱动将使用: $([ "$EP" = unix ] && echo 'Unix socket (优先)' || echo 'TCP (socket 不可用时的兜底)')"
+# 解码器身份（不依赖 v4l2-utils）
+if [ -r /dev/video32 ] && command -v python3 >/dev/null 2>&1; then
+    CARD=$(python3 - <<'PYEOF' 2>/dev/null
+import fcntl
+b=bytearray(104)
+try:
+    with open('/dev/video32','rb+',buffering=0) as f:
+        fcntl.ioctl(f, 0x80685600, b)
+    print(bytes(b[16:48]).split(b'\0')[0].decode())
+except Exception:
+    pass
+PYEOF
+)
+    if [ "$CARD" = "msm_vidc_vdec" ]; then
+        ok "解码器身份正确: card=$CARD"
+    elif [ -n "$CARD" ]; then
+        hint "card=$CARD（期望 msm_vidc_vdec，可能探到了别的节点）"
+    fi
 fi
 
 echo "== [2/5] VA-API 驱动可见性 =="
@@ -43,15 +57,15 @@ else
     bad "找不到 msm_drm_drv_video.so"
     hint "按 README 部署 vaapi-driver 到 dri 目录"
 fi
-if command -v vainfo >/dev/null 2>&1; then
-    if vainfo 2>/dev/null | grep -qE "VA-API|driver"; then
-        ok "vainfo 初始化成功 ($(vainfo 2>/dev/null | grep -c 'VAProfile') profiles)"
-    else
-        bad "vainfo 初始化失败 (LIBVA_DRIVER_NAME? 端点探测?)"
-        hint "试: LIBVA_DRIVER_NAME=msm vainfo; 或确认驱动回落到 tcp:20003"
-    fi
+# ⚠️ 不用 vainfo 检查 —— 它在本平台会挂住，即使给不存在的驱动名也一样。
+# 改为用 ffmpeg 实际解一帧，这也是唯一能证明"真的在硬解"的判据。
+if command -v ffmpeg >/dev/null 2>&1; then
+    ok "ffmpeg 存在（用它验证硬解，勿用 vainfo）"
+    hint "验证命令: LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \\"
+    hint "           -hwaccel_output_format vaapi -i test.mp4 -f null -"
+    hint "必须带 -hwaccel_output_format vaapi，否则会静默回落软解"
 else
-    hint "(未装 vainfo, 跳过 — 非必需)"
+    hint "没装 ffmpeg，无法验证硬解是否真的生效"
 fi
 
 echo "== [3/5] Chrome GPU 进程 =="
@@ -117,9 +131,13 @@ if command -v ffmpeg >/dev/null 2>&1; then
               -c:v libx265 -preset ultrafast -y "$T/t.mp4" >/dev/null 2>&1; then
         # 必须带 -hwaccel_output_format vaapi：只写 -hwaccel vaapi 时
         # 拿不到硬解会静默回落软解且不报错，测什么都"正常"。
-        R=$(ffmpeg -hide_banner -loglevel info \
+        # ⚠️ 必须显式指定 LIBVA_DRIVER_NAME 与打开 DMD_VA_LOG：
+        # 不指定驱动名时 libva 可能加载**系统目录里的旧版** .so，
+        # 测出来的结果与当前构建无关（实测踩过：/usr/lib 下那个比
+        # build/ 里的旧，日志里还带着早已删除的"退回 TCP"字样）。
+        R=$(DMD_VA_LOG=1 LIBVA_DRIVER_NAME=msm_drm \
+            ffmpeg -hide_banner -loglevel info \
                    -hwaccel vaapi -hwaccel_output_format vaapi \
-                   -hwaccel_device /dev/dri/renderD128 \
                    -c:v hevc -i "$T/t.mp4" -f null - 2>&1)
         FR=$(echo "$R" | grep -oE 'frame= *[0-9]+' | tail -1 | grep -oE '[0-9]+')
         SP=$(echo "$R" | grep -oE 'speed= *[0-9.]+x' | tail -1 | grep -oE '[0-9.]+')
@@ -127,7 +145,21 @@ if command -v ffmpeg >/dev/null 2>&1; then
         # ⚠️ 不要用日志里的 "hevc (native)" 判断软解 —— 那指的是 ffmpeg 以
         # 内置 hevc 解码器为前端，-hwaccel vaapi 是挂在它下面的加速后端，
         # 所以硬解生效时这行照样出现（我照它判过，误报了一次）。
-        # 可靠判据只有帧数与速度，以及 daemon 侧是否记下真实会话。
+        # ⚠️ 帧数与速度**也不足以**判断硬解：软解同样能跑满帧数且速度不低
+        # （实测本机 52/60 帧、3.57x，全是软解 —— V4L2 会话根本没建起来）。
+        # 唯一可靠的判据是驱动日志里有没有真正建立会话：
+        #   "会话已建立"  → V4L2 协商成功
+        #   "SOURCE_CHANGE" → 固件真的在解析码流
+        # 两者缺一就是没在硬解，无论帧数多好看。
+        SESS=$(echo "$R" | grep -acE '会话已建立|SOURCE_CHANGE')
+        if [ "${SESS:-0}" -eq 0 ]; then
+            bad "V4L2 会话未建立 — 帧数再好看也是软解"
+            hint "看日志: DMD_VA_LOG=1 LIBVA_DRIVER_NAME=msm_drm ffmpeg ..."
+            hint "若日志有「REQBUFS 失败」等，说明该设备解码路径起不来；"
+            hint "用 vaapi-driver/tools/probe_device_support.c 确认该设备是否可用"
+        else
+            ok "V4L2 会话已建立（真实硬解）"
+        fi
         if [ "$FR" -ge 55 ]; then
             SPI=${SP%%.*}; SPI=${SPI:-0}
             if [ "$SPI" -ge 3 ]; then
@@ -138,8 +170,8 @@ if command -v ffmpeg >/dev/null 2>&1; then
             fi
         else
             bad "解码中断: 仅 ${FR}/60 帧 (速度 ${SP:-?}x)"
-            hint "典型吞吐故障。查 daemon 日志「输入缓冲暂满，重试」"
-            hint "临时绕过: DMD_ENDPOINT=tcp:20003 换通道对比"
+            hint "先看上面 V4L2 会话是否建立；未建立即为软解"
+            hint "0.4.0 无端点可换；DMD_ENDPOINT 已无读者，设了不起作用"
         fi
     else
         hint "(无 libx265 编码器, 跳过 — 可手工用现成 HEVC 文件测)"
@@ -150,12 +182,24 @@ else
 fi
 
 echo ""
-echo "== 宿主侧人工复核(容器内看不到) =="
+echo "== 补充排查（0.4.0 全部在容器内完成，无需宿主侧）=="
 cat <<'NOTE'
-  adb shell 'su -c "tail -20 /data/local/Droidspaces/dmd/logs/decode-daemon.log"'
-  → 「输出格式 WxH stride=...」出现即真实解码; 只有握手无流量 = 上层没喂数据
-  → 「帧回传=SHM」= memfd 零拷贝生效; 「帧回传=内联」= 每帧经 socket 拷贝
-  → 「输入缓冲暂满，重试」= 吞吐瓶颈, 回传方向堵住导致输入槽位耗尽
+  驱动日志（这是唯一权威判据）：
+    DMD_VA_LOG=1 LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
+      -hwaccel_output_format vaapi -i test.mp4 -frames:v 3 -f null -
+    → 「会话已建立: codec=N WxH 端点=/dev/video32」 V4L2 协商成功
+    → 「[v4l2] 收到 SOURCE_CHANGE」            固件真的在解析码流
+    → 「[v4l2] REQBUFS 失败」等                该设备解码路径起不来
+
+  ⚠️ 确认你测的是当前构建，而不是系统目录里的旧 .so：
+    md5sum /usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so
+    md5sum vaapi-driver/build/msm_drm_drv_video.so
+    两者不同就先重新安装，否则测的是旧版本（实测踩过这个坑）。
+    免安装测法: LIBVA_DRIVERS_PATH=/tmp/dri 指向放了新 .so 的目录。
+
+  设备是否根本不支持：
+    cc -O2 -o /tmp/pds vaapi-driver/tools/probe_device_support.c && /tmp/pds test.h264
+    → 收不到 SOURCE_CHANGE 即该设备的解码会话起不来，驱动帮不上
 NOTE
 
 echo ""

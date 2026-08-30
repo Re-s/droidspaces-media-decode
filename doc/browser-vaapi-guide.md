@@ -1,64 +1,43 @@
 # 浏览器 VA-API 硬解接入指南（Chrome / Firefox）
 
 > 实测环境：nabu（SD855 / Adreno 640）+ DroidSpaces Debian 13 trixie 容器 +
-> decode-daemon TCP 模式（127.0.0.1:20003，ksu 域）+ msm_drm_drv_video.so。
-> 全部结论来自真机验证，非理论推导。验证日期：2026-08-26。
+> msm_drm_drv_video.so（驱动内 V4L2 直通）。
+> 浏览器侧的结论来自真机验证（验证日期 2026-08-26），非理论推导。
 
-前置：daemon 与驱动已按 README 部署完成，`vainfo` 能列出 H264/HEVC profile，
-`ffmpeg -hwaccel vaapi` 解码正常。若这一步不通，先解决后端，别碰浏览器。
+前置：驱动已按 README 部署完成，且 `ffmpeg -hwaccel vaapi` 解码正常。
+若这一步不通，先解决后端，别碰浏览器。
+
+> ⚠️ **不要用 `vainfo` 做前置检查** —— 它在本平台会挂住，
+> 即使指定不存在的驱动名也一样。用下面的 ffmpeg 命令代替。
 
 ---
 
-## 零、端点选择与那个曾经的大坑
+## 零、先确认后端真的在硬解
 
-驱动的端点探测顺序是 **Unix socket 优先、TCP 兜底**：不设 `DMD_ENDPOINT` 时，
-只要 `/run/dmd/decode.sock` 存在就走它。两条通道现在吞吐相当，**默认行为即可**。
-
-> ⚠️ **但驱动必须是 2026-08-26 之后的版本。** 在那之前 Unix 端点存在吞吐
-> 塌陷：默认 `SO_RCVBUF` 只有 224KB，而一帧 NV12 是 1.38MB(720p)/3.11MB(1080p)，
-> 缓冲装不下整帧 → daemon 的 `send_all` 反复阻塞 → 输出帧不回收 → 输入槽位
-> 耗尽 → 日志 `输入缓冲暂满，重试` → 放弃会话 → **上层静默回落 CPU 软解**。
->
-> | 端点 | 修复前 | 修复后 |
-> |---|---|---|
-> | TCP 20003 | 150 帧 / 8.6x | 150 帧 / 8.6x |
-> | Unix socket | 49 帧 / **0.92x** | **150 帧 / 7.4x** |
->
-> 修复方式是两端把收发缓冲显式设为 4MB，详见 CHANGELOG。
-
-**如果你用的是旧驱动**，可以给浏览器钉住 TCP 绕开（幂等，已配则跳过）：
+这是唯一一条必须先跑的检查，因为后面所有浏览器配置都建立在它成立的基础上。
 
 ```shell
-D=/usr/share/applications
-for f in google-chrome.desktop firefox-esr.desktop; do
-    T="$D/$f"; [ -f "$T" ] || continue
-    grep -q DMD_ENDPOINT "$T" && { echo "$f: 已配置"; continue; }
-    sudo cp "$T" "$T.bak-dmd"
-    sudo sed -i \
-      -e 's|^Exec=env |Exec=env DMD_ENDPOINT=tcp:20003 |' \
-      -e 's|^Exec=/usr/bin/google-chrome-stable|Exec=env DMD_ENDPOINT=tcp:20003 /usr/bin/google-chrome-stable|' \
-      -e 's|^Exec=/usr/lib/firefox-esr/firefox-esr|Exec=env DMD_ENDPOINT=tcp:20003 /usr/lib/firefox-esr/firefox-esr|' \
-      "$T"
-    echo "$f: $(grep -c DMD_ENDPOINT "$T") 处已加"
-done
-```
-
-容器内没有 sudo 时从宿主侧改
-`/mnt/Droidspaces/<容器名>/usr/share/applications/` —— sed 要在目标目录建临时
-文件，容器内普通用户会因权限不足失败（`无法打开临时文件 ./sedXXXX`）。
-
-**怎么确认自己踩没踩坑**：不带环境变量跑一遍，看速度就知道走了哪条路。
-
-```shell
-ffmpeg -hwaccel vaapi -hwaccel_output_format vaapi -c:v hevc \
+LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi -hwaccel_output_format vaapi \
        -i test.mp4 -f null - 2>&1 | tail -1
-#  ~150 帧 / 速度 >5x  → 走 TCP,正常
-#  ~50 帧  / 速度 <1x  → 走 socket,中招了
 ```
 
-⚠️ 必须带 `-hwaccel_output_format vaapi`。只写 `-hwaccel vaapi` 时 ffmpeg 拿不到
-硬解会**静默回落软解且不报错**，日志里出现 `hevc (native)` 就是软解 ——
-这样测什么配置都"正常"，等于没测。
+⚠️ **必须带 `-hwaccel_output_format vaapi`。** 只写 `-hwaccel vaapi` 时
+ffmpeg 拿不到硬解会**静默回落软解且不报错**，日志里出现 `hevc (native)`
+就是软解 —— 这样测什么配置都"正常"，等于没测。
+
+> ### 0.4.0 起不再需要选择端点
+>
+> 0.3.x 的驱动要在 Unix socket 与 TCP 之间选，因为解码走
+> `容器 → socket → Android 侧 decode-daemon → MediaCodec`。
+> 那时有个大坑：Unix 端点默认 `SO_RCVBUF` 只有 224KB 装不下整帧
+> （720p NV12 是 1.38MB），导致吞吐塌陷到 0.92x 并静默回落软解，
+> 需要给浏览器钉 `DMD_ENDPOINT=tcp:20003` 绕开。
+>
+> **这些全部不再适用。** 0.4.0 的驱动在浏览器进程内直接打开
+> `/dev/video32`，没有 socket、没有 daemon、没有端点可选。
+> `DMD_ENDPOINT` 与 `DMD_WANT_SHM` 两个环境变量已无任何读者，
+> 设了也不起作用 —— 如果你的 `.desktop` 文件里还留着它们，
+> 可以删掉（留着无害，只是没用）。
 
 ---
 
@@ -132,10 +111,14 @@ grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执�
 for p in $(pgrep -f "type=gpu-process"); do
   grep -c libva /proc/$p/maps; grep -c drv_video /proc/$p/maps; done
 
-# ② daemon 侧出现真实解码会话(有 NALU 流量、有输出格式行)
-tail -f /data/local/Droidspaces/Logs/decode-daemon-tcp.log
-#   [N] 握手成功: video/avc 1280x720 ...
-#   [N] 输出格式 1280x720 stride=1280 ...   ← 有这行才是真实解码
+# ② 驱动侧出现真实解码会话
+#    0.4.0 没有 daemon 日志了；驱动日志走 stderr，需要以 DMD_VA_LOG=1
+#    启动浏览器才能看到（.desktop 里 Exec=env DMD_VA_LOG=1 ...）
+#    期望看到：
+#      [dmd-va] init: ... vendor=DroidSpaces V4L2 VA-API driver 0.4.0
+#      [dmd-va] 会话已建立: codec=0 1280x720 端点=/dev/video32
+#      [v4l2] 收到 SOURCE_CHANGE          ← 有这行才是固件真的在解码
+#    只有 init 而没有"会话已建立"，说明浏览器没把解码交给本驱动
 
 # ③ 页面侧帧计数增长
 video.getVideoPlaybackQuality().totalVideoFrames
@@ -279,13 +262,12 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
-| dmd 会话握手成功但 0 NALU | Chrome 跑在 X11，dmabuf 输出走不通 | 换 Wayland 模式 |
+| 会话建立成功但 0 帧 | Chrome 跑在 X11，dmabuf 输出走不通 | 换 Wayland 模式 |
 | GPU 进程 maps 无 drv_video | PCI 白名单跳过了平台设备 | 确认 `--render-node-override` |
 | 启动即崩报 Vulkan 不兼容 | wayland+vulkan 硬性冲突 | 加 `--disable-vulkan` |
 | Firefox 有进程不解码 | RDD 沙箱拦设备 | `MOZ_DISABLE_RDD_SANDBOX=1` |
 | user.js 写了没生效 | 写错了 profile | 查 installs.ini 的 Default |
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |
-| 视频卡顿 + CPU 飙高，但"硬解已启用" | 走了 Unix socket 端点（吞吐不足） | 钉 `DMD_ENDPOINT=tcp:20003`，见第零章 |
-| daemon 日志 `输入缓冲暂满，重试` | 同上，socket 通道读 NALU 跟不上 | 同上 |
+| 视频卡顿 + CPU 飙高，但"硬解已启用" | 实际回落软解了（0.4.0 无端点问题，多为浏览器侧没走硬解路径） | 按第零章的 ffmpeg 判据自查后端；再用验证三步确认浏览器进程加载了驱动 |
 | ffmpeg 日志 `hevc (native)` | 根本没用硬解，静默回落软解了 | 测试命令要带 `-hwaccel_output_format vaapi` |
-| watchdog 报 healthy 但实际解不动 | 探活只测端点连通性，不测出帧能力 | 用第零章的 ffmpeg 速度判据自查 |
+| 驱动 init 了但一帧不出 | 该设备的 V4L2 解码会话起不来（已知有此类设备） | 跑 `vaapi-driver/tools/probe_device_support.c`：收不到 `SOURCE_CHANGE` 即该设备不可用 |
