@@ -1,9 +1,15 @@
 name: build
 
-# 两个产物的构建环境完全不同，所以分成两个 job：
-#   decode-daemon      NDK 交叉编译，x86_64 runner 直接跑
-#   msm_drm_drv_video.so  必须在 aarch64 上编（Makefile 顶部有说明：
-#                         x86_64 交叉工具链缺 aarch64 glibc），走 QEMU 容器
+# 0.4.0 起只有一个产物：msm_drm_drv_video.so
+#
+# 0.3.x 曾有三个（decode-daemon / 驱动 / dmd_watchdog 模块 zip），因为解码是
+# 在 Android 侧用 MediaCodec 做的，需要一个常驻 daemon 和一个看护它的 KSU 模块。
+# 改成驱动内 V4L2 直通后，解码全程在容器进程内完成（libva 驱动直连
+# /dev/video32），Android 侧不再有本项目的任何可执行文件 —— daemon job 与
+# watchdog job 一并删除。
+#
+# 驱动必须在 aarch64 上编（vaapi-driver/Makefile 顶部有说明：x86_64 交叉
+# 工具链缺 aarch64 glibc），所以走 QEMU 容器。
 on:
   push:
     branches: [ master ]
@@ -16,35 +22,6 @@ permissions:
   contents: write
 
 jobs:
-  daemon:
-    name: decode-daemon (NDK aarch64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up NDK
-        uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r26d
-
-      - name: Build
-        env:
-          NDK: ${{ steps.ndk.outputs.ndk-path }}
-        run: ./build.sh
-
-      - name: Verify it is an aarch64 Android binary
-        run: |
-          file build/decode-daemon
-          file build/decode-daemon | grep -q 'ARM aarch64' || {
-            echo "not an aarch64 binary" >&2; exit 1; }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: decode-daemon
-          path: build/decode-daemon
-          if-no-files-found: error
-
   driver:
     name: msm_drm_drv_video.so (native aarch64)
     runs-on: ubuntu-latest
@@ -69,6 +46,7 @@ jobs:
               make clean
               make all
               make check
+              make tests
             '
 
       - name: Verify it is an aarch64 shared object
@@ -83,91 +61,9 @@ jobs:
           path: vaapi-driver/build/msm_drm_drv_video.so
           if-no-files-found: error
 
-  watchdog:
-    name: dmd_watchdog module zip
-    # 依赖 daemon job：模块 zip 要把 decode-daemon 一起打进去，好让刷入模块
-    # 就完成**安卓侧**部署（customize.sh 负责装到 dmd/bin/）。
-    # 曾经不打包它，结果新设备刷完模块后 dmd/ 目录是空的 ——
-    # service.sh 只 mkdir 空目录，看护找不到 daemon 就一直报错；
-    # 老设备看不出来，因为那里的 daemon 是当初手动放的。
-    #
-    # 容器侧的 msm_drm_drv_video.so **故意不打包**：容器名与发行版布局都不
-    # 确定（Debian 的 usr/lib/aarch64-linux-gnu/dri 未必存在，Alpine 更不同），
-    # 遍历 Containers/*/ 猜路径一旦猜错就是静默装到无用位置，比不装更糟。
-    # 它作为独立 release 资产提供，由用户自行放进容器。
-    needs: [ daemon ]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Enable aarch64 emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Fetch decode-daemon
-        uses: actions/download-artifact@v4
-        with:
-          name: decode-daemon
-          path: prebuilt
-
-      # dmd-probe 是唯一需要编译的部件；静态链接，容器里不挑 libc。
-      # 与驱动同用 arm64 debian：编出来的二进制能在 qemu 下直接跑，
-      # 顺手当架构冒烟测试。
-      - name: Build dmd-probe (static aarch64)
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD:/src" -w /src/ksu-module \
-            debian:trixie-slim bash -euxc '
-              apt-get update -qq
-              apt-get install -y --no-install-recommends gcc libc6-dev file
-              gcc -O2 -static -Wall -Wextra -o dmd-probe src/dmd-probe.c
-              file dmd-probe | grep -q "ARM aarch64" || {
-                echo "not an aarch64 binary" >&2; exit 1; }
-              # 无参运行必须返回用法退出码 3。注意 bash -e 下不能直接跑——
-              # 非 0 退出会立刻终止脚本，先关掉 errexit 再取码。
-              set +e
-              ./dmd-probe >/dev/null 2>&1
-              rc=$?
-              set -e
-              [ "$rc" = "3" ] || { echo "probe usage rc=$rc, want 3" >&2; exit 1; }
-            '
-
-      - name: Package module zip
-        run: |
-          mkdir -p pkg
-          cp ksu-module/module.prop ksu-module/service.sh \
-             ksu-module/dmd-watchdog.sh ksu-module/action.sh \
-             ksu-module/sepolicy.rule ksu-module/README.md \
-             ksu-module/customize.sh pkg/
-          cp ksu-module/dmd-probe pkg/
-          # 安卓侧运行时：customize.sh 会把它搬到 dmd/bin/ 并从模块目录删除，
-          # 所以不长期占用 /data/adb 空间。容器侧驱动不在此列（见 job 注释）。
-          cp prebuilt/decode-daemon pkg/
-          test -s pkg/decode-daemon || { echo "decode-daemon 缺失或为空" >&2; exit 1; }
-          # 安装元数据:没有 META-INF 刷机器认不出这是模块,
-          # 没有 customize.sh 解包后全是 0644 -> 报"缺少文件或执行权限"
-          mkdir -p pkg/META-INF/com/google/android
-          cp ksu-module/META-INF/com/google/android/update-binary \
-             ksu-module/META-INF/com/google/android/updater-script \
-             pkg/META-INF/com/google/android/
-          chmod 755 pkg/service.sh pkg/dmd-watchdog.sh pkg/action.sh pkg/dmd-probe \
-                    pkg/decode-daemon \
-                    pkg/customize.sh pkg/META-INF/com/google/android/update-binary
-          chmod 644 pkg/module.prop pkg/sepolicy.rule pkg/README.md \
-                    pkg/META-INF/com/google/android/updater-script
-          ( cd pkg && zip -r "../dmd_watchdog-${GITHUB_REF_NAME}.zip" . )
-          unzip -l "dmd_watchdog-${GITHUB_REF_NAME}.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dmd_watchdog-zip
-          path: dmd_watchdog-*.zip
-          if-no-files-found: error
-
   release:
     name: Release
-    needs: [ daemon, driver, watchdog ]
+    needs: [ driver ]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -182,13 +78,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Same four assets every release has shipped since v0.3.3, so the
-      # download URLs stay predictable.
       - name: Checksums
         run: |
           cd dist
           ls -la
-          sha256sum decode-daemon msm_drm_drv_video.so dmd_watchdog-*.zip > SHA256SUMS
+          sha256sum msm_drm_drv_video.so > SHA256SUMS
           cat SHA256SUMS
 
       - name: Extract release notes for this tag
@@ -207,47 +101,28 @@ jobs:
           fi
           wc -l notes.md
 
-      # Every release ships all three assets, so a reader cannot tell from the
-      # file list which component actually changed. Worse, a rebuild on a
-      # different toolchain changes a binary's checksum with no source change at
-      # all, which looks like a silent code change. Say which source trees moved
-      # and pin the compiler, so a changed checksum is always explainable.
-      - name: Describe what changed per component
+      # A rebuild on a different toolchain changes the binary's checksum with no
+      # source change at all, which looks like a silent code change. Say whether
+      # the source tree moved and pin the compiler, so a changed checksum is
+      # always explainable.
+      - name: Describe what changed
         run: |
           prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
           {
             echo
-            echo '### 本次各组件的改动范围'
+            echo '### 本次改动范围'
             echo
             if [ -n "$prev" ]; then
               echo "与 \`${prev}\` 相比："
               echo
-              daemon_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- src/ | wc -l)
               driver_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | wc -l)
-
-              if [ "$daemon_changed" -gt 0 ]; then
-                echo "- **\`decode-daemon\`**：源码有改动（\`src/\` 下 ${daemon_changed} 个文件）"
-                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- src/ | sed 's/^/      /'
-              else
-                echo "- **\`decode-daemon\`**：**源码无改动**（\`src/\` 零变更）。"
-                echo "  二进制的 checksum 仍可能与上一版不同，因为它是在 CI 上用固定版本的 NDK"
-                echo "  重新编译的，而上一版可能来自不同工具链。行为未变，协议未变。"
-              fi
-
               if [ "$driver_changed" -gt 0 ]; then
                 echo "- **\`msm_drm_drv_video.so\`**：源码有改动（\`vaapi-driver/src/\` 下 ${driver_changed} 个文件）"
                 git diff --stat "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | sed 's/^/      /'
               else
-                echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更），同上。"
-              fi
-
-              wd_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- ksu-module/ | wc -l)
-              if [ "$wd_changed" -gt 0 ]; then
-                echo "- **\`dmd_watchdog-*.zip\`**（KSU 看护模块）：源码有改动（\`ksu-module/\` 下 ${wd_changed} 个文件）"
-                git diff --stat "${prev}..${GITHUB_REF_NAME}" -- ksu-module/ | sed 's/^/      /'
-              else
-                echo "- **\`dmd_watchdog-*.zip\`**（KSU 看护模块）：**源码无改动**（\`ksu-module/\` 零变更）。"
-                echo "  zip 的 checksum 仍可能因打包顺序/时间戳不同而变化，内容未变。"
+                echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更）。"
+                echo "  二进制的 checksum 仍可能与上一版不同，因为它是在 CI 上重新编译的。"
+                echo "  行为未变。"
               fi
             else
               echo "首个带此说明的版本，无法与上一 tag 比较。"
@@ -257,21 +132,30 @@ jobs:
             echo
             echo '| 产物 | 工具链 |'
             echo '|---|---|'
-            echo "| \`decode-daemon\` | Android NDK r26d，target API 29 |"
             echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64，系统 gcc |"
-            echo "| \`dmd_watchdog-*.zip\` | Debian trixie aarch64，静态 gcc（仅 dmd-probe 需编译） |"
             echo
             echo '> 换工具链会改变二进制的 checksum，即使源码一字未动。要判断是否真有'
             echo '> 代码改动，看上面的「改动范围」而不是 checksum。'
+            echo
+            echo '### 安装'
+            echo
+            echo '⚠️ 0.4.0 起**不需要任何 Android 侧部署** —— 没有 daemon、没有'
+            echo '看护模块、没有 socket。只需把驱动放进容器：'
+            echo
+            echo '```sh'
+            echo 'install -m 0644 msm_drm_drv_video.so \'
+            echo '  /usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so'
+            echo '```'
+            echo
+            echo '前提：容器内有 `libva2`、`libva-drm2`，且容器用户在'
+            echo '`droidspaces-gpu` 组内（平台侧通常已代为加组）。'
           } >> notes.md
           cat notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/decode-daemon
             dist/msm_drm_drv_video.so
-            dist/dmd_watchdog-*.zip
             dist/SHA256SUMS
           body_path: notes.md
           fail_on_unmatched_files: true
