@@ -59,6 +59,9 @@ static uint32_t br_ue(struct br *b)
     return ((1u << lz) - 1) + br_u(b, lz);
 }
 
+/* HEVC SPS 里暂时没解析到需要 se(v) 的字段，但位读取器成套保留 ——
+ * 后续要解析 pps_beta_offset_div2 一类字段时直接可用。 */
+__attribute__((unused))
 static int32_t br_se(struct br *b)
 {
     uint32_t c = br_ue(b);

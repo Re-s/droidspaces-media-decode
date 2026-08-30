@@ -256,7 +256,6 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 >
 > 链接锚定在 `v0.3.4` 标签上，脚本行为与本文档描述严格一致；
 > 想要最新版把 URL 里的 `v0.3.4` 换成 `master`。
-> 协议解析客户端（TCP 内联模式演示）：[tools/test_decode.py](../tools/test_decode.py)。
 
 ## 五、排障速查表
 

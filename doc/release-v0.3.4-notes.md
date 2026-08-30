@@ -95,7 +95,7 @@ adb shell 'su -c "tail -20 /data/local/Droidspaces/Logs/decode-daemon-tcp.log"'
 | [README.md](../README.md) | 项目总览、架构、编译与部署 |
 | [platform-integration-contract.md](platform-integration-contract.md) | 平台接入契约（⚠️ 已按 0.4.0 重写，bind mount 与 SELinux domain 两项要求已取消） |
 | `check-browser-vaapi.sh`（见本页 Assets） | 浏览器硬解一键体检脚本 |
-| `test_decode.py`（见本页 Assets） | 协议解析演示客户端（TCP 内联模式） |
+| `test_decode.py`（见 v0.3.4 Assets） | 协议解析演示客户端（TCP 内联模式）。⚠️ 该协议与 daemon 已在 0.4.0 移除，脚本已从仓库删除，仅 v0.3.4 的发布资产里还有 |
 | 编译产物：`decode-daemon` / `msm_drm_drv_video.so` / `dmd_watchdog-v0.3.4.zip` / `SHA256SUMS` | CI 构建的部署包，校验和见 SHA256SUMS |
 | [CHANGELOG.md](../CHANGELOG.md) | 全版本更新日志 |
 

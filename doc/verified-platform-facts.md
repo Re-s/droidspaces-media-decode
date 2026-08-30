@@ -246,6 +246,7 @@ Android 写的文件容器立即可读，反之亦然。
 ## 2. 端到端解码链路已验证可用
 
 测试方式：`build.sh` 交叉编译后 `adb push` 到 `/data/local/tmp/`，用 `su -c` 手动启动，容器内运行 `src/test_decode.py`。
+（⚠️ 这套取证方式属 0.3.x：`build.sh`、daemon 与 `test_decode.py` 均已在 0.4.0 移除。结论本身仍是当时的真实测量。）
 
 （早期计划用 KSU/Magisk 模块做开机自启，该方案**已放弃** —— daemon 改由 DroidSpace 平台托管。手动启动现在是开发测试的标准方式，不再是"临时替代"。）
 

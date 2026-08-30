@@ -139,3 +139,35 @@
 7. **增量构建的零警告不可信。** 一处嵌套注释警告只在 `make clean` 时暴露。
 8. **小样本"全对"不是修好。** 6 帧样本同时藏了三个缺陷（`allow_warped_motion`、
    `lr_type` 映射、`lr_unit_shift`），样本 6 → 24 → 60 → 150 放大才暴露。
+
+---
+
+## 排查工具
+
+`vaapi-driver/tools/probe_av1_feed.c` —— 把 OBU temporal unit 直送
+`/dev/video32`，绕过整个 VA-API 驱动。这是隔离"合成问题"与"硬件问题"的
+关键手段：
+
+```
+cc -O2 -o probe_av1_feed vaapi-driver/tools/probe_av1_feed.c
+./probe_av1_feed av1_1080p.obu
+```
+
+判据：
+
+| 结果 | 结论 |
+|---|---|
+| 直送源码流能吐满帧 | 硬件没问题，缺陷在驱动的 OBU 合成侧 |
+| 直送源码流也吐不满 | 硬件/内核侧的问题，与合成无关 |
+| 始终无 `SOURCE_CHANGE` | 该设备解码会话起不来，先跑 `probe_device_support` |
+
+正是这个手段在第 68 轮推翻了"SEF 复显由 ffmpeg 自行完成"的假设：
+源码流直送收 150 帧，而驱动合成流只收 80 帧，两条流的 OBU 构成差异
+只有那 70 个 `show_existing_frame` FRAME_HEADER。
+
+> ⚠️ 探针必须用 burst 模式（一次灌完再统一收帧）。AV1 解码器有
+> output delay，逐单元等帧会死锁 —— 它要收满 N 个输入才吐第一帧，
+> 而调用方在等第一帧。这个坑在旧版探针上踩过。
+
+> ⚠️ 旧版探针 `tools/av1_probe.py` 与 `tools/av1_probe_native.c` 走的是
+> daemon 线协议，随 daemon 一起在 0.4.0 删除，已由上面这个 V4L2 版替代。
