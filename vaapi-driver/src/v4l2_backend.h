@@ -37,7 +37,29 @@
  *    的约束**正好相反** —— 那条是另一台设备（有 dma_heap 的那台）的事实。
  *    所以 ION 虽然通了，nabu 上仍走不到出帧：当前实现固定用
  *    V4L2_MEMORY_DMABUF。要支持 nabu 需要再加一条 USERPTR 路径。
- *    这是尚未完成的工作，不要以为 ION 通了就等于 nabu 能解码。
+ *    ⚠️ 但第 85 轮把 USERPTR 整条流程走完后，nabu 依然出不了帧，
+ *    而且卡在更靠前的地方 —— 加 USERPTR 路径**不会**让 nabu 能解码：
+ *
+ *      REQBUFS(OUT,USERPTR)  成功 count=4
+ *      STREAMON(OUT)         成功
+ *      QBUF 4 个单元共 512KB 成功
+ *      等 V4L2_EVENT_SOURCE_CHANGE → **永不到达**（每次 poll 2 秒，全超时）
+ *      G_FMT(CAPTURE) 仍返回 1920x1088 / Q128，即残留默认值，
+ *      说明固件根本没解析过码流
+ *      REQBUFS(CAP,USERPTR)  也成功 count=6 —— 两侧都不是缓冲类型的问题
+ *
+ *    IRQ 硬证据（msm_vidc 是 IRQ 510，严格等时长对照）：
+ *      空闲基线      50 IRQ / 10s
+ *      USERPTR 喂料  49 IRQ / 12s   ← 与基线无差别
+ *      再次空闲      47 IRQ / 10s
+ *    固件对喂料毫无响应，与 doc/why-not-v4l2.md 当年测到的现象一致。
+ *
+ *    所以 nabu 的障碍不在缓冲类型，而在会话状态机到不了 START_DONE。
+ *    doc/why-not-v4l2.md 的结论**对这台设备是成立的**，
+ *    它错的只是把结论推广成"V4L2 这条路不通" —— 另一台设备上同样的
+ *    两段式协商能跑满 300 帧且像素与软解逐字节一致。
+ *    结论：nabu 无法用本驱动解码，属该设备的固件/内核限制；
+ *    不要再为它加缓冲类型分支。
  *
  * 2. 必须两阶段 stateful 流程，不能双向一起 STREAMON：
  *      S_FMT(OUTPUT) → REQBUFS/STREAMON(OUTPUT) → 送含序列头的单元
