@@ -65,7 +65,7 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
     /* 释放全部对象：消费者理应自己销毁，但异常退出路径下不会。
      * driver 被 dlclose 后这些内存就再也回收不了，所以必须在这里兜。
      *
-     * 顺序有讲究：context 先拆（它持有 daemon 会话与 socket），
+     * 顺序有讲究：context 先拆（它持有 V4L2 会话与设备 fd），
      * 再拆 image（可能借用 surface 缓冲），最后 surface 与 buffer。 */
     pthread_mutex_lock(&drv->lock);
 

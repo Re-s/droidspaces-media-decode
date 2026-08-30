@@ -41,21 +41,21 @@ enum {
     DMD_ERR_NOMEM     = -2,   /* 内存分配失败 */
     DMD_ERR_CONNECT    = -3,  /* connect 失败或超时 */
     DMD_ERR_REJECTED  = -4,   /* daemon 拒绝握手，见 dmd_error.handshake_status */
-    DMD_ERR_IO        = -5,   /* socket 读写失败 */
+    DMD_ERR_IO        = -5,   /* V4L2 ioctl 或读写失败 */
     DMD_ERR_TIMEOUT   = -6,   /* 等待超时 */
     DMD_ERR_PROTOCOL  = -7,   /* 收到不符合协议的字节 */
     DMD_ERR_STATE     = -8,   /* 会话状态不允许该操作（如已 finish_input 后再发） */
-    DMD_ERR_TOOBIG    = -9,   /* 数据单元/帧超出协议上限 */
-    DMD_ERR_ENDPOINT_MISMATCH = -10
-    /* 客户端 stat 到的 endpoint (dev,ino) 与 daemon 上报的不一致。
-     * 典型病因：平台把单个 socket 文件而非目录做 bind mount，daemon 重启后
-     * inode 变化，客户端侧解析到旧 socket。此错误不重试、不降级，
-     * 直接把错误抛给调用方（ffmpeg 会立刻看到失败而不是静默软解）。 */
+    DMD_ERR_TOOBIG    = -9    /* 数据单元/帧超出上限（当前无产生点，留作边界检查） */
+    /* ⚠️ 曾有 DMD_ERR_ENDPOINT_MISMATCH = -10，用于 socket 架构下
+     * "客户端 stat 到的 endpoint 与 daemon 上报的不一致"。
+     * 0.4.0 起驱动直接打开 /dev/video32，没有 endpoint 也没有 daemon，
+     * 该错误码零产生点，已删除。 */
 };
 
-/* daemon 的 codec id，与 decode-daemon.c 的 CodecId 逐值一致。
- * ⚠️ 跨目录耦合：这些值是线协议的一部分（握手第 4 个字），改一侧必须改另一侧。
- * 只能在末尾追加，不可重排 —— 数值错配不会报错，会静默解错码。 */
+/* codec id。0.4.0 前是线协议的一部分（与已删除的 decode-daemon.c 的
+ * CodecId 逐值一致），现在只在驱动内部用于选择 V4L2 pixelformat。
+ * ⚠️ 仍然只能在末尾追加、不可重排：这些值散布在 profiles.c 的能力表与
+ * dmd_v4l2_session.c 的格式映射里，重排不会报错但会静默解错码。 */
 enum {
     DMD_CODEC_H264 = 0,
     DMD_CODEC_HEVC = 1,
@@ -198,7 +198,7 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len);
 int dmd_session_finish_input(struct dmd_session *s);
 
 /*
- * 可逆排空：让 daemon 送 EOS 逼解码器吐出在手的帧，收齐后 flush 复位
+ * 可逆排空：送 V4L2_DEC_CMD_STOP 逼解码器吐出在手的帧，收齐后复位
  * 并重送 CSD —— 与 finish_input 的区别是**会话之后仍然可用**。
  *
  * 用途：消费者只保持少量帧在飞（浏览器是 3 帧），而解码器有 B 帧时要收到
@@ -206,7 +206,7 @@ int dmd_session_finish_input(struct dmd_session *s);
  * 原先只能用 finish_input 打破互等，代价是每次都要重建会话
  * （实测每帧 155 ms，播放慢 4.7 倍）。
  *
- * 排空后 daemon 会重新下发格式描述块，next_frame 内部自动消费，调用方无感。
+ * 排空后硬件会重新协商格式，next_frame 内部自动消费，调用方无感。
  * 返回 DMD_OK / DMD_ERR_*。
  */
 int dmd_session_drain(struct dmd_session *s);

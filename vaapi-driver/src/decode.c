@@ -3,11 +3,11 @@
  * ── 语义错配是这里的核心难点 ──────────────────────────────────
  * VA-API：一次 BeginPicture/EndPicture = 解一帧到**指定** surface，
  *         显示顺序由客户端安排，surface 之间无隐含顺序。
- * MediaCodec（经 daemon）：流式 in/out，输出按**解码顺序**吐出，
+ * V4L2 stateful 解码器：流式 in/out，输出按**解码顺序**吐出，
  *         没有"这一帧属于哪个 surface"的概念。
  *
  * 桥接办法：context 维护一个 FIFO 待解码队列 pending[]。EndPicture 把
- * 本帧码流送给 daemon 并把 render_target 入队；从 daemon 取回的第 k 帧
+ * 本帧码流送进 OUTPUT 队列并把 render_target 入队；从 CAPTURE 取回的第 k 帧
  * 就填给队列里的第 k 个 surface。这要求 **N 次提交 ⇔ N 个输出帧**：
  *   - VP9/VP8：每个数据单元恰好一帧（含 invisible 帧，show_frame==0 也产
  *     output buffer），天然 1:1
@@ -375,7 +375,8 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 
 /* ================================ context ================================ */
 
-/* 建 daemon 会话。调用方**不得持锁** —— connect 与握手是阻塞 IO。 */
+/* 建解码会话（打开 /dev/video32 并完成两段式协商）。
+ * 调用方**不得持锁** —— 打开与协商是阻塞 IO。 */
 static struct dmd_session *session_open(int codec, unsigned int width,
                                         unsigned int height)
 {
@@ -1227,7 +1228,7 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
         case VAIQMatrixBufferType:
         case VAProbabilityBufferType:
         case VAHuffmanTableBufferType:
-            /* daemon 侧是完整解码器（MediaCodec），这些表都在码流里，
+            /* V4L2 侧是完整的硬件解码器，这些表都在码流里，
              * 不需要我们转发。接受但忽略。 */
             break;
 
@@ -1470,7 +1471,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
         /* DMD_AV1_DUMP=<路径>：把首帧合成结果落盘，供离线校验。
          *
          * 这是本模块的主要验证手段，值得长期保留：合成正确性无法在设备上
-         * 直接判断（MediaCodec 只会"不出帧"，不告诉你哪一位错了），必须把
+         * 直接判断（硬件只会"不出帧"，不告诉你哪一位错了），必须把
          * 字节取回来交给权威工具。实测有效的判据是
          *   ffmpeg -f obu -i <落盘文件> -f null -        （能否解出帧）
          *   ffmpeg -bsf:v trace_headers ...              （逐字段比对位偏移）
@@ -2255,9 +2256,9 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
     c->pending_seq[qpos] = c->last_seq;
     c->pending_poc[qpos] = c->have_current_poc ? c->current_poc : INT32_MAX;
-    /* 发提交序号：daemon 会把它当 PTS 原样回传，配对时据此精确匹配。
-     * 与 daemon 的 vcl_in 对齐 —— 两侧都从 1 开始、每个数据单元加 1。
-     * 注意只有真正送出数据单元的提交才占号，参数集不占（daemon 侧同理：
+    /* 发提交序号：作为 timestamp 随 OUTPUT 缓冲送出，硬件原样回传，据此精确匹配。
+     * 编号从 1 开始、每个数据单元加 1。
+     * 注意只有真正送出数据单元的提交才占号，参数集不占（
      * is_param_set 的单元走 CSD 路径，不递增 vcl_in）。 */
     /* ⚠️ 已否证：这里也改用 session 同源编号。
      * 回退次数没有进一步下降（仍 64），但像素严重退化：
@@ -2685,7 +2686,7 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
      *
      * 首选：按提交序号精确配对。
      *
-     * daemon 把每个输入单元的序号当 PTS 送给 MediaCodec，解码器原样回传到
+     * 每个输入单元的序号作为 v4l2_buffer.timestamp 送出，硬件原样回传到
      * 对应的输出帧上（tools/probe_negotiate.c 实测未被改写），于是这一帧
      * 究竟属于哪次提交是**已知事实**，不需要推断。
      *

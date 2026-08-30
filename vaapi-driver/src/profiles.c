@@ -1,6 +1,6 @@
 /* profile / entrypoint / config 查询与 config 对象管理
  *
- * 声明的能力严格对应 Android 侧 decode-daemon 能提供的解码器：
+ * 声明的能力严格对应 /dev/video32 上 msm_vidc 能提供的解码器：
  * 协议 codec 取值 0=H.264 1=HEVC 2=VP9 3=VP8(已废弃) 4=AV1。
  * V4L2 直通下已真机端到端验证：H.264 300/300、HEVC 12/12、VP9 P0 50/50
  * （均逐字节等于软解）。AV1 帧数一致但像素未通过，详见 doc/av1-v4l2-status.md。
@@ -155,7 +155,7 @@ VAStatus dmd_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* 只做解码。编码走 MediaCodec 是另一个项目，这里不声明。 */
+    /* 只做解码。编码（/dev/video33）是另一个项目，这里不声明。 */
     entrypoint_list[0] = VAEntrypointVLD;
     *num_entrypoints = 1;
     return VA_STATUS_SUCCESS;

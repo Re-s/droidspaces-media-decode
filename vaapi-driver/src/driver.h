@@ -29,7 +29,8 @@
 /* ⚠️ 发版时必须同步：本串经 DMD_VENDOR_STRING 显示在 vainfo 的
  * "Driver version" 里，是用户可见信息。曾长期停在 0.3.3 而项目已到
  * 0.3.7（落后 4 版），用户按 vainfo 报 bug 时会指向错误的版本。
- * 同步清单：本文件、ksu-module/module.prop、CHANGELOG.md。 */
+ * 同步清单：本文件、CHANGELOG.md。
+ * （ksu-module/module.prop 曾在清单里，0.4.0 起 KSU 模块已整体删除。） */
 /* 0.4.0：架构改为驱动内 V4L2 直通（不再经 unix socket 与 Android 侧
  * decode-daemon / MediaCodec）。vendor 串里的 "MediaCodec" 随之去掉 ——
  * 它现在描述的是一条已经不存在的路径。 */
@@ -115,7 +116,7 @@
  *
  * ⚠️ 跨目录耦合：daemon 侧的 SHM_SLOT_WAIT_MS（src/decode-daemon.c）
  * 必须 > 本值。本值是客户端愿意等一帧的时长，daemon 等空闲槽位的上限
- * 若比它短，daemon 就会在客户端还愿意等的时候先放弃并杀掉会话。
+ * 若比它短，底层就会在调用方还愿意等的时候先放弃并中止会话。
  * 历史事故：daemon 只等 1000ms < 本值 5000ms，把本可正常完成的解码
  * 变成丢帧。调大本值时必须同步检查 SHM_SLOT_WAIT_MS。 */
 #define DMD_FRAME_TIMEOUT_MS 5000
@@ -188,7 +189,7 @@ struct dmd_image {
     VASurfaceID derived_from;
 };
 
-/* 一个 context：config + render target 集合 + 一条 daemon 会话。
+/* 一个 context：config + render target 集合 + 一条 V4L2 解码会话。
  *
  * 待解码队列 pending[] 是 VA-API 乱序语义与 MediaCodec 流式语义之间的桥。
  *
@@ -217,7 +218,7 @@ struct dmd_context {
     unsigned int picture_height;
     int flag;
 
-    /* daemon 会话。惰性创建：CreateContext 时建，失败则留 NULL 由
+    /* V4L2 解码会话。惰性创建：CreateContext 时建，失败则留 NULL 由
      * EndPicture 重试 —— 建 context 时 daemon 不可用不该让整个初始化失败。 */
     struct dmd_session *session;
     int session_failed; /* 建会话失败过，避免每帧重试拖慢失败路径 */
@@ -363,7 +364,7 @@ struct dmd_context {
     int            av1_send_show;
 
     /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
-     * 所以要从 pic param 反向合成，并在首个 VCL 之前发给 daemon。 */
+     * 所以要从 pic param 反向合成，并在首个 VCL 之前送入 OUTPUT 队列。 */
     int have_h264_pic_param;
     VAPictureParameterBufferH264 h264_pic_param;
     /* HEVC 图像参数：合成 VPS/SPS/PPS 用。与 h264 那份互斥使用。 */
@@ -598,7 +599,7 @@ VAStatus dmd_surface_sync_locked(struct dmd_driver *drv, VASurfaceID surface,
 
 /* 释放一个 surface 槽位持有的资源（不加锁）。 */
 void dmd_surface_reset_locked(struct dmd_surface *s);
-/* 释放一个 context 槽位持有的资源，含 daemon 会话（不加锁；会做 socket 关闭）。 */
+/* 释放一个 context 槽位持有的资源，含 V4L2 会话（不加锁；会关闭设备 fd）。 */
 void dmd_context_reset_locked(struct dmd_context *c);
 
 /* 按 surface 几何填一个 VAImage 描述（不含 image_id/buf）。
@@ -612,7 +613,7 @@ unsigned int dmd_align_up(unsigned int v, unsigned int align);
 
 /* ---- profiles.c 内部辅助 ---- */
 
-/* 该 profile 是否由本驱动支持（即 Android 侧 MediaCodec 有对应硬件解码器）。 */
+/* 该 profile 是否由本驱动支持（即 msm_vidc 有对应硬件解码器）。 */
 int dmd_profile_supported(VAProfile profile);
 
 /* profile → 协议 codec id（DMD_CODEC_*）。不支持的 profile 返回 -1。 */
