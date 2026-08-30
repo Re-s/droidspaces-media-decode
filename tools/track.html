@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>逐秒追踪</title>
+<style>
+  body { background:#111; color:#ddd; font-family:monospace; margin:0; padding:8px; }
+  video { width:700px; max-width:100%; background:#000; display:block; }
+  #hud { font-size:14px; line-height:1.6; padding:6px 0; }
+  #tl { font-size:12px; line-height:1.5; white-space:pre; }
+  b { color:#7fd; } .bad { color:#f66; } .ok { color:#6f6; }
+</style>
+</head>
+<body>
+<video id="v" muted playsinline></video>
+<div id="hud">追踪中…</div>
+<div id="tl"></div>
+
+<script>
+/* 逐秒追踪播放质量，用 setInterval 采样而**不用** requestVideoFrameCallback。
+ *
+ * 为什么不用 rVFC：实测它每 2.5 帧才回调一次（meta.presentedFrames 增量 610
+ * 而回调只有 241 次）。把回调次数当呈现帧数会算出 12fps 的假结果，
+ * 把回调间隔当帧间隔会算出 58% 的假顿卡。这是前三版探针共同的错误。
+ *
+ * 本版只信两个来源：
+ *   · getVideoPlaybackQuality().totalVideoFrames / droppedVideoFrames
+ *     —— 浏览器自己的累计计数，逐秒取差得到每秒真实解码量与丢帧量
+ *   · video.currentTime —— 播放进度，用来检测播放是否真的在推进
+ *
+ * 目标是抓住"同配置下丢帧数从 5 跳到 140"这个间歇性退化发生的时刻，
+ * 看它是持续性的还是突发性的。
+ */
+const q = new URLSearchParams(location.search);
+const secs = parseInt(q.get('secs') || '30', 10);
+const file = q.get('f') || 'h264_long.mp4';
+const nominal = parseFloat(q.get('fps') || '30');
+
+const v = document.getElementById('v');
+const hud = document.getElementById('hud');
+const tl = document.getElementById('tl');
+v.src = file;
+v.loop = false;
+
+const rows = [];
+let prev = null, t0 = null, timer = null, reported = false;
+
+function sample() {
+  const qq = v.getVideoPlaybackQuality();
+  const now = performance.now();
+  const ct = v.currentTime;
+
+  if (prev === null) {
+    t0 = now;
+    prev = { t: now, total: qq.totalVideoFrames, drop: qq.droppedVideoFrames, ct: ct };
+    return;
+  }
+
+  const dt = (now - prev.t) / 1000;
+  const dTotal = qq.totalVideoFrames - prev.total;
+  const dDrop = qq.droppedVideoFrames - prev.drop;
+  const dCt = ct - prev.ct;
+  const el = (now - t0) / 1000;
+
+  rows.push({
+    at: +el.toFixed(1),
+    decoded: dTotal, dropped: dDrop,
+    fps: +(dTotal / dt).toFixed(1),
+    /* 媒体时间推进速率：1.0 = 正常播放，<1 = 播放跟不上（卡） */
+    rate: +(dCt / dt).toFixed(3)
+  });
+
+  prev = { t: now, total: qq.totalVideoFrames, drop: qq.droppedVideoFrames, ct: ct };
+
+  /* 时间线：每秒一行，丢帧高亮 */
+  tl.innerHTML = rows.slice(-24).map(function (r) {
+    const bad = r.dropped > nominal * 0.05 || r.rate < 0.9;
+    const mark = bad ? '<span class="bad">' : '<span class="ok">';
+    return mark + ('  ' + r.at).slice(-5) + 's  解码 ' + ('  ' + r.decoded).slice(-3) +
+           '  丢 ' + ('  ' + r.dropped).slice(-3) +
+           '  ' + ('    ' + r.fps.toFixed(1)).slice(-5) + 'fps' +
+           '  进度x' + r.rate.toFixed(2) + '</span>';
+  }).join('\n');
+
+  const sumD = rows.reduce(function (a, r) { return a + r.decoded; }, 0);
+  const sumX = rows.reduce(function (a, r) { return a + r.dropped; }, 0);
+  const badSecs = rows.filter(function (r) {
+    return r.dropped > nominal * 0.05 || r.rate < 0.9;
+  }).length;
+
+  hud.innerHTML =
+    '已测 <b>' + el.toFixed(0) + '</b>/' + secs + 's　' +
+    '累计解码 <b>' + sumD + '</b>　丢 <b class="' + (sumX > sumD * 0.05 ? 'bad' : 'ok') +
+      '">' + sumX + '</b> (' + (sumD ? (100 * sumX / sumD).toFixed(2) : 0) + '%)<br>' +
+    '平均 <b>' + (sumD / el).toFixed(2) + '</b> fps（标称 ' + nominal + '）　' +
+    '异常秒数 <b class="' + (badSecs ? 'bad' : 'ok') + '">' + badSecs + '</b>/' + rows.length;
+
+  if (el >= secs && !reported) {
+    reported = true;
+    clearInterval(timer);
+    fetch('http://127.0.0.1:8931/result', {
+      method: 'POST',
+      body: JSON.stringify({
+        file: file, secs: +el.toFixed(1),
+        decoded: sumD, dropped: sumX,
+        drop_pct: sumD ? +(100 * sumX / sumD).toFixed(2) : 0,
+        avg_fps: +(sumD / el).toFixed(2),
+        bad_secs: badSecs, n_secs: rows.length,
+        timeline: rows
+      })
+    }).catch(function () {});
+  }
+}
+
+v.addEventListener('loadedmetadata', function () {
+  v.play().then(function () { timer = setInterval(sample, 1000); sample(); })
+          .catch(function (e) { hud.textContent = '播放失败: ' + e; });
+});
+v.addEventListener('error', function () { hud.textContent = '载入失败: ' + file; });
+</script>
+</body>
+</html>
