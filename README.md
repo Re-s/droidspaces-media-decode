@@ -155,12 +155,57 @@ user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.rdd-ffmpeg.enabled", true);
 user_pref("media.gpu-process-decoding", true);
 user_pref("media.vaapi-dmabuf-textures.enabled", true);
+user_pref("media.hardware-video-decoding.enabled", true);
+# 播放队列深度 —— 不是可选项，见下
+user_pref("media.video-queue.hw-accel-size", 10);
+user_pref("media.video-queue.default-size", 10);
+user_pref("media.video-queue.send-to-compositor-size", 6);
 EOF
 ```
 
 第五项 `media.vaapi-dmabuf-textures.enabled` 容易被当成可选项漏掉：
 缺了它硬解照跑，但每帧都要拷回内存再做 CPU 软件转色，
 内容进程能吃掉半个到多个核心 —— 表现为"开了硬解 CPU 反而更高"。
+
+`media.hardware-video-decoding.enabled` 要显式写 `true`。它默认就是 true，
+但 profile 里一旦残留过 `false`（比如做过软解对照测试），`user.js` 缺这一项
+就不会覆盖回来，于是**静默走软解**。这种情况下页面统计的丢帧率会很好看，
+容易误判成成功 —— 判断硬解是否真在跑要看 `DMD_VA_LOG=1` 有没有 `[v4l2]`
+输出，或 gdsc 是否 `enabled`，不能只看播放是否流畅。
+
+**三项 `media.video-queue.*` 是浏览器流畅播放的关键，不加就丢帧。**
+Venus 固件的解码流水线滞后 4 个输入单元才吐首帧（无 B 帧码流同样如此，
+`research/slowfeed.c` 实测），而 Firefox 默认的播放队列很浅，
+吸收不了这个滞后带来的交付抖动。1080p30 真实 27Mbps 码流实测（各 3-7 轮取中位）：
+
+| 配置 | 丢帧率 | 顺序回退 |
+|------|--------|----------|
+| 不加 `video-queue.*` | 14.25% | 20.75% |
+| 加上 | **0.89%** | 4.04% |
+
+软解基线是 0.5% / 1.85%，也就是说加上之后硬解与软解同量级。
+
+配齐之后的 Firefox 实测（各 3 轮取中位，`research/perf/bench.sh`）：
+
+| 素材 | 丢帧率 | 呈现帧率 | 顺序回退 |
+|------|--------|----------|----------|
+| H.264 1080p30 27Mbps | 1.34% | 29.38 fps（标称 30） | 4.54% |
+| HEVC 1080p30 | 0.67% | 29.45 fps | 3.48% |
+
+### 4K 不要开硬解
+
+同样的配置在 4K30 上是**倒退**：丢帧中位 72.38%、呈现只有 8.24 fps。
+原因是硬件能力不够，不是配置问题 —— ffmpeg 直接量吞吐：
+
+| 4K30 25Mbps | 吞吐 |
+|-------------|------|
+| VA-API 硬解 | 21.8 fps |
+| CPU 软解 | 48.7 fps |
+
+硬解 21.8 fps 达不到 30fps 的实时需求，而软解反而快一倍多。
+所以 4K 应当让浏览器走软解，硬解的价值在 1080p 及以下（省电、省 CPU）。
+顺序回退在 4K 下反而很低（0.76%），那是因为帧根本没跟上、无从错位，
+不是"4K 顺序更好"。
 
 还需要关掉 RDD 沙箱，否则解码进程打不开 `/dev/video32`：
 

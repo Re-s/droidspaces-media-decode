@@ -436,7 +436,40 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
      * 与 OMX HAL 活体 strace（pid omx@1.0-service）逐项对照得出： */
     struct v4l2_control ctl;
     static const struct { uint32_t id; int32_t val; const char *nm; } inits[] = {
-        { 0x00992003, 0,  "OUTPUT_ORDER"    },  /* base+3  */
+        /* OUTPUT_ORDER: 0=显示序（重排后输出）1=解码序（不等重排）。
+         *
+         * ⚠️ 必须用解码序(1)，否则浏览器无法硬解。
+         *
+         * research/slowfeed.c 直接打 V4L2 实测首帧滞后（1080p H.264）：
+         *     OUTPUT_ORDER=0（显示序）→ 送满 7 个单元，第 8 个才出首帧
+         *     OUTPUT_ORDER=1（解码序）→ 送 4 个单元，第 5 个就出首帧
+         * 差的 3 帧就是显示序重排的代价。
+         *
+         * 为什么这决定浏览器能否工作：Firefox 稳态只保持 5 帧在飞
+         * （实测 pending 恒为 5，占 99.9%），而显示序滞后 7 > 5，
+         * 于是它送完第 5 帧就等，解码器却还欠 2 帧料 —— 双方互等。
+         * SyncSurface 只能超时放行、谎报就绪，Firefox 采到未填充的缓冲：
+         * 实测 847 解码 / 792 丢弃 = 93.5%，画面几乎不动。
+         * 这是结构性矛盾，调 DMD_PIPELINE_DEPTH 无解 —— 12/4/7 三个值都试过，
+         * 分别是每帧放行(93.5% 丢帧)、每帧阻塞 5s 超时(fps 0.4、会话反复重建)、
+         * 仍然每帧放行(91.8% 丢帧)。
+         *
+         * 出帧顺序变成解码序不影响帧内容的正确性：配对按 v4l2_buffer.timestamp
+         * 携带的 unit_seq 精确匹配（见 decode.c 的 dmd_pending_take_locked），
+         * 与出帧顺序完全解耦 —— ffmpeg 五码流逐字节回归 5/5 即为此提供证据，
+         * 专门造的 B 帧顺序检验流（research/perf/order.mp4，220 个 B 帧、
+         * 匀速横移方块）在 ffmpeg 路径下 300 帧位置零回跳、与软解逐帧一致。
+         *
+         * ⚠️ 但浏览器路径有代价，取舍如下（Firefox 140，order_long.mp4，20s）：
+         *     ORDER=0 显示序: mediaTime 回退 0 处，但丢帧 99.79%
+         *                     （950 解码/948 丢弃，20s 任务跑了 62s，不可用）
+         *     ORDER=1 解码序: mediaTime 回退 2/465 = 0.43%，丢帧 4.17%
+         * 回退量恰为一帧（33ms），是 Firefox 自己上屏调度偶尔换位，
+         * 不是配对错误 —— Sync 只在请求的那张 surface 就绪时才返回。
+         * 用可察觉但极少的顺序抖动换回可用的播放，这是当前硬件下的最优解：
+         * 显示序滞后 7 > Firefox 在飞 5，互等无法靠软件消除（LOWLATENCY
+         * 开关对显示序滞后无影响，slowfeed 实测两种设置都是 7）。 */
+        { 0x00992003, 1,  "OUTPUT_ORDER"    },  /* base+3，1=解码序 */
         { 0x00992011, 2,  "EXTRADATA"       },  /* base+17，MENU，HAL 连设四种 */
         { 0x00992011, 25, "EXTRADATA"       },
         { 0x00992011, 31, "EXTRADATA"       },
@@ -744,10 +777,69 @@ int dmd_v4l2_send(struct dmd_v4l2_dec *d, const uint8_t *data, size_t len,
 
 /* ------------------------------------------------------------------- recv */
 
+/* 非阻塞取一帧 CAPTURE。返回 1=拿到画面, 2=EOS 标记帧, 0=当前没有, -1=错误。
+ * 设备是 O_NONBLOCK，队列空时 DQBUF 直接返回 EAGAIN，不会阻塞。 */
+static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
+                          size_t *out_len, uint64_t *out_pts, int *out_index)
+{
+    struct v4l2_buffer v;
+    struct v4l2_plane p[VIDEO_MAX_PLANES];
+    memset(&v, 0, sizeof(v));
+    memset(p, 0, sizeof(p));
+    v.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    v.memory = V4L2_MEMORY_USERPTR;
+    v.m.planes = p;
+    v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
+
+    if (ioctl(d->fd, VIDIOC_DQBUF, &v) != 0)
+        return 0;                       /* EAGAIN：现在没帧 */
+    if (v.index >= (unsigned)d->n_cap)
+        return -1;
+    d->cap[v.index].queued = 0;
+
+    /* bytesused==0 且带 LAST 标记 = 流结束标记帧，不是画面。 */
+    if (p[0].bytesused == 0) {
+        if (v.flags & V4L2_BUF_FLAG_LAST) {
+            d->saw_eos = 1;
+            return 2;
+        }
+        /* 空帧但非 LAST：还回去继续等。 */
+        qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                     (int)v.index, &d->cap[v.index], 0, 0,
+                     d->cap_planes > 1 ? d->extra[v.index].dbuf_fd : -1,
+                     (unsigned)d->extra_size);
+        return 0;
+    }
+
+    *out_data = (uint8_t *)d->cap[v.index].map;
+    *out_len = p[0].bytesused;
+    *out_pts = (uint64_t)v.timestamp.tv_sec * 1000000ULL +
+               (uint64_t)v.timestamp.tv_usec;
+    *out_index = (int)v.index;
+    if (v.flags & V4L2_BUF_FLAG_LAST) d->saw_eos = 1;
+    return 1;
+}
+
 int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                   uint64_t *out_pts, int *out_index, int timeout_ms)
 {
     if (d->fd < 0) return -1;
+
+    /* ⚠️ 先直接试一次非阻塞 DQBUF，再决定要不要 poll。
+     *
+     * msm_vidc 的 POLLIN 不能当作"有帧"的可靠信号：帧已经在 CAPTURE 队列里
+     * 了，poll 却可能不置位，于是空转到超时才返回，帧间隔被硬生生拖成
+     * 超时值。research/slowfeed.c 实测（真实 27Mbps 码流，维持 5 帧在飞，
+     * 300 帧）：
+     *     poll 超时 100ms → 第 250 帧后间隔稳定在 111ms（9fps）
+     *     poll 超时  20ms → 同一位置间隔变成 41~53ms
+     * 间隔跟着超时值走，正是空转的指纹。改成"先直取、取不到才 poll"后：
+     *     慢帧（>33ms）占比 15.3% → 3.4%，吞吐 32.6fps → 57.2fps
+     * 这也解释了浏览器侧 15.8% 的丢帧 —— 与 15.3% 的慢帧率吻合。 */
+    if (d->cap_ready) {
+        int r = try_dq_capture(d, out_data, out_len, out_pts, out_index);
+        if (r != 0) return r;
+    }
 
     struct pollfd pfd;
     pfd.fd = d->fd;
@@ -813,43 +905,10 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
     if (pfd.revents & POLLOUT)
         reap_output(d);
 
-    if ((pfd.revents & POLLIN) && d->cap_ready) {
-        struct v4l2_buffer v;
-        struct v4l2_plane p[VIDEO_MAX_PLANES];
-        memset(&v, 0, sizeof(v));
-        memset(p, 0, sizeof(p));
-        v.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        v.memory = V4L2_MEMORY_USERPTR;
-        v.m.planes = p;
-        v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
-        if (ioctl(d->fd, VIDIOC_DQBUF, &v) == 0) {
-            if (v.index >= (unsigned)d->n_cap) return -1;
-            d->cap[v.index].queued = 0;
-
-            /* bytesused==0 且带 LAST 标记 = 流结束标记帧，不是画面。 */
-            if (p[0].bytesused == 0) {
-                if (v.flags & V4L2_BUF_FLAG_LAST) {
-                    d->saw_eos = 1;
-                    return 2;
-                }
-                /* 空帧但非 LAST：还回去继续等。 */
-                qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-                            (int)v.index, &d->cap[v.index], 0, 0,
-                            d->cap_planes > 1 ? d->extra[v.index].dbuf_fd : -1,
-                            (unsigned)d->extra_size);
-                return 0;
-            }
-
-            *out_data = (uint8_t *)d->cap[v.index].map;
-            *out_len = p[0].bytesused;
-            *out_pts = (uint64_t)v.timestamp.tv_sec * 1000000ULL +
-                       (uint64_t)v.timestamp.tv_usec;
-            *out_index = (int)v.index;
-
-            if (v.flags & V4L2_BUF_FLAG_LAST) d->saw_eos = 1;
-            return 1;
-        }
-    }
+    /* poll 说有帧就再取一次。注意不能只信 POLLIN：上面开头那次直取已经
+     * 说明它会漏报，所以这里 cap_ready 就试，不要求 revents 带 POLLIN。 */
+    if (d->cap_ready)
+        return try_dq_capture(d, out_data, out_len, out_pts, out_index);
 
     return 0;
 }

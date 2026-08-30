@@ -43,11 +43,23 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
-    /* 导出前帧必须已经在 surface 里：Firefox 是在拿到解码帧之后才导出的，
-     * 但 VA-API 不保证这一点，稳妥起见先等就绪（内部自行加锁）。 */
-    VAStatus wait = dmd_surface_wait(drv, surface_id);
-    if (wait != VA_STATUS_SUCCESS)
-        return wait;
+    /* ⚠️ 不要在这里等帧就绪。
+     *
+     * 原来这里调 dmd_surface_wait()，理由写的是"Firefox 是在拿到解码帧之后
+     * 才导出的"。那对 Firefox 成立，但 **Chrome 的顺序正好相反**：它在
+     * CreateSurfaces 之后、提交任何解码之前就调 vaExportSurfaceHandle 拿
+     * dmabuf fd 去建输出纹理，拿到 fd 才开始喂码流。
+     *
+     * 于是 surface 还是 IDLE，dmd_surface_wait() 按设计拒绝（它防的是读一个
+     * 从未解码的 surface），export 返回 INVALID_SURFACE，Chrome 侧报
+     *     media/gpu/vaapi/vaapi_wrapper.cc:2756
+     *     vaExportSurfaceHandle failed, VA error: invalid VASurfaceID
+     * 随后整条硬解路径被放弃 —— 实测「送入 0 单元, 收到 0 帧」。
+     *
+     * 关键区别：**导出 dmabuf 不读像素**，只交出 fd 与几何描述。
+     * 缓冲生命周期由 surface 持有，何时写入由解码决定；消费方本来就要
+     * 等 vaSyncSurface 才采样。真正需要「必须已解码」这个前提的是
+     * GetImage / DeriveImage 那条读像素的路径，那里的 IDLE 拦截不变。 */
 
     pthread_mutex_lock(&drv->lock);
     struct dmd_surface *s = dmd_find_surface_locked(drv, surface_id);

@@ -399,6 +399,18 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
             return DMD_ERR_IO;
         }
         if (++spins > 500) {          /* 500 × 20ms = 10s */
+            /* 诊断这类死锁时，这三个计数是关键：pend_count 满而
+             * OUTPUT 全在驱动手里，说明消费者不取帧、CAPTURE 没归还、
+             * 固件停摆。DMD_VA_LOG=1 时打印。 */
+            int qout = 0, qcap = 0;
+            for (int i = 0; i < s->dec.n_out; i++)
+                if (s->dec.out[i].queued) qout++;
+            for (int i = 0; i < s->dec.n_cap; i++)
+                if (s->dec.cap[i].queued) qcap++;
+            sess_log(s, "背压超时: pend=%d/%d OUTPUT在驱动=%d/%d "
+                        "CAPTURE在驱动=%d/%d",
+                     s->pend_count, DMD_V4L2_MAX_CAP,
+                     qout, s->dec.n_out, qcap, s->dec.n_cap);
             set_err(s, DMD_ERR_TIMEOUT, "输入缓冲持续不可用");
             return DMD_ERR_TIMEOUT;
         }
@@ -529,8 +541,23 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
 
     int budget = timeout_ms > 0 ? timeout_ms : s->io_timeout_ms;
     /* 分片轮询：单片较小，便于及时处理 SOURCE_CHANGE 并在协商完成后
-     * 立刻发布格式（调用方靠它算 surface 布局）。 */
-    const int slice = 50;
+     * 立刻发布格式（调用方靠它算 surface 布局）。
+     *
+     * ⚠️ 粒度必须远小于帧间隔，否则交付延迟被轮询周期本身拖住。
+     * 原值 50ms 对 30fps（帧间隔 33ms）过粗：帧可能在 poll 刚开始就绪，
+     * 却要等满一片才被发现。实测（Firefox 140，1080p30，真实 27Mbps 码流）
+     * vaSyncSurface 延迟直方图：
+     *     均值 29.2ms  中位 31.6ms  p90 47.7ms  峰值 93.9ms
+     *     >33ms 帧间隔的占 44.9%   → 浏览器丢帧 15.8%
+     * 而硬件纯解码吞吐是 37.4fps（26.7ms/帧，slowfeed 实测），
+     * ⚠️ 但"大头是轮询周期"这个推断**已被实测否证**：把它降到 5ms 后
+     * 延迟几乎没动（均值 29.2→29.4ms，>33ms 占比 44.9%→43.8%），
+     * 浏览器丢帧反而从 15.8% 涨到 34.6%（峰值 93.9→126.9ms，
+     * 细粒度轮询的额外唤醒在这台 8 核设备上抢了 CPU）。
+     * 真正的大头就是解码本身的耗时（26.7ms/帧 ≈ 均值 29ms）——
+     * Firefox 在帧解出来之前就来要，等待时间必然接近一个解码周期。
+     * 取 20ms：比原来的 50ms 细（能及时处理事件），又不引入过多唤醒。 */
+    const int slice = 20;
     int waited = 0;
 
     for (;;) {

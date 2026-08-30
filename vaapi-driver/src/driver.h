@@ -85,8 +85,30 @@
  * SyncSurface 等 2000ms 超时 → 触发排空 → 会话终结 → 4 帧待配对，
  * ffmpeg 报 internal decoding error。
  * 而直连后端实测送 10 单元可稳定解出 10 帧，故取 12（10 再留 2 余量），
- * 且 12 < 24 不会撞 CAPTURE 缓冲上限。 */
-#define DMD_PIPELINE_DEPTH 12
+ * 且 12 < 24 不会撞 CAPTURE 缓冲上限。
+ *
+ * ⚠️ 0.4.1 修正：12 是 MediaCodec daemon 时代的值，V4L2 直通的真实滞后是 7。
+ *
+ * research/slowfeed.c 直接打 V4L2（绕过 VA-API 与本驱动）实测，1080p H.264：
+ *     [送 1..7]  已收 0        ← 送满 7 个单元都不出帧
+ *     [送 8]     已收 1        ← 第 8 个才吐首帧
+ *     [送 9..]   已收 2,3,4…   ← 之后 1:1 稳定跟随
+ * fast（连送，模拟 ffmpeg）与 slow（逐帧等，模拟 Firefox）两种节奏结论一致：
+ * 滞后都是 7，且 OUTPUT 缓冲从不掉到 0 —— 慢速送料本身没有问题。
+ *
+ * 配合 OUTPUT_ORDER=1（解码序，滞后降到 4）后取 5：
+ * 实测解码序下 pending 稳定在 6 > 滞后 4，解码器不欠料，可以安全真阻塞。
+ * 阈值留 7 时 pending=6 够不到，仍有 1057 次放行 / 15 次阻塞、丢帧 15.5%。
+ *
+ * 历史值 7 的理由（显示序时代）：pending < 7 时解码器确实还欠料，Sync 必须放行让消费者继续送，
+ * 否则双方互等。实测把它改成 4 就是这样卡死的：Firefox 每帧阻塞 5s 超时、
+ * 触发 flush、会话反复重建（日志里 6 次「会话已重建」），fps 掉到 0.4。
+ * pending >= 7 时流水线已满、下一帧必到，于是真阻塞等帧 —— 对靠 dmabuf
+ * 零拷贝采样的消费者（Firefox/Chrome 不调 DeriveImage，见 export.c）这是
+ * 唯一正确做法，它们没有"map 时再等"那条兜底路径。
+ * 留 12 的后果：pending 稳定在 5 永远够不到 12，于是每帧都放行、谎报就绪，
+ * Firefox 采到未填充的缓冲 —— 实测 847 解码 / 792 丢弃 = 93.5%，画面不动。 */
+#define DMD_PIPELINE_DEPTH 5
 
 /* 队列满时为腾空位收一帧的等待上限。
  *
@@ -242,6 +264,15 @@ struct dmd_context {
     int pending_count;
     /* 已提交的数据单元计数，给 pending_unit 发号。 */
     uint64_t units_submitted;
+    /* 本会话已交付给消费者的帧数，纯诊断用。
+     *
+     * 曾用它做"启动预热窗口"：前 N 帧内 Sync 对已入队 surface 也只探测不死等，
+     * 想借此消除启动阶段的丢帧簇。A/B 交替实测否证了这个改法
+     * （research/perf/ab.sh，各 4-5 轮）：
+     *     无预热     中位 3.50%（范围 1.82-39.84%）
+     *     预热 240 帧 中位 5.97%（范围 4.25-45.20%）
+     * 没有收益，反而偏差，已回退。计数本身留着，看会话交付量很方便。 */
+    uint64_t frames_out;
     /* daemon 是否回传 unit_seq（运行时从帧里观测，非编译期假设）。
      * 有它就能精确配对，且说明 daemon 已开跟随输入序输出（滞后 1）。 */
     int daemon_has_unit_seq;

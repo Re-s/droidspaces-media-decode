@@ -37,6 +37,17 @@
  * 解码路径小节里（放在那里更贴近使用现场）。 */
 static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
                                            uint32_t unit_seq);
+
+/* 序号追踪开关：DMD_TRACE_ORDER=1 打开。只影响日志，不改行为。 */
+static int dmd_trace_order(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DMD_TRACE_ORDER");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached;
+}
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f);
 
@@ -2273,6 +2284,13 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     c->have_current_poc = 0;
     c->current_target = VA_INVALID_ID;
 
+    /* 序号追踪（DMD_TRACE_ORDER=1 才开）：三列 CSV 便于外部量化错位。
+     * 目的是精确测出消费者的请求序与驱动出帧序的偏移，而不是靠猜。 */
+    if (dmd_trace_order())
+        dmd_log("ORDER submit surf=%u unit=%llu pend=%d\n",
+                (unsigned)target,
+                (unsigned long long)c->pending_unit[qpos], c->pending_count);
+
     /* 拷一份码流到局部缓冲：放锁后 c->slice_data 可能被别的线程复用。 */
     unsigned char *tx = scratch;
     if (!tx) {
@@ -3090,8 +3108,12 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
     /* 本次等待是否已经排空过一次。可逆排空不会改变队列深度，
      * 不加这个闸就会在同一次等待里反复排空（忙循环）。 */
     int drained_once = 0;
-    /* 单次等待用较小的片，这样能周期性回到锁内检查状态。 */
-    const int slice_ms = 100;
+    /* 单次等待用较小的片，这样能周期性回到锁内检查状态。
+     *
+     * 原值 100ms 是 daemon 时代的，对 V4L2 直通过粗。但也不要过细：
+     * 实测降到 10ms 时浏览器丢帧从 15.8% 涨到 34.6%，额外唤醒抢 CPU
+     * 反而有害（详见 dmd_v4l2_session.c 里 slice 的实测记录）。 */
+    const int slice_ms = 50;
     /* 等这么久还没帧就认为解码器在攥尾部帧，主动 flush。
      *
      * ⚠️ 不能取 timeout_ms/2：调用方的超时不是"流是否结束"的证据。
@@ -3276,6 +3298,11 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
 
         if (rc == DMD_OK) {
             VASurfaceID head = dmd_pending_take_locked(c, frame.unit_seq);
+            if (dmd_trace_order())
+                dmd_log("ORDER out    surf=%u unit_seq=%u waiting=%u pend=%d\n",
+                        (unsigned)head, frame.unit_seq, (unsigned)target,
+                        c->pending_count);
+            c->frames_out++;      /* 诊断计数：本会话已交付的帧数 */
             struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
             if (hs) {
                 surface_store_frame_locked(hs, &frame);
@@ -3390,6 +3417,10 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
     struct dmd_context *sc = dmd_find_context_locked(drv, context);
     int c_pending = sc ? sc->pending_count : 0;
 
+    if (dmd_trace_order())
+        dmd_log("ORDER req    surf=%u pend=%d state=%d timeout=%dms\n",
+                (unsigned)surface, c_pending, s->state, timeout_ms);
+
     /* 放行是有额度的：只在"在飞帧数还不足以喂饱解码器流水线"时才放行。
      *
      * 无条件放行会把死锁换成队列无界增长 —— 实测 pending 一路涨到
@@ -3401,12 +3432,60 @@ VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
      * 在飞帧数低于它时放行（让流水线填满，这是打破死锁的必要条件），
      * 达到之后就老实阻塞等帧 —— 此刻解码器已经不欠料，等得到，
      * 于是队列被排空，形成稳定的背压。 */
+    /* ⚠️ 判据不能只看 pending_count 总量。
+     *
+     * 总量阈值试遍了 12/7/5/4/3，浏览器丢帧率没有一个达标（分别是 93.5%、
+     * 91.8%、2~19% 剧烈波动、fps 0.4 卡死、26.4%）。原因是这个量根本不回答
+     * 真正的问题："我要等的这一张，帧到底在不在路上？"
+     *
+     * 真正的判据在队列里：pending_unit[] 记着每张已提交 surface 的单元序号。
+     * 请求的 surface 若已入队，说明它的码流已经送进解码器、帧一定会回来，
+     * 这时必须老实等 —— 对靠 dmabuf 零拷贝采样的消费者（Firefox/Chrome
+     * 不调 DeriveImage，没有"map 时再等"那条兜底路径）放行就是谎报就绪，
+     * 它采到未填充的缓冲，表现为丢帧与画面回跳。
+     * 若不在队列里，说明它还没被 EndPicture 提交，等它毫无意义 ——
+     * 此时放行让上游继续送料，这是打破互等的必要条件。 */
+    int in_queue = 0;
+    if (sc) {
+        for (int k = 0; k < sc->pending_count; k++) {
+            int qi = (sc->pending_head + k) % DMD_MAX_SURFACES;
+            if (sc->pending[qi] == surface) { in_queue = 1; break; }
+        }
+    }
+
     dmd_log("Sync: surface=%u pending=%d timeout=%dms %s\n",
             (unsigned)surface, c_pending, timeout_ms,
-            c_pending >= DMD_PIPELINE_DEPTH ? "阻塞等帧" : "放行");
+            in_queue ? "阻塞等帧(已入队)"
+                     : (c_pending >= DMD_PIPELINE_DEPTH ? "阻塞等帧(队列满)"
+                                                        : "放行(未入队)"));
 
-    if (c_pending >= DMD_PIPELINE_DEPTH) {
+    if (in_queue || c_pending >= DMD_PIPELINE_DEPTH) {
+        /* 交付延迟直方图（DMD_TRACE_ORDER=1 才统计）。
+         * 30fps 的帧间隔是 33ms：Sync 若经常拖过这个值，消费者就来不及
+         * 按时上屏，表现为丢帧 —— 这是定位长尾的关键数据。 */
+        struct timespec ts0, ts1;
+        int trace = dmd_trace_order();
+        if (trace) clock_gettime(CLOCK_MONOTONIC, &ts0);
+
         VAStatus st = sync_surface_locked(drv, context, surface, timeout_ms);
+
+        if (trace) {
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            long us = (ts1.tv_sec - ts0.tv_sec) * 1000000L +
+                      (ts1.tv_nsec - ts0.tv_nsec) / 1000L;
+            static unsigned long n_call, n_over33, n_over66, max_us, sum_us;
+            n_call++;
+            sum_us += (unsigned long)us;
+            if ((unsigned long)us > max_us) max_us = (unsigned long)us;
+            if (us > 33000) n_over33++;
+            if (us > 66000) n_over66++;
+            dmd_log("LAT %ld us surf=%u st=%d\n", us, (unsigned)surface, st);
+            if (n_call % 100 == 0)
+                dmd_log("LAT 汇总: %lu 次, 均值 %lu us, 峰值 %lu us, "
+                        ">33ms %lu (%.1f%%), >66ms %lu\n",
+                        n_call, sum_us / n_call, max_us,
+                        n_over33, 100.0 * n_over33 / n_call, n_over66);
+        }
         pthread_mutex_unlock(&drv->lock);
         return st;
     }
