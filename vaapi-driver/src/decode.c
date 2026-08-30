@@ -3009,7 +3009,23 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
          * 最后一项无变化说明：改写发生的时机与 dump 记录的
          * dpb_next_slot 不在同一时刻，或该值此刻已被推进 ——
          * 不能靠此刻的 slot 反推目标值。
-         * 结论：写 0 仍是最优；这 5 帧要靠解开 flush 死结才能修。 */
+         * 结论：写 0 仍是最优；这 5 帧要靠解开 flush 死结才能修。
+         *
+         * ---- 第 88 轮：排除了 8 位偏移的三个候选来源 ----
+         * 这 5 帧的 last_refresh_bitpos 是 58，其余 70 帧是 50，差 8 位。
+         * 用最小构造枚举 frame_type × show_frame × error_resilient_mode
+         * 全部 16 种组合（tests/test_av1_bitstream.c 的
+         * test_refresh_bitpos_invariants），实测最大差值只有 **3 位**
+         * （= primary_ref_frame 的宽度，规范 5.9.2 在
+         *   !intra_only && !error_resilient_mode 时才写它）。
+         * 3 凑不出 8，所以那 8 位差**不来自这三项中的任何一个**。
+         *
+         * 另外确认 frame_size_override_flag 也不是原因：VA-API 压根没有
+         * 这个字段，驱动恒写 0，且理由成立（尺寸变化会重建会话）。
+         *
+         * 剩余候选：真实码流里 bitpos 之前还有 tile_info / quantization
+         * 一类的可变长字段，需要拿真实码流逐帧 dump bitpos 才能定位。
+         * 那要设备在线，留待远端恢复。 */
         unsigned patch_val = 0;
         if (held_bitpos != (size_t)-1) {
             int patched = 1;

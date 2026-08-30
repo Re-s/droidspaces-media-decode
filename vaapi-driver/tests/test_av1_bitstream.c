@@ -507,6 +507,98 @@ static void test_frame_header_show_frame(void)
 }
 
 
+
+/* ------------------------------------------- refresh_frame_flags 的位偏移不变量
+ *
+ * 背景：AV1 剩余缺陷里有 5 帧（150 帧样本的第 30/60/90/120/150）
+ * refresh_frame_flags 改写不正确。测绘数据是：
+ *     70 帧 last_refresh_bitpos=50，这 5 帧 =58，差 **8 位**
+ * 而改写用的正是这个 bitpos，偏了就写到别的字段上。
+ *
+ * 本测试把影响该偏移的各因素钉住，并记录已排除的可能：
+ *   frame_type / show_frame / error_resilient_mode 三者的组合，
+ *   最大差值只有 3 位（primary_ref_frame 的宽度），**凑不出 8**。
+ * 所以那 8 位差不来自这三项 —— 缩小了后续排查范围。
+ *
+ * ⚠️ 这里的绝对值（15~19）比真实码流的 50/58 小很多，因为最小构造
+ * 缺少真实序列头带来的前置字段。测的是**差值关系**而非绝对偏移，
+ * 绝对值随实现调整会变，差值关系由规范 5.9.2 固定。 */
+static void test_refresh_bitpos_invariants(void)
+{
+    printf("refresh_frame_flags 位偏移的不变量（规范 5.9.2）\n");
+
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+    unsigned char buf[512];
+
+    /* 返回 last_refresh_bitpos；(size_t)-1 表示该帧不写该字段。 */
+    size_t bp[4][2][2];
+    for (int ft = 0; ft < 4; ft++)
+        for (int show = 0; show < 2; show++)
+            for (int er = 0; er < 2; er++) {
+                memset(&dpb, 0, sizeof(dpb));
+                memset(&pic, 0, sizeof(pic));
+                dpb.last_refresh_bitpos = (size_t)-1;
+                pic.frame_width_minus1 = 1919;
+                pic.frame_height_minus1 = 1079;
+                pic.order_hint = 4;
+                pic.order_hint_bits_minus_1 = 6;
+                pic.primary_ref_frame = 0;
+                pic.pic_info_fields.bits.frame_type = (unsigned)ft;
+                pic.pic_info_fields.bits.show_frame = (unsigned)show;
+                pic.pic_info_fields.bits.showable_frame = 1;
+                pic.pic_info_fields.bits.error_resilient_mode = (unsigned)er;
+                pic.seq_info_fields.fields.enable_order_hint = 1;
+                dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
+                bp[ft][show][er] = dpb.last_refresh_bitpos;
+            }
+
+    /* KEY+show 与 SWITCH 走 refresh_all 路径，不写该字段 —— 必须是 -1。
+     * 这条很重要：若它们误写了，改写就会落到一个不存在的字段上。 */
+    check_eq("KEY+show 不写 refresh 字段",
+             (long)(bp[0][1][0] == (size_t)-1), 1);
+    check_eq("SWITCH 不写 refresh 字段",
+             (long)(bp[3][1][0] == (size_t)-1), 1);
+    check_eq("SWITCH(show=0) 也不写",
+             (long)(bp[3][0][0] == (size_t)-1), 1);
+
+    /* 会写该字段的帧类型必须给出有效偏移。 */
+    check_eq("INTER 写 refresh 字段",
+             (long)(bp[1][1][0] != (size_t)-1), 1);
+    check_eq("INTRA_ONLY 写 refresh 字段",
+             (long)(bp[2][1][0] != (size_t)-1), 1);
+    check_eq("KEY(show=0) 写 refresh 字段",
+             (long)(bp[0][0][0] != (size_t)-1), 1);
+
+    /* error_resilient_mode 省掉 primary_ref_frame(3 位)，所以 er=1 少 3 位。
+     * 这是规范 5.9.2 的条件 !intra_only && !error_resilient_mode。 */
+    check_eq("INTER: er=1 比 er=0 少 3 位",
+             (long)(bp[1][1][0] - bp[1][1][1]), 3);
+
+    /* intra_only 同样跳过 primary_ref_frame，与 INTER(er=0) 差 3 位。 */
+    check_eq("INTRA_ONLY 比 INTER(er=0) 少 3 位",
+             (long)(bp[1][1][0] - bp[2][1][0]), 3);
+
+    /* ⚠️ 关键结论：上面所有组合的最大差值是 3，**凑不出实测的 8 位**。
+     * 所以第 30/60/90/120/150 帧那 8 位偏移不来自 frame_type /
+     * show_frame / error_resilient_mode 中的任何一个。
+     * 这条断言把它固定下来，防止后续误以为是这三项之一。 */
+    size_t mx = 0, mn = (size_t)-1;
+    for (int ft = 0; ft < 4; ft++)
+        for (int show = 0; show < 2; show++)
+            for (int er = 0; er < 2; er++) {
+                size_t v = bp[ft][show][er];
+                if (v == (size_t)-1) continue;
+                if (v > mx) mx = v;
+                if (v < mn) mn = v;
+            }
+    if (mx - mn >= 8) {
+        fails++;
+        printf("  ✗ 三因素已能造成 %zu 位差（>=8），"
+               "则实测的 8 位差可能就是它们，需重新排查\n", mx - mn);
+    }
+}
+
 int main(void)
 {
     printf("=== AV1 比特流原语自测 ===\n");
@@ -521,6 +613,7 @@ int main(void)
     test_show_existing();
     test_patch_prev_refresh();
     test_frame_header_show_frame();
+    test_refresh_bitpos_invariants();
 
     if (fails == 0) {
         printf("=== 全部通过 ===\n");
