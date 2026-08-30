@@ -34,6 +34,16 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* 厂商私有事件基址（厂商内核 include/uapi/linux/videodev2.h:2290）。
+ * 容器/主机的 glibc videodev2.h 没有这些宏，自行定义。 */
+#ifndef V4L2_EVENT_MSM_VIDC_START
+#define V4L2_EVENT_MSM_VIDC_START  (V4L2_EVENT_PRIVATE_START + 0x00001000)
+#endif
+#define DMD_EV_MSM_VIDC(n)  (V4L2_EVENT_MSM_VIDC_START + (n))
+
+/* msm_vidc 私有命令（videodev2.h:1991）：让 in_reconfig 生效后继续会话。 */
+#define DMD_V4L2_QCOM_CMD_SESSION_CONTINUE  5
+
 #ifndef V4L2_PIX_FMT_AV1
 #define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '1', '0')
 #endif
@@ -276,33 +286,45 @@ static int bufs_alloc(struct dmd_v4l2_dec *d, struct dmd_v4l2_buf *b, int n,
     return 0;
 }
 
+/* msm_vidc 只接受 V4L2_MEMORY_USERPTR，但那是个名义值：
+ * 驱动的 vb2_mem_ops.get_userptr 是返回 0xdeadbeef 的桩函数
+ * （厂商内核 msm_vidc.c:717-720），真正的缓冲来源是
+ *     b->m.planes[i].m.fd = b->m.planes[i].reserved[0];   (msm_vidc.c:533-536)
+ * 也就是 dmabuf fd 必须写进 plane.reserved[0]。 */
 static int req_bufs(int fd, enum v4l2_buf_type type, int count)
 {
     struct v4l2_requestbuffers rb;
     memset(&rb, 0, sizeof(rb));
     rb.count = (unsigned)count;
     rb.type = type;
-    rb.memory = V4L2_MEMORY_DMABUF;
+    rb.memory = V4L2_MEMORY_USERPTR;
     if (xioctl(fd, VIDIOC_REQBUFS, &rb, "REQBUFS") < 0) return -1;
     return (int)rb.count;
 }
 
-static int qbuf_dmabuf(int fd, enum v4l2_buf_type type, int index,
-                       struct dmd_v4l2_buf *b, unsigned bytesused,
-                       uint64_t pts_us)
+/* extra_fd >= 0 时作为第二平面（extradata）的 dmabuf fd，
+ * extra_len 为其长度。CAPTURE 侧设了 EXTRADATA 控制项后 num_planes 为 2。 */
+static int qbuf_userptr(int fd, enum v4l2_buf_type type, int index,
+                        struct dmd_v4l2_buf *b, unsigned bytesused,
+                        uint64_t pts_us, int extra_fd, unsigned extra_len)
 {
     struct v4l2_buffer v;
-    struct v4l2_plane p[1];
+    struct v4l2_plane p[VIDEO_MAX_PLANES];
     memset(&v, 0, sizeof(v));
     memset(p, 0, sizeof(p));
     v.type = type;
-    v.memory = V4L2_MEMORY_DMABUF;
+    v.memory = V4L2_MEMORY_USERPTR;
     v.index = (unsigned)index;
     v.m.planes = p;
-    v.length = 1;
-    p[0].m.fd = b->dbuf_fd;
+    v.length = (extra_fd >= 0) ? 2 : 1;
+    /* 关键：fd 走 reserved[0]，不是 m.fd 也不是 m.userptr */
+    p[0].reserved[0] = (unsigned)b->dbuf_fd;
     p[0].length = (unsigned)b->length;
     p[0].bytesused = bytesused;
+    if (extra_fd >= 0) {
+        p[1].reserved[0] = (unsigned)extra_fd;
+        p[1].length = extra_len ? extra_len : 16384;
+    }
     if (pts_us) {
         v.timestamp.tv_sec = (long)(pts_us / 1000000ULL);
         v.timestamp.tv_usec = (long)(pts_us % 1000000ULL);
@@ -335,6 +357,8 @@ int dmd_v4l2_probe(int codec_id)
     return found;
 }
 
+static int setup_capture(struct dmd_v4l2_dec *d);
+
 /* ------------------------------------------------------------------- open */
 
 int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
@@ -353,7 +377,9 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
         return -1;
     }
 
-    d->fd = open(DEC_NODE_PRIMARY, O_RDWR | O_CLOEXEC);
+    /* O_NONBLOCK 是必须的：事件队列空时 VIDIOC_DQEVENT 会阻塞在内核
+     * v4l2_event_dequeue()（实测 /proc/PID/wchan 确认），poll 循环回不来。 */
+    d->fd = open(DEC_NODE_PRIMARY, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (d->fd < 0) {
         V4L2_LOG("打开 %s 失败: %s", DEC_NODE_PRIMARY, strerror(errno));
         return -1;
@@ -361,29 +387,108 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
 
     /* OUTPUT 侧：告诉驱动我们要喂什么码流。 */
     struct v4l2_format f;
+
+    /* msm_vidc 的 S_FMT(OUTPUT) 在分辨率与当前值相同时会提前返回，
+     * 跳过 inst->bufq[OUTPUT_PORT].plane_sizes 的赋值：
+     *   if (fourcc 相同 && width 相同 && height 相同) {
+     *       dprintk("No change in OUTPUT port params"); return 0;
+     *   }                                    (msm_vdec.c:732-738)
+     * 驱动 open 后 OUTPUT 默认就是 1920x1088，所以直接设目标分辨率会命中它，
+     * sizeimage 永远回填 0。先用一个不同分辨率做 dummy S_FMT 破开。
+     * 实测：直接设 1920x1088 → sizeimage=0；
+     *       先 1280x720 再 1920x1088 → sizeimage=16588800。 */
+    memset(&f, 0, sizeof(f));
+    f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    f.fmt.pix_mp.pixelformat = fourcc;
+    f.fmt.pix_mp.width = (unsigned)((w == 1280 && h == 720) ? 640 : 1280);
+    f.fmt.pix_mp.height = (unsigned)((w == 1280 && h == 720) ? 480 : 720);
+    f.fmt.pix_mp.num_planes = 1;
+    ioctl(d->fd, VIDIOC_S_FMT, &f);   /* dummy，忽略结果 */
+
     memset(&f, 0, sizeof(f));
     f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     f.fmt.pix_mp.pixelformat = fourcc;
     f.fmt.pix_mp.width = (unsigned)w;
     f.fmt.pix_mp.height = (unsigned)h;
     f.fmt.pix_mp.num_planes = 1;
-    /* 给一个足够大的初值；驱动会按自己的规则改写 sizeimage。 */
-    f.fmt.pix_mp.plane_fmt[0].sizeimage = 4u * 1024u * 1024u;
     if (xioctl(d->fd, VIDIOC_S_FMT, &f, "S_FMT(OUTPUT)") < 0) goto fail;
+    d->out_w = (int)f.fmt.pix_mp.width;
+    d->out_h = (int)f.fmt.pix_mp.height;
     d->in_size = f.fmt.pix_mp.plane_fmt[0].sizeimage;
+    if (!d->in_size) {
+        V4L2_LOG("警告: sizeimage 仍为 0，dummy S_FMT 未生效，退回 2MB");
+        d->in_size = 2u * 1024u * 1024u;
+    }
     V4L2_LOG("S_FMT(OUTPUT) OK: %ux%u sizeimage=%u", f.fmt.pix_mp.width,
              f.fmt.pix_mp.height, d->in_size);
 
-    /* 订阅事件。SOURCE_CHANGE 是分辨率协商的信号，EOS 用于排空收尾。
-     * 不订阅就无从知道何时可以配置 CAPTURE，固件会按错误假设解析。 */
-    struct v4l2_event_subscription sub;
-    memset(&sub, 0, sizeof(sub));
-    sub.type = V4L2_EVENT_SOURCE_CHANGE;
-    if (xioctl(d->fd, VIDIOC_SUBSCRIBE_EVENT, &sub, "SUBSCRIBE(SOURCE_CHANGE)") < 0)
+    /* 帧率：msm_comm_get_mbs_per_sec() 用 inst->prop.fps 算负载。 */
+    struct v4l2_streamparm sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    sp.parm.output.timeperframe.numerator = 1;
+    sp.parm.output.timeperframe.denominator = 30;
+    ioctl(d->fd, VIDIOC_S_PARM, &sp);
+
+    /* msm_vidc 私有控制项。CID 数值来自厂商 uapi 头
+     * include/uapi/linux/v4l2-controls.h:684
+     *   V4L2_CID_MPEG_MSM_VIDC_BASE = V4L2_CTRL_CLASS_MPEG|0x2000 = 0x00992000
+     * 与 OMX HAL 活体 strace（pid omx@1.0-service）逐项对照得出： */
+    struct v4l2_control ctl;
+    static const struct { uint32_t id; int32_t val; const char *nm; } inits[] = {
+        { 0x00992003, 0,  "OUTPUT_ORDER"    },  /* base+3  */
+        { 0x00992011, 2,  "EXTRADATA"       },  /* base+17，MENU，HAL 连设四种 */
+        { 0x00992011, 25, "EXTRADATA"       },
+        { 0x00992011, 31, "EXTRADATA"       },
+        { 0x00992011, 29, "EXTRADATA"       },
+        { 0x00992038, 1,  "LOWLATENCY_MODE" },  /* base+56 */
+    };
+    for (unsigned i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+        memset(&ctl, 0, sizeof(ctl));
+        ctl.id = inits[i].id;
+        ctl.value = inits[i].val;
+        if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) < 0)
+            V4L2_LOG("S_CTRL %s(0x%x)=%d 失败: %s", inits[i].nm,
+                     inits[i].id, inits[i].val, strerror(errno));
+    }
+
+    /* 决定性一项：必须启用 SECONDARY 分流模式。
+     *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base+22 = 0x00992016
+     *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_SECONDARY = 1
+     * PRIMARY（默认）下 CAPTURE 直接充当 DPB，start_streaming() 恒返回
+     * -EINVAL。SECONDARY 启用 HAL_BUFFER_OUTPUT2，DPB 与 OPB 分离
+     * （msm_vidc.c:1214-1222 会额外调 msm_comm_set_output_buffers()
+     * 让驱动自行分配 DPB），校验路径不同，两侧 STREAMON 才能通过。
+     * 单一变量对照实测：SECONDARY → OK；PRIMARY → EINVAL。
+     * 附带好处：CAPTURE 可用线性 NV12，不必走 UBWC 的 Q128。 */
+    memset(&ctl, 0, sizeof(ctl));
+    ctl.id = 0x00992016;
+    ctl.value = 1;
+    if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) < 0) {
+        V4L2_LOG("致命: STREAM_OUTPUT_MODE=SECONDARY 失败: %s", strerror(errno));
         goto fail;
-    memset(&sub, 0, sizeof(sub));
-    sub.type = V4L2_EVENT_EOS;
-    xioctl(d->fd, VIDIOC_SUBSCRIBE_EVENT, &sub, "SUBSCRIBE(EOS)");  /* 非致命 */
+    }
+
+    /* 订阅事件。关键：msm_vidc 用的是**厂商私有事件**，
+     * 从不发标准 V4L2_EVENT_SOURCE_CHANGE。
+     *   V4L2_EVENT_MSM_VIDC_START = V4L2_EVENT_PRIVATE_START + 0x1000
+     *                             = 0x08001000        (videodev2.h:2290)
+     *     +1 FLUSH_DONE   +2 PORT_SETTINGS_SUFFICIENT
+     *     +3 PORT_SETTINGS_INSUFFICIENT   +4 BITDEPTH_CHANGED
+     *     +5 SYS_ERROR    +6 RELEASE_BUFFER_REFERENCE
+     *     +7 RELEASE_UNQUEUED_BUFFER
+     * 只订阅标准 SOURCE_CHANGE 会导致 poll 永不返回 POLLPRI。 */
+    struct v4l2_event_subscription sub;
+    static const unsigned evs[] = {
+        DMD_EV_MSM_VIDC(1), DMD_EV_MSM_VIDC(2), DMD_EV_MSM_VIDC(3),
+        DMD_EV_MSM_VIDC(4), DMD_EV_MSM_VIDC(5), DMD_EV_MSM_VIDC(6),
+        DMD_EV_MSM_VIDC(7), V4L2_EVENT_SOURCE_CHANGE, V4L2_EVENT_EOS,
+    };
+    for (unsigned i = 0; i < sizeof(evs) / sizeof(evs[0]); i++) {
+        memset(&sub, 0, sizeof(sub));
+        sub.type = evs[i];
+        ioctl(d->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);   /* 单项失败非致命 */
+    }
 
     /* OUTPUT 缓冲 + STREAMON。CAPTURE 侧要等 SOURCE_CHANGE 才能配。 */
     d->n_out = req_bufs(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
@@ -429,10 +534,21 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
         }
     }
 
+    /* 顺序很关键：msm_vidc.c:1294-1302 里第一个 STREAMON 因对侧未 streaming
+     * 而跳过 start_streaming()（假通过），第二个才真正执行全部校验。
+     * SECONDARY 模式下不需要等 SOURCE_CHANGE 才配 CAPTURE ——
+     * G_FMT(CAPTURE) 在 session_init 后就能给出正确的 1920x1088，
+     * 所以两侧都先配好，再让 STREAMON(OUTPUT) 触发校验。 */
+    if (setup_capture(d) < 0) {
+        V4L2_LOG("CAPTURE 配置失败");
+        goto fail;
+    }
+
     if (xioctl(d->fd, VIDIOC_STREAMON, &type, "STREAMON(OUTPUT)") < 0) goto fail;
     d->out_streaming = 1;
 
-    V4L2_LOG("OUTPUT 就绪: %d 缓冲 x %u 字节", d->n_out, d->in_size);
+    V4L2_LOG("会话就绪: OUTPUT %d x %u 字节, CAPTURE %d x %u 字节",
+             d->n_out, d->in_size, d->n_cap, d->cap_size);
     return 0;
 
 fail:
@@ -461,6 +577,25 @@ static int setup_capture(struct dmd_v4l2_dec *d)
              (char)((got >> 16) & 0xFF), (char)((got >> 24) & 0xFF),
              f.fmt.pix_mp.plane_fmt[0].sizeimage);
 
+    /* G_FMT(CAPTURE) 返回的可能是驱动 open 时的残留默认值 1920x1088，
+     * 不随 S_FMT(OUTPUT) 的分辨率联动。实测 4K 码流：
+     *   S_FMT(OUTPUT) 3840x2160 之后 G_FMT(CAPTURE) 仍是 1920x1088，
+     *   CAPTURE 按 1080p 配好，固件随后报 PORT_SETTINGS h=2160 w=3840，
+     *   几何不符 → 一帧都取不到（ffmpeg 侧是
+     *   "Failed to read image from surface: 18 invalid parameter"）。
+     * 所以要用 OUTPUT 侧协商出的尺寸覆盖它。
+     * msm_vidc 不支持缩放（capability.scale_x/y 为 0，
+     * msm_vidc_common.c:5613-5625 要求两侧像素数严格相等），
+     * 两侧本来就必须一致。 */
+    if (d->out_w > 0 && d->out_h > 0 &&
+        ((unsigned)d->out_w != f.fmt.pix_mp.width ||
+         (unsigned)d->out_h != f.fmt.pix_mp.height)) {
+        V4L2_LOG("CAPTURE 残留 %ux%u，改用 OUTPUT 协商值 %dx%d",
+                 f.fmt.pix_mp.width, f.fmt.pix_mp.height, d->out_w, d->out_h);
+        f.fmt.pix_mp.width = (unsigned)d->out_w;
+        f.fmt.pix_mp.height = (unsigned)d->out_h;
+    }
+
     f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
     if (xioctl(d->fd, VIDIOC_S_FMT, &f, "S_FMT(CAPTURE/NV12)") < 0) return -1;
 
@@ -468,12 +603,44 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     d->h = (int)f.fmt.pix_mp.height;
     d->cap_size = f.fmt.pix_mp.plane_fmt[0].sizeimage;
     d->stride = (int)f.fmt.pix_mp.plane_fmt[0].bytesperline;
-    if (d->stride <= 0) d->stride = d->w;
+    /* 覆盖过 width 时驱动可能不回填 bytesperline（实测 4K：width 改成 3840
+     * 后 bytesperline 仍是 1920），stride 小于宽度会让上层按错误行距取像素。
+     * NV12 的 stride 至少等于宽度。 */
+    if (d->stride < d->w) d->stride = d->w;
     /* NV12 单平面布局：Y 平面高度即 slice_height，UV 紧随其后。
-     * 用 sizeimage 反推比信任驱动的 plane 描述更稳。 */
-    d->slice_height = (d->stride > 0)
-                    ? (int)((d->cap_size * 2u) / (unsigned)(d->stride * 3))
-                    : d->h;
+     *
+     * ⚠️ 不要用 sizeimage 反推。msm_vidc 的 sizeimage 含额外对齐余量，
+     * 整数除法会得到偏大的值：
+     *   3137536 * 2 / (1920 * 3) = 1089.16 → 1089
+     * 而真实的 Y 平面高度是 1088。多出的这一行会让上层 nv12_copy 按
+     * 1089 行读源缓冲、越过末尾 SIGSEGV（实测栈：__memcpy_generic
+     * → nv12_copy(src_slice=1089, dst_slice=1088) → dmd_GetImage）。
+     *
+     * 正常路径下 f.fmt.pix_mp.height 就是驱动对齐后的 slice_height
+     * （1080p 是 1088），直接用它。
+     *
+     * ⚠️ 但走了上面那段"用 OUTPUT 协商值覆盖 CAPTURE 残留"之后，height 是
+     * 我们自己写进去的**未对齐**值，驱动不会替我们对齐。4K 实测：
+     *   写入 height=2160 → slice_height 也成了 2160，
+     *   而驱动的 sizeimage=12537856 对应的真实 slice_height 是 **2176**
+     *   （3840*2176*3/2 = 12533760，再加 4096 对齐余量）。
+     * 后果是 UV 平面起点算成 3840*2160=8294400 而实际在 3840*2176=8355840，
+     * 表现为 **Y 平面全对、UV 平面从 Y 末尾起全错**（逐帧实测：
+     * Y 采样差异 0，UV 采样差异 281-301）。
+     *
+     * 所以要按 msm_vidc 的 32 行对齐规则自己补齐，再用 sizeimage 校验。 */
+    d->slice_height = (int)f.fmt.pix_mp.height;
+    if (d->slice_height < d->h) d->slice_height = d->h;
+    if (d->stride > 0 && d->cap_size > 0) {
+        /* sizeimage 能容纳的最大 slice_height（含对齐余量，故向下取）。 */
+        int fit = (int)((size_t)d->cap_size * 2u / (size_t)(d->stride * 3));
+        /* msm_vidc 的 CAPTURE 高度按 32 对齐（1080→1088，2160→2176）。 */
+        int aligned = (d->slice_height + 31) & ~31;
+        if (aligned <= fit)
+            d->slice_height = aligned;
+        else if (d->slice_height > fit)
+            d->slice_height = fit & ~1;
+    }
 
     /* 有效显示区域：用 G_SELECTION 拿裁剪矩形（1080p 会是 1088 对齐后裁回 1080）。 */
     struct v4l2_selection sel;
@@ -495,9 +662,27 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     if (d->n_cap > DMD_V4L2_MAX_CAP) d->n_cap = DMD_V4L2_MAX_CAP;
     if (bufs_alloc(d, d->cap, d->n_cap, d->cap_size, 1) < 0) return -1;
 
+    /* 设了 EXTRADATA 控制项后 CAPTURE 是 2 平面，第二个是 extradata。
+     * valid_v4l2_buffer() 要求 b->length == bufq[port].num_planes
+     * （msm_vidc.c:452-461），平面数不符会直接 EINVAL。 */
+    d->cap_planes = (int)f.fmt.pix_mp.num_planes;
+    if (d->cap_planes < 1) d->cap_planes = 1;
+    d->extra_size = (d->cap_planes > 1)
+                  ? f.fmt.pix_mp.plane_fmt[1].sizeimage : 0;
+    if (d->cap_planes > 1 && !d->extra_size) d->extra_size = 16384;
+    if (d->cap_planes > 1) {
+        for (int i = 0; i < d->n_cap; i++) {
+            d->extra[i].dbuf_fd = dmabuf_alloc(d, d->extra_size);
+            if (d->extra[i].dbuf_fd < 0) return -1;
+            d->extra[i].length = d->extra_size;
+        }
+    }
+
     for (int i = 0; i < d->n_cap; i++) {
-        if (qbuf_dmabuf(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, i,
-                        &d->cap[i], 0, 0) < 0)
+        if (qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, i,
+                        &d->cap[i], 0, 0,
+                        d->cap_planes > 1 ? d->extra[i].dbuf_fd : -1,
+                        (unsigned)d->extra_size) < 0)
             return -1;
     }
 
@@ -524,7 +709,7 @@ static void reap_output(struct dmd_v4l2_dec *d)
         memset(&v, 0, sizeof(v));
         memset(p, 0, sizeof(p));
         v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        v.memory = V4L2_MEMORY_DMABUF;
+        v.memory = V4L2_MEMORY_USERPTR;
         v.m.planes = p;
         v.length = 1;
         if (ioctl(d->fd, VIDIOC_DQBUF, &v) < 0) break;
@@ -551,8 +736,8 @@ int dmd_v4l2_send(struct dmd_v4l2_dec *d, const uint8_t *data, size_t len,
     if (!d->out[idx].map) return -1;
 
     memcpy(d->out[idx].map, data, len);
-    if (qbuf_dmabuf(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, idx,
-                    &d->out[idx], (unsigned)len, pts_us) < 0)
+    if (qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, idx,
+                    &d->out[idx], (unsigned)len, pts_us, -1, 0) < 0)
         return -1;
     return 0;
 }
@@ -573,18 +758,55 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
     if (pr < 0) return (errno == EINTR) ? 0 : -1;
     if (pr == 0) return 0;
 
-    /* 事件优先：SOURCE_CHANGE 决定能否进入出帧阶段。 */
+    /* 事件处理。msm_vidc 发的是私有事件（见 open 里的订阅列表）。 */
     if (pfd.revents & POLLPRI) {
         struct v4l2_event ev;
+        int guard = 0;
         memset(&ev, 0, sizeof(ev));
-        if (ioctl(d->fd, VIDIOC_DQEVENT, &ev) == 0) {
-            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
-                V4L2_LOG("收到 SOURCE_CHANGE");
+        /* 上限保护：设备是 O_NONBLOCK，队列空时 DQEVENT 返回 EAGAIN 而非阻塞。 */
+        while (guard++ < 8 && ioctl(d->fd, VIDIOC_DQEVENT, &ev) == 0) {
+            unsigned rel = ev.type - V4L2_EVENT_MSM_VIDC_START;
+
+            if (ev.type == DMD_EV_MSM_VIDC(2) || ev.type == DMD_EV_MSM_VIDC(3) ||
+                ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                const unsigned *ed = (const unsigned *)ev.u.data;
+                V4L2_LOG("PORT_SETTINGS%s: h=%u w=%u bitdepth=%u picstruct=%u",
+                         ev.type == DMD_EV_MSM_VIDC(3) ? "(INSUFFICIENT)"
+                                                       : "(SUFFICIENT)",
+                         ed[0], ed[1], ed[2], ed[3]);
+
                 if (!d->cap_ready && setup_capture(d) < 0) return -1;
-            } else if (ev.type == V4L2_EVENT_EOS) {
-                V4L2_LOG("收到 EOS 事件");
+
+                /* 驱动在事件处理里无条件置 inst->in_reconfig = true
+                 * （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
+                 * msm_comm_session_continue() 只有两个调用点：
+                 *   1. start_streaming() 内 (msm_vidc.c:1244)
+                 *   2. msm_vidc_comm_cmd() 的 V4L2_QCOM_CMD_SESSION_CONTINUE
+                 *      分支 (msm_vidc_common.c:4155)
+                 * 走 (1) 需要重跑 STREAMON，实测必然触发 SYS_ERROR
+                 * （STREAMOFF 把 state 打回 MSM_VIDC_START_DONE 以下）。
+                 * 走 (2) 才是正解：不动队列状态。 */
+                if (!d->reconfig_done) {
+                    struct v4l2_decoder_cmd dc;
+                    memset(&dc, 0, sizeof(dc));
+                    dc.cmd = DMD_V4L2_QCOM_CMD_SESSION_CONTINUE;
+                    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &dc) == 0) {
+                        d->reconfig_done = 1;
+                        V4L2_LOG("已发 SESSION_CONTINUE");
+                    } else {
+                        V4L2_LOG("SESSION_CONTINUE 失败: %s", strerror(errno));
+                    }
+                }
+            } else if (ev.type == DMD_EV_MSM_VIDC(5)) {
+                V4L2_LOG("致命: 收到 SYS_ERROR，会话已失效");
+                return -1;
+            } else if (ev.type == V4L2_EVENT_EOS || ev.type == DMD_EV_MSM_VIDC(1)) {
+                V4L2_LOG("收到 EOS/FLUSH_DONE");
                 d->saw_eos = 1;
+            } else if (rel <= 7) {
+                V4L2_LOG("私有事件 +%u", rel);
             }
+            memset(&ev, 0, sizeof(ev));
         }
     }
 
@@ -593,13 +815,13 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
 
     if ((pfd.revents & POLLIN) && d->cap_ready) {
         struct v4l2_buffer v;
-        struct v4l2_plane p[1];
+        struct v4l2_plane p[VIDEO_MAX_PLANES];
         memset(&v, 0, sizeof(v));
         memset(p, 0, sizeof(p));
         v.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        v.memory = V4L2_MEMORY_DMABUF;
+        v.memory = V4L2_MEMORY_USERPTR;
         v.m.planes = p;
-        v.length = 1;
+        v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
         if (ioctl(d->fd, VIDIOC_DQBUF, &v) == 0) {
             if (v.index >= (unsigned)d->n_cap) return -1;
             d->cap[v.index].queued = 0;
@@ -611,8 +833,10 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                     return 2;
                 }
                 /* 空帧但非 LAST：还回去继续等。 */
-                qbuf_dmabuf(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-                            (int)v.index, &d->cap[v.index], 0, 0);
+                qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                            (int)v.index, &d->cap[v.index], 0, 0,
+                            d->cap_planes > 1 ? d->extra[v.index].dbuf_fd : -1,
+                            (unsigned)d->extra_size);
                 return 0;
             }
 
@@ -634,8 +858,10 @@ int dmd_v4l2_release(struct dmd_v4l2_dec *d, int index)
 {
     if (d->fd < 0 || index < 0 || index >= d->n_cap) return -1;
     if (d->cap[index].queued) return 0;
-    return qbuf_dmabuf(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, index,
-                       &d->cap[index], 0, 0);
+    return qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, index,
+                       &d->cap[index], 0, 0,
+                       d->cap_planes > 1 ? d->extra[index].dbuf_fd : -1,
+                       (unsigned)d->extra_size);
 }
 
 /* ------------------------------------------------------------------ drain */
@@ -653,8 +879,8 @@ int dmd_v4l2_drain(struct dmd_v4l2_dec *d)
         reap_output(d);
         for (int i = 0; i < d->n_out; i++) {
             if (!d->out[i].queued) {
-                qbuf_dmabuf(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, i,
-                            &d->out[i], 0, 0);
+                qbuf_userptr(d->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, i,
+                            &d->out[i], 0, 0, -1, 0);
                 break;
             }
         }
@@ -667,6 +893,7 @@ int dmd_v4l2_drain(struct dmd_v4l2_dec *d)
 
 void dmd_v4l2_close(struct dmd_v4l2_dec *d)
 {
+    bufs_free(d->extra, DMD_V4L2_MAX_CAP);
     if (!d) return;
 
     if (d->fd >= 0) {

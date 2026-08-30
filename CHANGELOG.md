@@ -1,5 +1,119 @@
 # 更新日志
 
+## v0.4.1
+
+**nabu（Xiaomi Pad 5 / Snapdragon 860 / kernel 4.14）解码路径打通。**
+0.4.0 判定"这台设备的 video32 解码路径起不来"，那个结论是错的。
+
+### ✨ 补齐 msm_vidc 的四项私有协议要求
+
+缺的不是缓冲类型、不是 ION heap、不是容器权限，也不是固件能力：
+
+1. **必须启用 SECONDARY 分流模式**
+   `V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base + 22 = 0x00992016`，
+   值 1 = SECONDARY（厂商 `v4l2-controls.h:865-869`）。
+   PRIMARY（默认）下 CAPTURE 直接充当 DPB，`start_streaming()` 恒返回 -EINVAL；
+   SECONDARY 启用 `HAL_BUFFER_OUTPUT2`，DPB 与 OPB 分离，
+   `msm_vidc.c:1214-1222` 会额外调 `msm_comm_set_output_buffers()`
+   让驱动自行分配 DPB，校验路径完全不同。
+   单一变量对照：SECONDARY → STREAMON(OUT) OK；PRIMARY → EINVAL。
+   附带好处：CAPTURE 可用线性 NV12，不必解 UBWC 的 Q128。
+
+2. **必须订阅厂商私有事件**，驱动从不发标准 `V4L2_EVENT_SOURCE_CHANGE`
+   `V4L2_EVENT_MSM_VIDC_START = V4L2_EVENT_PRIVATE_START + 0x1000 = 0x08001000`
+   （厂商 `videodev2.h:2290-2305`），+2 是 `PORT_SETTINGS_CHANGED_SUFFICIENT`。
+   **这就是 0.3.x/0.4.0 记录的"等 SOURCE_CHANGE 永不到达"的真相** ——
+   不是固件没响应，是订阅错了事件类型，poll 永远不返回 POLLPRI。
+
+3. **收到 PORT_SETTINGS 事件后必须发 SESSION_CONTINUE**
+   驱动在事件处理里无条件置 `inst->in_reconfig = true`
+   （`msm_vidc_common.c:1761`），固件随后停在 reconfig 等待态。
+   `msm_comm_session_continue()` 只有两个调用点：`start_streaming()` 内
+   （`msm_vidc.c:1244`）和 `V4L2_QCOM_CMD_SESSION_CONTINUE` 分支
+   （`msm_vidc_common.c:4155`）。前者需重跑 STREAMON，而 STREAMOFF 会把
+   state 打回 `MSM_VIDC_START_DONE` 以下 → 实测必然 `SYS_ERROR`。
+   正解是 `VIDIOC_DECODER_CMD` + `cmd = 5`（`videodev2.h:1991`），不动队列状态。
+
+4. **设备必须 `O_NONBLOCK` 打开**
+   `VIDIOC_DQEVENT` 在事件队列空时会阻塞在内核 `v4l2_event_dequeue()`，
+   poll 循环再也回不来。内核 tracer/debugfs 全不可用的情况下，
+   靠 `/proc/PID/wchan` + `/proc/PID/syscall` 定位。
+
+### 💥 缓冲传递方式变更：DMABUF → USERPTR + `reserved[0]`
+
+msm_vidc 只接受 `V4L2_MEMORY_USERPTR`（`q->io_modes = VB2_MMAP | VB2_USERPTR`，
+`msm_vidc.c:1548`），MMAP 与 DMABUF 的 REQBUFS 都返回 EINVAL。
+
+但 USERPTR 是个名义值 —— `vb2_mem_ops.get_userptr` 是返回 `0xdeadbeef` 的
+桩函数（`msm_vidc.c:717-720`），真正的缓冲来源是：
+
+```c
+b->m.planes[i].m.fd        = b->m.planes[i].reserved[0];
+b->m.planes[i].data_offset = b->m.planes[i].reserved[1];   /* msm_vidc.c:533-536 */
+```
+
+**dmabuf fd 必须写进 `plane.reserved[0]`**，`m.userptr` 被完全忽略。
+这解释了 0.4.0 "USERPTR 整条流程走完却出不了帧"的困局。
+
+分配器不变：仍是 dma_heap 优先、`/dev/ion` 兜底（nabu 无 dma_heap，
+system heap id=25）。产出的都是标准 dmabuf fd，导出路径不受影响。
+
+### 🐛 修三个缺陷
+
+- **`decode.c` 对 mmap 地址调 `realloc`** —— exportable surface 的 `s->data`
+  是 DRM dumb buffer 的 mmap 地址（`surface_alloc_dumb`），
+  `surface_store_frame_locked` 无条件 realloc 它必然 SIGSEGV：glibc 拿 mmap
+  地址往前找 malloc chunk 头，读到的是像素数据。
+  这是既有缺陷，只因以前从没走到出帧才没暴露。
+- **slice_height 用 `sizeimage` 反推** ——
+  `3137536*2/(1920*3) = 1089.16 → 1089`，真实值 1088，
+  多出一行让上层 `nv12_copy` 越界（`image.c:261`）。
+- **4K 的 CAPTURE 几何三连坑** —— `G_FMT(CAPTURE)` 返回 open 时的残留默认值
+  1920x1088，**不随 `S_FMT(OUTPUT)` 联动**；覆盖 width 后驱动不回填
+  `bytesperline`；覆盖 height 后 slice_height 未按 32 对齐（2160 vs 真实
+  2176），导致 **Y 平面全对、UV 平面从 Y 末尾起全错**
+  （逐帧实测 Y 采样差异 0，UV 采样差异 281-301）。
+
+### ✅ 验证
+
+`ffmpeg -hwaccel vaapi -hwaccel_output_format nv12` 走完整 VA-API 路径，
+输出走管道算 MD5，与纯软解逐字节对比。**5/5 全通，构建零告警。**
+
+| 码流 | 分辨率 | codec | 整流 MD5 |
+|---|---|---|---|
+| `t.h264` | 1920x1080 | H.264 | `6b09e45570cf393e45dd42c0a3bc4c75` |
+| `real1080p.h264` | 1920x1080 | H.264 | `ab51452b44d8461767d7dd86045a173f` |
+| `s_3840x2160.h264` | 3840x2160 | H.264 | `bc5b31831aa7062ab9861b5456e5aebe` |
+| `hevc.h265` | 1920x1080 | HEVC | `82318dd6c2e065fe9cb0b9f38244d8f5` |
+| `vp9.ivf` | 1920x1080 | VP9 | `185b96897e45ef9c4d9c2669e1db450a` |
+
+比对方法上踩过一个坑：硬解输出 1088 行含 8 行对齐填充。若让参考端也输出
+1088 行，填充数据参与比对会让所有行错位，得出"PSNR 只有 25.9 dB"的假结论。
+必须按 1920x1080 有效区比对。
+
+### 📝 文档更正
+
+`v4l2_backend.h` 的协议约束段**整段重写**。原内容结论是"这台设备的 video32
+解码路径起不来，不要再为它加缓冲类型分支"，已被实测推翻。
+
+同时更正 0.4.0 的两处方法论错误：
+
+- **"必须两段式协商、不能双向一起 STREAMON"不成立。**
+  真相是 `msm_vidc.c:1294-1302` 里第一个 STREAMON 因对侧未 streaming 而
+  **跳过** `start_streaming()`（假通过），第二个才承担全部校验。
+  SECONDARY 模式下两侧先配好、再让第二个 STREAMON 触发校验即可。
+- **不能用 `QUERYCTRL` 枚举结果推断控制项不存在。**
+  私有 CID 不在标准控制框架里、枚举确实是 0 项，但直接 `S_CTRL` 是成功的。
+  （`G_CTRL` 不校验 id、拿 `0xDEADBEEF` 也返回成功，这点仍成立，
+  别用它验证控制项存在。）
+
+### ⚠️ 已知限制
+
+- video32 解码会话一次只能有一个。Android 侧 HAL 占用时
+  `MIN_BUFFERS` 会从 6/14 降到 4/12，两边会争这个节点。
+- 4K 的 24 个 CAPTURE 缓冲需约 287MB ION 内存。测试机
+  `MemAvailable` 2.2GB 时正常，内存紧张下的行为未测。
+
 ## v0.4.0
 
 **架构性重写：解码改为驱动内 V4L2 直通，整条 Android 侧链路删除。**

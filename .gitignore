@@ -12,6 +12,10 @@
 *.su
 *.idb
 *.pdb
+# coredump：调试驱动崩溃时会在工作目录留下几百 MB 的 core
+# （0.4.1 那次是 362MB），别让它进仓库。
+core
+core.[0-9]*
 
 # Build output
 # 用锚定路径而非裸名：裸名 "decode-client" 会匹配任意深度的同名文件或目录，

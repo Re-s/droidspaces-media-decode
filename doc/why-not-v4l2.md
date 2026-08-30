@@ -30,8 +30,47 @@
 > SELinux 排除，证据链扎实，却仍给出了错误的判定。
 > 原因是把"我这样调用不工作"写成了"这条路不通"——
 > **排除了若干种失败原因，不等于穷尽了所有成功路径。**
-> 置信度标成 `certain` 更是过头：它劝退了后续投入，
-> 而正确的两段式协商其实就在 V4L2 stateful decoder 的规范里。
+> 置信度标成 `certain` 更是过头：它劝退了后续投入。
+>
+> ---
+>
+> ## ⚠️ 二次更正（0.4.1）：上面那段"正确做法"也是错的
+>
+> **2026-08-30：nabu（Snapdragon 860 / kernel 4.14）上跑通了，
+> 但用的不是上面写的两段式协商。** 上面第 19-27 行的说法有三处不成立：
+>
+> **一、"等 `V4L2_EVENT_SOURCE_CHANGE`"永远等不到。**
+> msm_vidc 从不发这个标准事件，它发的是厂商私有事件：
+> `V4L2_EVENT_MSM_VIDC_START = V4L2_EVENT_PRIVATE_START + 0x1000 = 0x08001000`
+> （厂商 `videodev2.h:2290-2305`），+2 是 `PORT_SETTINGS_CHANGED_SUFFICIENT`。
+> 订阅错了类型，poll 就永远不返回 POLLPRI ——
+> **这才是本文原始版本"喂数据对固件毫无贡献"现象的真正解释**，
+> 不是固件没响应，是我们没在听正确的频道。
+>
+> **二、"不能两个队列一起 STREAMON"不成立。**
+> `msm_vidc.c:1294-1302` 显示第一个 STREAMON 因对侧未 streaming 而
+> **跳过** `start_streaming()`（假通过），第二个才承担全部校验。
+> 所以"CAPTURE 先 STREAMON 就成功"是假象，失败只是被推迟。
+> 正确做法是两侧都先配好，再让第二个 STREAMON 触发校验。
+>
+> **三、"另需 dma-heap DMABUF"不成立。**
+> msm_vidc 只接受 `V4L2_MEMORY_USERPTR`
+> （`q->io_modes = VB2_MMAP | VB2_USERPTR`，`msm_vidc.c:1548`），
+> DMABUF 的 REQBUFS 恒 EINVAL。而 USERPTR 是名义值：
+> `get_userptr` 是返回 `0xdeadbeef` 的桩函数（`msm_vidc.c:717-720`），
+> dmabuf fd 必须写进 `plane.reserved[0]`（`msm_vidc.c:533-536`）。
+>
+> 真正缺的四项是：**SECONDARY 分流模式**（`0x00992016`，PRIMARY 下
+> `start_streaming()` 恒 -EINVAL）、**私有事件订阅**、
+> **`DECODER_CMD(cmd=5)` SESSION_CONTINUE**（`in_reconfig` 后固件停在等待态）、
+> **`O_NONBLOCK`**（否则 `DQEVENT` 阻塞在 `v4l2_event_dequeue`）。
+> 完整协议见 `vaapi-driver/src/v4l2_backend.h` 的头部注释与 CHANGELOG v0.4.1。
+>
+> **叠加的方法教训：** 第一次更正修对了结论、却把新的失败模式又写成了定论。
+> 一份文档连续两版给出错误的"正确做法"，说明**在诊断手段受限时
+> （本设备无 function tracer、无 kprobe、debugfs 挂不上、printk 提到 8
+> 也没有 msm_vidc 输出），"我找到了原因"这句话本身就该降低置信度。**
+> 真正管用的是逐项单一变量对照 + 读厂商源码，而不是从现象反推机制。
 >
 > 下文保留原样（除本标注外未删改），因为它的**探测结果表、源码定位、
 > IRQ 数据仍然准确**，只是不该由此推出"不可用"。

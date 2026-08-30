@@ -34,7 +34,11 @@
 /* 0.4.0：架构改为驱动内 V4L2 直通（不再经 unix socket 与 Android 侧
  * decode-daemon / MediaCodec）。vendor 串里的 "MediaCodec" 随之去掉 ——
  * 它现在描述的是一条已经不存在的路径。 */
-#define DMD_DRIVER_VERSION "0.4.0"
+/* 0.4.1：nabu（Snapdragon 860 / kernel 4.14）解码路径打通。补齐 msm_vidc 的
+ * 四项私有协议要求（SECONDARY 分流模式 / 私有事件订阅 / SESSION_CONTINUE /
+ * O_NONBLOCK），缓冲传递改为 USERPTR + plane.reserved[0]。
+ * 五个码流整流 MD5 与 ffmpeg 软解逐字节一致。详见 CHANGELOG。 */
+#define DMD_DRIVER_VERSION "0.4.1"
 #define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " DMD_DRIVER_VERSION
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。

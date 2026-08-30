@@ -2807,14 +2807,32 @@ static void surface_store_frame_locked(struct dmd_surface *s,
 
     size_t need = (size_t)src_stride * src_slice * 3 / 2;
     if (need > s->data_size) {
-        /* 解码器给的缓冲比预分配的大（流内分辨率变大）。扩容而不是截断。 */
-        unsigned char *mem = realloc(s->data, need);
-        if (!mem) {
-            s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
-            return;
+        /* 解码器给的缓冲比预分配的大（流内分辨率变大）。
+         *
+         * ⚠️ 只有 calloc 出来的缓冲能 realloc。exportable surface 的
+         * s->data 是 DRM dumb buffer 的 mmap 地址（见 surface_alloc_dumb），
+         * 对它调 realloc 必然 SIGSEGV —— glibc 会拿 mmap 地址往前找
+         * malloc chunk 头，读到的是像素数据。
+         * 实测崩溃栈（第 8 轮，ffmpeg -hwaccel vaapi）：
+         *   __GI___libc_realloc (oldmem=0x7fafda3000, bytes=3136320)
+         *   → surface_store_frame_locked → sync_surface_locked
+         *   → dmd_SyncSurface2 → vaSyncSurface → av_hwframe_transfer_data
+         * dumb buffer 的尺寸在 surface 创建时按对齐几何定好，正常容得下
+         * 解码器输出；真不够就只拷放得下的部分，而不是崩掉整个进程。 */
+        if (s->exportable) {
+            dmd_log("surface %u: 帧需 %zu 字节 > dumb buffer %zu 字节，"
+                    "截断（stride=%u slice=%u）\n",
+                    (unsigned)s->id, need, s->data_size, src_stride, src_slice);
+            need = s->data_size;
+        } else {
+            unsigned char *mem = realloc(s->data, need);
+            if (!mem) {
+                s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+                return;
+            }
+            s->data = mem;
+            s->data_size = need;
         }
-        s->data = mem;
-        s->data_size = need;
     }
 
     size_t copy = f->size < need ? f->size : need;

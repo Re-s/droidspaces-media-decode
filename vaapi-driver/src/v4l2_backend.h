@@ -14,108 +14,125 @@
  *
  * 关键约束（都是实测踩出来的，改动时务必保持）：
  *
- * 1. 只接受 DMABUF。REQBUFS 报 capabilities 里含 MMAP，但 QUERYBUF 给出的
- *    offset 无法 mmap（ENODEV）。必须先拿到 DMABUF fd 再以
- *    V4L2_MEMORY_DMABUF 传入。
+ * ⚠️ 本段在 0.4.1 被整体重写。此前记录的"nabu 的 video32 解码路径起不来"
+ *    这一结论**已被推翻** —— nabu 上现在能解出与 ffmpeg 软解逐字节一致的
+ *    1080p 帧（300/300 帧 MD5 相同，两个不同码流各自整流一致）。
+ *    当时缺的不是缓冲类型、不是 ION heap、不是权限、也不是固件能力，
+ *    而是下面第 4/6/7/8 条这四项 msm_vidc 私有协议要求。
+ *    厂商内核出处：MiCode/Xiaomi_Kernel_OpenSource 分支 nabu-r-oss。
  *
- *    缓冲来源按设备分两条（见 v4l2_backend.c 的 heap_open）：
- *      /dev/dma_heap/system   内核 5.x，优先
- *      /dev/ion               内核 4.14 一类的老设备只有这个
+ * 1. 缓冲类型：msm_vidc **只接受 V4L2_MEMORY_USERPTR**，
+ *    MMAP 与 DMABUF 的 REQBUFS 都返回 EINVAL
+ *    （q->io_modes = VB2_MMAP | VB2_USERPTR，msm_vidc.c:1548）。
  *
- *    ⚠️ 第 81 轮曾断言"nabu 的 ION 也不可用"，**那是错的**（第 84 轮更正）。
- *    当时把 heap_id_mask 从 1 逐位试到 0x80，而 nabu 的 system heap id 是
- *    **25**，不在试探范围。用 ION_IOC_HEAP_QUERY 问内核即可拿到：
- *      9 个 heap，id=25 name=system type=0
- *    用它分配 1080p NV12 一帧（3133440 字节）成功且可 mmap，
- *    Android 侧 root 与容器内普通用户结果一致。
+ *    但 USERPTR 是个名义值 —— 驱动的 vb2_mem_ops.get_userptr 是桩函数：
+ *        static void *vidc_get_userptr(...) { return (void *)0xdeadbeef; }
+ *                                              (msm_vidc.c:717-720)
+ *    真正的缓冲来源是
+ *        b->m.planes[i].m.fd        = b->m.planes[i].reserved[0];
+ *        b->m.planes[i].data_offset = b->m.planes[i].reserved[1];
+ *                                              (msm_vidc.c:533-536)
+ *    也就是 **dmabuf fd 必须写进 plane.reserved[0]**，m.userptr 被完全忽略。
+ *    映射发生在 QBUF 时（msm_vidc_common.c:6693-6708 的 msm_smem_map_dma_buf）。
+ *    这解释了当年"USERPTR 整条流程走完却出不了帧"的困局。
  *
- * 1b. ⚠️ **但缓冲类型本身也是设备相关的**（第 84 轮实测，nabu）：
- *      REQBUFS OUTPUT_MPLANE + MMAP    → EINVAL
- *      REQBUFS OUTPUT_MPLANE + DMABUF  → EINVAL
- *      REQBUFS OUTPUT_MPLANE + USERPTR → **成功**，count=4
- *    也就是说 nabu 这块 msm_vidc 只接受 USERPTR，与上面"只接受 DMABUF"
- *    的约束**正好相反** —— 那条是另一台设备（有 dma_heap 的那台）的事实。
- *    所以 ION 虽然通了，nabu 上仍走不到出帧：当前实现固定用
- *    V4L2_MEMORY_DMABUF。要支持 nabu 需要再加一条 USERPTR 路径。
- *    ⚠️ 但第 85 轮把 USERPTR 整条流程走完后，nabu 依然出不了帧，
- *    而且卡在更靠前的地方 —— 加 USERPTR 路径**不会**让 nabu 能解码：
+ *    缓冲来源：nabu 无 dma_heap，只有 /dev/ion，system heap id=**25**
+ *    （用 ION_IOC_HEAP_QUERY 问内核，不要逐位试探 mask）。
  *
- *      REQBUFS(OUT,USERPTR)  成功 count=4
- *      STREAMON(OUT)         成功
- *      QBUF 4 个单元共 512KB 成功
- *      等 V4L2_EVENT_SOURCE_CHANGE → **永不到达**（每次 poll 2 秒，全超时）
- *      G_FMT(CAPTURE) 仍返回 1920x1088 / Q128，即残留默认值，
- *      说明固件根本没解析过码流
- *      REQBUFS(CAP,USERPTR)  也成功 count=6 —— 两侧都不是缓冲类型的问题
+ * 2. S_FMT(OUTPUT) 必须先用一个**不同的分辨率**做 dummy 调用。
+ *    驱动在分辨率与当前值相同时提前返回，跳过 plane_sizes 赋值：
+ *        if (fourcc 相同 && width 相同 && height 相同) {
+ *            dprintk("No change in OUTPUT port params"); return 0;
+ *        }                                     (msm_vdec.c:732-738)
+ *    driver open 后 OUTPUT 默认就是 1920x1088，直接设目标分辨率必然命中它，
+ *    sizeimage 永远回填 0。实测：直接设 → 0；先 1280x720 再设 → 16588800。
  *
- *    IRQ 硬证据（msm_vidc 是 IRQ 510，严格等时长对照）：
- *      空闲基线      50 IRQ / 10s
- *      USERPTR 喂料  49 IRQ / 12s   ← 与基线无差别
- *      再次空闲      47 IRQ / 10s
- *    固件对喂料毫无响应，与 doc/why-not-v4l2.md 当年测到的现象一致。
+ * 3. 输入输出分辨率必须严格相等，本设备不支持缩放：
+ *        if (!scale_x.min || !scale_x.max || !scale_y.min || !scale_y.max) {
+ *            if (input_w * input_h != output_w * output_h) return -ENOTSUPP;
+ *        }                                     (msm_vidc_common.c:5613-5625)
+ *    所以 1080p 要用 1920x**1088**（CAPTURE 的对齐值），不是 1080。
+ *    尺寸不符时 STREAMON 报 524 (ENOTSUPP)，而非 EINVAL —— 可用来区分。
  *
- *    所以 nabu 的障碍不在缓冲类型，而在会话状态机到不了 START_DONE。
- *    doc/why-not-v4l2.md 的结论**对这台设备是成立的**，
- *    它错的只是把结论推广成"V4L2 这条路不通" —— 另一台设备上同样的
- *    两段式协商能跑满 300 帧且像素与软解逐字节一致。
- *    第 86 轮补充了一组关键对照，把"设备限制"这个说法收窄：
+ * 4. **必须启用 SECONDARY 分流模式**（这是当年缺的决定性一项）：
+ *        V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base + 22 = 0x00992016
+ *        V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_SECONDARY = 1
+ *                                     (厂商 v4l2-controls.h:865-869)
+ *    PRIMARY（默认）下 CAPTURE 直接充当 DPB，start_streaming() 恒返回
+ *    -EINVAL。SECONDARY 启用 HAL_BUFFER_OUTPUT2，DPB 与 OPB 分离，
+ *    msm_vidc.c:1214-1222 会额外调 msm_comm_set_output_buffers()
+ *    让驱动自行分配 DPB，校验路径完全不同。
+ *    单一变量对照实测：SECONDARY → STREAMON(OUT) OK；PRIMARY → EINVAL。
+ *    附带好处：CAPTURE 可用线性 NV12，不必解 UBWC 的 Q128。
  *
- *      screenrecord（走 video33 **编码器**）  IRQ 净增 **753**，产出正常 mp4
- *      我的 video32 **解码**尝试              IRQ 净增 ~0（空闲 51 上下浮动）
+ * 5. 私有控制项基址（厂商 v4l2-controls.h:684）：
+ *        V4L2_CID_MPEG_MSM_VIDC_BASE = V4L2_CTRL_CLASS_MPEG|0x2000 = 0x00992000
+ *    与 OMX HAL 活体 strace 对照出的初始化项：
+ *        0x00992003 base+3  VIDEO_OUTPUT_ORDER    = 0
+ *        0x00992011 base+17 VIDEO_EXTRADATA       = 2, 25, 31, 29（连设四种）
+ *        0x00992038 base+56 VIDEO_LOWLATENCY_MODE = 1
+ *    注意 base+15 SYNC_FRAME_DECODE 设 1 会把 MIN_BUFFERS 压到 out=1 cap=1，
+ *    不适用于正常解码。
  *
- *    所以 **Venus 固件本身完全能起**，不是芯片坏了也不是内核没编进去 ——
- *    第 85 轮"属该设备固件/内核限制"这个说法太宽。
- *    准确的说法是：**这台设备的 video32 解码路径起不来**，
- *    而 video33 编码路径正常。
+ *    ⚠️ 此前记录的"QUERYCTRL 0 项、S_CTRL EINVAL、这个节点没有控制项"
+ *    是**错的**：QUERYCTRL 确实枚举不出私有 CID（它们不在标准控制框架里），
+ *    但直接 S_CTRL 这些 id 是**成功**的。用 QUERYCTRL 的结果推断控制项
+ *    不存在会得出相反结论。（G_CTRL 不校验 id、拿 0xDEADBEEF 也返回成功
+ *    这一点仍然成立，别用它验证控制项存在。）
  *
- *    已排除的原因（逐一实测）：
- *      缓冲类型      USERPTR 两侧都能 REQBUFS 成功
- *      ION heap      HEAP_QUERY 拿到 system(id=25)，分配 + mmap 均成功
- *      容器权限      Android 侧 root 跑同一二进制，结果完全一致
- *      喂料切分      按 Annex-B 切出真 NALU（SPS7/PPS8/SEI6/IDR5 逐个送）
- *                    仍无 SOURCE_CHANGE —— 不是"切块不是完整 NALU"的问题
- *      控制项        QUERYCTRL 0 项、S_CTRL EINVAL（G_CTRL 不可信，见下）
+ * 6. STREAMON 的真实语义：**第一个是假通过，第二个承担全部校验**。
+ *        case OUTPUT_MPLANE: if (CAPTURE 已 streaming) rc = start_streaming();
+ *        case CAPTURE_MPLANE: if (OUTPUT 已 streaming) rc = start_streaming();
+ *                                              (msm_vidc.c:1294-1302)
+ *    第一个 STREAMON 因对侧未 streaming 而**跳过** start_streaming()。
+ *    所以"CAPTURE 先 STREAMON 就成功"是假象，失败只是被推迟到第二个。
+ *    ⚠️ 这也推翻了旧注释第 2 条的"必须两阶段、不能双向一起 STREAMON"：
+ *    SECONDARY 模式下不需要等事件才配 CAPTURE，两侧先配好再让第二个
+ *    STREAMON 触发校验即可。
  *
- *    第 87 轮又排除两项，并拿到决定性观测：
+ * 7. **必须订阅厂商私有事件**，驱动从不发标准 V4L2_EVENT_SOURCE_CHANGE：
+ *        V4L2_EVENT_MSM_VIDC_START = V4L2_EVENT_PRIVATE_START + 0x1000
+ *                                  = 0x08001000   (厂商 videodev2.h:2290-2305)
+ *          +1 FLUSH_DONE   +2 PORT_SETTINGS_CHANGED_SUFFICIENT
+ *          +3 PORT_SETTINGS_CHANGED_INSUFFICIENT  +4 BITDEPTH_CHANGED
+ *          +5 SYS_ERROR    +6 RELEASE_BUFFER_REFERENCE
+ *          +7 RELEASE_UNQUEUED_BUFFER
+ *    只订阅标准 SOURCE_CHANGE 会导致 poll 永不返回 POLLPRI ——
+ *    当年"等 SOURCE_CHANGE 永不到达"就是这个原因，不是固件没响应。
  *
- *      物理连续内存    从 ION user_contig(id=26, type=DMA) 与
- *                      system(id=25) 各分配 4x4MB 并 mmap，
- *                      两者表现**完全相同** —— 连续性不是原因
- *      两侧同时 STREAMON  STREAMON(CAPTURE) 直接 EINVAL，
- *                      证实两段式协商是强制的，不能提前
+ * 8. 收到 PORT_SETTINGS 事件后**必须发 SESSION_CONTINUE**。
+ *    驱动在事件处理里无条件置 inst->in_reconfig = true
+ *    （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
+ *    msm_comm_session_continue() 只有两个调用点：
+ *      a. start_streaming() 内                  (msm_vidc.c:1244)
+ *      b. msm_vidc_comm_cmd() 的 V4L2_QCOM_CMD_SESSION_CONTINUE 分支
+ *                                              (msm_vidc_common.c:4155)
+ *    走 (a) 需要重跑 STREAMON，实测必然触发 SYS_ERROR（STREAMOFF 把 state
+ *    打回 MSM_VIDC_START_DONE 以下）。走 (b) 才是正解：
+ *    VIDIOC_DECODER_CMD + cmd = 5（videodev2.h:1991），不动队列状态。
  *
- *    ⚠️ 决定性观测：**缓冲有去无回**
- *      QBUF 4 个 NALU（SPS/PPS/SEI/IDR）全部返回 0
- *      第 5 个 QBUF 返回 EINVAL —— 队列满了
- *      随后 5 次 poll(POLLOUT|POLLPRI|POLLIN, 1s) 全部 revents=0
- *      5 次 VIDIOC_DQBUF 全部 EAGAIN
- *    也就是驱动把 4 个缓冲全吞下、一个都不归还、poll 永不就绪。
- *    这与 doc/why-not-v4l2.md 记录的源码行为精确吻合：
- *    会话状态机未达 MSM_VIDC_START_DONE 时缓冲被标 DEFERRED 后丢弃，
- *    而 QBUF 仍返回 0（唯一提示走默认关闭的 VIDC_DBG）。
+ * 9. **设备必须用 O_NONBLOCK 打开**。事件队列空时 VIDIOC_DQEVENT 会阻塞在
+ *    内核 v4l2_event_dequeue()，poll 循环再也回不来。
+ *    定位方式：/proc/PID/wchan 显示 v4l2_event_dequeue，
+ *    /proc/PID/syscall 显示 29 (ioctl) + 0x80885659 (VIDIOC_DQEVENT)。
  *
- *    所以卡点已定位到"会话没到 START_DONE"，而非任何用户态调用细节。
- *    结合第 86 轮的 IRQ 对照（编码器 753 / 解码器 ~0），
- *    结论是：**这台设备的解码会话根本没启动固件**。
+ * 10. CAPTURE 几何的两个坑：
+ *     · slice_height 不要用 sizeimage 反推。3137536*2/(1920*3) = 1089.16
+ *       → 1089，而真实值是 1088，多出的一行会让上层 nv12_copy 越界
+ *       SIGSEGV。直接用 f.fmt.pix_mp.height。
+ *     · G_FMT(CAPTURE) 可能返回 open 时的残留默认值 1920x1088，
+ *       不随 S_FMT(OUTPUT) 联动（4K 码流实测），必须用 OUTPUT 侧协商值覆盖；
+ *       覆盖 width 后驱动也不回填 bytesperline，stride 要自己兜底。
  *
- *    尚未排除、留给后续的方向：
- *      · Codec2/OMX HAL 在 open 后可能还设了一批 msm_vidc 私有控制项
- *        （V4L2_CID_MPEG_VIDC_*），那些 id 不在标准头里，需要从
- *        厂商内核头或 HAL 反查
- *      · 解码器可能需要 secure/non-secure session 类型的显式声明
- *    结论：nabu 上本驱动仍不可用，但这是**解码路径未跑通**，
- *    不等于该设备不可能支持。不要再为它加缓冲类型分支。
+ * 11. 输出 1088 行含 8 行对齐填充，取有效区要按 1080 裁剪。
+ *     ⚠️ 比对正确性时别让参考端也输出 1088 行 —— 填充数据参与比对会让
+ *     所有行错位，得出"PSNR 只有 25.9 dB"的假结论（本会话踩过）。
  *
- * 2. 必须两阶段 stateful 流程，不能双向一起 STREAMON：
- *      S_FMT(OUTPUT) → REQBUFS/STREAMON(OUTPUT) → 送含序列头的单元
- *      → 等 V4L2_EVENT_SOURCE_CHANGE → G_FMT(CAPTURE)
- *      → S_FMT(CAPTURE/NV12) → REQBUFS/STREAMON(CAPTURE) → 出帧
- *    跳过协商会让固件按错误假设解析，dmesg 里是
- *    "av1DecParseFrame: AV1 ERROR code 8c000060"，表现为 0 帧。
- *
- * 3. CAPTURE 默认格式是 QCOM 压缩的 Q08C，必须显式 S_FMT 成 NV12 才得到
- *    线性帧（1080p 下 sizeimage 从 3219456 变为 3133440）。
- */
+ * 验证状态（0.4.1，nabu / Snapdragon 860 / kernel 4.14）：
+ *     t.h264        1080p  300 帧  整流 MD5 与 ffmpeg 软解一致
+ *     real1080p     1080p         整流 MD5 与 ffmpeg 软解一致
+ *     s_3840x2160   4K            能出帧但帧数非整（166.18），内容不符，待查
+  */
 #ifndef DMD_V4L2_BACKEND_H
 #define DMD_V4L2_BACKEND_H
 
@@ -152,6 +169,7 @@ struct dmd_v4l2_dec {
     int      heap_kind;                       /* 见 v4l2_backend.c 的 HEAP_* */
     unsigned ion_mask;                        /* ION system heap 的 mask */
 
+    int      out_w, out_h;                    /* OUTPUT 侧协商出的对齐尺寸 */
     int      w, h;                            /* 协商后的对齐尺寸 */
     int      crop_w, crop_h;                  /* 有效显示区域 */
     unsigned in_size;                         /* OUTPUT 单缓冲字节数 */
@@ -163,6 +181,10 @@ struct dmd_v4l2_dec {
     struct dmd_v4l2_buf out[DMD_V4L2_MAX_OUT];
     struct dmd_v4l2_buf cap[DMD_V4L2_MAX_CAP];
 
+    int      cap_planes;                      /* CAPTURE 平面数（含 extradata） */
+    size_t   extra_size;                      /* extradata 平面字节数 */
+    struct dmd_v4l2_buf extra[DMD_V4L2_MAX_CAP];  /* extradata dmabuf */
+    int      reconfig_done;                   /* 已发过 SESSION_CONTINUE */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
     int      out_streaming, cap_streaming;
     int      draining;                        /* 已送 EOS，等剩余帧 */
