@@ -30,8 +30,11 @@
  * "Driver version" 里，是用户可见信息。曾长期停在 0.3.3 而项目已到
  * 0.3.7（落后 4 版），用户按 vainfo 报 bug 时会指向错误的版本。
  * 同步清单：本文件、ksu-module/module.prop、CHANGELOG.md。 */
-#define DMD_DRIVER_VERSION "0.3.7"
-#define DMD_VENDOR_STRING "DroidSpaces MediaCodec VA-API driver " DMD_DRIVER_VERSION
+/* 0.4.0：架构改为驱动内 V4L2 直通（不再经 unix socket 与 Android 侧
+ * decode-daemon / MediaCodec）。vendor 串里的 "MediaCodec" 随之去掉 ——
+ * 它现在描述的是一条已经不存在的路径。 */
+#define DMD_DRIVER_VERSION "0.4.0"
+#define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " DMD_DRIVER_VERSION
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。
  * H.264/HEVC 解码器规格：96x96 ~ 8192x4320，并发实例 16，支持 adaptive-playback。 */

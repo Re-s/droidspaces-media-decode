@@ -39,14 +39,15 @@ SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDI
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 DEPS    := $(OBJECTS:.o=.d)
 
-# 客户端库的自测程序：独立目标，make all 不依赖它。
-# 它只链 dmd_client.c，不碰 libva，也不需要 driver 的其余部分。
+# 单元测试：纯函数、不碰硬件、不需要 daemon。
+#
+# 旧的 test_dmd_client / probe_shm_fallback 两个目标已随 socket 架构一起废弃：
+# 前者要连 daemon 的 TCP 20003，后者验证 daemon 的 SHM 降级行为，
+# V4L2 直通下都无对应物，且是 `make tests` 长期 exit 2 的原因。
 TESTDIR   := tests
-TESTBIN   := $(BUILD)/test_dmd_client
-TEST_SRCS := $(TESTDIR)/test_dmd_client.c $(SRCDIR)/dmd_v4l2_session.c \
-          $(SRCDIR)/v4l2_backend.c
-# 裸协议探针：不链客户端库，独立验证 daemon 的 SHM 降级行为
-PROBEBIN  := $(BUILD)/probe_shm_fallback
+TESTBIN   := $(BUILD)/test_av1_bitstream
+TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
+          $(SRCDIR)/bitstream.c
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -74,17 +75,16 @@ check: $(BUILD)/$(TARGET)
 	@nm -D --defined-only $(BUILD)/$(TARGET) | grep vaDriverInit || \
 		{ echo "错误：未导出 __vaDriverInit_* 符号"; exit 1; }
 
-# 客户端库自测程序。需要 daemon 在跑（TCP 20003），用法见 tests/ 里的源码头注释。
+# 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN) $(PROBEBIN)
+tests: $(TESTBIN)
+	@echo "== 运行单元测试 =="
+	@$(TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
-$(TESTBIN): $(TEST_SRCS) $(SRCDIR)/dmd_client.h | $(BUILD)
+$(TESTBIN): $(TEST_SRCS) | $(BUILD)
 	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
-
-$(PROBEBIN): $(TESTDIR)/probe_shm_fallback.c | $(BUILD)
-	$(CC) $(TESTCFLAGS) $< -o $@
 
 # 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
 gen:

@@ -37,8 +37,37 @@ static const VAProfile dmd_profiles[] = {
     VAProfileH264High,
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
+#ifdef DMD_ENABLE_AV1
+    /* 开发/调试专用：-DDMD_ENABLE_AV1 才声明 AV1。
+     * 发布版不声明（理由见下方注释），但本设备仍需要能直接测硬件链路，
+     * 所以用编译期开关而不是删掉代码 —— 免得每次调试都手改源文件。 */
     VAProfileAV1Profile0,
-    /* ⚠️ VP8 已移除声明（V4L2 直通改造的一部分）。
+#endif
+    /* ⚠️ AV1 暂不声明（0.4.0 发布版）。
+     *
+     * AV1 硬解在本设备上确实可用，但驱动侧的码流合成尚未完全正确：
+     * 实测帧数与 dav1d 一致（150），码流合成 145/150 逐字节相同，
+     * 而像素只有 17/30 个不同画面（软解 30）——
+     * 缺的是 70 个 show_existing_frame 复显帧，详见 doc/av1-v4l2-status.md。
+     *
+     * 在像素校验通过之前声明 AV1 属于虚报：Firefox / ffmpeg 会据此
+     * 把 AV1 解码任务交过来，得到的是重复帧与花屏，比回落软解更糟。
+     * 映射（dmd_profile_to_codec 的 VAProfileAV1Profile0 分支）保留 ——
+     * 它本身无害，等像素通过后把这一行加回声明表即可。
+     * 开发调试用 -DDMD_ENABLE_AV1 编译即可声明（见上方 #ifdef），
+     * 不必手改源文件。
+     *
+     * ⚠️ 实测确认的一个行为差异：发布版（不声明 AV1）下，
+     * ffmpeg 的 `-hwaccel vaapi` 遇到未声明的 profile **不会静默回落**，
+     * 而是直接失败退出（rc=69）：
+     *     No support for codec av1 profile 0.
+     *     Your platform doesn't support hardware accelerated AV1 decoding.
+     * 这是 ffmpeg 的既有语义（-hwaccel 是硬性要求，非"尽力而为"），
+     * 不是本驱动的缺陷 —— 同一码流不带 -hwaccel 时纯软解正常出 30 帧。
+     * 若要自动回落需用 `-hwaccel auto` 或不指定 -hwaccel。
+     * Firefox 走的是能力探测路径，不声明即不会尝试，不受此影响。
+     *
+     * ⚠️ VP8 已移除声明（V4L2 直通改造的一部分）。
      *
      * 理由是硬件层面的事实：msm_vidc 的 V4L2 层**没有 VP80 格式**
      * （v4l2_backend.c 的 codec 映射对 VP8 返回 0，调用方据此拒绝）。
