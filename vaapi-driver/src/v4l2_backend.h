@@ -206,23 +206,6 @@ int dmd_v4l2_release(struct dmd_v4l2_dec *d, int index);
  * 这是**不可逆**的：之后不应再送料。用于会话收尾。 */
 int dmd_v4l2_drain(struct dmd_v4l2_dec *d);
 
-/*
- * 可逆排空：催出流水线里已积压的帧，但保持会话可继续送料。
- *
- * 为什么需要它：VA-API 上层（decode.c 的 SyncSurface）在等帧超时时会调
- * 排空来打破"解码器攒够输入才吐帧、调用方等帧才继续送料"的互等。它假设
- * 排空是可逆的 —— 在 MediaCodec 下确实如此（EOS + flush 后会话仍可用）。
- *
- * V4L2 下用 DECODER_CMD(STOP) → 收完带 LAST 标记的帧 → DECODER_CMD(START)
- * 表达同一语义。STOP 让解码器吐完已有帧，START 让它回到可接收状态。
- * 这是 V4L2 规范定义的 drain-and-resume 序列（dev-decoder.rst）。
- *
- * 直接用不可逆的 drain 会终结整条流：实测表现为 ffmpeg 送 6 单元只回 2 帧、
- * 4 帧待配对、报 internal decoding error。
- *
- * 返回 0 成功，-1 失败（此时调用方应退回不可逆路径）。
- */
-int dmd_v4l2_drain_reversible(struct dmd_v4l2_dec *d);
 
 /* 关闭并释放全部资源。可重复调用。 */
 void dmd_v4l2_close(struct dmd_v4l2_dec *d);

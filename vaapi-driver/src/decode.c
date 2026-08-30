@@ -2105,9 +2105,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              * 但 ffmpeg 仍会对每个 surface 调 GetImage，
              * data 为空就导出全零帧（实测 30 帧里 9 个全零）。
              *
-             * 折中：复制最近一个已就绪 surface 的像素。
-             * 这不是该帧真正的画面，但比全零接近 —— 且不改变流程。
-             * DMD_AV1_NO_CARRY=1 可关掉，退回全零行为便于对照。
+             * 曾试的折中（复制最近就绪 surface 的像素）已删除，见下方
+             * "像素承接整条路线已否证"。
              *
              * ---- 承接被证明无效（本轮实测）----
              * 开关两侧都是"30 帧 / 17 个不同画面"，只有 md5 不同
@@ -2174,48 +2173,21 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
              *        而非枚举失败或探错了节点。）
              *      探针见 tools/probe_v4l2_ctrls.c。
              *      结论：没有控制项可调，方向 B 不存在。
-             * 保留承接代码但它只是止损（避免全零），不是解法。
-             *
-             * DMD_AV1_NO_CARRY=1 关掉承接，退回全零便于对照。
-             * DMD_AV1_CARRY=last 切回旧的"最近就绪"策略作 A/B。 */
-            if (!getenv("DMD_AV1_NO_CARRY") && ns->data) {
-                const char *mode = getenv("DMD_AV1_CARRY");
-                VASurfaceID src_id = VA_INVALID_ID;
-
-                if (mode && strcmp(mode, "last") == 0) {
-                    src_id = c->av1_last_ready;
-                } else {
-                    /* 该帧刚刚占用的 DPB 槽（build_unit 里已更新 shadow）。
-                     * dpb_next_slot 指向下一个待用槽，所以本帧占的是它的前一个。 */
-                    unsigned slot = (c->av1_dpb.dpb_next_slot + 7u) & 7u;
-                    src_id = c->av1_dpb.dpb_shadow[slot];
-                    if (src_id == VA_INVALID_ID ||
-                        src_id == c->av1_send_surface)
-                        src_id = c->av1_last_ready;   /* 该槽还没内容，退回旧策略 */
-                }
-
-                if (src_id != VA_INVALID_ID && src_id != c->av1_send_surface) {
-                    struct dmd_surface *src =
-                        dmd_find_surface_locked(drv, src_id);
-                    if (src && src->data && src->data_size == ns->data_size) {
-                        /* 诊断：源是否本身就是空壳（全零）。
-                         * 只查前 256 字节，够区分全零与有内容。 */
-                        int src_blank = 1;
-                        for (size_t z = 0; z < 256 && z < src->data_size; z++)
-                            if (src->data[z]) { src_blank = 0; break; }
-                        memcpy(ns->data, src->data, ns->data_size);
-                        c->av1_carry_dpb++;
-                        if (src_blank) c->av1_carry_blank++;
-                    }
-                }
-            }
+             * 结论：没有控制项可调，方向 B 不存在。 */
+            /* ---- 像素承接（surface 间 memcpy）整条路线已否证，第 70 轮 ----
+             * 曾试三种源：本帧占用的 DPB 槽、最近就绪帧、全零。
+             * 结果分别是 17 / 16 / 17 个不同画面 —— 与不做承接毫无区别。
+             * 决定性证据：计数器显示 19 次承接里有 **13 次源本身全零**。
+             * 原因是 show_frame=0 的帧互相引用，被引用的像素在硬件那边
+             * 从未产生过，信息在驱动层根本不存在。
+             * 所以任何 surface→surface 的拷贝都是死路，不是调参问题。
+             * 相关开关（DMD_AV1_CARRY / DMD_AV1_NO_CARRY）与计数器
+             * （av1_carry_dpb / av1_carry_blank）已随本块一并删除。 */
             ns->state = DMD_SURFACE_READY;
             ns->decode_status = VA_STATUS_SUCCESS;
         }
-        dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队"
-                "（DPB承接累计 %lu，其中源全零 %lu）\n",
-                (unsigned)c->av1_send_surface, c->av1_carry_dpb,
-                c->av1_carry_blank);
+        dmd_log("EndPicture: AV1 surface=%u show_frame=0，只送料不入队\n",
+                (unsigned)c->av1_send_surface);
     }
 
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
@@ -2506,25 +2478,20 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 真正的原因更可能是 SEF 单元数量本身 —— 补到 60~70 个时崩，
      * 补 4 个时正常。方向应转向"多送的单元如何打乱 CAPTURE 缓冲
      * 与 pending 配对"，而不是继续找更严格的门。 */
-    /* DMD_AV1_SEF_MAX=<n>：不设门、但本会话最多补 n 个 SEF。
-     *
-     * 实测结果（150 帧样本，判据为 ffmpeg 输出帧数）：
-     *     SEF_MAX=8   → 150 帧 ✓
-     *     SEF_MAX=20  → 150 帧 ✓
-     *     SEF_MAX=40  → 超时（>180s，正常约 40s）
+    /* ---- SEF 数量上限的测绘结论（第 68 轮，DMD_AV1_SEF_MAX 开关已删）----
+     * 实测（150 帧样本，判据为 ffmpeg 输出帧数）：
+     *     上限 8   → 150 帧 ✓
+     *     上限 20  → 150 帧 ✓
+     *     上限 40  → 超时（>180s，正常约 40s）
      *     无上限(~68) →  64 帧
-     * 所以崩溃阈值在 20~40 之间，且**与门无关** ——
-     * 20 个 SEF 完全不设门也能跑满 150 帧。
-     *
+     * 崩溃阈值在 20~40 之间，且**与门无关** —— 20 个完全不设门也能跑满。
      * 这否证了第 65 轮"SEF 抢在被引用帧解码前送出"的归因：
-     * 若是抢跑，补 20 个也该出问题。真正的原因是数量本身，
-     * 方向应转向"多送的单元如何耗尽 CAPTURE 缓冲或撑爆 pending 队列"。
-     * 不设则沿用 send_show 门（保守，只补约 4 个）。 */
-    const char *sefmax = getenv("DMD_AV1_SEF_MAX");
-    const int sef_no_gate = sefmax != NULL;
-    const unsigned long sef_cap = sefmax ? strtoul(sefmax, NULL, 10) : 0;
+     * 若是抢跑，补 20 个也该出问题。真正的原因是数量本身。
+     * 未解之谜：为何 20~40 之间会崩。方向是"多送的单元如何耗尽 CAPTURE
+     * 缓冲或撑爆 pending 队列"，需设备在线逐帧观测。
+     * 当前行为：沿用 send_show 门（保守，只补约 4 个），不设数量上限开关。 */
     if (c->codec == DMD_CODEC_AV1 && c->av1_sef_count > 0 &&
-        (sef_no_gate ? (c->av1_sef_sent < sef_cap) : (c->av1_send_show != 0))) {
+        c->av1_send_show != 0) {
         sef_send_slot = (int)c->av1_sef_slot[c->av1_sef_head];
         c->av1_sef_head = (c->av1_sef_head + 1) & 63;
         c->av1_sef_count--;

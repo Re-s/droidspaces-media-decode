@@ -1494,43 +1494,6 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
             int wm = uniform_ref
                    ? 0
                    : (int)p->pic_info_fields.bits.allow_warped_motion;
-            const char *ov = getenv("DMD_AV1_WARP");
-            if (ov && ov[0] == 'm')
-                wm = (int)p->pic_info_fields.bits.use_ref_frame_mvs;
-            else if (ov && ov[0] == 'v')
-                wm = (int)p->pic_info_fields.bits.allow_warped_motion;
-            else if (ov && ov[0] == 'i') {
-                /* 假设：ref_frame_idx 全相同（单一参考）时源写 0，
-                 * 出现不同值（多参考）时写 VA-API 值。
-                 * 实测三组的错帧 idx=[0,1,0,0,0,0,0]，
-                 * 而写 0 正确的帧 idx 全同或 [1,2,1,1,1,0,1]。 */
-                int uniform = 1;
-                for (int q = 1; q < 7; q++)
-                    if (p->ref_frame_idx[q] != p->ref_frame_idx[0]) {
-                        uniform = 0; break;
-                    }
-                wm = uniform ? 0
-                   : (int)p->pic_info_fields.bits.allow_warped_motion;
-            }
-            else if (ov)
-                wm = atoi(ov);
-            if (getenv("DMD_AV1_WARPSEQ"))
-                fprintf(stderr, "[warpseq] oh=%u va=%u pri=%u refmvs=%u "
-                        "idx=[%d,%d,%d,%d,%d,%d,%d] interp=%u sr=%u "
-                        "txmode=%u refsel=%u cdef_d=%u\n",
-                        p->order_hint,
-                        p->pic_info_fields.bits.allow_warped_motion,
-                        p->primary_ref_frame,
-                        p->pic_info_fields.bits.use_ref_frame_mvs,
-                        p->ref_frame_idx[0], p->ref_frame_idx[1],
-                        p->ref_frame_idx[2], p->ref_frame_idx[3],
-                        p->ref_frame_idx[4], p->ref_frame_idx[5],
-                        p->ref_frame_idx[6],
-                        p->interp_filter,
-                        p->superres_scale_denominator,
-                        p->mode_control_fields.bits.tx_mode,
-                        p->mode_control_fields.bits.reference_select,
-                        p->cdef_damping_minus_3);
             if (getenv("DMD_AV1_BITS"))
                 fprintf(stderr, "[warp] oh=%u va=%u mms=%u ref_mvs=%u "
                         "intra=%u err=%d prim=%u gm=[%u,%u,%u,%u,%u,%u,%u]\n",
