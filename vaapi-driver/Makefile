@@ -28,6 +28,21 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
            -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) $(DRM_CFLAGS) \
            -I$(SRCDIR) -MMD -MP
+
+# AV1=1 声明 AV1 profile（开发/调试用）。发布版默认不声明 —— 像素校验未通过时
+# 声明它就是虚报，见 src/profiles.c 的说明。
+#
+# ⚠️ 必须走这个变量，不要在命令行覆盖 CFLAGS：
+#   make CFLAGS=-DDMD_ENABLE_AV1     ← 错，会丢掉 -fPIC（链接期报
+#                                      "relocation R_AARCH64_ADR_PREL_PG_HI21
+#                                      ... recompile with -fPIC"）
+#   make CPPFLAGS=-DDMD_ENABLE_AV1   ← 无效，编译规则只用 $(CFLAGS)，
+#                                      宏静默不生效（表现为 ffmpeg 报
+#                                      "No support for codec av1 profile 0"）
+# 两个坑都实际踩过，所以在这里提供一个正确的入口。
+ifeq ($(AV1),1)
+CFLAGS  += -DDMD_ENABLE_AV1
+endif
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 

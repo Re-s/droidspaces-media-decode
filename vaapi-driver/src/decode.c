@@ -2620,6 +2620,44 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
+    /* ⚠️ 已否证：为 SEF 登记 pending（用它引用的那个 surface）。
+     *
+     * 动机是对的：SEF 是独立单元，硬件会为它吐一帧，而驱动此前只递增计数器
+     * 不入队 —— 那一帧于是落到队列里属于别人的项上（第 68 轮的像素退化根因）。
+     *
+     * 但"登记它引用的 surface"这个修法行不通。实测（30 帧样本，SEF 登记 8 次）：
+     *     不同画面 17 → 2，且 ffmpeg 报
+     *     Failed to read image from surface 0xc: 23 (internal decoding error)
+     * 日志比对给出直接证据：
+     *     SEF 登记的 surface:   3 4 5 10 11 12
+     *     正常配对的 surface:   1 3 4 5 6 7 11
+     * 两组**重叠**（3/4/5/11）。同一张 surface 被登记两次，
+     * 第二次归还时它已被 ffmpeg 取走并复用 → 内部解码错误。
+     *
+     * 症结：VA-API 的 surface 生命周期由消费者管，一张 surface 同时只能有
+     * 一个未完成的解码结果。复显帧需要的是**另一张**装着相同内容的 surface，
+     * 而驱动无权凭空造一张交给 ffmpeg —— ffmpeg 只会来取它自己 BeginPicture
+     * 指定过的那些 target。
+     *
+     * ⚠️ 顺手否证了一个看似合理的推论。
+     * 我曾推测"复显由上层负责、驱动补 SEF 是多余的"，判据是
+     * "若 ffmpeg 只调 80 次 EndPicture，说明它自己处理了那 70 个复显帧"。
+     * 实测（AV1=1 构建、不开 SEF、150 帧码流）：
+     *     EndPicture 进入 **150** 次，ffmpeg 输出 **150** 帧
+     * 所以 ffmpeg **不**自己处理复显 —— 它对全部 150 帧（含 70 个 SEF）
+     * 都走完整 VA-API 流程，每帧都有自己的 target surface。
+     *
+     * 这同时解释了为什么"登记引用的 surface"必然冲突：
+     * ffmpeg 为 SEF 帧准备的是一张**新** target，而不是复用被引用的那张。
+     * 正确方向应是把复显内容**拷进 ffmpeg 为该帧指定的 target**，
+     * 而不是让硬件多吐一帧、也不是重复登记旧 surface。
+     *
+     * 已知的数据支撑：build_unit 对这 150 次调用返回非空 75 次、NULL 75 次 ——
+     * 那 75 次 NULL 极可能正是 SEF 帧（驱动认出 show_existing_frame 后不产出
+     * 码流单元）。若能在那条 NULL 路径上直接把 dpb_shadow[slot] 的像素
+     * 复制到本次 target，就不需要让硬件参与复显。
+     * 下一步验证：确认 75 次 NULL 与 70 个 SEF 的对应关系（差 5 待查）。 */
+
     if (need_param_sets) {
         c->param_sets_sent = 1;
         c->sent_mbs_wide = mbs_wide;
