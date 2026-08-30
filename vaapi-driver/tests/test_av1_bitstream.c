@@ -284,6 +284,110 @@ static void test_sequence_header(void)
      * 即 profile/color_range/matrix_coefficients 三者均被如实解析。 */
 }
 
+
+/* ---------------------------------------------------------------- SEF 合成
+ *
+ * 为什么值得测：show_existing_frame 单元只有 4 位有效载荷，但它的
+ * 字节布局在第 65~68 轮反复出问题（当时靠改代码试反应，没有基准）。
+ * 这里按规范 5.9.2 + 5.3.4 把它钉死。
+ *
+ * 期望值推导（规范 5.3.2 obu_header + 5.9.2 frame_header + 5.3.4 trailing）：
+ *   OBU 头 = forbidden(1)=0 | type(4)=OBU_FRAME_HEADER=3 | ext(1)=0
+ *            | has_size(1)=1 | reserved(1)=0
+ *          = 0<<7 | 3<<3 | 0<<2 | 1<<1 | 0 = 0x1a
+ *   obu_size = 1（载荷一字节）
+ *   载荷 = show_existing_frame(1)=1, frame_to_show_map_idx(3)=idx,
+ *          trailing: 停止位 1 + 零填充到字节边界
+ *        = 1 idx idx idx 1 0 0 0
+ * idx=0 → 0b1000_1000 = 0x88；idx=5 → 0b1101_1000 = 0xd8
+ * idx=7 → 0b1111_1000 = 0xf8 */
+static void test_show_existing(void)
+{
+    printf("show_existing_frame 合成（规范 5.9.2）\n");
+    unsigned char buf[8];
+
+    static const unsigned char want0[] = { 0x1a, 0x01, 0x88 };
+    size_t n = dmd_av1_build_show_existing(buf, sizeof(buf), 0);
+    check_bytes("SEF map_idx=0", buf, n, want0, sizeof(want0));
+
+    static const unsigned char want5[] = { 0x1a, 0x01, 0xd8 };
+    n = dmd_av1_build_show_existing(buf, sizeof(buf), 5);
+    check_bytes("SEF map_idx=5", buf, n, want5, sizeof(want5));
+
+    static const unsigned char want7[] = { 0x1a, 0x01, 0xf8 };
+    n = dmd_av1_build_show_existing(buf, sizeof(buf), 7);
+    check_bytes("SEF map_idx=7", buf, n, want7, sizeof(want7));
+
+    /* map_idx 只有 3 位，高位必须被截掉而不是溢出到 OBU 头。 */
+    n = dmd_av1_build_show_existing(buf, sizeof(buf), 13);   /* 13 & 7 == 5 */
+    check_bytes("SEF map_idx=13 应等价于 5", buf, n, want5, sizeof(want5));
+
+    /* 容量不足必须返回 0 而不是写坏内存。 */
+    check_eq("SEF cap=3 拒绝", (long)dmd_av1_build_show_existing(buf, 3, 0), 0);
+    check_eq("SEF cap=0 拒绝", (long)dmd_av1_build_show_existing(buf, 0, 0), 0);
+    check_eq("SEF buf=NULL 拒绝",
+             (long)dmd_av1_build_show_existing(NULL, 8, 0), 0);
+}
+
+/* ------------------------------------------------- refresh_frame_flags 改写
+ *
+ * 为什么值得测：这是 AV1 路径里唯一的**原地位改写**，改错会静默污染
+ * 已经写好的帧头。第 79 轮查出的"5 帧 refresh 值不对"就出在这条链上，
+ * 而当时没有任何单测能定位是差分算错还是写入位置算错。
+ *
+ * 这里只测最基础的不变量（不依赖真实码流）：
+ *   1. dpb 为 NULL 或 cur_pic 为 NULL 时不得崩、不得改写
+ *   2. 首次调用（prev_valid=0）不改写，但必须保存 map 并置 prev_valid
+ *      —— 这正是第 76 轮那个"序列 —,8,32,64 首值丢失"的根因
+ *   3. 第二次调用时按 ref_frame_map 的差分位写入指定 bitpos */
+static void test_patch_prev_refresh(void)
+{
+    printf("refresh_frame_flags 原地改写\n");
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+    unsigned char frame[4];
+
+    /* 1. NULL 保护 */
+    memset(&dpb, 0, sizeof(dpb));
+    memset(&pic, 0, sizeof(pic));
+    dmd_av1_patch_prev_refresh(NULL, &pic, frame, sizeof(frame), 0);
+    dmd_av1_patch_prev_refresh(&dpb, NULL, frame, sizeof(frame), 0);
+    check_eq("NULL 参数不置 prev_valid", (long)dpb.prev_valid, 0);
+
+    /* 2. 首次调用：不改写，但保存 map 并置 prev_valid */
+    memset(&dpb, 0, sizeof(dpb));
+    memset(&pic, 0, sizeof(pic));
+    for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
+    memset(frame, 0, sizeof(frame));
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0);
+    check_eq("首次调用置 prev_valid", (long)dpb.prev_valid, 1);
+    check_eq("首次调用不改写码流", (long)frame[0], 0);
+    check_eq("首次调用保存 map", (long)dpb.prev_ref_map[0], 0xff);
+
+    /* 3. 第二次调用：槽 0 与槽 3 变化 → mask = 0b00001001 = 0x09。
+     *    bitpos=0 表示从 frame[0] 的最高位开始写 8 位。 */
+    pic.ref_frame_map[0] = 0x11;   /* 变了 */
+    pic.ref_frame_map[3] = 0x22;   /* 变了 */
+    memset(frame, 0, sizeof(frame));
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0);
+    check_eq("差分改写 mask 槽0|槽3", (long)frame[0], 0x09);
+
+    /* 4. bitpos 非字节对齐时也要写对：bitpos=4 → 跨 frame[0]/frame[1]。
+     *    mask 0x09 = 0000_1001，从第 4 位起写 8 位：
+     *      frame[0] 低 4 位 = 高 4 位的 mask = 0000
+     *      frame[1] 高 4 位 = 低 4 位的 mask = 1001 → 0x90 */
+    memset(&dpb, 0, sizeof(dpb));
+    memset(&pic, 0, sizeof(pic));
+    for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4);
+    pic.ref_frame_map[0] = 0x11;
+    pic.ref_frame_map[3] = 0x22;
+    memset(frame, 0, sizeof(frame));
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4);
+    check_eq("bitpos=4 低半字节", (long)(frame[0] & 0x0f), 0x00);
+    check_eq("bitpos=4 高半字节", (long)(frame[1] & 0xf0), 0x90);
+}
+
 int main(void)
 {
     printf("=== AV1 比特流原语自测 ===\n");
@@ -295,6 +399,8 @@ int main(void)
     test_ns();
     test_su();
     test_sequence_header();
+    test_show_existing();
+    test_patch_prev_refresh();
 
     if (fails == 0) {
         printf("=== 全部通过 ===\n");
