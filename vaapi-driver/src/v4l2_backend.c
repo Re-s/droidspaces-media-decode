@@ -91,29 +91,114 @@ static int xioctl(int fd, unsigned long req, void *arg, const char *name)
 
 /* ------------------------------------------------------------ dmabuf 分配 */
 
+/* DMABUF 来源：dma-heap 优先，legacy ION 兜底。
+ *
+ * 为什么需要两条路（第 81 轮实测）：
+ *   有 dma-heap 的设备（较新内核）    → /dev/dma_heap/system 可用
+ *   小米平板 5 / nabu（内核 4.14）    → **没有 /dev/dma_heap**，只有 /dev/ion
+ * 此前代码硬依赖 dma-heap，在 nabu 上 dmd_v4l2_open 直接失败，
+ * 表现为驱动加载正常但"打开 V4L2 解码器失败"、0 帧。
+ *
+ * ⚠️ nabu 的 ION 实测两种接口都分配不出来（modern ENODEV / legacy EINVAL），
+ * 所以这条兜底路径在 nabu 上仍然拿不到缓冲 —— 加它不是为了救 nabu，
+ * 而是为了让**别的只有 ION 且 ION 可用**的设备能跑，
+ * 并且把失败原因说清楚（区分"没有 heap 设备"与"heap 存在但分配失败"）。
+ * nabu 的结论是硬件/内核限制，不是驱动缺陷。 */
+
+enum { HEAP_NONE = 0, HEAP_DMA_HEAP, HEAP_ION_MODERN, HEAP_ION_LEGACY };
+
+/* legacy ION（内核 4.14 及更早）：先 ALLOC 拿 handle，再 SHARE 换 dmabuf fd。 */
+struct ion_alloc_legacy {
+    size_t len; size_t align; unsigned int heap_id_mask;
+    unsigned int flags; int handle;
+};
+struct ion_fd_data { int handle; int fd; };
+#define ION_IOC_ALLOC_LEGACY _IOWR('I', 0, struct ion_alloc_legacy)
+#define ION_IOC_SHARE_LEGACY _IOWR('I', 4, struct ion_fd_data)
+
+/* modern ION（4.19+）：一步返回 dmabuf fd。 */
+struct ion_alloc_modern {
+    uint64_t len; uint32_t heap_id_mask; uint32_t flags;
+    uint32_t fd; uint32_t unused;
+};
+#define ION_IOC_ALLOC_MODERN _IOWR('I', 0, struct ion_alloc_modern)
+
 static int heap_open(struct dmd_v4l2_dec *d)
 {
     if (d->heap_fd >= 0) return 0;
+
     d->heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
-    if (d->heap_fd < 0) {
-        V4L2_LOG("打开 /dev/dma_heap/system 失败: %s", strerror(errno));
-        return -1;
+    if (d->heap_fd >= 0) {
+        d->heap_kind = HEAP_DMA_HEAP;
+        V4L2_LOG("缓冲来源: /dev/dma_heap/system");
+        return 0;
     }
-    return 0;
+    const int dh_errno = errno;
+
+    d->heap_fd = open("/dev/ion", O_RDONLY | O_CLOEXEC);
+    if (d->heap_fd >= 0) {
+        /* 两种 ION 接口的 ALLOC 号相同，靠试探区分。此处只记下待定，
+         * 由 dmabuf_alloc 首次分配时确定并缓存。 */
+        d->heap_kind = HEAP_ION_MODERN;
+        V4L2_LOG("无 dma_heap（%s），回退 /dev/ion", strerror(dh_errno));
+        return 0;
+    }
+
+    V4L2_LOG("无可用 DMABUF 来源：dma_heap=%s ion=%s",
+             strerror(dh_errno), strerror(errno));
+    return -1;
 }
 
 static int dmabuf_alloc(struct dmd_v4l2_dec *d, size_t len)
 {
     if (heap_open(d) < 0) return -1;
-    struct dma_heap_allocation_data a;
-    memset(&a, 0, sizeof(a));
-    a.len = len;
-    a.fd_flags = O_RDWR | O_CLOEXEC;
-    if (ioctl(d->heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
-        V4L2_LOG("dma_heap 分配 %zu 字节失败: %s", len, strerror(errno));
-        return -1;
+
+    if (d->heap_kind == HEAP_DMA_HEAP) {
+        struct dma_heap_allocation_data a;
+        memset(&a, 0, sizeof(a));
+        a.len = len;
+        a.fd_flags = O_RDWR | O_CLOEXEC;
+        if (ioctl(d->heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
+            V4L2_LOG("dma_heap 分配 %zu 字节失败: %s", len, strerror(errno));
+            return -1;
+        }
+        return (int)a.fd;
     }
-    return (int)a.fd;
+
+    /* ION：heap_id_mask 因设备而异，逐位试。system heap 通常是低位之一。 */
+    if (d->heap_kind == HEAP_ION_MODERN) {
+        for (unsigned mask = 1; mask <= 0x80u; mask <<= 1) {
+            struct ion_alloc_modern m;
+            memset(&m, 0, sizeof(m));
+            m.len = len;
+            m.heap_id_mask = mask;
+            if (ioctl(d->heap_fd, ION_IOC_ALLOC_MODERN, &m) == 0) {
+                V4L2_LOG("ION(modern) 分配成功: mask=0x%x", mask);
+                return (int)m.fd;
+            }
+        }
+        d->heap_kind = HEAP_ION_LEGACY;   /* 换 legacy 再试一轮 */
+    }
+
+    for (unsigned mask = 1; mask <= 0x80u; mask <<= 1) {
+        struct ion_alloc_legacy l;
+        memset(&l, 0, sizeof(l));
+        l.len = len;
+        l.heap_id_mask = mask;
+        if (ioctl(d->heap_fd, ION_IOC_ALLOC_LEGACY, &l) != 0)
+            continue;
+        struct ion_fd_data sh;
+        memset(&sh, 0, sizeof(sh));
+        sh.handle = l.handle;
+        if (ioctl(d->heap_fd, ION_IOC_SHARE_LEGACY, &sh) == 0) {
+            V4L2_LOG("ION(legacy) 分配成功: mask=0x%x", mask);
+            return sh.fd;
+        }
+    }
+
+    V4L2_LOG("ION 分配 %zu 字节失败（modern 与 legacy 全 mask 均不成功）: %s",
+             len, strerror(errno));
+    return -1;
 }
 
 static void bufs_free(struct dmd_v4l2_buf *b, int n)
@@ -219,6 +304,7 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     memset(d, 0, sizeof(*d));
     d->fd = -1;
     d->heap_fd = -1;
+    d->heap_kind = HEAP_NONE;
     for (int i = 0; i < DMD_V4L2_MAX_OUT; i++) d->out[i].dbuf_fd = -1;
     for (int i = 0; i < DMD_V4L2_MAX_CAP; i++) d->cap[i].dbuf_fd = -1;
 
@@ -273,9 +359,19 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
      * surface 也读像素。V4L2 标准控制 DISPLAY_DELAY(_ENABLE) 可要求解码器
      * 不做重排、逐帧立即输出，从而让每个 surface 都拿到内容。
      *
-     * 实测这两项在 msm_vidc /dev/video32 上 S_CTRL 均返回 OK（默认都是 0）。
-     * 用 DMD_V4L2_DISPLAY_DELAY=1 开启，便于与默认行为对照；
-     * 设置失败不致命 —— 只是回到默认的重排输出。 */
+     * ⚠️ 更正（第 81 轮本机实测）：此前这里写"实测这两项 S_CTRL 均返回 OK"。
+     * 在 nabu 的 msm_vidc 上实测 **S_CTRL 返回 EINVAL**，两项都设不进去。
+     *
+     * 当时那个"返回 OK"的结论很可能来自 G_CTRL —— 而这个驱动的 G_CTRL
+     * **完全不校验 id**：拿 0xDEADBEEF 去读也返回成功、值为 0。
+     * 所以 G_CTRL 成功不能作为"控制项存在"的证据，只有 S_CTRL 能。
+     * 配套证据：VIDIOC_QUERYCTRL 遍历这个节点得到 0 项
+     * （见 tools/probe_v4l2_ctrls.c）。
+     *
+     * 结论：DISPLAY_DELAY 这条路在 msm_vidc 上不存在。保留代码是因为它
+     * 在别的 V4L2 stateful 解码器上是标准做法，且失败不致命；
+     * 但**不要**再把它当成 AV1 缺陷的可行解法。
+     * 用 DMD_V4L2_DISPLAY_DELAY=1 开启（在 msm_vidc 上只会打印设置失败）。 */
     if (getenv("DMD_V4L2_DISPLAY_DELAY")) {
         struct v4l2_control ctl;
         memset(&ctl, 0, sizeof(ctl));
@@ -584,6 +680,7 @@ void dmd_v4l2_close(struct dmd_v4l2_dec *d)
 
     if (d->fd >= 0) { close(d->fd); d->fd = -1; }
     if (d->heap_fd >= 0) { close(d->heap_fd); d->heap_fd = -1; }
+    d->heap_kind = HEAP_NONE;
 
     d->cap_ready = 0;
     d->n_out = d->n_cap = 0;

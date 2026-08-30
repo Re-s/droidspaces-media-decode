@@ -92,6 +92,43 @@ int main(int argc, char **argv)
                r == 0 ? "支持" : (errno == EINVAL ? "不支持" : strerror(errno)));
     }
 
+    /* ⚠️ 关键：G_CTRL 在 msm_vidc 上**完全不校验 id**。
+     * 拿 0xDEADBEEF 去读也返回成功、值为 0 —— 所以"G_CTRL 成功"
+     * 不能作为控制项存在的证据。这个陷阱骗过我一次（第 81 轮）：
+     * 扫高通私有区间 0x00992000..ff 得到"256 项全可读"，全是假阳性。
+     * 唯一可信的判据是 S_CTRL 能否设进去。 */
+    printf("\n=== G_CTRL 假阳性对照（这些 id 绝不该存在）===\n");
+    unsigned bogus[] = { 0x00992ABCu, 0x0099FFFFu, 0xDEADBEEFu };
+    for (unsigned i = 0; i < sizeof bogus / sizeof *bogus; i++) {
+        struct v4l2_control c;
+        memset(&c, 0, sizeof(c));
+        c.id = bogus[i];
+        int r = ioctl(fd, VIDIOC_G_CTRL, &c);
+        printf("  0x%08x G_CTRL %s%s\n", bogus[i],
+               r == 0 ? "成功" : "失败",
+               r == 0 ? "  ← 假阳性！G_CTRL 不可信" : "");
+    }
+
+    printf("\n=== S_CTRL 真判据（设进去才算支持）===\n");
+    struct { unsigned id; int val; const char *nm; } sets[] = {
+#ifdef V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE
+        { V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE, 1, "DISPLAY_DELAY_ENABLE=1" },
+#endif
+#ifdef V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY
+        { V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,        0, "DISPLAY_DELAY=0" },
+#endif
+        { 0, 0, NULL }
+    };
+    for (int i = 0; sets[i].nm; i++) {
+        struct v4l2_control c;
+        memset(&c, 0, sizeof(c));
+        c.id = sets[i].id;
+        c.value = sets[i].val;
+        int r = ioctl(fd, VIDIOC_S_CTRL, &c);
+        printf("  %-26s %s\n", sets[i].nm,
+               r == 0 ? "✓ 设置成功" : strerror(errno));
+    }
+
     close(fd);
     return 0;
 }

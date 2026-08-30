@@ -9,14 +9,21 @@
  * /dev/video32 的 OUTPUT_MPLANE 枚举出 AV10，实测 V4L2 直通能解出帧，
  * 且像素与 ffmpeg 软解逐点完全一致（tools/v4l2_dec_probe.c 的验证结论）。
  *
- * 因此本后端只服务于 MediaCodec 走不通的 codec（当前是 AV1）。
- * H264/HEVC/VP8/VP9 继续走 MediaCodec —— 那条路已经稳定，不引入变数。
+ * ⚠️ 上面这段是 0.3.x 的定位，已过时：0.4.0 起**全部** codec 都走本后端，
+ * 没有 MediaCodec 那条路了（daemon 已删除）。
  *
  * 关键约束（都是实测踩出来的，改动时务必保持）：
  *
  * 1. 只接受 DMABUF。REQBUFS 报 capabilities 里含 MMAP，但 QUERYBUF 给出的
- *    offset 无法 mmap（ENODEV）。必须从 /dev/dma_heap/system 分配后以
- *    V4L2_MEMORY_DMABUF 传 fd。
+ *    offset 无法 mmap（ENODEV）。必须先拿到 DMABUF fd 再以
+ *    V4L2_MEMORY_DMABUF 传入。
+ *
+ *    缓冲来源按设备分两条（第 81 轮实测，见 v4l2_backend.c 的 heap_open）：
+ *      /dev/dma_heap/system   较新内核，优先
+ *      /dev/ion               内核 4.14 一类的老设备只有这个
+ *    ⚠️ 小米平板 5 / nabu 两条都用不了：没有 dma_heap，而 ION 的
+ *    modern 接口 ENODEV、legacy 接口 EINVAL，分配不出缓冲。
+ *    那台设备因此无法用本驱动解码 —— 属内核限制，不是驱动缺陷。
  *
  * 2. 必须两阶段 stateful 流程，不能双向一起 STREAMON：
  *      S_FMT(OUTPUT) → REQBUFS/STREAMON(OUTPUT) → 送含序列头的单元
@@ -60,7 +67,8 @@ struct dmd_v4l2_buf {
 
 struct dmd_v4l2_dec {
     int      fd;                              /* /dev/videoN */
-    int      heap_fd;                         /* /dev/dma_heap/system */
+    int      heap_fd;                         /* dma_heap 或 /dev/ion 的 fd */
+    int      heap_kind;                       /* 见 v4l2_backend.c 的 HEAP_* */
 
     int      w, h;                            /* 协商后的对齐尺寸 */
     int      crop_w, crop_h;                  /* 有效显示区域 */
