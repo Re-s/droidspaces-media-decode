@@ -71,7 +71,7 @@ int main(int argc,char**argv){
         printf("  QBUF[%d] %zu 字节 = %s\n",i,n,q==0?"ok":strerror(errno));
 
         struct pollfd pf={.fd=fd,.events=POLLPRI};
-        int pr=poll(&pf,1,2000);
+        poll(&pf,1,2000);
         if(pf.revents&POLLPRI){
             struct v4l2_event ev; memset(&ev,0,sizeof ev);
             ioctl(fd,VIDIOC_DQEVENT,&ev);
