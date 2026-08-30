@@ -58,8 +58,31 @@
  *    doc/why-not-v4l2.md 的结论**对这台设备是成立的**，
  *    它错的只是把结论推广成"V4L2 这条路不通" —— 另一台设备上同样的
  *    两段式协商能跑满 300 帧且像素与软解逐字节一致。
- *    结论：nabu 无法用本驱动解码，属该设备的固件/内核限制；
- *    不要再为它加缓冲类型分支。
+ *    第 86 轮补充了一组关键对照，把"设备限制"这个说法收窄：
+ *
+ *      screenrecord（走 video33 **编码器**）  IRQ 净增 **753**，产出正常 mp4
+ *      我的 video32 **解码**尝试              IRQ 净增 ~0（空闲 51 上下浮动）
+ *
+ *    所以 **Venus 固件本身完全能起**，不是芯片坏了也不是内核没编进去 ——
+ *    第 85 轮"属该设备固件/内核限制"这个说法太宽。
+ *    准确的说法是：**这台设备的 video32 解码路径起不来**，
+ *    而 video33 编码路径正常。
+ *
+ *    已排除的原因（逐一实测）：
+ *      缓冲类型      USERPTR 两侧都能 REQBUFS 成功
+ *      ION heap      HEAP_QUERY 拿到 system(id=25)，分配 + mmap 均成功
+ *      容器权限      Android 侧 root 跑同一二进制，结果完全一致
+ *      喂料切分      按 Annex-B 切出真 NALU（SPS7/PPS8/SEI6/IDR5 逐个送）
+ *                    仍无 SOURCE_CHANGE —— 不是"切块不是完整 NALU"的问题
+ *      控制项        QUERYCTRL 0 项、S_CTRL EINVAL（G_CTRL 不可信，见下）
+ *
+ *    尚未排除、留给后续的方向：
+ *      · Codec2/OMX HAL 在 open 后可能还设了一批 msm_vidc 私有控制项
+ *        （V4L2_CID_MPEG_VIDC_*），那些 id 不在标准头里，需要从
+ *        厂商内核头或 HAL 反查
+ *      · 解码器可能需要 secure/non-secure session 类型的显式声明
+ *    结论：nabu 上本驱动仍不可用，但这是**解码路径未跑通**，
+ *    不等于该设备不可能支持。不要再为它加缓冲类型分支。
  *
  * 2. 必须两阶段 stateful 流程，不能双向一起 STREAMON：
  *      S_FMT(OUTPUT) → REQBUFS/STREAMON(OUTPUT) → 送含序列头的单元
