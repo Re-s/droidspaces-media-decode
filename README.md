@@ -35,11 +35,14 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | H.264 | ✅ 可用 | 300/300 帧，md5 与软解逐字节一致 |
 | HEVC Main | ✅ 可用 | 12/12 帧，md5 与软解逐字节一致 |
 | VP9 Profile 0 | ✅ 可用 | 50/50 帧，md5 与软解逐字节一致 |
+| VP8 | ✅ 可用 | 90/90 帧，md5 与软解逐字节一致（0.4.2 新增）|
 | AV1 Profile 0 | 🚧 未完成 | 帧数与 dav1d 一致，**像素未通过**，默认不声明 |
-| VP8 | ❌ 不支持 | msm_vidc 的 V4L2 层没有 VP80 格式，无硬件路径 |
+| MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
+| HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
 
 AV1 需要 `-DDMD_ENABLE_AV1` 编译才会声明；遗留缺陷见
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md)。
+MPEG-2 需要 `-DDMD_ENABLE_MPEG2`；10bit 探测开关见 `CHANGELOG.md` 的 v0.4.2。
 
 > HEVC 有一类码流无法支持：SPS 带 `st_ref_pic_set` 的
 > （`num_short_term_ref_pic_sets > 0`）。VA-API 只给个数不给内容，无法复现，
@@ -82,13 +85,27 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
   -hwaccel_output_format vaapi -i in.mp4 -f null -
 ```
 
+> ⚠️ **0.4.1 及更早版本执行这条命令会挂死**（26 帧后 `internal decoding error`，
+> 约 40s 超时），那是 CAPTURE 背压死锁，已在 0.4.2 修复。
+> 在旧版上它会让你误判成"驱动不可用"。旧版请改用落盘形式自检：
+> `... -i in.mp4 -pix_fmt yuv420p -f rawvideo out.yuv -y`。
+
+想确认硬件真的在解码，可以看 Venus 的内核实况（用户态改不了这些值）：
+
+```sh
+# 解码期间 mvs0_gdsc 应为 enabled，空闲时 disabled
+for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
+  [ "$(cat $r/name)" = mvs0_gdsc ] && echo "mvs0_gdsc=$(cat $r/state)"; done
+```
+
 `vainfo` 也能用（0.3.x 时代它会挂在 daemon socket 上，0.4.0 起没有 socket 了）：
 
 ```
-vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.1
+vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.2
       VAProfileH264High               : VAEntrypointVLD
       VAProfileHEVCMain               : VAEntrypointVLD
       VAProfileVP9Profile0            : VAEntrypointVLD
+      VAProfileVP8Version0_3          : VAEntrypointVLD
 ```
 
 但它只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧 ——

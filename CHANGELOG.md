@@ -1,5 +1,134 @@
 # 更新日志
 
+## v0.4.2
+
+**新增 VP8 硬解；修复消费者不逐帧取帧时的 CAPTURE 背压死锁。**
+10bit 与 MPEG-2 经实测判定受固件限制，实现保留在编译开关后但不声明。
+
+测试环境：nabu（Xiaomi Pad 5 / Snapdragon 855 / kernel 4.14），
+Ubuntu 26.04 aarch64 容器，libva 2.23，ffmpeg 8.0.1。
+全部结论均以 `ffmpeg` 实测帧数 + 与软解的 md5 逐字节比对为判据。
+
+### 🐞 修复：CAPTURE 背压死锁（消费者不逐帧同步时挂死）
+
+**症状**：`ffmpeg -hwaccel vaapi -hwaccel_output_format vaapi -f null -`
+在第 26 帧后挂死，报 `internal decoding error`，40s 超时退出。
+同一条流改用 `-f rawvideo` 落盘则 150/150 正常。
+
+**根因不是 surface 重复入队**（那是第一轮的误判，按此修改后错误反而增多）。
+真正的机制是两个队列容量不匹配：
+
+- session 的待取帧队列容量 = CAPTURE 缓冲数 = `DMD_V4L2_MAX_CAP` (24)
+- 驱动侧待配对队列的背压阈值 = `DMD_MAX_SURFACES` (64)
+
+队列里每一帧都扣着一个未归还的 CAPTURE 缓冲。占满 24 时 msm_vidc 无处写帧、
+连输入缓冲也停止回收，`send_unit` 陷入永久背压 —— 而 `pending_count >= 64`
+这个条件 **永远等不到触发**，保护形同虚设。
+
+实测日志（36 次 EndPicture 提交、0 次取帧）：
+
+```
+[dmd-v4l2] 背压超时: pend=24/24 OUTPUT在驱动=8/8 CAPTURE在驱动=0/24
+```
+
+落盘路径侥幸不触发，是因为它每帧立即 `vaSyncSurface`，队列从不积压。
+**Chrome 属于不逐帧同步的模式**（靠 `vaExportSurfaceHandle` 批量取 dmabuf），
+因此很可能同样受影响。
+
+**修法**：触发条件改为按 session 水位判断（到容量 3/4 开始排空，
+降回一半即停），新增 `dmd_session_frames_pending()` /
+`dmd_session_pending_capacity()` 供驱动侧查询。
+
+排空量是关键权衡，两个方向都验证过：只收 1 帧救不回来（收 1 压 1，水位不降）；
+循环收光会替消费者把帧全收走（仓库既有注释记录：配对 1651 次而 Chrome
+只导出 24 帧，帧率反跌到 1 fps）。留一半队列深度给消费者是折中。
+
+**效果**：40s 挂死 → 3s 正常退出，零背压超时、零解码错误。
+
+### ✨ 新增：VP8 硬解
+
+`VAProfileVP8Version0_3` / `VAEntrypointVLD`，实测 **90/90 帧，
+md5 与软解逐字节一致**。
+
+此前不声明的两条理由 **都不成立**：
+
+- "msm_vidc 的 V4L2 层没有 VP80 格式" —— 错。`VIDIOC_ENUM_FMT` 实测
+  `/dev/video32` 的 OUTPUT 侧列出 `MPG2 H264 HEVC VP80 VP90`，VP80 在列。
+- "驱动侧缺 RFC 6386 §9.1 的码流重建" —— 也不成立。`decode.c` 的
+  `vp8_build_frame()` 早已实现（frame tag + key frame 的 start code 与尺寸），
+  参数收集与 `build_unit` 的分派分支都在位。
+
+缺的只是三道闸门：`profiles.c` 的声明与映射、`codec_to_fourcc` 的 VP80 一项。
+`DMD_V4L2_CODEC_VP8 = 3` 就是它原本的编号，不是新占号。
+
+### 🔍 10bit（HEVC Main10 / VP9 Profile2）：固件限制，不声明
+
+固件 **能识别** Main10（`PORT_SETTINGS` 上报 `bitdepth=1`），也接受
+QP10 / Q12A 格式设置（CAPTURE 缓冲从 3137536 翻到 6270976 字节）。
+
+**顺带修掉一个真实 bug**：CAPTURE stride 的下限按 1 字节/像素计算
+（`if (d->stride < d->w)`），10bit 需要 2 字节。实测固件期望 stride=3840
+（`3840*1088*3/2 = 6266880`，与它给的 sizeimage 只差对齐余量），
+按 8bit 钳成 1920 时几何不符。已改为按 fourcc 判断每像素字节数。
+
+但即使 stride 正确，固件仍持续报 `PORT_SETTINGS(INSUFFICIENT)`、
+**从不给 SUFFICIENT**，送入 8 单元收 0 帧。尝试在收到 INSUFFICIENT 后
+真正重协商 CAPTURE（STREAMOFF + REQBUFS(0) + 重配）会立刻触发 `SYS_ERROR`，
+印证了 v0.4.1 记录的"STREAMOFF 把 state 打回 `MSM_VIDC_START_DONE` 以下"。
+
+判定为平台限制。探测代码保留在 `DMD_PROBE_10BIT` / `DMD_PROBE_10BIT_RECFG`
+（运行时）与 `-DDMD_PROBE_10BIT_PROFILES`（编译期）开关后，发布版不声明 ——
+上层像素路径全是 8bit NV12 假设，声明了会输出错画面。
+
+### 🚧 MPEG-2：合成逐字节正确，但固件 SYS_ERROR
+
+新增 `mpeg2_bitstream.c`：合成 sequence_header + sequence_extension +
+GOP header + picture_header + picture_coding_extension。
+VA-API 只在 slice data 里给 slice 层字节，帧级与序列级头全被拆进了
+`VAPictureParameterBufferMPEG2` 与 `VAIQMatrixBufferMPEG2`，必须反向写回。
+
+**合成结果与 ffmpeg 原始流逐字节完全一致**：第 1 帧 82620 字节、
+第 2 帧 129038 字节，差异数 0；层次
+`seq → ext → GOP → picture → ext → slice` 也一致。
+
+定位过程中修正的四个字段（每个都靠与原始流逐字节比对确认）：
+
+| 字段 | 错值 | 正确值 | 说明 |
+|---|---|---|---|
+| `profile_and_level` | 0x48 | 0x44 | 1080p 超过 Main level 的 720x576 上限，需 High-1440 |
+| `vbv_buffer_size` | 112 | 3 | 填过大等于要求固件准备不存在的缓冲 |
+| `aspect_ratio` | 1 (square) | 3 (16:9) | VA 不提供，按尺寸比推断 |
+| 量化矩阵 | 恒写入 | 与默认矩阵比对后决定 | ffmpeg 恒把 `load_*` 填 1，照写会让 header 从 12 字节膨胀到 140 |
+
+即便如此，送入 `/dev/video32` 后固件在第 2 个单元处 `SYS_ERROR`、一帧不吐。
+既然码流与固件自己能解的原始流没有任何字节差异，问题不在合成侧。
+
+待查方向：MPEG-2 的 OUTPUT `sizeimage` 只有 1958400（H.264/HEVC 是
+16588800），单帧 129038 字节虽装得下，但固件可能要求按 GOP/序列边界
+而非逐帧送料。
+
+实现置于 `-DDMD_ENABLE_MPEG2` 后不声明：ffmpeg 的 `-hwaccel vaapi`
+遇到已声明的 profile 不会回落软解，会直接失败退出。
+
+### ⚠️ 文档更正：自检命令会误判
+
+README 的自检命令用的是 `-f null -`，而那恰好是本版修复的死锁路径。
+修复前按 README 自检会得到"挂死"的结果并误判为驱动不可用。
+判断硬解是否真在跑，除看帧数外还可核对 Venus 硬件状态：
+解码期间 `mvs0_gdsc` 会从 `disabled` 翻到 `enabled`，
+`venus_bus_ddr` 频率从空闲 64000 升到 221000（用户态改不了，是内核实况）。
+
+### 回归验证
+
+| 编解码器 | 帧数 | 硬解 | 软解 | md5 |
+|---|---|---|---|---|
+| H.264 1080p | 150/150 | 11s | 18s | 逐字节一致 |
+| HEVC Main 1080p | 90/90 | 8s | 7s | 逐字节一致 |
+| VP9 Profile0 1080p | 90/90 | 10s | 9s | 逐字节一致 |
+| VP8 1080p | 90/90 | 9s | ~9s | 逐字节一致 |
+
+`-f null` 挂死场景：40s 超时 → 3s 正常退出。AV1 单元测试全部通过。
+
 ## v0.4.1
 
 **nabu（Xiaomi Pad 5 / Snapdragon 860 / kernel 4.14）解码路径打通。**
