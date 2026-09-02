@@ -154,6 +154,7 @@ enum {
     DMD_V4L2_CODEC_VP9  = 2,
     DMD_V4L2_CODEC_VP8  = 3,
     DMD_V4L2_CODEC_AV1  = 4,
+    DMD_V4L2_CODEC_MPEG2 = 5,
 };
 
 #define DMD_V4L2_MAX_OUT 8    /* 输入（码流）缓冲数 */

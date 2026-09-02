@@ -59,6 +59,25 @@ static const VAProfile dmd_profiles[] = {
      * 硬件侧同样确认可用：VIDIOC_ENUM_FMT 在 /dev/video32 的 OUTPUT 侧
      * 列出 MPG2/H264/HEVC/VP80/VP90，VP80 在列。 */
     VAProfileVP8Version0_3,
+#ifdef DMD_ENABLE_MPEG2
+    /* MPEG-2：⚠️ **暂不声明**（需 -DDMD_ENABLE_MPEG2 才启用）。
+     *
+     * 实现是完整的：mpeg2_bitstream.c 合成出的码流与 ffmpeg 原始流
+     * **逐字节完全一致**（实测第 1 帧 82620 字节、第 2 帧 129038 字节，
+     * 差异数 0；层次 seq → ext → GOP → picture → ext → slice 也一致）。
+     * 合成正确性因此可以认为已证实。
+     *
+     * 但送入 /dev/video32 后 Venus 固件在第 2 个单元处报 SYS_ERROR，
+     * 一帧不吐。既然码流与固件自己能解的原始流没有任何字节差异，
+     * 问题不在合成，而在这颗固件（SM8150）对 MPG2 的送料路径 ——
+     * 待查方向：OUTPUT sizeimage 只有 1958400（H.264/HEVC 是 16588800），
+     * 而单帧实际 129038 字节虽然装得下，但固件可能对 MPEG-2 要求
+     * 按 GOP/序列边界而非逐帧送料。
+     *
+     * 在能真正出帧之前声明它属于虚报：ffmpeg 的 -hwaccel vaapi 遇到
+     * 已声明的 profile 不会回落软解，会直接失败退出。 */
+    VAProfileMPEG2Main,
+#endif
 #ifdef DMD_ENABLE_AV1
     /* 开发/调试专用：-DDMD_ENABLE_AV1 才声明 AV1。
      * 发布版不声明（理由见下方注释），但本设备仍需要能直接测硬件链路，
@@ -144,6 +163,11 @@ int dmd_profile_to_codec(VAProfile profile)
     /* VP8：0.4.2 恢复映射，码流重建见 decode.c 的 vp8_build_frame()。 */
     case VAProfileVP8Version0_3:
         return DMD_CODEC_VP8;
+    /* MPEG-2：Simple 与 Main 走同一条 V4L2 路径（MPG2 fourcc）。
+     * Simple 只是限制了 B 帧与色度格式，码流语法是 Main 的真子集。 */
+    case VAProfileMPEG2Simple:
+    case VAProfileMPEG2Main:
+        return DMD_CODEC_MPEG2;
 #ifdef DMD_PROBE_10BIT_PROFILES
     /* 探测专用：走同一个 V4L2 codec，位深由码流序列头自述。 */
     case VAProfileHEVCMain10:

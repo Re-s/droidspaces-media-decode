@@ -89,6 +89,7 @@ static uint32_t codec_to_fourcc(int codec_id)
     case DMD_V4L2_CODEC_VP9:  return V4L2_PIX_FMT_VP9;
     case DMD_V4L2_CODEC_VP8:  return V4L2_PIX_FMT_VP8;
     case DMD_V4L2_CODEC_AV1:  return V4L2_PIX_FMT_AV1;
+    case DMD_V4L2_CODEC_MPEG2: return V4L2_PIX_FMT_MPEG2;
     default:                  return 0;
     }
 }
