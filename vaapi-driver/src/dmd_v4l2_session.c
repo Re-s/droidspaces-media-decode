@@ -669,3 +669,14 @@ uint64_t dmd_session_frames_received(const struct dmd_session *s)
 {
     return s ? s->frames_recv : 0;
 }
+
+int dmd_session_frames_pending(const struct dmd_session *s)
+{
+    return s ? s->pend_count : 0;
+}
+
+int dmd_session_pending_capacity(const struct dmd_session *s)
+{
+    (void)s;
+    return DMD_V4L2_MAX_CAP;
+}

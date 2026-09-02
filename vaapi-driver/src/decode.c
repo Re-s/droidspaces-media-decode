@@ -1643,6 +1643,7 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return buf;
     }
 
+
     case DMD_CODEC_H264: {
         /* slice data 是**完整原始 NALU**（含 NAL header 与 slice header），
          * 只缺起始码。已核实：h264dec.c:674 传 nal->raw_data/raw_size，
@@ -1999,33 +2000,80 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * ⚠️ 只收一帧，收够就走。曾试过在这里循环收光，那会替消费者把帧全
      * 收走（实测配对 1651 次而 Chrome 只导出 24 帧，帧率反跌到 1 fps）。
      * 也试过把队列放大到 256，只是把症状推后（送入 67 → 259）而未解决。 */
-    if (c->pending_count >= DMD_MAX_SURFACES) {
+    /* ⚠️ 0.4.2：触发条件不能只看驱动侧队列。
+     *
+     * session 的待取队列容量是 CAPTURE 缓冲数（DMD_V4L2_MAX_CAP = 24），
+     * 远小于这里的 DMD_MAX_SURFACES = 64。队列里每一帧都扣着一个未归还的
+     * CAPTURE 缓冲，占满 24 时 msm_vidc 无处写帧、输入缓冲也停止回收，
+     * send_unit 陷入永久背压 —— 也就是说 `pending_count >= 64` 这个条件
+     * **永远等不到**，保护形同虚设。
+     *
+     * 实测（ffmpeg `-hwaccel_output_format vaapi -f null -`，消费者全程不调
+     * vaSyncSurface / vaExportSurfaceHandle）：36 次提交、0 次取帧，日志刷
+     * "背压超时: pend=24/24 OUTPUT在驱动=8/8 CAPTURE在驱动=0/24" 后挂死，
+     * 40s 超时退出。同一条流用 `-f rawvideo` 落盘则 150/150 正常 —— 那条
+     * 路径每帧立即 vaSyncSurface，队列从不积压，所以侥幸不触发。
+     *
+     * 所以改成看 session 水位：到容量的 3/4 就开始排空。 */
+    struct dmd_session *bp_sess0 = c->session;
+    const int sess_cap = bp_sess0 ? dmd_session_pending_capacity(bp_sess0) : 0;
+    const int sess_hi  = sess_cap > 0 ? (sess_cap * 3) / 4 : 0;
+    const int sess_backlogged =
+        bp_sess0 && sess_hi > 0 &&
+        dmd_session_frames_pending(bp_sess0) >= sess_hi;
+
+    if (c->pending_count >= DMD_MAX_SURFACES || sess_backlogged) {
         struct dmd_session *bp_sess = c->session;
         int bp_idx = (int)(c - drv->contexts);
 
         if (bp_sess && !drv->io_busy[bp_idx]) {
             drv->io_busy[bp_idx] = 1;
-            pthread_mutex_unlock(&drv->lock);
 
-            struct dmd_frame bp_frame;
-            memset(&bp_frame, 0, sizeof(bp_frame));
-            int bp_rc = dmd_session_next_frame(bp_sess, &bp_frame,
-                                               DMD_BACKPRESSURE_MS);
+            /* ⚠️ 收多少帧是这里的关键权衡，两个方向都踩过：
+             *
+             * 只收 1 帧（0.4.1 的做法）：session 队列已满时根本救不回来 ——
+             * 每次 EndPicture 收 1 帧、又立刻压回 1 帧，水位不降，死锁维持。
+             *
+             * 循环收光：会替消费者把帧全收走。仓库注释记录的实测是
+             * "配对 1651 次而 Chrome 只导出 24 帧，帧率反跌到 1 fps"。
+             *
+             * 折中：收到水位降回一半（sess_cap/2）就停，给消费者留一半
+             * 队列深度。这样既打破死锁，也不抢走消费者该拿的帧。 */
+            const int drain_to = sess_cap / 2;
+            int drained = 0;
 
-            pthread_mutex_lock(&drv->lock);
-            drv->io_busy[bp_idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
+            for (;;) {
+                if (dmd_session_frames_pending(bp_sess) <= drain_to &&
+                    c->pending_count < DMD_MAX_SURFACES)
+                    break;
+                /* 上限兜底：单次 EndPicture 最多排 sess_cap 帧，
+                 * 避免异常情况下在这里长时间打转。 */
+                if (drained >= sess_cap)
+                    break;
 
-            c = dmd_find_context_locked(drv, context);
-            if (!c) {
-                if (bp_rc == DMD_OK)
-                    dmd_session_release_frame(bp_sess, &bp_frame);
                 pthread_mutex_unlock(&drv->lock);
-                free(scratch);
-                return VA_STATUS_ERROR_INVALID_CONTEXT;
-            }
 
-            if (bp_rc == DMD_OK) {
+                struct dmd_frame bp_frame;
+                memset(&bp_frame, 0, sizeof(bp_frame));
+                int bp_rc = dmd_session_next_frame(bp_sess, &bp_frame,
+                                                   DMD_BACKPRESSURE_MS);
+
+                pthread_mutex_lock(&drv->lock);
+
+                c = dmd_find_context_locked(drv, context);
+                if (!c) {
+                    if (bp_rc == DMD_OK)
+                        dmd_session_release_frame(bp_sess, &bp_frame);
+                    drv->io_busy[bp_idx] = 0;
+                    pthread_cond_broadcast(&drv->io_done);
+                    pthread_mutex_unlock(&drv->lock);
+                    free(scratch);
+                    return VA_STATUS_ERROR_INVALID_CONTEXT;
+                }
+
+                if (bp_rc != DMD_OK)
+                    break;      /* 没帧可收了，别再空转 */
+
                 VASurfaceID bp_head = dmd_pending_take_locked(c,
                                                              bp_frame.unit_seq);
                 struct dmd_surface *bp_hs = dmd_find_surface_locked(drv,
@@ -2033,9 +2081,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 if (bp_hs) {
                     surface_store_frame_locked(bp_hs, &bp_frame);
                     bp_hs->state = DMD_SURFACE_READY;
+                } else {
+                    dmd_log("EndPicture 排空: 待配对 surface %u 已销毁，"
+                            "帧被丢弃\n", (unsigned)bp_head);
                 }
                 dmd_session_release_frame(bp_sess, &bp_frame);
+                drained++;
             }
+
+            drv->io_busy[bp_idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+
+            if (drained > 0)
+                dmd_log("EndPicture: 提前排空 %d 帧（session 待取 %d/%d，"
+                        "待配对 %d）\n", drained,
+                        dmd_session_frames_pending(bp_sess), sess_cap,
+                        c->pending_count);
         }
 
         if (c->pending_count >= DMD_MAX_SURFACES) {
