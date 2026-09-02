@@ -39,6 +39,18 @@ static const VAProfile dmd_profiles[] = {
     VAProfileH264High,
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
+    /* VP8：0.4.2 重新声明。
+     *
+     * 此前不声明的理由（见下方原注释）是"驱动侧没写码流重建"，但那已经
+     * 不成立 —— decode.c 的 vp8_build_frame() 实现了 RFC 6386 §9.1 的
+     * uncompressed data chunk 合成（frame tag + key frame 的 start code
+     * 与尺寸），参数收集（VASliceParameterBufferVP8 /
+     * VAPictureParameterBufferVP8）与 build_unit 的 DMD_CODEC_VP8 分支
+     * 也都在位。缺的只是这里的声明和 dmd_profile_to_codec 的映射两道闸门。
+     *
+     * 硬件侧同样确认可用：VIDIOC_ENUM_FMT 在 /dev/video32 的 OUTPUT 侧
+     * 列出 MPG2/H264/HEVC/VP80/VP90，VP80 在列。 */
+    VAProfileVP8Version0_3,
 #ifdef DMD_ENABLE_AV1
     /* 开发/调试专用：-DDMD_ENABLE_AV1 才声明 AV1。
      * 发布版不声明（理由见下方注释），但本设备仍需要能直接测硬件链路，
@@ -121,7 +133,9 @@ int dmd_profile_to_codec(VAProfile profile)
         return DMD_CODEC_HEVC;
     case VAProfileVP9Profile0:
         return DMD_CODEC_VP9;
-    /* VP8 不映射：缺码流重建实现（硬件本身支持 VP80，详见上方更正说明）。 */
+    /* VP8：0.4.2 恢复映射，码流重建见 decode.c 的 vp8_build_frame()。 */
+    case VAProfileVP8Version0_3:
+        return DMD_CODEC_VP8;
     /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
      * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
      * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */

@@ -74,15 +74,20 @@ struct dma_heap_allocation_data {
 #define V4L2_LOG(fmt, ...) \
     fprintf(stderr, "[v4l2] " fmt "\n", ##__VA_ARGS__)
 
-/* codec_id → V4L2 fourcc。取值经 /dev/video32 的 ENUM_FMT 实测确认：
- *   [0] H264  [1] HEVC  [2] VP90  [3] HEIC  [4] AV10
- * VP8 不在驱动的枚举里，故无映射 —— 传入会返回 0，调用方据此拒绝。 */
+/* codec_id → V4L2 fourcc。
+ *
+ * 取值经本机 /dev/video32 的 VIDIOC_ENUM_FMT 实测确认，OUTPUT 侧枚举为：
+ *   [0] MPG2  [1] H264  [2] HEVC  [3] VP80  [4] VP90
+ * （driver=msm_vidc_driver card=msm_vidc_vdec）
+ *
+ * ⚠️ 0.4.2：VP8 加入映射。此前注释说"VP8 不在驱动的枚举里"，实测不成立。 */
 static uint32_t codec_to_fourcc(int codec_id)
 {
     switch (codec_id) {
     case DMD_V4L2_CODEC_H264: return V4L2_PIX_FMT_H264;
     case DMD_V4L2_CODEC_HEVC: return V4L2_PIX_FMT_HEVC;
     case DMD_V4L2_CODEC_VP9:  return V4L2_PIX_FMT_VP9;
+    case DMD_V4L2_CODEC_VP8:  return V4L2_PIX_FMT_VP8;
     case DMD_V4L2_CODEC_AV1:  return V4L2_PIX_FMT_AV1;
     default:                  return 0;
     }
@@ -868,6 +873,7 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                          ed[0], ed[1], ed[2], ed[3]);
 
                 if (!d->cap_ready && setup_capture(d) < 0) return -1;
+
 
                 /* 驱动在事件处理里无条件置 inst->in_reconfig = true
                  * （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
