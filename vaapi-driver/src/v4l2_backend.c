@@ -634,8 +634,30 @@ static int setup_capture(struct dmd_v4l2_dec *d)
         f.fmt.pix_mp.height = (unsigned)d->out_h;
     }
 
-    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-    if (xioctl(d->fd, VIDIOC_S_FMT, &f, "S_FMT(CAPTURE/NV12)") < 0) return -1;
+    /* DMD_PROBE_10BIT=1：把 CAPTURE 设成 QP10（P10 Venus，10bit 半平面）
+     * 而不是 NV12，用来判定"10bit 解不出来"是硬件/固件的限制还是驱动没实现。
+     *
+     * ⚠️ 这是**探测开关，不是功能开关**。上层（surface 分配、VAImage、
+     * export）全都假设 8bit NV12：每像素字节数、UV 平面偏移、
+     * DRM_FORMAT_NV12 都是按 8bit 写死的，所以开了它像素必然错乱。
+     * 它只回答一个问题：固件在 Main10 码流下会不会吐 CAPTURE 缓冲。 */
+    uint32_t want = V4L2_PIX_FMT_NV12;
+    const char *probe10 = getenv("DMD_PROBE_10BIT");
+    if (probe10 && (probe10[0] == '1' || probe10[0] == '2')) {
+        want = (probe10[0] == '2') ? v4l2_fourcc('Q', '1', '2', 'A')
+                                   : v4l2_fourcc('Q', 'P', '1', '0');
+        V4L2_LOG("⚠️ DMD_PROBE_10BIT=%c：CAPTURE 试设 %s（仅探测，像素会错）",
+                 probe10[0], probe10[0] == '2' ? "Q12A(TP10 UBWC)"
+                                               : "QP10(P10 Venus)");
+    }
+    f.fmt.pix_mp.pixelformat = want;
+    if (xioctl(d->fd, VIDIOC_S_FMT, &f, "S_FMT(CAPTURE)") < 0) return -1;
+    if (f.fmt.pix_mp.pixelformat != want)
+        V4L2_LOG("CAPTURE 格式被驱动改写为 %c%c%c%c",
+                 (char)(f.fmt.pix_mp.pixelformat & 0xFF),
+                 (char)((f.fmt.pix_mp.pixelformat >> 8) & 0xFF),
+                 (char)((f.fmt.pix_mp.pixelformat >> 16) & 0xFF),
+                 (char)((f.fmt.pix_mp.pixelformat >> 24) & 0xFF));
 
     d->w = (int)f.fmt.pix_mp.width;
     d->h = (int)f.fmt.pix_mp.height;
@@ -643,8 +665,17 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     d->stride = (int)f.fmt.pix_mp.plane_fmt[0].bytesperline;
     /* 覆盖过 width 时驱动可能不回填 bytesperline（实测 4K：width 改成 3840
      * 后 bytesperline 仍是 1920），stride 小于宽度会让上层按错误行距取像素。
-     * NV12 的 stride 至少等于宽度。 */
-    if (d->stride < d->w) d->stride = d->w;
+     * NV12 的 stride 至少等于宽度。
+     *
+     * ⚠️ 10bit 格式每像素 2 字节，下限是 width*2 而不是 width。
+     * 实测（Main10 1080p，CAPTURE=QP10）：固件给的 sizeimage 是 6270976，
+     * 而 3840*1088*3/2 = 6266880（差值是对齐余量），也就是说它期望
+     * stride=3840；按 8bit 钳成 1920 后几何不符，固件持续报
+     * PORT_SETTINGS(INSUFFICIENT) 且一帧不吐。 */
+    const int bpp2 = (want == v4l2_fourcc('Q', 'P', '1', '0') ||
+                      want == v4l2_fourcc('Q', '1', '2', 'A') ||
+                      want == v4l2_fourcc('P', '0', '1', '0')) ? 2 : 1;
+    if (d->stride < d->w * bpp2) d->stride = d->w * bpp2;
     /* NV12 单平面布局：Y 平面高度即 slice_height，UV 紧随其后。
      *
      * ⚠️ 不要用 sizeimage 反推。msm_vidc 的 sizeimage 含额外对齐余量，
@@ -874,6 +905,50 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
 
                 if (!d->cap_ready && setup_capture(d) < 0) return -1;
 
+                /* INSUFFICIENT 表示已配好的 CAPIURE 缓冲不满足固件要求
+                 * （典型场景：10bit 码流下每像素 2 字节，按 8bit 算出的
+                 * sizeimage 只有一半）。此时只发 SESSION_CONTINUE 是不够的
+                 * —— 缓冲几何没变，固件继续停在 reconfig 等待态，一帧不吐。
+                 *
+                 * 实测（Main10 1080p，CAPTURE 设 QP10 或 Q12A）：
+                 * 送入 8 单元、收到 0 帧，日志只有 INSUFFICIENT，
+                 * 从未出现 SUFFICIENT。
+                 *
+                 * DMD_PROBE_10BIT_RECFG=1 时在这里尝试真正的重协商。
+                 * ⚠️ 仓库既有注释记录：STREAMOFF 会把 state 打回
+                 * MSM_VIDC_START_DONE 以下并触发 SYS_ERROR。所以这条路径
+                 * 是**探测**用的，用来验证那条结论在 CAPTURE 侧是否也成立。 */
+                if (ev.type == DMD_EV_MSM_VIDC(3) && d->cap_ready) {
+                    const char *rec = getenv("DMD_PROBE_10BIT_RECFG");
+                    if (rec && rec[0] == '1' && !d->cap_recfg_tried) {
+                        d->cap_recfg_tried = 1;
+                        V4L2_LOG("⚠️ INSUFFICIENT：尝试重协商 CAPTURE"
+                                 "（探测路径）");
+                        int ct = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                        if (d->cap_streaming) {
+                            if (xioctl(d->fd, VIDIOC_STREAMOFF, &ct,
+                                       "STREAMOFF(CAPTURE)") == 0)
+                                d->cap_streaming = 0;
+                        }
+                        /* 释放旧缓冲后重新按固件报的几何配一遍。 */
+                        struct v4l2_requestbuffers rb0;
+                        memset(&rb0, 0, sizeof(rb0));
+                        rb0.type = ct;
+                        rb0.memory = V4L2_MEMORY_DMABUF;
+                        rb0.count = 0;
+                        xioctl(d->fd, VIDIOC_REQBUFS, &rb0, "REQBUFS(CAPTURE,0)");
+                        d->cap_ready = 0;
+                        d->n_cap = 0;
+                        if (setup_capture(d) < 0) {
+                            V4L2_LOG("重协商 CAPTURE 失败");
+                            return -1;
+                        }
+                        V4L2_LOG("重协商完成: %ux%u stride=%d slice=%d "
+                                 "%d 缓冲 x %u 字节",
+                                 (unsigned)d->w, (unsigned)d->h, d->stride,
+                                 d->slice_height, d->n_cap, d->cap_size);
+                    }
+                }
 
                 /* 驱动在事件处理里无条件置 inst->in_reconfig = true
                  * （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。

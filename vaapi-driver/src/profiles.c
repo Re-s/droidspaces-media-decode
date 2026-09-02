@@ -39,6 +39,14 @@ static const VAProfile dmd_profiles[] = {
     VAProfileH264High,
     VAProfileHEVCMain,
     VAProfileVP9Profile0,
+#ifdef DMD_PROBE_10BIT_PROFILES
+    /* 探测专用（-DDMD_PROBE_10BIT_PROFILES）：声明 10bit profile 好让
+     * ffmpeg 愿意把 Main10 / VP9 Profile2 码流交过来，配合运行时的
+     * DMD_PROBE_10BIT=1 判定固件是否真能解。
+     * ⚠️ 不要在发布版打开：上层像素路径全是 8bit NV12 假设，会输出错画面。 */
+    VAProfileHEVCMain10,
+    VAProfileVP9Profile2,
+#endif
     /* VP8：0.4.2 重新声明。
      *
      * 此前不声明的理由（见下方原注释）是"驱动侧没写码流重建"，但那已经
@@ -136,6 +144,13 @@ int dmd_profile_to_codec(VAProfile profile)
     /* VP8：0.4.2 恢复映射，码流重建见 decode.c 的 vp8_build_frame()。 */
     case VAProfileVP8Version0_3:
         return DMD_CODEC_VP8;
+#ifdef DMD_PROBE_10BIT_PROFILES
+    /* 探测专用：走同一个 V4L2 codec，位深由码流序列头自述。 */
+    case VAProfileHEVCMain10:
+        return DMD_CODEC_HEVC;
+    case VAProfileVP9Profile2:
+        return DMD_CODEC_VP9;
+#endif
     /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
      * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
      * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */

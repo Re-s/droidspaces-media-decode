@@ -188,6 +188,7 @@ struct dmd_v4l2_dec {
     size_t   extra_size;                      /* extradata 平面字节数 */
     struct dmd_v4l2_buf extra[DMD_V4L2_MAX_CAP];  /* extradata dmabuf */
     int      reconfig_done;                   /* 已发过 SESSION_CONTINUE */
+    int      cap_recfg_tried;                 /* 已试过 CAPTURE 重协商（探测） */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
     int      out_streaming, cap_streaming;
     int      draining;                        /* 已送 EOS，等剩余帧 */
