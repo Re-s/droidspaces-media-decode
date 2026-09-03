@@ -57,11 +57,12 @@ enum {
  * ⚠️ 仍然只能在末尾追加、不可重排：这些值散布在 profiles.c 的能力表与
  * dmd_v4l2_session.c 的格式映射里，重排不会报错但会静默解错码。 */
 enum {
-    DMD_CODEC_H264 = 0,
-    DMD_CODEC_HEVC = 1,
-    DMD_CODEC_VP9  = 2,
-    DMD_CODEC_VP8  = 3,
-    DMD_CODEC_AV1  = 4
+    DMD_CODEC_H264  = 0,
+    DMD_CODEC_HEVC  = 1,
+    DMD_CODEC_VP9   = 2,
+    DMD_CODEC_VP8   = 3,
+    DMD_CODEC_AV1   = 4,
+    DMD_CODEC_MPEG2 = 5   /* 0.4.2 追加：硬件 ENUM_FMT 列出 MPG2 */
 };
 
 /* 帧数据传输模式 */
@@ -247,6 +248,23 @@ int dmd_session_fd(const struct dmd_session *s);
 /* 统计：送入的数据单元数 / 取出的帧数 */
 uint64_t dmd_session_units_sent(const struct dmd_session *s);
 uint64_t dmd_session_frames_received(const struct dmd_session *s);
+
+/* 已解好、在 session 待取队列里等调用方来拿的帧数，以及该队列容量。
+ *
+ * 为什么需要暴露它：session 的待取队列（容量 = CAPTURE 缓冲数 24）比驱动
+ * 侧的待配对队列（DMD_MAX_SURFACES = 64）小得多。队列里每一帧都占着一个
+ * 未归还的 CAPTURE 缓冲，占满时 msm_vidc 无处写新帧、连输入缓冲也不再
+ * 回收，send_unit 于是永久背压。
+ *
+ * 后果是驱动侧那条 `pending_count >= DMD_MAX_SURFACES` 的背压保护**永远
+ * 等不到触发**：64 > 24，session 早在它之前就锁死了。实测（ffmpeg
+ * `-hwaccel_output_format vaapi -f null -`，消费者全程不调 vaSyncSurface /
+ * vaExportSurfaceHandle）：36 次 EndPicture 提交、0 次取帧，日志刷
+ * "背压超时: pend=24/24 OUTPUT在驱动=8/8 CAPTURE在驱动=0/24" 后挂死。
+ *
+ * 驱动侧据此改为按 session 队列水位提前排空，而不是等自己的队列满。 */
+int dmd_session_frames_pending(const struct dmd_session *s);
+int dmd_session_pending_capacity(const struct dmd_session *s);
 
 #ifdef __cplusplus
 }

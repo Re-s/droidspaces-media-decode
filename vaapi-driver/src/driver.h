@@ -38,7 +38,11 @@
  * 四项私有协议要求（SECONDARY 分流模式 / 私有事件订阅 / SESSION_CONTINUE /
  * O_NONBLOCK），缓冲传递改为 USERPTR + plane.reserved[0]。
  * 五个码流整流 MD5 与 ffmpeg 软解逐字节一致。详见 CHANGELOG。 */
-#define DMD_DRIVER_VERSION "0.4.1"
+/* 0.4.2：新增 VP8 硬解（90/90 帧 md5 与软解逐字节一致）；修复消费者不逐帧
+ * 取帧时的 CAPTURE 背压死锁（`-f null` 场景由 40s 挂死变 3s 正常退出）。
+ * 10bit 与 MPEG-2 经实测判定受固件限制，实现置于编译开关后不声明。
+ * 详见 CHANGELOG。 */
+#define DMD_DRIVER_VERSION "0.4.2"
 #define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " DMD_DRIVER_VERSION
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。
@@ -299,6 +303,18 @@ struct dmd_context {
     VASliceParameterBufferVP8 vp8_slice_param;
     int have_vp8_pic_param;
     VAPictureParameterBufferVP8 vp8_pic_param;
+
+    /* MPEG-2：sequence/picture header 只存在于 pic param 与 IQ matrix 里，
+     * slice data 只有 slice 层字节，必须反向合成（见 mpeg2_bitstream.c）。 */
+    int have_mpeg2_pic_param;
+    VAPictureParameterBufferMPEG2 mpeg2_pic_param;
+    int have_mpeg2_iq_matrix;
+    VAIQMatrixBufferMPEG2 mpeg2_iq_matrix;
+    /* temporal_reference 按提交序自增（模 1024）。MPEG-2 的这个字段只用于
+     * 显示序标识，解码器不靠它做参考帧管理，所以自增即可。 */
+    unsigned int mpeg2_temporal_ref;
+    /* sequence header 只在首帧与分辨率变化时送，与 param_sets_sent 同理。 */
+    int mpeg2_seq_sent;
 
     /* AV1：合成 OBU 需要两样东西 ——
      *   1) pic param 的结构化字段：序列头与帧头**只存在于这里**，

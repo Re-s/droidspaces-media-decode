@@ -38,11 +38,15 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 | H.264 | ✅ Working | 300/300 frames, md5 byte-identical to software |
 | HEVC Main | ✅ Working | 12/12 frames, md5 byte-identical to software |
 | VP9 Profile 0 | ✅ Working | 50/50 frames, md5 byte-identical to software |
+| VP8 | ✅ Working | 90/90 frames, md5 byte-identical to software (new in 0.4.2) |
 | AV1 Profile 0 | 🚧 Incomplete | Frame count matches dav1d, **pixels do not**; not advertised by default |
-| VP8 | ❌ Unsupported | msm_vidc's V4L2 layer has no VP80 format — no hardware path exists |
+| MPEG-2 | 🚧 Incomplete | Synthesis is byte-identical to the original stream, but firmware raises `SYS_ERROR`; not advertised by default |
+| HEVC Main10 / VP9 Profile2 | ❌ Firmware limit | Firmware recognises 10-bit but keeps reporting `INSUFFICIENT` and emits no frames |
 
 AV1 is only advertised when built with `-DDMD_ENABLE_AV1`; see
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) for the outstanding defects.
+MPEG-2 requires `-DDMD_ENABLE_MPEG2`; for the 10-bit probe switches see
+v0.4.2 in `CHANGELOG.md`.
 
 > One class of HEVC stream cannot be supported: those whose SPS carries
 > `st_ref_pic_set` (`num_short_term_ref_pic_sets > 0`). VA-API exposes only the
@@ -86,9 +90,25 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
   -hwaccel_output_format vaapi -i in.mp4 -f null -
 ```
 
-> ⚠️ **Do not use `vainfo` to test this.** It hangs on this platform even when
-> pointed at a nonexistent driver name, so a hang tells you nothing about the
-> driver. Use the ffmpeg command above.
+> ⚠️ **On 0.4.1 and earlier this command hangs** (`internal decoding error`
+> after 26 frames, ~40s timeout). That was the CAPTURE back-pressure deadlock,
+> fixed in 0.4.2. On older builds it will make you misdiagnose the driver as
+> broken — use the file-writing form instead:
+> `... -i in.mp4 -pix_fmt yuv420p -f rawvideo out.yuv -y`.
+
+> ⚠️ Correction (0.4.1): an earlier revision of this file said `vainfo` hangs on
+> this platform. That is no longer true — `vainfo` works and reports the driver
+> version and profile list. It still only proves the driver loads: the profile
+> list is a **static declaration** and does not prove frames come out.
+
+To confirm the hardware is really decoding, check the Venus kernel state
+(these values cannot be forged from user space):
+
+```sh
+# mvs0_gdsc should read enabled while decoding, disabled when idle
+for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
+  [ "$(cat $r/name)" = mvs0_gdsc ] && echo "mvs0_gdsc=$(cat $r/state)"; done
+```
 
 Debug logging: `DMD_VA_LOG=1`.
 

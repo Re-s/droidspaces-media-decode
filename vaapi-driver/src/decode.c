@@ -32,6 +32,7 @@
 
 #include "driver.h"
 #include "av1_bitstream.h"
+#include "mpeg2_bitstream.h"
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
@@ -1074,6 +1075,10 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
     c->av1_tile_count = 0;   /* tile 边界随帧重置，与 slice_len 同生命周期 */
     c->have_vp8_slice_param = 0;
     c->have_vp8_pic_param = 0;
+    /* MPEG-2 的 pic param / IQ matrix 是逐帧下发的，与 slice_len 同生命周期。
+     * mpeg2_seq_sent / mpeg2_temporal_ref 是**跨帧**状态，不能在这里清。 */
+    c->have_mpeg2_pic_param = 0;
+    c->have_mpeg2_iq_matrix = 0;
 
     s->state = DMD_SURFACE_PENDING;
     s->decode_status = VA_STATUS_SUCCESS;
@@ -1205,6 +1210,13 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->vp8_pic_param, b->data,
                        sizeof(VAPictureParameterBufferVP8));
                 c->have_vp8_pic_param = 1;
+            } else if (c->codec == DMD_CODEC_MPEG2 &&
+                       b->size >= sizeof(VAPictureParameterBufferMPEG2)) {
+                /* MPEG-2：sequence_header 与 picture_header 的全部内容都在
+                 * 这里（尺寸、picture_coding_type、f_code、各扩展标志位）。 */
+                memcpy(&c->mpeg2_pic_param, b->data,
+                       sizeof(VAPictureParameterBufferMPEG2));
+                c->have_mpeg2_pic_param = 1;
             } else if (c->codec == DMD_CODEC_HEVC &&
                        b->size >= sizeof(VAPictureParameterBufferHEVC)) {
                 /* 用途同 H.264：合成 VPS/SPS/PPS，并取 POC 供配对回退路径用。
@@ -1237,6 +1249,20 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
             break;
 
         case VAIQMatrixBufferType:
+            /* ⚠️ MPEG-2 是例外：它的量化矩阵**不在** slice data 里。
+             * VA-API 把 sequence_header 的 load_*_quantiser_matrix 与矩阵
+             * 内容都搬到了 VAIQMatrixBufferMPEG2，slice data 只从 slice 层
+             * 开始。合成 sequence_header 时必须把矩阵写回去，否则用默认
+             * 矩阵解非默认矩阵的码流 → 残差反量化全错、画面可解但不正确。
+             * 其余 codec（H.264/HEVC）的矩阵仍在码流字节里，照旧忽略。 */
+            if (c->codec == DMD_CODEC_MPEG2 &&
+                b->size >= sizeof(VAIQMatrixBufferMPEG2)) {
+                memcpy(&c->mpeg2_iq_matrix, b->data,
+                       sizeof(VAIQMatrixBufferMPEG2));
+                c->have_mpeg2_iq_matrix = 1;
+            }
+            break;
+
         case VAProbabilityBufferType:
         case VAHuffmanTableBufferType:
             /* V4L2 侧是完整的硬件解码器，这些表都在码流里，
@@ -1643,6 +1669,74 @@ static const unsigned char *build_unit(struct dmd_context *c,
         return buf;
     }
 
+    case DMD_CODEC_MPEG2: {
+        /* 组装顺序（13818-2 §6.1.1 的层次）：
+         *   [sequence_header + sequence_extension]   ← 仅首帧/尺寸变化时
+         *   picture_header + picture_coding_extension ← 每帧
+         *   slice 层字节（VA 给的 slice data，已含 slice_start_code）
+         *
+         * ⚠️ slice data 里是否含起始码：VA-API 规范未强制，实测 ffmpeg 的
+         * vaapi_mpeg2.c 传的是从 slice_start_code(00 00 01 01..AF) 起的
+         * 完整 slice。所以这里不补起始码，直接拼接。若某消费者不带，
+         * 表现是解码器找不到 slice → 无输出，而不是坏画面。 */
+        if (!c->have_mpeg2_pic_param)
+            return NULL;
+        if (!dmd_mpeg2_can_build(&c->mpeg2_pic_param))
+            return NULL;
+
+        /* 头部上限：sequence_header 最多 12 字节 + 4 组 64 字节矩阵
+         * + sequence_extension 10 字节 + picture 头 ~16 字节，取 320 宽裕。 */
+        unsigned char hdr[320];
+        size_t hn = 0;
+
+        const unsigned int w = c->mpeg2_pic_param.horizontal_size;
+        const unsigned int h = c->mpeg2_pic_param.vertical_size;
+        if (!c->mpeg2_seq_sent || c->sent_mbs_wide != w ||
+            c->sent_mbs_high != h) {
+            size_t sn = dmd_mpeg2_build_sequence(
+                &c->mpeg2_pic_param,
+                c->have_mpeg2_iq_matrix ? &c->mpeg2_iq_matrix : NULL,
+                hdr, sizeof(hdr));
+            if (sn == 0)
+                return NULL;
+            hn = sn;
+            c->mpeg2_seq_sent = 1;
+            c->sent_mbs_wide = w;
+            c->sent_mbs_high = h;
+        }
+
+        size_t pn = dmd_mpeg2_build_picture(&c->mpeg2_pic_param,
+                                            c->mpeg2_temporal_ref,
+                                            hdr + hn, sizeof(hdr) - hn);
+        if (pn == 0)
+            return NULL;
+        hn += pn;
+        c->mpeg2_temporal_ref = (c->mpeg2_temporal_ref + 1) & 0x3FF;
+
+        unsigned char *buf = malloc(hn + c->slice_len);
+        if (!buf)
+            return NULL;
+        memcpy(buf, hdr, hn);
+        memcpy(buf + hn, c->slice_data, c->slice_len);
+
+        /* DMD_MPEG2_DUMP=<路径>：把合成结果按送出顺序追加落盘。
+         * 合成正确性无法在设备上直接判断（解不出帧不告诉你哪一位错了），
+         * 唯一可靠的验证是把落盘文件喂给参考解码器（ffmpeg/mpeg2dec）
+         * 看它能否解出与软解一致的画面 —— 与 AV1 的 DMD_AV1_DUMP 同思路。 */
+        const char *mp2dump = getenv("DMD_MPEG2_DUMP");
+        if (mp2dump && mp2dump[0]) {
+            FILE *df = fopen(mp2dump, "ab");
+            if (df) {
+                fwrite(buf, 1, hn + c->slice_len, df);
+                fclose(df);
+            }
+        }
+
+        *scratch = buf;
+        *out_len = hn + c->slice_len;
+        return buf;
+    }
+
     case DMD_CODEC_H264: {
         /* slice data 是**完整原始 NALU**（含 NAL header 与 slice header），
          * 只缺起始码。已核实：h264dec.c:674 传 nal->raw_data/raw_size，
@@ -1999,33 +2093,80 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * ⚠️ 只收一帧，收够就走。曾试过在这里循环收光，那会替消费者把帧全
      * 收走（实测配对 1651 次而 Chrome 只导出 24 帧，帧率反跌到 1 fps）。
      * 也试过把队列放大到 256，只是把症状推后（送入 67 → 259）而未解决。 */
-    if (c->pending_count >= DMD_MAX_SURFACES) {
+    /* ⚠️ 0.4.2：触发条件不能只看驱动侧队列。
+     *
+     * session 的待取队列容量是 CAPTURE 缓冲数（DMD_V4L2_MAX_CAP = 24），
+     * 远小于这里的 DMD_MAX_SURFACES = 64。队列里每一帧都扣着一个未归还的
+     * CAPTURE 缓冲，占满 24 时 msm_vidc 无处写帧、输入缓冲也停止回收，
+     * send_unit 陷入永久背压 —— 也就是说 `pending_count >= 64` 这个条件
+     * **永远等不到**，保护形同虚设。
+     *
+     * 实测（ffmpeg `-hwaccel_output_format vaapi -f null -`，消费者全程不调
+     * vaSyncSurface / vaExportSurfaceHandle）：36 次提交、0 次取帧，日志刷
+     * "背压超时: pend=24/24 OUTPUT在驱动=8/8 CAPTURE在驱动=0/24" 后挂死，
+     * 40s 超时退出。同一条流用 `-f rawvideo` 落盘则 150/150 正常 —— 那条
+     * 路径每帧立即 vaSyncSurface，队列从不积压，所以侥幸不触发。
+     *
+     * 所以改成看 session 水位：到容量的 3/4 就开始排空。 */
+    struct dmd_session *bp_sess0 = c->session;
+    const int sess_cap = bp_sess0 ? dmd_session_pending_capacity(bp_sess0) : 0;
+    const int sess_hi  = sess_cap > 0 ? (sess_cap * 3) / 4 : 0;
+    const int sess_backlogged =
+        bp_sess0 && sess_hi > 0 &&
+        dmd_session_frames_pending(bp_sess0) >= sess_hi;
+
+    if (c->pending_count >= DMD_MAX_SURFACES || sess_backlogged) {
         struct dmd_session *bp_sess = c->session;
         int bp_idx = (int)(c - drv->contexts);
 
         if (bp_sess && !drv->io_busy[bp_idx]) {
             drv->io_busy[bp_idx] = 1;
-            pthread_mutex_unlock(&drv->lock);
 
-            struct dmd_frame bp_frame;
-            memset(&bp_frame, 0, sizeof(bp_frame));
-            int bp_rc = dmd_session_next_frame(bp_sess, &bp_frame,
-                                               DMD_BACKPRESSURE_MS);
+            /* ⚠️ 收多少帧是这里的关键权衡，两个方向都踩过：
+             *
+             * 只收 1 帧（0.4.1 的做法）：session 队列已满时根本救不回来 ——
+             * 每次 EndPicture 收 1 帧、又立刻压回 1 帧，水位不降，死锁维持。
+             *
+             * 循环收光：会替消费者把帧全收走。仓库注释记录的实测是
+             * "配对 1651 次而 Chrome 只导出 24 帧，帧率反跌到 1 fps"。
+             *
+             * 折中：收到水位降回一半（sess_cap/2）就停，给消费者留一半
+             * 队列深度。这样既打破死锁，也不抢走消费者该拿的帧。 */
+            const int drain_to = sess_cap / 2;
+            int drained = 0;
 
-            pthread_mutex_lock(&drv->lock);
-            drv->io_busy[bp_idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
+            for (;;) {
+                if (dmd_session_frames_pending(bp_sess) <= drain_to &&
+                    c->pending_count < DMD_MAX_SURFACES)
+                    break;
+                /* 上限兜底：单次 EndPicture 最多排 sess_cap 帧，
+                 * 避免异常情况下在这里长时间打转。 */
+                if (drained >= sess_cap)
+                    break;
 
-            c = dmd_find_context_locked(drv, context);
-            if (!c) {
-                if (bp_rc == DMD_OK)
-                    dmd_session_release_frame(bp_sess, &bp_frame);
                 pthread_mutex_unlock(&drv->lock);
-                free(scratch);
-                return VA_STATUS_ERROR_INVALID_CONTEXT;
-            }
 
-            if (bp_rc == DMD_OK) {
+                struct dmd_frame bp_frame;
+                memset(&bp_frame, 0, sizeof(bp_frame));
+                int bp_rc = dmd_session_next_frame(bp_sess, &bp_frame,
+                                                   DMD_BACKPRESSURE_MS);
+
+                pthread_mutex_lock(&drv->lock);
+
+                c = dmd_find_context_locked(drv, context);
+                if (!c) {
+                    if (bp_rc == DMD_OK)
+                        dmd_session_release_frame(bp_sess, &bp_frame);
+                    drv->io_busy[bp_idx] = 0;
+                    pthread_cond_broadcast(&drv->io_done);
+                    pthread_mutex_unlock(&drv->lock);
+                    free(scratch);
+                    return VA_STATUS_ERROR_INVALID_CONTEXT;
+                }
+
+                if (bp_rc != DMD_OK)
+                    break;      /* 没帧可收了，别再空转 */
+
                 VASurfaceID bp_head = dmd_pending_take_locked(c,
                                                              bp_frame.unit_seq);
                 struct dmd_surface *bp_hs = dmd_find_surface_locked(drv,
@@ -2033,9 +2174,22 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 if (bp_hs) {
                     surface_store_frame_locked(bp_hs, &bp_frame);
                     bp_hs->state = DMD_SURFACE_READY;
+                } else {
+                    dmd_log("EndPicture 排空: 待配对 surface %u 已销毁，"
+                            "帧被丢弃\n", (unsigned)bp_head);
                 }
                 dmd_session_release_frame(bp_sess, &bp_frame);
+                drained++;
             }
+
+            drv->io_busy[bp_idx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+
+            if (drained > 0)
+                dmd_log("EndPicture: 提前排空 %d 帧（session 待取 %d/%d，"
+                        "待配对 %d）\n", drained,
+                        dmd_session_frames_pending(bp_sess), sess_cap,
+                        c->pending_count);
         }
 
         if (c->pending_count >= DMD_MAX_SURFACES) {

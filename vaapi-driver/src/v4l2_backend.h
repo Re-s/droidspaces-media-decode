@@ -141,16 +141,20 @@
 
 /* 与 decode-daemon.c 的 CodecId 对应（wire id，追加式，不可重排）。
  *
- * VP8 不在此列：驱动侧缺码流重建实现。
- * ⚠️ 第 80 轮实测更正：硬件**支持** VP80（ENUM_FMT 列出 MPG2/H264/HEVC/VP80/VP90），
- * Android 上它一直是靠 c2.android.vp8.decoder 软解。既然整体切到 V4L2，
- * VP8 就没有硬件路径可走，明确放弃。 */
+ * ⚠️ 0.4.2 更正：VP8 恢复启用，编号 3 就是它原本的号（不是新占号）。
+ * 此前两条否定理由都不成立：
+ *   - "硬件没有 VP80 格式" —— 错，ENUM_FMT 实测列出
+ *     MPG2/H264/HEVC/VP80/VP90，VP80 在列；
+ *   - "驱动侧缺码流重建" —— 也不成立，decode.c 的 vp8_build_frame()
+ *     已实现 RFC 6386 §9.1 的 uncompressed data chunk 合成。
+ * 缺的只是 profiles.c 的声明、映射，与 codec_to_fourcc 的 VP80 一项。 */
 enum {
     DMD_V4L2_CODEC_H264 = 0,
     DMD_V4L2_CODEC_HEVC = 1,
     DMD_V4L2_CODEC_VP9  = 2,
-    /* 3 = VP8，已废弃，保留编号不复用 */
+    DMD_V4L2_CODEC_VP8  = 3,
     DMD_V4L2_CODEC_AV1  = 4,
+    DMD_V4L2_CODEC_MPEG2 = 5,
 };
 
 #define DMD_V4L2_MAX_OUT 8    /* 输入（码流）缓冲数 */
@@ -185,6 +189,7 @@ struct dmd_v4l2_dec {
     size_t   extra_size;                      /* extradata 平面字节数 */
     struct dmd_v4l2_buf extra[DMD_V4L2_MAX_CAP];  /* extradata dmabuf */
     int      reconfig_done;                   /* 已发过 SESSION_CONTINUE */
+    int      cap_recfg_tried;                 /* 已试过 CAPTURE 重协商（探测） */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
     int      out_streaming, cap_streaming;
     int      draining;                        /* 已送 EOS，等剩余帧 */
