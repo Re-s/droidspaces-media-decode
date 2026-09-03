@@ -43,6 +43,10 @@
 
 /* msm_vidc 私有命令（videodev2.h:1991）：让 in_reconfig 生效后继续会话。 */
 #define DMD_V4L2_QCOM_CMD_SESSION_CONTINUE  5
+/* 私有 flush 命令。in_reconfig 期间只能 flush CAPTURE（厂商 OMX
+ * execute_omx_flush 同样如此），flush 输入侧会丢掉已排队的 ETB。 */
+#define DMD_V4L2_QCOM_CMD_FLUSH             4
+#define DMD_V4L2_QCOM_CMD_FLUSH_CAPTURE     (1 << 1)
 
 #ifndef V4L2_PIX_FMT_AV1
 #define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '1', '0')
@@ -364,6 +368,7 @@ int dmd_v4l2_probe(int codec_id)
 }
 
 static int setup_capture(struct dmd_v4l2_dec *d);
+static int cap_reconfig(struct dmd_v4l2_dec *d);
 
 /* ------------------------------------------------------------------- open */
 
@@ -573,11 +578,14 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
         }
     }
 
-    /* 顺序很关键：msm_vidc.c:1294-1302 里第一个 STREAMON 因对侧未 streaming
-     * 而跳过 start_streaming()（假通过），第二个才真正执行全部校验。
-     * SECONDARY 模式下不需要等 SOURCE_CHANGE 才配 CAPTURE ——
-     * G_FMT(CAPTURE) 在 session_init 后就能给出正确的 1920x1088，
-     * 所以两侧都先配好，再让 STREAMON(OUTPUT) 触发校验。 */
+    /* 顺序照厂商 OMX 组件（omx_vdec_v4l2.cpp）：CAPTURE 先配好并 STREAMON，
+     * 再喂 SPS/PPS，最后 STREAMON(OUTPUT)。
+     * ⚠️ 下游 msm_vidc **不是**标准 stateful 模型 —— 内核里
+     * V4L2_EVENT_SOURCE_CHANGE 零命中，只有私有 PORT_SETTINGS_*，
+     * 所以不能照 FFmpeg/GStreamer 那样"等事件再配 CAPTURE"（本会话实测：
+     * 延后 CAPTURE 只会让固件在解析序列头时无 OPB 可用）。
+     * 安全性来自双端 gating：msm_vidc.c:1300-1313 里第一个 STREAMON 因对侧
+     * 未 streaming 而跳过 start_streaming()，HFI session 在第二个才启动。 */
     if (setup_capture(d) < 0) {
         V4L2_LOG("CAPTURE 配置失败");
         goto fail;
@@ -812,6 +820,111 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     return 0;
 }
 
+/* --------------------------------------------- INSUFFICIENT 后重配 CAPTURE */
+
+/*
+ * 收到 PORT_SETTINGS_CHANGED_INSUFFICIENT 后按厂商正规序列重配 OPB。
+ * 只动 CAPTURE：OUTPUT 全程保持 streaming，否则 session 被拆、已排队的
+ * ETB 全部丢失（msm_vidc.c 的 msm_vidc_streamoff 用 in_reconfig 守卫）。
+ *
+ * 返回 0 成功（CAPTURE 已按新几何重新 STREAMON），-1 失败。
+ */
+static int cap_reconfig(struct dmd_v4l2_dec *d)
+{
+    int ct = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    d->cap_recfg_count++;
+    V4L2_LOG("INSUFFICIENT：开始重配 CAPTURE 第 %d 次（当前 %dx%d stride=%d "
+             "%d 缓冲 x %u 字节）",
+             d->cap_recfg_count, d->w, d->h, d->stride, d->n_cap, d->cap_size);
+
+    /* 1) 只 flush CAPTURE。固件必须先把所有 OPB 交还，否则后面的
+     *    STREAMON 会 EINVAL（本会话实测）。厂商 OMX 在 in_reconfig 时
+     *    同样只置 FLUSH_CAPTURE，不碰输入侧。 */
+    struct v4l2_decoder_cmd fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.cmd = DMD_V4L2_QCOM_CMD_FLUSH;
+    fc.flags = DMD_V4L2_QCOM_CMD_FLUSH_CAPTURE;
+    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &fc) < 0)
+        V4L2_LOG("FLUSH_CAPTURE 失败（继续尝试排空）: %s", strerror(errno));
+
+    /* 2) 把固件交还的 CAPTURE 缓冲全部 DQ 掉，并等 FLUSH_DONE。
+     *    设备是 O_NONBLOCK，这里用短 poll 分片等，最多约 500ms。 */
+    int flush_done = 0;
+    for (int i = 0; i < 50 && !flush_done; i++) {
+        for (;;) {
+            struct v4l2_buffer v;
+            struct v4l2_plane p[VIDEO_MAX_PLANES];
+            memset(&v, 0, sizeof(v));
+            memset(p, 0, sizeof(p));
+            v.type = ct;
+            v.memory = V4L2_MEMORY_USERPTR;
+            v.m.planes = p;
+            v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
+            if (ioctl(d->fd, VIDIOC_DQBUF, &v) < 0) break;
+            if (v.index < (unsigned)d->n_cap) d->cap[v.index].queued = 0;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = d->fd;
+        pfd.events = POLLPRI | POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 10) <= 0) continue;
+        if (!(pfd.revents & POLLPRI)) continue;
+
+        struct v4l2_event ev;
+        memset(&ev, 0, sizeof(ev));
+        while (ioctl(d->fd, VIDIOC_DQEVENT, &ev) == 0) {
+            if (ev.type == DMD_EV_MSM_VIDC(1)) {
+                flush_done = 1;
+            } else if (ev.type == DMD_EV_MSM_VIDC(5)) {
+                V4L2_LOG("重配中收到 SYS_ERROR");
+                return -1;
+            }
+            memset(&ev, 0, sizeof(ev));
+        }
+    }
+    V4L2_LOG("重配：FLUSH_DONE %s", flush_done ? "已收到" : "未收到（继续）");
+
+    /* 3) STREAMOFF + REQBUFS(0)。memory 必须与申请时一致（USERPTR，
+     *    dma-buf fd 走 plane.reserved[0]）。 */
+    if (d->cap_streaming) {
+        if (xioctl(d->fd, VIDIOC_STREAMOFF, &ct, "STREAMOFF(CAPTURE)") < 0)
+            return -1;
+        d->cap_streaming = 0;
+    }
+
+    struct v4l2_requestbuffers rb0;
+    memset(&rb0, 0, sizeof(rb0));
+    rb0.type = ct;
+    rb0.memory = V4L2_MEMORY_USERPTR;
+    rb0.count = 0;
+    if (xioctl(d->fd, VIDIOC_REQBUFS, &rb0, "REQBUFS(CAPTURE,0)") < 0)
+        return -1;
+
+    /* 4) 内核已解除对 dma-buf 的引用，此时才可关 fd/解映射。
+     *    在 REQBUFS(0) 之前释放会让异步硬件 DMA 到已释放内存。 */
+    bufs_free(d->cap, DMD_V4L2_MAX_CAP);
+    bufs_free(d->extra, DMD_V4L2_MAX_CAP);
+    d->cap_ready = 0;
+    d->n_cap = 0;
+
+    /* 5) 按固件的新几何重配并 STREAMON —— 内核在这次 STREAMON 里
+     *    自动下发 session_continue，恢复对已排队 ETB 的解码。 */
+    if (setup_capture(d) < 0) return -1;
+
+    /* 6) 兜底：若内核这一代没在 STREAMON 里 continue，补发一次。
+     *    msm_comm_session_continue() 对非 in_reconfig 状态是安全 no-op。 */
+    struct v4l2_decoder_cmd dc;
+    memset(&dc, 0, sizeof(dc));
+    dc.cmd = DMD_V4L2_QCOM_CMD_SESSION_CONTINUE;
+    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &dc) == 0)
+        V4L2_LOG("重配完成并已补发 SESSION_CONTINUE");
+    else
+        V4L2_LOG("重配完成（SESSION_CONTINUE 补发返回 %s）", strerror(errno));
+    return 0;
+}
+
 /* ------------------------------------------------------------------- send */
 
 /* 回收所有已完成的 OUTPUT 缓冲，让它们可被复用。 */
@@ -943,77 +1056,58 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
             if (ev.type == DMD_EV_MSM_VIDC(2) || ev.type == DMD_EV_MSM_VIDC(3) ||
                 ev.type == V4L2_EVENT_SOURCE_CHANGE) {
                 const unsigned *ed = (const unsigned *)ev.u.data;
-                V4L2_LOG("PORT_SETTINGS%s: h=%u w=%u bitdepth=%u picstruct=%u",
+                /* payload 布局跨代不兼容（8998 与 sm8150 的 word 含义不同），
+                 * 所以除了按本机布局解出 h/w，其余原样打印。
+                 * ev.u.data 是 64 字节，最多 16 个 u32。 */
+                V4L2_LOG("PORT_SETTINGS%s: h=%u w=%u bitdepth=%u picstruct=%u "
+                         "raw=[%08x %08x %08x %08x %08x %08x %08x %08x "
+                         "%08x %08x %08x %08x]",
                          ev.type == DMD_EV_MSM_VIDC(3) ? "(INSUFFICIENT)"
                                                        : "(SUFFICIENT)",
-                         ed[0], ed[1], ed[2], ed[3]);
+                         ed[0], ed[1], ed[2], ed[3],
+                         ed[0], ed[1], ed[2], ed[3],
+                         ed[4], ed[5], ed[6], ed[7],
+                         ed[8], ed[9], ed[10], ed[11]);
 
                 if (!d->cap_ready && setup_capture(d) < 0) return -1;
 
-                /* INSUFFICIENT 表示已配好的 CAPIURE 缓冲不满足固件要求
-                 * （典型场景：10bit 码流下每像素 2 字节，按 8bit 算出的
-                 * sizeimage 只有一半）。此时只发 SESSION_CONTINUE 是不够的
-                 * —— 缓冲几何没变，固件继续停在 reconfig 等待态，一帧不吐。
+                /* INSUFFICIENT：固件要求重配 OPB。厂商 OMX
+                 * （omx_vdec_v4l2.cpp execute_omx_flush / PortDisable）的正规
+                 * 序列是：
+                 *   DECODER_CMD{FLUSH, FLUSH_CAPTURE}
+                 *   → 等 FLUSH_DONE，固件交还全部 OPB
+                 *   → STREAMOFF(CAPTURE) → REQBUFS(CAPTURE,0)
+                 *   → 按新几何重配 → STREAMON(CAPTURE)
+                 * 内核在这次 STREAMON 里自动下发 session_continue
+                 * （msm_vidc.c:1240-1252 的权威注释）。
                  *
-                 * 实测（Main10 1080p，CAPTURE 设 QP10 或 Q12A）：
-                 * 送入 8 单元、收到 0 帧，日志只有 INSUFFICIENT，
-                 * 从未出现 SUFFICIENT。
+                 * ⚠️ reconfig 期间只能动 CAPTURE：msm_vidc_streamoff() 用
+                 * `if (!inst->in_reconfig)` 守卫，所以此时的 STREAMOFF 不会拆
+                 * session；但 STREAMOFF(OUTPUT)/REQBUFS(OUTPUT,0) 会走
+                 * RELEASE_RESOURCES_DONE，已排队的 ETB 全丢。
                  *
-                 * DMD_PROBE_10BIT_RECFG=1 时在这里尝试真正的重协商。
-                 * ⚠️ 仓库既有注释记录：STREAMOFF 会把 state 打回
-                 * MSM_VIDC_START_DONE 以下并触发 SYS_ERROR。所以这条路径
-                 * 是**探测**用的，用来验证那条结论在 CAPTURE 侧是否也成立。 */
+                 * ⚠️ 本会话实测：跳过 FLUSH 直接 STREAMOFF 时，24 个 OPB 仍在
+                 * 固件手里，随后的 STREAMON(CAPTURE) 恒 EINVAL 并连锁
+                 * SYS_ERROR。缺的就是这一步 flush。 */
                 if (ev.type == DMD_EV_MSM_VIDC(3) && d->cap_ready) {
-                    const char *rec = getenv("DMD_PROBE_10BIT_RECFG");
-                    if (rec && rec[0] == '1' && !d->cap_recfg_tried) {
-                        d->cap_recfg_tried = 1;
-                        V4L2_LOG("⚠️ INSUFFICIENT：尝试重协商 CAPTURE"
-                                 "（探测路径）");
-                        int ct = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                        if (d->cap_streaming) {
-                            if (xioctl(d->fd, VIDIOC_STREAMOFF, &ct,
-                                       "STREAMOFF(CAPTURE)") == 0)
-                                d->cap_streaming = 0;
-                        }
-                        /* 释放旧缓冲后重新按固件报的几何配一遍。 */
-                        struct v4l2_requestbuffers rb0;
-                        memset(&rb0, 0, sizeof(rb0));
-                        rb0.type = ct;
-                        rb0.memory = V4L2_MEMORY_DMABUF;
-                        rb0.count = 0;
-                        xioctl(d->fd, VIDIOC_REQBUFS, &rb0, "REQBUFS(CAPTURE,0)");
-                        d->cap_ready = 0;
-                        d->n_cap = 0;
-                        if (setup_capture(d) < 0) {
-                            V4L2_LOG("重协商 CAPTURE 失败");
-                            return -1;
-                        }
-                        V4L2_LOG("重协商完成: %ux%u stride=%d slice=%d "
-                                 "%d 缓冲 x %u 字节",
-                                 (unsigned)d->w, (unsigned)d->h, d->stride,
-                                 d->slice_height, d->n_cap, d->cap_size);
+                    if (cap_reconfig(d) < 0) {
+                        V4L2_LOG("CAPTURE 重配失败，交由上层重建会话");
+                        return -1;
                     }
-                }
-
-                /* 驱动在事件处理里无条件置 inst->in_reconfig = true
-                 * （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
-                 * msm_comm_session_continue() 只有两个调用点：
-                 *   1. start_streaming() 内 (msm_vidc.c:1244)
-                 *   2. msm_vidc_comm_cmd() 的 V4L2_QCOM_CMD_SESSION_CONTINUE
-                 *      分支 (msm_vidc_common.c:4155)
-                 * 走 (1) 需要重跑 STREAMON，实测必然触发 SYS_ERROR
-                 * （STREAMOFF 把 state 打回 MSM_VIDC_START_DONE 以下）。
-                 * 走 (2) 才是正解：不动队列状态。 */
-                if (!d->reconfig_done) {
+                } else {
+                    /* SUFFICIENT：几何未变，只需让固件离开 in_reconfig。
+                     * 每个事件都要发 —— sm8150 一代内核不再自动 continue，
+                     * 且 Firefox seek/ABR 会在同一 fd 上反复触发，
+                     * 用会话级闩锁会让固件永久卡在等 FBD。 */
                     struct v4l2_decoder_cmd dc;
                     memset(&dc, 0, sizeof(dc));
                     dc.cmd = DMD_V4L2_QCOM_CMD_SESSION_CONTINUE;
-                    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &dc) == 0) {
-                        d->reconfig_done = 1;
-                        V4L2_LOG("已发 SESSION_CONTINUE");
-                    } else {
-                        V4L2_LOG("SESSION_CONTINUE 失败: %s", strerror(errno));
-                    }
+                    if (ioctl(d->fd, VIDIOC_DECODER_CMD, &dc) == 0)
+                        V4L2_LOG("已发 SESSION_CONTINUE（事件 seq=%u）",
+                                 ev.sequence);
+                    else
+                        V4L2_LOG("SESSION_CONTINUE 失败（事件 seq=%u）: %s",
+                                 ev.sequence, strerror(errno));
                 }
             } else if (ev.type == DMD_EV_MSM_VIDC(5)) {
                 V4L2_LOG("致命: 收到 SYS_ERROR，会话已失效");
