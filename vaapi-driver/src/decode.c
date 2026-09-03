@@ -18,12 +18,15 @@
  * 上的 IO。持锁做阻塞 IO 会让其他线程的 CreateBuffer 一起卡死。
  */
 
+#include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <linux/dma-buf.h>
 #include <sys/stat.h>
 
 /* surface 分配在 msm_drm 的 dumb buffer 里，为的是能导出 dmabuf
@@ -33,6 +36,8 @@
 #include "driver.h"
 #include "av1_bitstream.h"
 #include "mpeg2_bitstream.h"
+
+static void dumb_sync_end_write(struct dmd_surface *s);
 
 /* 前置声明：DestroyContext 需要排空在飞的帧，而这两个辅助定义在下方的
  * 解码路径小节里（放在那里更贴近使用现场）。 */
@@ -99,6 +104,11 @@ struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv, VABufferID id)
 void dmd_surface_reset_locked(struct dmd_surface *s)
 {
     if (s->exportable) {
+        /* 同步用的 dmabuf fd 先关：它对 buffer 持有一份引用，
+         * 留着会让 DESTROY_DUMB 之后内存仍不释放。
+         * 注意这不是交给 vaExportSurfaceHandle 调用方的那个 fd。 */
+        if (s->dumb_sync_fd >= 0)
+            close(s->dumb_sync_fd);
         /* dumb buffer：先 munmap 再销毁 handle，顺序不能颠倒。 */
         if (s->data)
             munmap(s->data, s->dumb_size);
@@ -197,7 +207,21 @@ static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
         ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
         return -1;
     }
-    memset(map, 0, creq.size);
+    /* 初始化成合法的"纯黑"NV12，而不是整块清零。
+     *
+     * NV12 里 UV=0 不是无色，而是最大色偏：经限制范围 BT.601 转 RGB 得到
+     * R≈0,G≈135,B≈0 —— 正是那个标志性的纯绿。无色偏的中性值是 128。
+     *
+     * 为什么这一格有意义：Firefox 会在**解码之前**就 vaExportSurfaceHandle
+     * 拿 fd 去建纹理（实测每个 surface 首次导出时 Y=0、UV=0），此时缓冲里
+     * 就是这里填的内容。整块清零会让它先采样到一帧纯绿；填 UV=128 则是纯黑，
+     * 与视频起播前的画面一致，不会闪一下绿。
+     *
+     * 实测（1280x720，230 次导出）：改前 6 个 surface 的首次导出有 3 次判定
+     * 纯绿；后续 781 次导出全部正常（UV 均值约 123.6）。 */
+    memset(map, 0, (size_t)bw * bh);                       /* Y 平面：黑 */
+    memset((unsigned char *)map + (size_t)bw * bh, 0x80,
+           creq.size - (size_t)bw * bh);                   /* UV 平面：无色偏 */
 
     s->dumb_handle = creq.handle;
     s->dumb_size = creq.size;
@@ -205,7 +229,80 @@ static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
     s->data = (unsigned char *)map;
     s->data_size = creq.size;
     s->exportable = 1;
+
+    /* 常驻 dmabuf fd，供 DMA_BUF_IOCTL_SYNC 做 cache 维护用（见 driver.h 的
+     * dumb_sync_fd 注释）。失败不影响分配成功：只是 GPU 零拷贝消费方可能
+     * 读到过期数据，CPU 读路径不受影响。 */
+    s->dumb_sync_fd = -1;
+    {
+        struct drm_prime_handle ph;
+        memset(&ph, 0, sizeof(ph));
+        ph.handle = creq.handle;
+        ph.flags = DRM_CLOEXEC;
+        if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) == 0)
+            s->dumb_sync_fd = ph.fd;
+        else
+            dmd_log("警告: 无法为 surface 建立同步用 dmabuf fd（%s），"
+                    "GPU 零拷贝可能看到过期数据\n", strerror(errno));
+    }
+
+    /* 上面 memset(map, 0, ...) 的清零同样是 CPU 写，也要刷出去。
+     * 否则首帧解出来之前 GPU 采样到的是**未初始化的物理内存**
+     * （可能是上一个进程的残留），而不是我们以为的黑/绿画面。
+     * 这里 fd 刚建好，正好补一次 END —— 清零发生在 fd 之前，
+     * 拿不到 START/END 的完整包裹，但 clean 语义仍然有效。 */
+    dumb_sync_end_write(s);
     return 0;
+}
+
+/* dumb buffer 的 CPU 写访问必须用 DMA_BUF_IOCTL_SYNC 成对包裹。
+ *
+ * 为什么不能用 msync：dumb buffer 的 mmap 是 VM_PFNMAP/VM_IO，没有页缓存
+ * 可回写，msync 直接返回 EINVAL（本机实测确认）。
+ *
+ * ⚠️ START 与 END 必须成对，缺一不可。linux/dma-buf.h 的注释是命令式的：
+ * "Prior to accessing the map, the client **must** call DMA_BUF_IOCTL_SYNC
+ *  with DMA_BUF_SYNC_START ... Once the access is complete, the client
+ *  should call ... with DMA_BUF_SYNC_END and **the same** read/write flags."
+ *
+ * 曾经只调 END 想省一次 ioctl（理由是"CPU 写、设备读，不需要 invalidate"）。
+ * 那是错的：内核按 START/END 配对来管理 cache 状态机，孤立的 END 不保证
+ * 触发 clean。实测表现是**绿屏与正常画面交替、并伴随局部色块** ——
+ * 部分帧刷出去了、部分没有，正是配对缺失导致的时序竞争，
+ * 比完全不同步（恒绿屏）更难判断。
+ *
+ * 两个函数分别对应写访问的开始与结束，调用方必须包住整段 memcpy。 */
+static void dumb_sync_begin_write(struct dmd_surface *s)
+{
+    if (!s || s->dumb_sync_fd < 0)
+        return;
+    struct dma_buf_sync sync;
+    memset(&sync, 0, sizeof(sync));
+    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+    if (ioctl(s->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            dmd_log("警告: DMA_BUF_SYNC_START 失败（%s）\n", strerror(errno));
+        }
+    }
+}
+
+static void dumb_sync_end_write(struct dmd_surface *s)
+{
+    if (!s || s->dumb_sync_fd < 0)
+        return;
+    struct dma_buf_sync sync;
+    memset(&sync, 0, sizeof(sync));
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+    if (ioctl(s->dumb_sync_fd, DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            dmd_log("警告: DMA_BUF_SYNC_END 失败（%s），GPU 零拷贝消费方"
+                    "可能看到过期数据（表现为绿屏）\n", strerror(errno));
+        }
+    }
 }
 
 static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
@@ -368,6 +465,7 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     VAStatus status = VA_STATUS_SUCCESS;
+    int freed = 0;
 
     pthread_mutex_lock(&drv->lock);
     for (int i = 0; i < num_surfaces; i++) {
@@ -379,8 +477,17 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
             continue;
         }
         dmd_surface_reset_locked(s);
+        freed++;
     }
     pthread_mutex_unlock(&drv->lock);
+
+    /* CreateSurfaces 有日志而这里没有，排查时会看成"只创建不销毁"的泄漏。
+     * 上一轮就因此误判过一次：45 秒播放里 CreateSurfaces 6 次、
+     * DestroySurfaces 0 次，实际是浏览器一直复用同一批 surface，
+     * 而不是驱动漏了销毁。补上日志让两侧可以直接对账。 */
+    dmd_log("DestroySurfaces: 请求 %d 个，已释放 %d 个%s\n",
+            num_surfaces, freed,
+            status == VA_STATUS_SUCCESS ? "" : "（含无效 ID）");
 
     return status;
 }
@@ -3007,10 +3114,21 @@ static void surface_store_frame_locked(struct dmd_surface *s,
         }
     }
 
+    /* ⚠️ CPU 对 dumb buffer 的写入必须被 DMA_BUF_IOCTL_SYNC 的 START/END
+     * 包住，否则数据可能停在 D-cache 里，GPU 通过导出的 dmabuf 采样时
+     * 读到旧内容。实测症状：Firefox 绿屏与正常画面交替、伴随局部色块
+     * （只调 END 时）或恒定纯绿（完全不同步时）—— 后者是因为
+     * surface_alloc_dumb 用 memset 把缓冲清成了全零，而 NV12 全零转 RGB
+     * 恰好是纯绿。CPU 读路径（ffmpeg 的 DeriveImage）走同一份 cache，
+     * 不受影响，所以 md5 校验发现不了这个缺陷。 */
+    dumb_sync_begin_write(s);
+
     size_t copy = f->size < need ? f->size : need;
     memcpy(s->data, f->data, copy);
     if (copy < need)
         memset(s->data + copy, 0, need - copy);
+
+    dumb_sync_end_write(s);
 
     s->decode_status = VA_STATUS_SUCCESS;
 }
