@@ -100,16 +100,23 @@
  *    只订阅标准 SOURCE_CHANGE 会导致 poll 永不返回 POLLPRI ——
  *    当年"等 SOURCE_CHANGE 永不到达"就是这个原因，不是固件没响应。
  *
- * 8. 收到 PORT_SETTINGS 事件后**必须发 SESSION_CONTINUE**。
- *    驱动在事件处理里无条件置 inst->in_reconfig = true
+ * 8. 每个 PORT_SETTINGS 事件都要让固件离开 in_reconfig，且两种事件的
+ *    处理**不一样**。驱动在事件处理里无条件置 inst->in_reconfig = true
  *    （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
  *    msm_comm_session_continue() 只有两个调用点：
- *      a. start_streaming() 内                  (msm_vidc.c:1244)
+ *      a. CAPTURE 的 start_streaming() 内，条件 in_reconfig
+ *                                              (msm_vidc.c:1240-1252)
  *      b. msm_vidc_comm_cmd() 的 V4L2_QCOM_CMD_SESSION_CONTINUE 分支
  *                                              (msm_vidc_common.c:4155)
- *    走 (a) 需要重跑 STREAMON，实测必然触发 SYS_ERROR（STREAMOFF 把 state
- *    打回 MSM_VIDC_START_DONE 以下）。走 (b) 才是正解：
- *    VIDIOC_DECODER_CMD + cmd = 5（videodev2.h:1991），不动队列状态。
+ *
+ *    · +2 SUFFICIENT（几何未变）→ 走 (b)：VIDIOC_DECODER_CMD + cmd=5
+ *      （videodev2.h:1991），不动队列状态。
+ *      ⚠️ 老内核（msm8998）由内核自动 continue，但 sm8150 一代改成
+ *      **userspace 必须自己发**，否则永久卡在等 FBD。
+ *    · +3 INSUFFICIENT（要求重配 OPB）→ 必须走 (a)，序列见第 12 条。
+ *
+ *    ⚠️ 不能做成会话级一次性闩锁：Firefox seek/ABR 会在同一 fd 上反复
+ *    收到事件，漏发一次固件就停在 in_reconfig 直到上层超时。
  *
  * 9. **设备必须用 O_NONBLOCK 打开**。事件队列空时 VIDIOC_DQEVENT 会阻塞在
  *    内核 v4l2_event_dequeue()，poll 循环再也回不来。
@@ -127,6 +134,34 @@
  * 11. 输出 1088 行含 8 行对齐填充，取有效区要按 1080 裁剪。
  *     ⚠️ 比对正确性时别让参考端也输出 1088 行 —— 填充数据参与比对会让
  *     所有行错位，得出"PSNR 只有 25.9 dB"的假结论（本会话踩过）。
+ *
+ * 12. **PORT_SETTINGS_INSUFFICIENT 的重配序列（0.4.4，见 cap_reconfig）。**
+ *     浏览器 seek / ABR 清晰度切换会在同一 fd 上反复触发它。正规序列
+ *     （厂商 OMX omx_vdec_v4l2.cpp 的 execute_omx_flush + PortDisable）：
+ *
+ *       DECODER_CMD{cmd=4 FLUSH, flags=FLUSH_CAPTURE}
+ *       → 把固件交还的 CAPTURE 缓冲全部 DQ 掉，等 FLUSH_DONE(+1)
+ *       → STREAMOFF(CAPTURE)
+ *       → REQBUFS(CAPTURE, 0)      ← memory 必须仍是 USERPTR
+ *       → 释放 dma-buf fd / 解映射  ← 只能在 REQBUFS(0) 之后
+ *       → 按新几何重配 + QBUF + STREAMON(CAPTURE)
+ *       → 内核在这次 STREAMON 里自动下发 session_continue
+ *
+ *     ⚠️ 第一步的 flush 不可省。内核注释（msm_vidc.c:1240-1252）把
+ *     "all output buffers have been flushed and freed"列为 continue 的
+ *     前置条件。跳过它直接 STREAMOFF 时 24 个 OPB 仍在固件手里，随后的
+ *     STREAMON(CAPTURE) 恒 EINVAL 并连锁 SYS_ERROR ——
+ *     0.4.3 及更早据此误判为"msm_vidc 不允许 CAPTURE 重启"，是错的。
+ *
+ *     ⚠️ 全程只能动 CAPTURE。msm_vidc_streamoff() 用 `if (!in_reconfig)`
+ *     守卫，所以 reconfig 期间的 STREAMOFF(CAPTURE) 不会拆 session；但
+ *     STREAMOFF(OUTPUT) / REQBUFS(OUTPUT,0) 会走 RELEASE_RESOURCES_DONE，
+ *     已排队的 ETB 全部丢失。
+ *
+ *     实测（Firefox，H.264/HEVC，含 seek 与 856x480↔1920x1080 切换）：
+ *     9 次 INSUFFICIENT 全部重配成功，SYS_ERROR 0、2s flush 空等 0、
+ *     5s SyncSurface 超时 0、会话重建 0，2977 帧配对，
+ *     DestroyContext 送入/取回完全平衡（如 1080/1080）。
  *
  * 验证状态（0.4.1，nabu / Snapdragon 860 / kernel 4.14）：
  *     t.h264        1080p  300 帧  整流 MD5 与 ffmpeg 软解一致
@@ -188,8 +223,8 @@ struct dmd_v4l2_dec {
     int      cap_planes;                      /* CAPTURE 平面数（含 extradata） */
     size_t   extra_size;                      /* extradata 平面字节数 */
     struct dmd_v4l2_buf extra[DMD_V4L2_MAX_CAP];  /* extradata dmabuf */
-    int      reconfig_done;                   /* 已发过 SESSION_CONTINUE */
-    int      cap_recfg_tried;                 /* 已试过 CAPTURE 重协商（探测） */
+    int      reconfig_done;                   /* 保留：曾用于一次性 CONTINUE 闩锁，现已不再置位 */
+    int      cap_recfg_count;                 /* CAPTURE 重配次数（诊断用） */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
     int      out_streaming, cap_streaming;
     int      draining;                        /* 已送 EOS，等剩余帧 */

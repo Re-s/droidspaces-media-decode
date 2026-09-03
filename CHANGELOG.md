@@ -1,5 +1,108 @@
 # 更新日志
 
+## v0.4.4
+
+**修复浏览器 seek / 切清晰度时的长时间缓冲。**
+根因是 `PORT_SETTINGS_CHANGED_INSUFFICIENT` 从未被真正处理：每次触发都要
+白等 2s flush + 5s SyncSurface 超时，然后重建会话，循环往复。
+
+测试环境同 0.4.3：nabu（Xiaomi Pad 5 / Snapdragon 855 / kernel 4.14），
+Ubuntu 26.04 aarch64，libva 2.23，ffmpeg 8.0.1，Firefox 硬解（RDD）。
+
+### 🐞 修复：INSUFFICIENT 重配前漏了 FLUSH_CAPTURE
+
+**症状**：Firefox 拖进度条或 ABR 切清晰度后卡住数秒才恢复。日志里是固定循环：
+
+```text
+PORT_SETTINGS(INSUFFICIENT)
+flush 触发: futile=0(recv=0 has_seq=0 pend=5) spent=2000/2000
+SyncSurface: 等帧超时 5000 ms
+会话已重建（codec=0 864x480）
+```
+
+每轮约 7 秒，`recv=0` —— 固件停在 `in_reconfig` 一帧不吐。
+
+**根因**：重配 CAPTURE 前没有先 flush。厂商 OMX（`omx_vdec_v4l2.cpp` 的
+`execute_omx_flush` + `OMX_CommandPortDisable`）的正规序列是：
+
+```text
+DECODER_CMD{cmd=4 FLUSH, flags=FLUSH_CAPTURE}
+→ DQ 掉固件交还的全部 CAPTURE 缓冲，等 FLUSH_DONE(+1)
+→ STREAMOFF(CAPTURE) → REQBUFS(CAPTURE,0)
+→ 按新几何重配 + QBUF + STREAMON(CAPTURE)
+→ 内核在这次 STREAMON 里自动下发 session_continue
+```
+
+下游内核 `msm_vidc.c:1240-1252` 的注释把 **all output buffers have been
+flushed and freed** 明确列为 `session_continue` 的前置条件。跳过 flush 直接
+`STREAMOFF` 时，24 个 OPB 仍在固件手里，随后的 `STREAMON(CAPTURE)` 恒
+`EINVAL` 并连锁 `SYS_ERROR`。
+
+**⚠️ 更正 0.4.1/0.4.3 的一条结论**：此前记录"STREAMOFF 会把 state 打回
+`MSM_VIDC_START_DONE` 以下，实测必然 SYS_ERROR，所以 CAPTURE 不能重启"。
+这是错的。`msm_vidc_streamoff()` 有 `if (!inst->in_reconfig)` 守卫，
+reconfig 期间的 `STREAMOFF(CAPTURE)` **不会**拆 session。真正缺的只是
+前面那步 flush。
+
+同时确认：全程只能动 CAPTURE。`STREAMOFF(OUTPUT)` / `REQBUFS(OUTPUT,0)`
+会走 `RELEASE_RESOURCES_DONE`，已排队的 ETB 全部丢失。
+
+### 🐞 修复：SESSION_CONTINUE 被做成会话级一次性闩锁
+
+原实现是 `if (!d->reconfig_done) { …; d->reconfig_done = 1; }`，一个会话
+只发一次。但每个 `PORT_SETTINGS` 都会重新置 `inst->in_reconfig = true`，
+而浏览器 seek / ABR 会在同一 fd 上反复触发事件，漏发就永久卡在等 FBD。
+
+跨代差异（调研 CAF 两代 OMX 确认）：`SUFFICIENT` 在 msm8998 由内核自动
+continue，但 sm8150 一代改成 **userspace 必须自己发**。现已改为逐事件发送。
+
+### 📝 更正：下游 msm_vidc 不是标准 stateful 模型
+
+排查中途曾按内核 [stateful decoder 规范](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html)
+把 CAPTURE 的 STREAMON 延后到收到事件之后 —— 那是错的，已回退。
+
+下游 msm_vidc 三个驱动文件里 `V4L2_EVENT_SOURCE_CHANGE` **零命中**，
+它只有私有 `PORT_SETTINGS_*`；这正是原生 FFmpeg v4l2_m2m / GStreamer
+v4l2videodec 在这类设备上不可用的根因。厂商 OMX 的顺序是
+**先 STREAMON(CAPTURE) → 喂 SPS/PPS → 再 STREAMON(OUTPUT)**，
+安全性来自内核 `start_streaming()` 的双端 gating（`msm_vidc.c:1300-1313`）：
+第一个 STREAMON 因对侧未 streaming 而跳过，HFI session 在第二个才启动。
+
+事件 payload 布局跨代不兼容（8998 与 sm8150 的 word 含义不同），不能照抄
+别的平台。诊断日志现在除按本机布局解出 `h/w` 外，另原样打印前 12 个 u32
+（`ev.u.data` 是 64 字节）。
+
+⚠️ 排查中途曾据日志推断"后四个 word 恒为 `0,0,0,height`、不含额外 buffer
+需求"，那是日志格式串把 `ed[0..3]` 重复打印两遍造成的假象，已修正。真正的
+根因与 payload 无关 —— 是缺了 flush。
+
+### ✅ 验证
+
+Firefox 实测（H.264/HEVC，含 seek 与 856x480 ↔ 1920x1080 切换）：
+
+| 指标 | 0.4.3 | 0.4.4 |
+|---|---|---|
+| `SYS_ERROR` | 数百次 | **0** |
+| 2s flush 空等 | 反复 | **0** |
+| 5s SyncSurface 超时 | 反复 | **0** |
+| 会话重建循环 | 持续 | **0** |
+| `INSUFFICIENT` | 卡死 | 9 次，**9/9 重配成功** |
+| 帧配对 | 大量丢失 | 2977 帧 |
+
+`DestroyContext` 送入/取回完全平衡（1080/1080、850/850、630/630），
+说明重配后流水线无丢帧、无残留未取回 surface。
+
+md5 回归全通过，构建零告警：
+
+| 码流 | 帧数 | 整流 MD5 |
+|---|---|---|
+| `test.h264` | 150 | `c52b41abe76368f41ce45a6b50949670` |
+| `test.hevc` | 90 | `c462f2d791fb82cb7da1d7d5d21d35dc` |
+| `test.vp9.ivf` | 90 | `a3e0ea1e3b185033c5a256651847273e` |
+| `test.vp8.ivf` | 90 | `ef167f620ed68df92aa4bb867d5160f1` |
+
+多分辨率回归（1280x720 / 854x480 / 640x360 / 720x1280 / 切换流）5 通过 0 失败。
+
 ## v0.4.3
 
 **修复浏览器绿屏：CAPTURE 残留几何导致非 1080p 像素错位。**
