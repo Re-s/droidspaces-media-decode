@@ -677,6 +677,32 @@ static int setup_capture(struct dmd_v4l2_dec *d)
                       want == v4l2_fourcc('Q', '1', '2', 'A') ||
                       want == v4l2_fourcc('P', '0', '1', '0')) ? 2 : 1;
     if (d->stride < d->w * bpp2) d->stride = d->w * bpp2;
+
+    /* ⚠️ stride 还可能**大得离谱**：覆盖 CAPTURE 残留尺寸后，驱动同样不会
+     * 把 bytesperline 改小。实测 1280x720（前一条流是 1080p）：
+     *   G_FMT(CAPTURE) 残留 1920x1088 → 我们改写 width=1280,height=720
+     *   S_FMT 之后 bytesperline 仍是 **1920**（1080p 的行距）
+     * 上面的下限检查 1920 < 1280 不成立，于是错误 stride 被留下，
+     * 后果是双重的：
+     *   1) 按 stride=1920 取 1280 宽的帧，每行错位 640 字节 → 斜纹/色块；
+     *   2) 用它反推 slice_height：cap_size*2/(1920*3) = 492，
+     *      把真实的 736 压成 492，surface 按 736 分配却按 492 写，
+     *      每帧都触发"帧需 1416960 > dumb buffer 1413120，截断"。
+     * Firefox 侧表现就是绿屏夹杂正常画面与局部色块（实测 356 次导出里
+     * 351 次带着这个坏几何）。ffmpeg 的 md5 回归看不到，因为它跑单条流、
+     * 不会在同一 fd 上从 1080p 切到 720p。
+     *
+     * 判据：msm_vidc 的 CAPTURE stride 按 128 对齐（Venus 的
+     * VENUS_Y_STRIDE 宏），所以合法 stride 一定落在
+     * [align(w,128), align(w,128)+128) 内。超出就是残留值，按对齐规则重算。 */
+    if (bpp2 == 1) {
+        int want_stride = (d->w + 127) & ~127;
+        if (d->stride > want_stride) {
+            V4L2_LOG("CAPTURE stride 残留 %d（宽 %d 应为 %d），已纠正",
+                     d->stride, d->w, want_stride);
+            d->stride = want_stride;
+        }
+    }
     /* NV12 单平面布局：Y 平面高度即 slice_height，UV 紧随其后。
      *
      * ⚠️ 不要用 sizeimage 反推。msm_vidc 的 sizeimage 含额外对齐余量，
@@ -701,15 +727,33 @@ static int setup_capture(struct dmd_v4l2_dec *d)
      * 所以要按 msm_vidc 的 32 行对齐规则自己补齐，再用 sizeimage 校验。 */
     d->slice_height = (int)f.fmt.pix_mp.height;
     if (d->slice_height < d->h) d->slice_height = d->h;
+    /* msm_vidc 的 CAPTURE 高度按 32 对齐（1080→1088，720→736，2160→2176）。 */
+    int aligned = (d->slice_height + 31) & ~31;
     if (d->stride > 0 && d->cap_size > 0) {
         /* sizeimage 能容纳的最大 slice_height（含对齐余量，故向下取）。 */
         int fit = (int)((size_t)d->cap_size * 2u / (size_t)(d->stride * 3));
-        /* msm_vidc 的 CAPTURE 高度按 32 对齐（1080→1088，2160→2176）。 */
-        int aligned = (d->slice_height + 31) & ~31;
         if (aligned <= fit)
             d->slice_height = aligned;
         else if (d->slice_height > fit)
             d->slice_height = fit & ~1;
+    } else {
+        d->slice_height = aligned;
+    }
+
+    /* ⚠️ cap_size 同样可能是残留值。上面纠正 stride 之后，用对齐几何
+     * 反算出真实需求；sizeimage 小于它就说明那个值属于旧分辨率，
+     * 必须按新几何重算，否则 bufs_alloc 分配的 CAPTURE 缓冲装不下一帧，
+     * 每帧都被截断（实测 1080p→720p 切换时 cap_size 停留在 1417216，
+     * 而 720p 对齐几何需要 1280*736*3/2 = 1413120，看似够，
+     * 但驱动按 stride=1920 写入时需要 1416960 —— 正是日志里的截断量）。 */
+    if (d->stride > 0 && d->slice_height > 0) {
+        unsigned int need = (unsigned int)d->stride *
+                            (unsigned int)d->slice_height * 3u / 2u;
+        if (d->cap_size < need) {
+            V4L2_LOG("CAPTURE sizeimage %u < 几何需求 %u（stride=%d slice_h=%d），已纠正",
+                     d->cap_size, need, d->stride, d->slice_height);
+            d->cap_size = need;
+        }
     }
 
     /* 有效显示区域：用 G_SELECTION 拿裁剪矩形（1080p 会是 1088 对齐后裁回 1080）。 */

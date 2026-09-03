@@ -162,10 +162,23 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         }
     }
 
+    /* 把消费方真实传入的 flags 一起打出来。
+     *
+     * 为什么必须在驱动里打：Firefox 经 libva 的 driver vtable 进入这里，
+     * 不走公共符号 vaExportSurfaceHandle()，所以 LD_PRELOAD 拦不到
+     * （实测 RDD 确实加载了 hook 库，但没有任何记录产生）。
+     * 只有这里能确定它走的是 COMPOSED 还是 SEPARATE 分支。 */
     dmd_log("ExportSurfaceHandle: surface=%u -> fd=%d %ux%u stride=%u "
-            "uv_offset=%u layers=%u\n",
+            "slice_h=%u uv_offset=%u flags=0x%x%s%s%s layers=%u fmt0=%.4s%s%s\n",
             (unsigned)surface_id, prime.fd, disp_w, disp_h, stride,
-            (unsigned)(stride * slice_h), desc->num_layers);
+            slice_h, (unsigned)(stride * slice_h), flags,
+            (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) ? " COMPOSED" : "",
+            (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) ? " SEPARATE" : "",
+            (flags & VA_EXPORT_SURFACE_READ_ONLY) ? " RO" : "",
+            desc->num_layers, (const char *)&desc->layers[0].drm_format,
+            desc->num_layers > 1 ? " fmt1=" : "",
+            desc->num_layers > 1
+                ? (const char *)&desc->layers[1].drm_format : "");
 
     return VA_STATUS_SUCCESS;
 }
