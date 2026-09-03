@@ -151,14 +151,35 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     if (getenv("DMD_VA_LUMA")) {
         const unsigned char *y = s->data;
         if (y && s->data_size >= (size_t)stride * 16) {
+            size_t y_lim = (size_t)stride * slice_h;
+            if (y_lim > s->data_size) y_lim = s->data_size;
             double sum = 0; int cnt = 0;
-            size_t lim = (size_t)stride * slice_h;
-            if (lim > s->data_size) lim = s->data_size;
-            for (size_t k = 0; k < lim; k += 1499) { sum += y[k]; cnt++; }
+            for (size_t k = 0; k < y_lim; k += 1499) { sum += y[k]; cnt++; }
             double mean = cnt ? sum / cnt : 0;
-            dmd_log("亮度: surface=%u 均值 %.1f%s\n",
-                    (unsigned)surface_id, mean,
-                    mean < 20.0 ? "  ← 黑帧!" : "");
+
+            /* 只看 Y 判不出绿屏：纯绿的判据在 UV。
+             * NV12 的 UV 全零经限制范围 BT.601 转 RGB 得到 R≈0,G≈135,B≈0，
+             * 也就是那个标志性的纯绿；而正常画面的 UV 应围绕 128 波动
+             * （128 表示无色偏）。所以这里统计 UV 均值与"接近 0 的比例"，
+             * 让驱动自己就能回答"交给浏览器的像素是不是绿的"，
+             * 不必依赖截图 —— KWin 出于安全会拒绝未授权进程抓屏，
+             * XWayland 也拿不到 Wayland 原生窗口内容。 */
+            double uv_sum = 0; int uv_cnt = 0, uv_zero = 0;
+            size_t uv_end = y_lim + (size_t)stride * slice_h / 2;
+            if (uv_end > s->data_size) uv_end = s->data_size;
+            for (size_t k = y_lim; k < uv_end; k += 1499) {
+                uv_sum += y[k];
+                if (y[k] < 16) uv_zero++;
+                uv_cnt++;
+            }
+            double uv_mean = uv_cnt ? uv_sum / uv_cnt : 0;
+            double uv_zero_pct = uv_cnt ? 100.0 * uv_zero / uv_cnt : 0;
+            int greenish = (uv_cnt > 0 && uv_zero_pct > 80.0);
+
+            dmd_log("像素: surface=%u Y均值 %.1f UV均值 %.1f UV近零 %.0f%%%s%s\n",
+                    (unsigned)surface_id, mean, uv_mean, uv_zero_pct,
+                    mean < 20.0 ? "  ← 黑帧" : "",
+                    greenish ? "  ← 纯绿!" : "");
         }
     }
 

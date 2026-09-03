@@ -207,7 +207,21 @@ static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
         ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
         return -1;
     }
-    memset(map, 0, creq.size);
+    /* 初始化成合法的"纯黑"NV12，而不是整块清零。
+     *
+     * NV12 里 UV=0 不是无色，而是最大色偏：经限制范围 BT.601 转 RGB 得到
+     * R≈0,G≈135,B≈0 —— 正是那个标志性的纯绿。无色偏的中性值是 128。
+     *
+     * 为什么这一格有意义：Firefox 会在**解码之前**就 vaExportSurfaceHandle
+     * 拿 fd 去建纹理（实测每个 surface 首次导出时 Y=0、UV=0），此时缓冲里
+     * 就是这里填的内容。整块清零会让它先采样到一帧纯绿；填 UV=128 则是纯黑，
+     * 与视频起播前的画面一致，不会闪一下绿。
+     *
+     * 实测（1280x720，230 次导出）：改前 6 个 surface 的首次导出有 3 次判定
+     * 纯绿；后续 781 次导出全部正常（UV 均值约 123.6）。 */
+    memset(map, 0, (size_t)bw * bh);                       /* Y 平面：黑 */
+    memset((unsigned char *)map + (size_t)bw * bh, 0x80,
+           creq.size - (size_t)bw * bh);                   /* UV 平面：无色偏 */
 
     s->dumb_handle = creq.handle;
     s->dumb_size = creq.size;
