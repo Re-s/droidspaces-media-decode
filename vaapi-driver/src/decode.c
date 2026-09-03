@@ -465,6 +465,7 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     VAStatus status = VA_STATUS_SUCCESS;
+    int freed = 0;
 
     pthread_mutex_lock(&drv->lock);
     for (int i = 0; i < num_surfaces; i++) {
@@ -476,8 +477,17 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
             continue;
         }
         dmd_surface_reset_locked(s);
+        freed++;
     }
     pthread_mutex_unlock(&drv->lock);
+
+    /* CreateSurfaces 有日志而这里没有，排查时会看成"只创建不销毁"的泄漏。
+     * 上一轮就因此误判过一次：45 秒播放里 CreateSurfaces 6 次、
+     * DestroySurfaces 0 次，实际是浏览器一直复用同一批 surface，
+     * 而不是驱动漏了销毁。补上日志让两侧可以直接对账。 */
+    dmd_log("DestroySurfaces: 请求 %d 个，已释放 %d 个%s\n",
+            num_surfaces, freed,
+            status == VA_STATUS_SUCCESS ? "" : "（含无效 ID）");
 
     return status;
 }
