@@ -40,15 +40,20 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
 | HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
 
-v0.4.3 复测 1080p 四路回归结果不变（H.264 150 帧、HEVC 90 帧、VP9 90 帧、
-VP8 90 帧），并补上了非 1080p 的覆盖：HEVC 的 1280x720、854x480、640x360、
-720x1280（竖屏）与 H.264、VP9 的 720p / 360p 全部与软解逐字节一致。
+v0.4.4 复测四路 1080p 回归结果不变（H.264 150 帧、HEVC 90 帧、VP9 90 帧、
+VP8 90 帧），非 1080p 回归同样全部通过：HEVC 的 1280x720、854x480、640x360、
+720x1280（竖屏）与一条 1080p→720p→480p 切换流，5 通过 0 失败。
+H.264、VP9 的 720p / 360p 在 0.4.3 也已逐字节验证。判据一律是与软解 md5
+逐字节一致，而不是"能解出来"。
+
 **0.4.2 及更早版本播非 1080p 会绿屏**，详见下方自检一节的警告。
+**0.4.3 及更早版本在浏览器里拖进度条或切清晰度会卡住数秒**，
+已在 0.4.4 修复，见下方浏览器一节。
 
 AV1 需要 `-DDMD_ENABLE_AV1` 编译才会声明；遗留缺陷见
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md)。
 MPEG-2 需要 `-DDMD_ENABLE_MPEG2`；10bit 探测开关见 `CHANGELOG.md` 的 v0.4.2，
-非 1080p 绿屏的根因与取证见 v0.4.3。
+非 1080p 绿屏的根因与取证见 v0.4.3，seek / 切清晰度卡顿见 v0.4.4。
 
 > HEVC 有一类码流无法支持：SPS 带 `st_ref_pic_set` 的
 > （`num_short_term_ref_pic_sets > 0`）。VA-API 只给个数不给内容，无法复现，
@@ -146,7 +151,7 @@ for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
 `vainfo` 也能用（0.3.x 时代它会挂在 daemon socket 上，0.4.0 起没有 socket 了）：
 
 ```
-vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git短hash>
+vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.4+<git短hash>
       VAProfileH264High               : VAEntrypointVLD
       VAProfileHEVCMain               : VAEntrypointVLD
       VAProfileVP9Profile0            : VAEntrypointVLD
@@ -156,7 +161,7 @@ vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git短hash>
 但它只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧 ——
 验真实解码用上面的 ffmpeg 命令。
 
-版本串从 0.4.3 起带构建 ID：`0.4.3+<git短hash>`，工作区有未提交改动时
+版本串从 0.4.3 起带构建 ID，当前形如 `0.4.4+<git短hash>`，工作区有未提交改动时
 带 `-dirty`。这是排查工具 —— 浏览器把解码放在单独的 RDD/GPU 进程里，
 系统目录和 `LIBVA_DRIVERS_PATH` 可能各有一份 `.so`，靠这个后缀能直接确认
 实际 `dlopen` 的是哪一版，而不是你以为的那一版。
@@ -262,6 +267,51 @@ Venus 固件的解码流水线滞后 4 个输入单元才吐首帧（无 B 帧�
 0.4.3 的 720p 长播复测（Firefox 硬解，45 秒）：924 次导出，纯绿 0、截断 0、
 错误 0，送入 3863 单元收到 3863 帧。
 
+### seek 与切清晰度：0.4.3 及更早会卡数秒
+
+**0.4.3 及更早版本拖进度条或让播放器切清晰度会卡住数秒，然后循环重复。**
+0.4.4 修复。如果你在用 0.4.3，这是升级的理由。
+
+根因是分辨率变更事件没被真正处理。固件发的是 msm_vidc 私有事件
+`PORT_SETTINGS_CHANGED_INSUFFICIENT`（`V4L2_EVENT_MSM_VIDC_START+3`），
+要求按新几何重配 CAPTURE；旧版收到后没有真正重配，固件停在 `in_reconfig`
+一帧不吐，上层白等 2 秒 flush 阈值加 5 秒 `SyncSurface` 超时后重建会话，
+如此循环，**每轮约 7 秒**：
+
+```
+PORT_SETTINGS(INSUFFICIENT)
+flush 触发: futile=0(recv=0 has_seq=0 pend=5) spent=2000/2000
+SyncSurface: 等帧超时 5000 ms
+会话已重建（codec=0 864x480）
+```
+
+`recv=0` 是它的指纹 —— 送了料但一帧没回来。
+
+0.4.4 按厂商 OMX 的正规序列重配：先 `FLUSH_CAPTURE` 并等 `FLUSH_DONE`
+把固件手里的 OPB 全部收回，再 `STREAMOFF(CAPTURE)` + `REQBUFS(CAPTURE,0)`，
+之后才释放 dma-buf，最后按新几何重配并 `STREAMON(CAPTURE)`。
+**第一步 flush 不可省**：跳过它时 24 个 OPB 仍在固件手里，
+`STREAMON(CAPTURE)` 恒 `EINVAL` 并连锁 `SYS_ERROR`。全程只动 CAPTURE，
+碰 OUTPUT 会丢掉已排队的输入。同版还修了 `SESSION_CONTINUE` 原本是会话级
+一次性闩锁的问题 —— 每个事件都会重新置 `in_reconfig`，浏览器 seek/ABR
+在同一 fd 上反复触发，漏发一次就永久卡在等帧，现改为逐事件发送。
+序列细节与内核取证见
+[`doc/verified-platform-facts.md`](doc/verified-platform-facts.md) §12。
+
+Firefox 实测（H.264/HEVC，含 seek 与 856x480 ↔ 1920x1080 切换）：
+
+| 指标 | 0.4.3 | 0.4.4 |
+|---|---|---|
+| `SYS_ERROR` | 数百次 | **0** |
+| 2s flush 空等 | 反复 | **0** |
+| 5s `SyncSurface` 超时 | 反复 | **0** |
+| 会话重建循环 | 持续 | **0** |
+| `INSUFFICIENT` | 卡死 | 9 次，**9/9 重配成功** |
+| 帧配对 | 大量丢失 | 2977 帧 |
+
+`DestroyContext` 的送入/取回计数完全平衡（1080/1080、850/850、630/630），
+说明重配后既没丢帧，也没有残留未取回的 surface。
+
 ### 4K 不要开硬解
 
 同样的配置在 4K30 上是**倒退**：丢帧中位 72.38%、呈现只有 8.24 fps。
@@ -305,13 +355,28 @@ LIBVA_DRIVER_NAME=msm_drm vainfo 2>&1 | grep 'Driver version'
 驱动日志（需 `DMD_VA_LOG=1`）出现这两行才是固件真的在解码：
 
 ```
-[v4l2] PORT_SETTINGS(SUFFICIENT): h=1088 w=1920
-[v4l2] 已发 SESSION_CONTINUE
+[v4l2] PORT_SETTINGS(SUFFICIENT): h=1088 w=1920 ...
+[v4l2] 已发 SESSION_CONTINUE（事件 seq=0）
 ```
+
+拖过进度条或切过清晰度后，还应能看到重配走完的这三行（0.4.4 起）：
+
+```
+[v4l2] INSUFFICIENT：开始重配 CAPTURE 第 1 次（当前 1920x1088 ...）
+[v4l2] 重配：FLUSH_DONE 已收到
+[v4l2] 重配完成并已补发 SESSION_CONTINUE
+```
+
+只看到 `INSUFFICIENT` 而没有后两行，说明重配没走完，会退化成每轮约 7 秒的
+会话重建循环 —— 那是 0.4.3 及更早版本的行为。
 
 > ⚠️ 别拿 `[v4l2] 收到 SOURCE_CHANGE` 当判据 —— **那行永远不会出现。**
 > msm_vidc 从不发标准 `V4L2_EVENT_SOURCE_CHANGE`，它发的是私有事件
 > `0x08001002`。0.3.x/0.4.0 的文档写错了这一点，会导致误判成"没在硬解"。
+> 这不只是日志措辞问题：下游 msm_vidc **不是标准 V4L2 stateful 解码器**，
+> 分辨率变更只经私有 `PORT_SETTINGS_*` 通知，重配序列也与内核规范不同。
+> 这正是原生 FFmpeg `v4l2_m2m` 与 GStreamer `v4l2videodec` 在这类设备上
+> 用不了的根因，也是本项目自己实现驱动的原因。
 
 > 遇到画面异常，**不要再从 CPU cache 未刷到 GPU 那条路查起**。0.4.3 排查绿屏时
 > 长期怀疑这一点，已被实测推翻：用 `LD_PRELOAD` 在真实解码流程上把导出的

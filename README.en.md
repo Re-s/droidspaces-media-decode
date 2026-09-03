@@ -43,17 +43,23 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 | MPEG-2 | 🚧 Incomplete | Synthesis is byte-identical to the original stream, but firmware raises `SYS_ERROR`; not advertised by default |
 | HEVC Main10 / VP9 Profile2 | ❌ Firmware limit | Firmware recognises 10-bit but keeps reporting `INSUFFICIENT` and emits no frames |
 
-0.4.3 re-ran the four 1080p regressions with unchanged results (H.264 150 frames,
-HEVC 90, VP9 90, VP8 90) and added non-1080p coverage: HEVC at 1280x720,
-854x480, 640x360 and 720x1280 (portrait), plus H.264 and VP9 at 720p and 360p,
-all byte-identical to software. **0.4.2 and earlier show a green screen on
-anything that is not 1080p** — see the warning under Build and install.
+0.4.4 re-ran the four 1080p regressions with unchanged results (H.264 150 frames,
+HEVC 90, VP9 90, VP8 90); the non-1080p suite also passes in full — HEVC at
+1280x720, 854x480, 640x360 and 720x1280 (portrait) plus a 1080p→720p→480p
+switching stream, 5 passed and 0 failed. H.264 and VP9 at 720p and 360p were
+verified byte for byte in 0.4.3. The criterion is always md5 byte-identical to
+software decode, not merely "it decodes".
+
+**0.4.2 and earlier show a green screen on anything that is not 1080p** — see
+the warning under Build and install. **0.4.3 and earlier stall for seconds when
+you seek or the player switches quality** in a browser; fixed in 0.4.4, see
+Browser setup.
 
 AV1 is only advertised when built with `-DDMD_ENABLE_AV1`; see
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) for the outstanding defects.
 MPEG-2 requires `-DDMD_ENABLE_MPEG2`; for the 10-bit probe switches see
-v0.4.2 in `CHANGELOG.md`, and for the root cause of the non-1080p green screen
-see v0.4.3.
+v0.4.2 in `CHANGELOG.md`, for the root cause of the non-1080p green screen
+see v0.4.3, and for the seek / quality-switch stall see v0.4.4.
 
 > One class of HEVC stream cannot be supported: those whose SPS carries
 > `st_ref_pic_set` (`num_short_term_ref_pic_sets > 0`). VA-API exposes only the
@@ -156,8 +162,8 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
 > version and profile list. It still only proves the driver loads: the profile
 > list is a **static declaration** and does not prove frames come out.
 
-Since 0.4.3 the version string carries a build ID:
-`DroidSpaces V4L2 VA-API driver 0.4.3+<git short hash>`, with `-dirty` appended
+Since 0.4.3 the version string carries a build ID, currently
+`DroidSpaces V4L2 VA-API driver 0.4.4+<git short hash>`, with `-dirty` appended
 when the working tree has uncommitted changes. This is a debugging tool: browsers
 decode in a separate RDD/GPU process and there may be one `.so` in the system
 directory and another under `LIBVA_DRIVERS_PATH`, so the suffix tells you which
@@ -200,6 +206,68 @@ Full instructions, flags, profile configuration and verification steps are in
   `LD_PRELOAD` in a real decode run yields bytes identical to the
   `vaDeriveImage` CPU path. The paired `DMA_BUF_IOCTL_SYNC` START/END wrapping
   stays (it is what `linux/dma-buf.h` requires) but was not the cause
+
+### Seeking and quality switches: 0.4.3 and earlier stall for seconds
+
+**On 0.4.3 and earlier, dragging the progress bar or letting the player switch
+quality stalls playback for seconds, over and over.** Fixed in 0.4.4; if you are
+on 0.4.3, that is the reason to upgrade.
+
+The cause is that the resolution-change event was never really handled. The
+firmware raises the msm_vidc private event
+`PORT_SETTINGS_CHANGED_INSUFFICIENT` (`V4L2_EVENT_MSM_VIDC_START+3`) to demand a
+CAPTURE reconfiguration with the new geometry. Older builds did not actually
+reconfigure, so the firmware sat in `in_reconfig` and emitted nothing; the layer
+above burned a 2 s flush threshold plus a 5 s `SyncSurface` timeout and then
+rebuilt the session, looping at **roughly 7 seconds per round** (driver log is
+Chinese):
+
+```
+PORT_SETTINGS(INSUFFICIENT)
+flush 触发: futile=0(recv=0 has_seq=0 pend=5) spent=2000/2000
+SyncSurface: 等帧超时 5000 ms
+会话已重建（codec=0 864x480）
+```
+
+`recv=0` is the fingerprint: units went in, no frame came back.
+
+0.4.4 follows the vendor OMX sequence: `FLUSH_CAPTURE` first and wait for
+`FLUSH_DONE` so the firmware hands back every output buffer, then
+`STREAMOFF(CAPTURE)` + `REQBUFS(CAPTURE,0)`, release the dma-bufs only after
+that, and finally reconfigure to the new geometry and `STREAMON(CAPTURE)`.
+**The leading flush cannot be skipped**: without it the firmware still holds all
+24 output buffers, and the following `STREAMON(CAPTURE)` always returns `EINVAL`
+and cascades into `SYS_ERROR`. Only CAPTURE may be touched — touching OUTPUT
+discards the already queued input. The same release fixes `SESSION_CONTINUE`
+having been a once-per-session latch: every event sets `in_reconfig` again and
+browser seek/ABR retriggers it repeatedly on the same fd, so a single missed
+send left the firmware waiting for frames forever. It is now sent per event.
+The sequence and its kernel evidence are in
+[`doc/verified-platform-facts.md`](doc/verified-platform-facts.md) §12
+(Chinese).
+
+Measured in Firefox (H.264/HEVC, including seeks and 856x480 ↔ 1920x1080
+switches):
+
+| Metric | 0.4.3 | 0.4.4 |
+|---|---|---|
+| `SYS_ERROR` | hundreds | **0** |
+| 2 s flush spent waiting for nothing | repeatedly | **0** |
+| 5 s `SyncSurface` timeout | repeatedly | **0** |
+| Session-rebuild loop | continuous | **0** |
+| `INSUFFICIENT` | deadlock | 9 events, **9/9 reconfigured** |
+| Frame pairing | heavy loss | 2977 frames |
+
+`DestroyContext` in/out counts balance exactly (1080/1080, 850/850, 630/630),
+so the pipeline neither dropped frames nor leaked un-returned surfaces after a
+reconfiguration.
+
+> The downstream msm_vidc decoder is **not a standard V4L2 stateful decoder**.
+> `V4L2_EVENT_SOURCE_CHANGE` has zero occurrences in its three driver files; only
+> the private `PORT_SETTINGS_*` events exist, and the reconfiguration sequence
+> differs from the kernel specification. That is why upstream FFmpeg
+> `v4l2_m2m` and GStreamer `v4l2videodec` cannot drive this device, and why this
+> project implements its own driver.
 
 ## Power: hardware decode does not save energy
 

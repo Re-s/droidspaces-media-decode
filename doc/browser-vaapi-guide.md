@@ -3,7 +3,9 @@
 > 实测环境：nabu（SD855 / Adreno 640）+ DroidSpaces Debian 13 trixie 容器 +
 > msm_drm_drv_video.so（驱动内 V4L2 直通）。
 > 浏览器侧的结论来自真机验证（验证日期 2026-08-26；
-> 第二章第 4、5 节为 0.4.3 绿屏排查追加，2026-09-03），非理论推导。
+> 第二章第 4、5 节为 0.4.3 绿屏排查追加，2026-09-03；
+> 第二章第 6 节为 0.4.4 seek / 切清晰度卡顿排查追加，2026-09-03），
+> 非理论推导。
 
 前置：驱动已按 README 部署完成，且 `ffmpeg -hwaccel vaapi` 解码正常。
 若这一步不通，先解决后端，别碰浏览器。
@@ -137,13 +139,18 @@ for p in $(pgrep -f "type=gpu-process"); do
 #      [v4l2] CAPTURE 就绪: 1920x1088（有效 1920x1088）stride=1920 slice_h=1088
 #      [v4l2] 会话就绪: OUTPUT 8 x 16588800 字节, CAPTURE 24 x 3137536 字节
 #      [v4l2] PORT_SETTINGS(SUFFICIENT): h=1088 w=1920 ← 固件解析出序列参数
-#      [v4l2] 已发 SESSION_CONTINUE                    ← 有这两行才真在解码
+#      [v4l2] 已发 SESSION_CONTINUE（事件 seq=0）      ← 有这两行才真在解码
 #
 #    ⚠️ 0.4.1 更正：本文原写"[v4l2] 收到 SOURCE_CHANGE ← 有这行才是固件
 #    真的在解码"。那行**永远不会出现** —— msm_vidc 从不发标准
 #    V4L2_EVENT_SOURCE_CHANGE，它发的是私有事件 0x08001002
 #    (PORT_SETTINGS_CHANGED_SUFFICIENT)。拿 SOURCE_CHANGE 当判据会
-#    误判成"没在硬解"。
+#    误判成"没在硬解"。这不只是措辞问题：下游 msm_vidc 不是标准 V4L2
+#    stateful 解码器，分辨率变更只经私有 PORT_SETTINGS_* 通知，
+#    重配序列也与内核规范不同（见第二章第 6 节）。
+#
+#    ⚠️ 0.4.4 起 SESSION_CONTINUE 是**每个事件发一次**（带事件 seq），
+#    不再是一个会话只发一次。日志里出现多行属正常，缺行才是问题。
 #
 #    只有 init 而没有"会话就绪"，说明浏览器没把解码交给本驱动
 
@@ -232,6 +239,9 @@ grep -c drv_video "/proc/$(pgrep -f 'rdd$' | head -1)/maps"
 - `about:support` → 图形 → 应显示 VA-API 相关条目
 - 驱动日志（需 `DMD_VA_LOG=1`）出现 `会话就绪` 与 `已发 SESSION_CONTINUE`
   （0.4.0 起没有 daemon，本文旧版写的 `daemon 日志 ... 收到 N NALU` 已不适用）
+- 拖过进度条或切过清晰度后，还应能看到 `重配：FLUSH_DONE 已收到` 与
+  `重配完成并已补发 SESSION_CONTINUE`（0.4.4 起；只有 `INSUFFICIENT`
+  没有这两行，说明重配没走完，见第 6 节）
 - glxtest 报 "No GPUs detected via PCI" 是噪声，不影响 DMABUF 解码路径
 
 ### 4. Firefox 特有的三个坑（0.4.3 绿屏排查所得）
@@ -307,6 +317,54 @@ Wayland 原生窗口内容（报 `BadMatch`）。
 0.4.3 在 720p 上的 45 秒长播复测：924 次导出，纯绿 0、截断 0、错误 0，
 送入 3863 单元收到 3863 帧。
 
+### 6. seek / 切清晰度卡数秒：0.4.3 及更早的固定循环（0.4.4 已修）
+
+**症状**：拖进度条或播放器自动切清晰度（ABR）后，画面卡住数秒才恢复，
+而且会反复发生。0.4.4 修复；在旧版上这不是配置问题，换 pref 没用。
+
+**判据在驱动日志里，是一个每轮约 7 秒的固定循环**（需 `DMD_VA_LOG=1`）：
+
+```
+PORT_SETTINGS(INSUFFICIENT)
+flush 触发: futile=0(recv=0 has_seq=0 pend=5) spent=2000/2000
+SyncSurface: 等帧超时 5000 ms
+会话已重建（codec=0 864x480）
+```
+
+7 秒 = 2 秒 flush 阈值 + 5 秒 `SyncSurface` 超时，然后重建会话。
+`recv=0` 是关键 —— 送了料但一帧没回来，固件停在 `in_reconfig` 等重配。
+
+**根因**：固件用 msm_vidc 私有事件 `PORT_SETTINGS_CHANGED_INSUFFICIENT`
+（`V4L2_EVENT_MSM_VIDC_START+3`）要求按新几何重配 CAPTURE，旧版收到后没有
+真正重配。0.4.4 按厂商 OMX 的正规序列处理：先 `FLUSH_CAPTURE` 并等
+`FLUSH_DONE` 把固件手里的输出缓冲全部收回，再 `STREAMOFF(CAPTURE)` +
+`REQBUFS(CAPTURE,0)`，之后才释放 dma-buf，最后按新几何重配并
+`STREAMON(CAPTURE)`。序列细节与内核取证见
+[`verified-platform-facts.md`](verified-platform-facts.md) §12。
+
+**0.4.4 上该看到的日志**（一次成功的重配）：
+
+```
+[v4l2] PORT_SETTINGS(INSUFFICIENT): h=480 w=856 ...
+[v4l2] INSUFFICIENT：开始重配 CAPTURE 第 1 次（当前 1920x1088 ...）
+[v4l2] 重配：FLUSH_DONE 已收到
+[v4l2] CAPTURE 就绪: 856x480 ...
+[v4l2] 重配完成并已补发 SESSION_CONTINUE
+```
+
+看到 `INSUFFICIENT` 却没有 `重配完成`，说明重配中断了（日志里会有
+`重配中收到 SYS_ERROR` 或 `CAPTURE 重配失败`）—— 这时才是真的缺陷，
+可带这段日志报障。
+
+**另一处易误判**：`已发 SESSION_CONTINUE` 在 0.4.4 起是**逐事件**打印的
+（带 `事件 seq=`），一次播放里出现多行属正常，不是重复发送的 bug。
+反过来，浏览器 seek 会在同一 fd 上反复触发事件，**漏发一次就永久卡在等帧**。
+
+**实测**（Firefox，H.264/HEVC，含 seek 与 856x480 ↔ 1920x1080 切换）：
+`SYS_ERROR` 从数百次降到 0，2 秒 flush 空等 0、5 秒 `SyncSurface` 超时 0、
+会话重建循环 0，9 次 `INSUFFICIENT` 全部重配成功（9/9），2977 帧配对，
+`DestroyContext` 送入/取回完全平衡（1080/1080、850/850、630/630）。
+
 ---
 
 ## 三、实时监视：确认硬解"持续"在用
@@ -370,4 +428,5 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |
 | 视频卡顿 + CPU 飙高，但"硬解已启用" | 实际回落软解了（0.4.0 无端点问题，多为浏览器侧没走硬解路径） | 按第零章的 ffmpeg 判据自查后端；再用验证三步确认浏览器进程加载了驱动 |
 | ffmpeg 日志 `hevc (native)` | 根本没用硬解，静默回落软解了 | 测试命令要带 `-hwaccel_output_format vaapi` |
-| 驱动 init 了但一帧不出 | 该设备的 V4L2 解码会话起不来（已知有此类设备） | 跑 `vaapi-driver/tools/probe_device_support.c`：收不到 `SOURCE_CHANGE` 即该设备不可用 |
+| 拖进度条/切清晰度卡数秒并反复 | `INSUFFICIENT` 重配没做（0.4.3 及更早） | 升级到 0.4.4；判据见第二章第 6 节的 7 秒循环 |
+| 驱动 init 了但一帧不出 | 该设备的 V4L2 解码会话起不来（已知有此类设备） | 跑 `vaapi-driver/tools/probe_device_support.c`，看有没有事件到达（⚠️ 该探针只订阅标准 `SOURCE_CHANGE`，而 msm_vidc 只发私有 `PORT_SETTINGS_*`，所以"没有 `SOURCE_CHANGE`"本身不构成不可用的判据，见第二章第 6 节） |

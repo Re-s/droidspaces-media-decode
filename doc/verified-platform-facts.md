@@ -13,6 +13,8 @@
 - §3.1、§10、§11 为 0.4.3 绿屏排查追加（2026-09-03，Ubuntu 26.04
   aarch64 容器 / libva 2.23 / ffmpeg 8.0.1 / Firefox 硬解走 RDD），
   判据是硬解与软解逐字节比对
+- §12 为 0.4.4 浏览器 seek / 切清晰度卡顿排查追加（2026-09-03，环境同上），
+  判据是 Firefox 真实播放下的驱动日志与帧配对统计
 
 ---
 
@@ -38,6 +40,7 @@
 | §3.1 CAPTURE 残留几何 | ✅ 0.4.3 追加，是浏览器绿屏的直接根因 |
 | §10 NV12 的 UV=0 是最大色偏 | ✅ 0.4.3 追加，与架构无关（是 BT.601 的数学性质） |
 | §11 dumb buffer 的 cache 维护 | ✅ 0.4.3 追加，直接描述当前 V4L2 直通架构 |
+| §12 `PORT_SETTINGS` 与分辨率重配 | ✅ 0.4.4 追加，是浏览器 seek / 切清晰度长时间缓冲的直接根因；同时更正了 0.4.1/0.4.3 关于 `STREAMOFF` 的一条错误结论 |
 
 > ⚠️ 另外注意：本文开头的环境描述里"Root：KernelSU"一项对 0.4.0
 > **不再是前提** —— 驱动是纯用户态 `.so`，容器内普通用户靠
@@ -399,7 +402,8 @@ H.264 / HEVC 解码器规格（两者一致）：
 - 码率上限：220 Mbps
 - 并发实例：最多 16 —— 但**会话数不是瓶颈**，实测 3 路与 6 路 1080p 的
   总吞吐都停在约 8.8x（Venus 硬件吞吐上限，详见 §9）
-- 支持 `adaptive-playback`（流内动态分辨率切换）
+- 支持 `adaptive-playback`（流内动态分辨率切换）—— 但 V4L2 路径下这不是
+  自动的，用户态要按 §12.3 的序列自己重配 CAPTURE
 
 结论：**扩展 HEVC/VP9 支持不受硬件限制**，仅是服务端 MIME 配置与客户端协议协商的工作量。
 
@@ -433,6 +437,10 @@ capture / output mplane 队列，而不是一个 mem2mem 设备，属于
 **pre-M2M 时代的 downstream 实现**。因此依赖 `V4L2_CAP_VIDEO_M2M*`
 探测 m2m 解码器的通用用户态（含部分 ffmpeg / GStreamer 路径）
 会直接认不出这个节点。
+
+capability 位只是"通用用户态用不了它"的一半原因，另一半是事件模型不同：
+它不发标准 `V4L2_EVENT_SOURCE_CHANGE`，只发私有 `PORT_SETTINGS_*`，
+分辨率变更的处理序列也与内核 stateful decoder 规范不同，见 §12。
 
 节点存在不等于可用。**容器内直接走 V4L2 喂码流会"成功但无解码"，
 根因已由设备真实内核源码（`MiCode/Xiaomi_Kernel_OpenSource` 分支
@@ -717,3 +725,154 @@ GPU 零拷贝读到旧数据）。**该假设已被实测推翻。**
 内存再把解码结果拷进去。这是架构差异带来的必然代价，不是实现选择上的疏忽 ——
 但也意味着**不能拿 Mesa 驱动当参考实现来判断"该不该做 cache 维护"**，
 它们的前提和我们不一样。
+
+## 12. `PORT_SETTINGS` 事件与 CAPTURE 重配：不是标准 stateful 模型
+
+验证日期：2026-09-03（0.4.4 浏览器 seek / 切清晰度卡顿排查）。
+取证是 Firefox 真实播放（H.264/HEVC，含拖进度条与 856x480 ↔ 1920x1080
+切换）下的驱动日志与帧配对统计，并与设备真实内核源码
+（`MiCode/Xiaomi_Kernel_OpenSource` 分支 `nabu-r-oss`）及厂商 OMX
+（`omx_vdec_v4l2.cpp`）交叉核对。
+
+### 12.1 只有私有 `PORT_SETTINGS_*`，没有 `SOURCE_CHANGE`
+
+下游 msm_vidc 的三个驱动文件里 `V4L2_EVENT_SOURCE_CHANGE` **零命中**。
+分辨率信息只经私有事件送出，相对 `V4L2_EVENT_MSM_VIDC_START` 的偏移：
+
+| 事件 | 含义 |
+|---|---|
+| `+1` | `FLUSH_DONE` |
+| `+2` | `PORT_SETTINGS_CHANGED_SUFFICIENT`（几何未变） |
+| `+3` | `PORT_SETTINGS_CHANGED_INSUFFICIENT`（要求重配 OPB） |
+| `+4` | `BITDEPTH_CHANGED` |
+| `+5` | `SYS_ERROR` |
+| `+6` | `RELEASE_BUFFER_REFERENCE` |
+| `+7` | `RELEASE_UNQUEUED_BUFFER` |
+
+**这是原生 FFmpeg `v4l2_m2m` 与 GStreamer `v4l2videodec` 在这类设备上
+不可用的根因**：它们等的是标准 `SOURCE_CHANGE`，而那个事件永远不来
+（另一半原因是 capability 位缺 `V4L2_CAP_VIDEO_M2M*`，见 §6）。
+
+**事件 payload 布局跨代不兼容，不能照抄别的平台。** 调研 CAF 两代 OMX 可见：
+msm8998 是 `ptr[0]=h, ptr[1]=w, ptr[2]=flags, ptr[3]=bitdepth, ptr[4]=picstruct,
+ptr[5]=colorspace`，而 sm8150 变成 `ptr[2]=bitdepth, ptr[3]=picstruct,
+ptr[4]=colorspace, ptr[9]=profile, ptr[10]=level`。要按目标平台的 userspace
+源码对齐，本驱动只解 `h/w`，其余原样打印。
+
+> ⚠️ **不要照抄一条曾出现在本文档里的结论**：0.4.4 排查中途曾据日志推断
+> "后四个 word 恒为 `0,0,0,height`、不含额外 buffer 需求"。那是驱动日志的
+> 格式串把 `ed[0..3]` 重复打印了两遍造成的假象，已在 0.4.4 一并修掉
+> （现原样打印前 12 个 u32，`ev.u.data` 是 64 字节）。
+> 重配所需的缓冲数仍应自己按新几何算，但**理由不是"payload 里没有"** ——
+> 那次推断的观察本身就不成立。真正的根因与 payload 无关，是缺了 flush
+> （见 §12.3）。
+
+### 12.2 STREAMON 顺序：厂商 OMX 是先 CAPTURE 再 OUTPUT
+
+内核 stateful decoder 规范要求把 CAPTURE 的 `STREAMON` 延后到收到
+`SOURCE_CHANGE` 之后。**这台设备上不适用**，厂商 OMX 的顺序是：
+
+```
+STREAMON(CAPTURE) → 喂 SPS/PPS → STREAMON(OUTPUT)
+```
+
+看着像"还没协商就把输出端起来了"，实际安全 —— 安全性来自内核
+`start_streaming()` 的**双端 gating**（`msm_vidc.c:1300-1313`）：
+第一个 `STREAMON` 因对侧尚未 streaming 而直接跳过，HFI session 是在
+第二个 `STREAMON` 里才真正启动。
+
+排查 0.4.4 时曾按 stateful 规范把 CAPTURE 的 `STREAMON` 延后，那是错的，
+已回退。**判断该走哪套序列，依据是厂商 OMX 与内核源码，不是通用规范。**
+
+### 12.3 `INSUFFICIENT` 的重配序列，第一步 flush 不可省
+
+收到 `+3 INSUFFICIENT` 后的正规序列（厂商 OMX `execute_omx_flush` +
+`OMX_CommandPortDisable`）：
+
+```
+DECODER_CMD{cmd=4 FLUSH, flags=FLUSH_CAPTURE}
+→ DQ 掉固件交还的全部 CAPTURE 缓冲，等 FLUSH_DONE(+1)
+→ STREAMOFF(CAPTURE)
+→ REQBUFS(CAPTURE, 0)         ← memory 必须仍是 USERPTR
+→ 释放 dma-buf fd / 解映射     ← 只能在 REQBUFS(0) 之后
+→ 按新几何重配 + QBUF + STREAMON(CAPTURE)
+→ 内核在这次 STREAMON 里自动下发 session_continue
+```
+
+两条容易踩的边界：
+
+- **第一步 flush 不可省。** 内核 `msm_vidc.c:1240-1252` 的注释把
+  "all output buffers have been flushed and freed"列为 `session_continue`
+  的前置条件。跳过 flush 直接 `STREAMOFF` 时 24 个 OPB 仍在固件手里，
+  随后的 `STREAMON(CAPTURE)` **恒 `EINVAL`** 并连锁 `SYS_ERROR`。
+- **释放 dma-buf 只能在 `REQBUFS(0)` 之后。** 在此之前内核还持有引用，
+  提前关 fd / 解映射等于让异步硬件 DMA 写进已释放内存。
+
+**全程只能动 CAPTURE。** `STREAMOFF(OUTPUT)` / `REQBUFS(OUTPUT, 0)` 会走
+`RELEASE_RESOURCES_DONE`，已排队的 ETB 全部丢失。
+
+### 12.4 ⚠️ 更正：reconfig 期间的 `STREAMOFF(CAPTURE)` 不会拆 session
+
+0.4.1/0.4.3 的文档与代码注释里记着这样一条结论：
+
+> `STREAMOFF` 会把 state 打回 `MSM_VIDC_START_DONE` 以下，实测必然
+> `SYS_ERROR`，所以 CAPTURE 不能重启。
+
+**这是错的。** `msm_vidc_streamoff()` 有 `if (!inst->in_reconfig)` 守卫 ——
+reconfig 期间的 `STREAMOFF(CAPTURE)` 根本不走拆 session 那条路径。
+当年观察到的 `SYS_ERROR` 是真的，但归因错了：缺的是 §12.3 的第一步 flush，
+不是"内核不允许重启 CAPTURE"。
+
+这条错误结论的代价是把一整类修复方向排除在外，`INSUFFICIENT`
+因此在 0.4.3 及更早版本一直没有被真正处理。**教训**：`SYS_ERROR`
+只说明序列错了，不说明哪一步不许做；带守卫的内核函数要连守卫一起读。
+
+### 12.5 `SESSION_CONTINUE` 必须逐事件发送
+
+`msm_comm_session_continue()` 只有两个调用点：
+
+| 调用点 | 触发方式 |
+|---|---|
+| CAPTURE 的 `start_streaming()` 内，条件 `in_reconfig`（`msm_vidc.c:1240-1252`） | 重配时的 `STREAMON(CAPTURE)` |
+| `msm_vidc_comm_cmd()` 的 `V4L2_QCOM_CMD_SESSION_CONTINUE` 分支（`msm_vidc_common.c:4155`） | `VIDIOC_DECODER_CMD` + `cmd=5` |
+
+**不能做成会话级一次性闩锁。** 驱动在每个 `PORT_SETTINGS` 事件里都会无条件
+置 `inst->in_reconfig = true`（`msm_vidc_common.c:1761`），而浏览器 seek 与
+ABR 切清晰度会在**同一个 fd 上反复触发**该事件 —— 漏发一次，固件就永久停在
+等 FBD 的状态，上层只能靠超时兜底。
+
+跨代差异（核对 CAF 两代 OMX 确认）：
+
+| 内核代次 | `+2 SUFFICIENT` 之后 |
+|---|---|
+| msm8998 一代 | 内核自动 `continue` |
+| sm8150 一代（本机） | **userspace 必须自己发** |
+
+所以"老平台不发也能跑"不能外推到本机。
+
+### 12.6 修复前后的实测对照
+
+漏处理 `INSUFFICIENT` 时日志是一个固定循环，每轮约 7 秒
+（2 秒 flush 阈值 + 5 秒 `SyncSurface` 超时，然后重建会话）：
+
+```text
+PORT_SETTINGS(INSUFFICIENT)
+flush 触发: futile=0(recv=0 has_seq=0 pend=5) spent=2000/2000
+SyncSurface: 等帧超时 5000 ms
+会话已重建（codec=0 864x480）
+```
+
+`recv=0` 是关键特征 —— 固件停在 `in_reconfig`，一帧不吐。按 §12.3
+的序列处理后（Firefox，H.264/HEVC，含 seek 与 856x480 ↔ 1920x1080 切换）：
+
+| 指标 | 0.4.3 | 0.4.4 |
+|---|---|---|
+| `SYS_ERROR` | 数百次 | **0** |
+| 2s flush 空等 | 反复 | **0** |
+| 5s `SyncSurface` 超时 | 反复 | **0** |
+| 会话重建循环 | 持续 | **0** |
+| `INSUFFICIENT` | 卡死 | 9 次，**9/9 重配成功** |
+| 帧配对 | 大量丢失 | 2977 帧 |
+
+`DestroyContext` 的送入/取回计数完全平衡（1080/1080、850/850、630/630），
+说明重配后流水线既没丢帧，也没有残留未取回的 surface。
