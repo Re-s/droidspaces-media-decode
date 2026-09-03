@@ -40,9 +40,15 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
 | HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
 
+v0.4.3 复测 1080p 四路回归结果不变（H.264 150 帧、HEVC 90 帧、VP9 90 帧、
+VP8 90 帧），并补上了非 1080p 的覆盖：HEVC 的 1280x720、854x480、640x360、
+720x1280（竖屏）与 H.264、VP9 的 720p / 360p 全部与软解逐字节一致。
+**0.4.2 及更早版本播非 1080p 会绿屏**，详见下方自检一节的警告。
+
 AV1 需要 `-DDMD_ENABLE_AV1` 编译才会声明；遗留缺陷见
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md)。
-MPEG-2 需要 `-DDMD_ENABLE_MPEG2`；10bit 探测开关见 `CHANGELOG.md` 的 v0.4.2。
+MPEG-2 需要 `-DDMD_ENABLE_MPEG2`；10bit 探测开关见 `CHANGELOG.md` 的 v0.4.2，
+非 1080p 绿屏的根因与取证见 v0.4.3。
 
 > HEVC 有一类码流无法支持：SPS 带 `st_ref_pic_set` 的
 > （`num_short_term_ref_pic_sets > 0`）。VA-API 只给个数不给内容，无法复现，
@@ -60,6 +66,25 @@ make            # 产物 build/msm_drm_drv_video.so
 make check      # 确认导出了 __vaDriverInit_* 入口
 make tests      # 单元测试
 ```
+
+多分辨率回归（**需要真机**，跑的是真实硬解）：
+
+```sh
+cd vaapi-driver/tests
+FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
+```
+
+`FFMPEG` 指定带 libx265 与 vaapi 支持的 ffmpeg，`DRIVER_DIR` 指向
+`msm_drm_drv_video.so` 所在目录（脚本用它设 `LIBVA_DRIVERS_PATH`）；
+两者都有默认值（`ffmpeg` / `../build`），源码流参数默认 `test.hevc`，
+找不到就以 77 跳过。它从源码流转出 1280x720、854x480（宽非 128 倍数）、
+640x360、720x1280（竖屏）各一段，再拼一条 1080p→720p→480p 的切换流，
+判据是**硬解与软解 md5 逐字节一致**，而不是"能解出来"。
+
+> 这条回归补的是 0.4.2 及更早版本的盲区：原有四条回归流全是 1920x1080，
+> 恰好等于 msm_vidc 打开设备时的默认 CAPTURE 几何，因此永远不触发
+> "用 OUTPUT 协商值覆盖 CAPTURE 残留"那条分支 —— 1080p 全绿，
+> 浏览器却在 720p 上绿屏。
 
 安装到容器（**这是全部步骤**）：
 
@@ -90,6 +115,26 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
 > 在旧版上它会让你误判成"驱动不可用"。旧版请改用落盘形式自检：
 > `... -i in.mp4 -pix_fmt yuv420p -f rawvideo out.yuv -y`。
 
+> ⚠️ **0.4.2 及更早版本播非 1080p 会绿屏**，已在 0.4.3 修复 ——
+> 如果你在用 0.4.2，这是升级的理由。`G_FMT(CAPTURE)` 总是返回
+> msm_vidc 打开设备时的默认几何 `1920x1088`，不随 `S_FMT(OUTPUT)` 联动；
+> 驱动虽然用 OUTPUT 协商值覆盖了宽高，但 `bytesperline` 与 `sizeimage`
+> 驱动不回填，仍是 1080p 的值，而原有保护只检查下限
+> （`if (d->stride < d->w * bpp2)`，播 1280x720 时 `1920 < 1280` 不成立），
+> 于是错误 stride 被保留，造成双重损坏：按 `stride=1920` 取 1280 宽的帧
+> **每行错位 640 字节**；用它反推 slice_height 得 `cap_size*2/(1920*3) = 492`，
+> 把真实的 736 压成 492，于是每帧截断
+> （`帧需 1416960 字节 > dumb buffer 1413120 字节`）。
+> Firefox 实测 356 次导出里 351 次带着坏几何。
+> 0.4.3 给 stride 加了上限校验（Venus 的 CAPTURE stride 按 128 对齐，
+> 合法值必落在 `[align(w,128), align(w,128)+128)`），`cap_size` 按纠正后
+> 几何重算。同版还修了起播首帧纯绿：NV12 里 `UV=0` 不是无色而是最大色偏，
+> 经限制范围 BT.601 转 RGB 得到 `R≈0, G≈135, B≈0`（中性值是 128），
+> 而 Firefox 会在解码之前就 `vaExportSurfaceHandle` 拿 fd 建纹理，
+> 于是看到 surface 分配时 memset 出来的那一整块零 —— 改为 Y 填 0、UV 填 `0x80`
+> 后，230 次导出 3 次纯绿变成 247 次导出 0 次。
+> **1080p 自检通过不代表非 1080p 没问题**：旧版在 1080p 上完全正常。
+
 想确认硬件真的在解码，可以看 Venus 的内核实况（用户态改不了这些值）：
 
 ```sh
@@ -110,6 +155,11 @@ vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git短hash>
 
 但它只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧 ——
 验真实解码用上面的 ffmpeg 命令。
+
+版本串从 0.4.3 起带构建 ID：`0.4.3+<git短hash>`，工作区有未提交改动时
+带 `-dirty`。这是排查工具 —— 浏览器把解码放在单独的 RDD/GPU 进程里，
+系统目录和 `LIBVA_DRIVERS_PATH` 可能各有一份 `.so`，靠这个后缀能直接确认
+实际 `dlopen` 的是哪一版，而不是你以为的那一版。
 
 不想装进系统目录可以用 `LIBVA_DRIVERS_PATH` 指向 `.so` 所在目录：
 
@@ -209,6 +259,9 @@ Venus 固件的解码流水线滞后 4 个输入单元才吐首帧（无 B 帧�
 | H.264 1080p30 27Mbps | 1.34% | 29.38 fps（标称 30） | 4.54% |
 | HEVC 1080p30 | 0.67% | 29.45 fps | 3.48% |
 
+0.4.3 的 720p 长播复测（Firefox 硬解，45 秒）：924 次导出，纯绿 0、截断 0、
+错误 0，送入 3863 单元收到 3863 帧。
+
 ### 4K 不要开硬解
 
 同样的配置在 4K30 上是**倒退**：丢帧中位 72.38%、呈现只有 8.24 fps。
@@ -244,6 +297,9 @@ for p in $(pgrep -f "type=gpu-process"); do
 
 # ② 页面侧帧计数在增长（DevTools console，播放中执行两次比较）
 #    document.querySelector('video').getVideoPlaybackQuality().totalVideoFrames
+
+# ③ 确认解码进程真的加载了你以为的那一版（0.4.3 起版本串带 git 短 hash）
+LIBVA_DRIVER_NAME=msm_drm vainfo 2>&1 | grep 'Driver version'
 ```
 
 驱动日志（需 `DMD_VA_LOG=1`）出现这两行才是固件真的在解码：
@@ -256,6 +312,13 @@ for p in $(pgrep -f "type=gpu-process"); do
 > ⚠️ 别拿 `[v4l2] 收到 SOURCE_CHANGE` 当判据 —— **那行永远不会出现。**
 > msm_vidc 从不发标准 `V4L2_EVENT_SOURCE_CHANGE`，它发的是私有事件
 > `0x08001002`。0.3.x/0.4.0 的文档写错了这一点，会导致误判成"没在硬解"。
+
+> 遇到画面异常，**不要再从 CPU cache 未刷到 GPU 那条路查起**。0.4.3 排查绿屏时
+> 长期怀疑这一点，已被实测推翻：用 `LD_PRELOAD` 在真实解码流程上把导出的
+> dma-buf fd 重新 `mmap`，读到的字节与 `vaDeriveImage` 的 CPU 路径逐字节相同。
+> `DMA_BUF_IOCTL_SYNC` 的 START/END 成对包裹仍保留（符合 `linux/dma-buf.h`
+> 规范），但它不是绿屏的原因 —— 真正的原因是 CAPTURE 残留几何与 surface
+> 初始值，见上面自检一节。
 
 ### 选哪个浏览器
 

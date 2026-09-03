@@ -763,8 +763,16 @@ variables, zero arguments):
 vainfo
 ```
 
-It should print `Driver version: DroidSpaces MediaCodec VA-API driver ...` and 6
+It should print
+`Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git-short-hash>` and 6
 `VAEntrypointVLD` profiles, with exit code 0.
+
+> The `+<git-short-hash>` suffix is injected by the Makefile on every build, with
+> `-dirty` appended when the working tree has uncommitted changes. Its purpose is
+> to confirm **which build a consumer actually `dlopen`ed** when debugging
+> browsers: Firefox decodes in a separate RDD process, environment variables do
+> not always reach it, and guessing from file timestamps leads to wrong
+> conclusions.
 
 Other checks:
 

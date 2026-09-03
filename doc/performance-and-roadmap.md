@@ -355,6 +355,16 @@ Android ION/gralloc dmabuf → abstract socket + SCM_RIGHTS → 容器
   且 `EGL_HEIGHT` 须传**逻辑高度** 1080
 - 调试：`FD_MESA_DEBUG=layout,msgs` 会打印 `invalid pitch (%u vs %u)` 等原因
 
+> ⚠️ **v0.4.3 的教训：上面这条对齐公式当时已记在本文档里，实现却没照做。**
+> 驱动直接采信了 `G_FMT(CAPTURE)` 返回的 `bytesperline`，而 msm_vidc 在
+> 覆盖过宽高之后**不回填**它 —— 播 1280x720 时沿用了 1080p 的 `stride=1920`，
+> 既不等于 `align(1280,128)=1280`，也让 slice_height 被反推成 492（真实 736）。
+> 浏览器侧表现为绿屏与局部色块，而 1080p 回归全绿（1920 恰好等于默认值）。
+>
+> 现在 `v4l2_backend.c` 按 `align(w,128)` 校验 stride 上限，并用
+> `align(h,32)` 定 slice_height，与本节公式一致。
+> 结论：**pitch/offset 这类几何量不要相信驱动回填的值，要按已知对齐规则自己算或校验。**
+
 另注意本机 GL 栈是 **zink over turnip**（走 `VK_EXT_image_drm_format_modifier`），
 若改走 freedreno gallium 路径，pitch 精确匹配的约束需重新验证。
 

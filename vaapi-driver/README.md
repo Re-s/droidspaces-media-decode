@@ -156,6 +156,36 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 失败），但 `offsets[1] = stride * slice_height` 要用 **1088**。按 1080 算会让
 色度平面偏移 `stride*8` 字节，症状是绿边、花屏、色度错位。
 
+**`G_FMT(CAPTURE)` 的 `bytesperline` / `sizeimage` 可能是残留值，必须校验上限。**
+msm_vidc 的 `G_FMT(CAPTURE)` 总是返回打开设备时的默认几何 `1920x1088`，
+不随 `S_FMT(OUTPUT)` 联动，所以驱动会用 OUTPUT 协商值覆盖宽高 —— 但驱动
+**不会替我们回填** `bytesperline` 与 `sizeimage`，它们仍是 1080p 的值。
+
+原有保护只检查下限，播 1280x720 时 `1920 < 1280` 不成立，错误 stride 被留下，
+后果是双重的：
+
+1. 按 `stride=1920` 取 1280 宽的帧，**每行错位 640 字节**；
+2. 用它反推 slice_height：`cap_size*2/(1920*3) = 492`，把真实的 736 压成 492，
+   于是每帧都截断 —— `帧需 1416960 字节 > dumb buffer 1413120 字节`。
+
+浏览器侧表现为绿屏夹杂正常画面与局部色块（Firefox 实测 356 次导出里
+**351 次**带着坏几何）。判据是 Venus 的 CAPTURE stride 按 **128 对齐**，
+合法值必落在 `[align(w,128), align(w,128)+128)`，超出即残留值；
+CAPTURE 高度按 **32 对齐**（1080→1088、720→736、480→480、360→384、2160→2176）。
+`cap_size` 也要按纠正后的几何重算。
+
+这个缺陷长期未被发现，是因为回归流全是 **1920x1080** —— 恰好等于默认几何，
+永远不触发覆盖分支。现由 `tests/regress_resolutions.sh` 覆盖。
+
+**surface 初始化不能整块清零。** NV12 里 `UV=0` 不是无色而是**最大色偏**：
+经限制范围 BT.601 转 RGB 得到 `R≈0, G≈135, B≈0`，正是那个标志性的纯绿。
+无色偏的中性值是 **128**。
+
+这一格之所以有影响：Firefox 会在**解码之前**就 `vaExportSurfaceHandle` 拿 fd
+去建纹理（实测每个 surface 首次导出时读到的就是初始化填的值），整块清零
+会让它先采样到一帧纯绿。现在 Y 平面填 0、UV 平面填 `0x80`，首帧是纯黑。
+反过来说，**全零缓冲显示为纯绿是"数据从未到达"的指纹**，不是几何算错。
+
 ## 消费者契约差异：同一个驱动，三种用法
 
 三个消费者对驱动的期望不一样，只测一个会漏掉另外两个的坑。已实测跑通的差异：
@@ -166,6 +196,17 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 | 逐帧 `vaSyncSurface` | 调 | 调 | **从不调** |
 | 取帧方式 | `vaDeriveImage` | `vaExportSurfaceHandle` | `vaExportSurfaceHandle`（大批提交后取） |
 | dmabuf layout | 不用 | `SEPARATE_LAYERS` | `SEPARATE_LAYERS` |
+| 导出时机 | — | **解码前**就导出建纹理 | 提交任何解码**之前** |
+
+Firefox 的导出入参已实测确认：`flags=0x5`，即
+`VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_READ_ONLY`，
+驱动返回两层 —— Y 用 `DRM_FORMAT_R8`、UV 用 `DRM_FORMAT_GR88`，
+单个 dmabuf object，modifier 为 `DRM_FORMAT_MOD_LINEAR`。
+
+> 想抓 Firefox 的真实入参**不能用 `LD_PRELOAD`**：它经 libva 的 driver vtable
+> 进入驱动回调，不走公共符号 `vaExportSurfaceHandle()`。实测 RDD 进程确实
+> 加载了 hook 库（`/proc/<pid>/maps` 可见）却没有任何记录产生。
+> 只有在驱动内部打日志才拿得到 —— 这也是 `DMD_VA_LOG` 会打印 flags 的原因。
 
 两条 Chrome 特有要求各自造成过一次"硬解完全不可用"：
 
@@ -630,8 +671,13 @@ LIBVA_DRIVERS_PATH=/tmp/vatest vainfo --display drm --device /dev/dri/renderD128
 vainfo
 ```
 
-应输出 `Driver version: DroidSpaces MediaCodec VA-API driver ...` 与 6 个
-`VAEntrypointVLD` profile，exit code 0。
+应输出 `Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git短hash>` 与
+6 个 `VAEntrypointVLD` profile，exit code 0。
+
+> 版本串尾部的 `+<git短hash>` 由 Makefile 每次构建注入，工作区有未提交改动时
+> 带 `-dirty`。它的用途是排查浏览器问题时**确认消费者实际 `dlopen` 的是哪一版
+> `.so`** —— Firefox 的解码跑在 RDD 子进程里，环境变量未必如你所愿传进去，
+> 靠文件时间戳猜会误判。
 
 其他检查：
 
@@ -642,6 +688,36 @@ ffmpeg -init_hw_device vaapi=va:/dev/dri/renderD128 -v verbose \
 ```
 
 ffmpeg 应报 `Initialised VAAPI connection: version 1.22` 与我们的 vendor 串。
+
+### 多分辨率回归（必跑）
+
+```bash
+FFMPEG=/path/to/ffmpeg DRIVER_DIR=build ./tests/regress_resolutions.sh in.hevc
+```
+
+覆盖 1280x720、854x480（宽非 128 倍数）、640x360、720x1280（竖屏），
+以及**分辨率切换流**（同一 fd 上依次解 1080p→720p→480p，最接近浏览器
+自适应码率的场景）。判据是硬解与软解**逐字节一致**，不是"能解出来"。
+
+之所以必须单独测非 1080p：1920x1080 恰好等于 msm_vidc 的默认 CAPTURE 几何，
+不触发残留几何那条分支 —— 真实缺陷就藏在这个盲区里（见上文"两个必踩的坑"
+前面那条 `bytesperline` 残留）。
+
+### 判断浏览器画面是否正常
+
+`DMD_VA_LUMA=1` 会在每次导出时抽样打印 Y 与 UV 的统计：
+
+```
+像素: surface=3 Y均值 29.3 UV均值 123.7 UV近零 2%
+像素: surface=1 Y均值 0.0  UV均值 128.0 UV近零 0%   ← 黑帧
+```
+
+只看 Y 判不出绿屏，**判据在 UV**：正常彩色画面实测 UV 均值落在
+123.6–124.8；纯黑是 128.0；纯绿是 0.0（`UV近零` 超过 80% 会标注 `← 纯绿!`）。
+
+有了它就不必依赖截图 —— 本平台上两条截图路径都走不通：
+KWin 的 `org.kde.KWin.ScreenShot2` 对未授权进程返回 `NoAuthorized`，
+XWayland 的 `xwd -root` 拿不到 Wayland 原生窗口内容（报 `BadMatch`）。
 
 > 在无显示的 SSH 会话里裸跑 `vainfo` 会先打印 Wayland/X11 连接失败，
 > 随后自动落到 drm 路径成功。那两行与本 driver 无关。

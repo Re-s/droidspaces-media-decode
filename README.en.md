@@ -43,10 +43,17 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 | MPEG-2 | 🚧 Incomplete | Synthesis is byte-identical to the original stream, but firmware raises `SYS_ERROR`; not advertised by default |
 | HEVC Main10 / VP9 Profile2 | ❌ Firmware limit | Firmware recognises 10-bit but keeps reporting `INSUFFICIENT` and emits no frames |
 
+0.4.3 re-ran the four 1080p regressions with unchanged results (H.264 150 frames,
+HEVC 90, VP9 90, VP8 90) and added non-1080p coverage: HEVC at 1280x720,
+854x480, 640x360 and 720x1280 (portrait), plus H.264 and VP9 at 720p and 360p,
+all byte-identical to software. **0.4.2 and earlier show a green screen on
+anything that is not 1080p** — see the warning under Build and install.
+
 AV1 is only advertised when built with `-DDMD_ENABLE_AV1`; see
 [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) for the outstanding defects.
 MPEG-2 requires `-DDMD_ENABLE_MPEG2`; for the 10-bit probe switches see
-v0.4.2 in `CHANGELOG.md`.
+v0.4.2 in `CHANGELOG.md`, and for the root cause of the non-1080p green screen
+see v0.4.3.
 
 > One class of HEVC stream cannot be supported: those whose SPS carries
 > `st_ref_pic_set` (`num_short_term_ref_pic_sets > 0`). VA-API exposes only the
@@ -65,6 +72,29 @@ make            # produces build/msm_drm_drv_video.so
 make check      # confirms the __vaDriverInit_* entry point is exported
 make tests      # unit tests
 ```
+
+Multi-resolution regression (**needs real hardware** — it exercises actual
+hardware decode):
+
+```sh
+cd vaapi-driver/tests
+FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
+```
+
+`FFMPEG` points at an ffmpeg with libx265 and vaapi support, `DRIVER_DIR` at the
+directory holding `msm_drm_drv_video.so` (the script uses it as
+`LIBVA_DRIVERS_PATH`). Both have defaults (`ffmpeg` / `../build`); the source
+stream argument defaults to `test.hevc` and the script exits 77 if it is missing.
+It transcodes the source into 1280x720, 854x480 (width not a multiple of 128),
+640x360 and 720x1280 (portrait), then concatenates a 1080p→720p→480p switching
+stream. The criterion is **hardware and software md5 being byte-identical**, not
+merely "it decodes".
+
+> This regression covers the blind spot of 0.4.2 and earlier: all four existing
+> regression streams were 1920x1080, which happens to equal msm_vidc's default
+> CAPTURE geometry at device open, so the "override the CAPTURE leftovers with
+> the negotiated OUTPUT values" branch was never taken — 1080p passed while
+> browsers showed a green screen at 720p.
 
 Install into the container (**this is the whole procedure**):
 
@@ -96,10 +126,46 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
 > broken — use the file-writing form instead:
 > `... -i in.mp4 -pix_fmt yuv420p -f rawvideo out.yuv -y`.
 
+> ⚠️ **0.4.2 and earlier show a green screen on anything that is not 1080p**,
+> fixed in 0.4.3 — if you are on 0.4.2, that is the reason to upgrade.
+> `G_FMT(CAPTURE)` always returns msm_vidc's default geometry at device open,
+> `1920x1088`, and does not follow `S_FMT(OUTPUT)`. The driver did override width
+> and height with the negotiated OUTPUT values, but the driver does not write
+> back `bytesperline` and `sizeimage`, which stayed at their 1080p values, and the
+> existing guard only checked the lower bound (`if (d->stride < d->w * bpp2)` —
+> for 1280x720, `1920 < 1280` is false). The bad stride survived, causing damage
+> twice over: reading a 1280-wide frame at `stride=1920` shifts **every row by
+> 640 bytes**, and deriving slice_height from it gives
+> `cap_size*2/(1920*3) = 492`, squeezing the real 736 down to 492 so every frame
+> is truncated (`frame needs 1416960 bytes > dumb buffer 1413120 bytes`).
+> Measured in Firefox, 351 of 356 exports carried the bad geometry.
+> 0.4.3 adds an **upper**-bound check on stride (Venus aligns CAPTURE stride to
+> 128, so a legal value must fall in `[align(w,128), align(w,128)+128)`) and
+> recomputes `cap_size` from the corrected geometry. The same release fixes a
+> solid-green first frame: in NV12, `UV=0` is not colourless but maximum chroma
+> offset, converting through limited-range BT.601 to `R≈0, G≈135, B≈0` (the
+> neutral value is 128). Firefox calls `vaExportSurfaceHandle` to build a texture
+> **before** decoding starts, so it saw the all-zero block left by the surface
+> allocation memset. Filling Y with 0 and UV with `0x80` took 3 solid-green
+> exports out of 230 down to 0 out of 247.
+> **Passing the 1080p smoke test does not mean non-1080p works**: older builds
+> are perfectly fine at 1080p.
+
 > ⚠️ Correction (0.4.1): an earlier revision of this file said `vainfo` hangs on
 > this platform. That is no longer true — `vainfo` works and reports the driver
 > version and profile list. It still only proves the driver loads: the profile
 > list is a **static declaration** and does not prove frames come out.
+
+Since 0.4.3 the version string carries a build ID:
+`DroidSpaces V4L2 VA-API driver 0.4.3+<git short hash>`, with `-dirty` appended
+when the working tree has uncommitted changes. This is a debugging tool: browsers
+decode in a separate RDD/GPU process and there may be one `.so` in the system
+directory and another under `LIBVA_DRIVERS_PATH`, so the suffix tells you which
+build was actually `dlopen`ed rather than which one you assumed.
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm vainfo 2>&1 | grep 'Driver version'
+```
 
 To confirm the hardware is really decoding, check the Venus kernel state
 (these values cannot be forged from user space):
@@ -126,6 +192,14 @@ Full instructions, flags, profile configuration and verification steps are in
 - Firefox is recommended for HEVC playback (Chrome has a platform-level
   presentation-feedback issue on the anland display bridge)
 - Quick check: `bash tools/check-browser-vaapi.sh`
+- 0.4.3 45-second Firefox soak at 720p: 924 exports, 0 solid-green, 0 truncated,
+  0 errors, 3863 frames received for 3863 units fed
+- If you hit corrupted output, **do not start from the "CPU cache not flushed to
+  the GPU" theory**. It was suspected at length while chasing the green screen in
+  0.4.3 and disproved by measurement: re-`mmap`ing the exported dma-buf fd via
+  `LD_PRELOAD` in a real decode run yields bytes identical to the
+  `vaDeriveImage` CPU path. The paired `DMA_BUF_IOCTL_SYNC` START/END wrapping
+  stays (it is what `linux/dma-buf.h` requires) but was not the cause
 
 ## Power: hardware decode does not save energy
 

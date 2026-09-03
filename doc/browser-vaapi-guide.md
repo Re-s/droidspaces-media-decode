@@ -2,7 +2,8 @@
 
 > 实测环境：nabu（SD855 / Adreno 640）+ DroidSpaces Debian 13 trixie 容器 +
 > msm_drm_drv_video.so（驱动内 V4L2 直通）。
-> 浏览器侧的结论来自真机验证（验证日期 2026-08-26），非理论推导。
+> 浏览器侧的结论来自真机验证（验证日期 2026-08-26；
+> 第二章第 4、5 节为 0.4.3 绿屏排查追加，2026-09-03），非理论推导。
 
 前置：驱动已按 README 部署完成，且 `ffmpeg -hwaccel vaapi` 解码正常。
 若这一步不通，先解决后端，别碰浏览器。
@@ -229,8 +230,82 @@ grep -c drv_video "/proc/$(pgrep -f 'rdd$' | head -1)/maps"
 ```
 
 - `about:support` → 图形 → 应显示 VA-API 相关条目
-- daemon 日志出现 `video/avc|hevc ... 收到 N NALU, 回传 M 帧`（N>0）
+- 驱动日志（需 `DMD_VA_LOG=1`）出现 `会话就绪` 与 `已发 SESSION_CONTINUE`
+  （0.4.0 起没有 daemon，本文旧版写的 `daemon 日志 ... 收到 N NALU` 已不适用）
 - glxtest 报 "No GPUs detected via PCI" 是噪声，不影响 DMABUF 解码路径
+
+### 4. Firefox 特有的三个坑（0.4.3 绿屏排查所得）
+
+**① 环境变量可能进不了 RDD 进程 —— 会让你误以为在测硬解。**
+
+Firefox 把解码放在单独的 RDD 进程里。用 `nohup firefox` 之类方式设置的
+`LIBVA_DRIVER_NAME` / `LIBVA_DRIVERS_PATH` **未必传得进去**，此时它静默走
+CPU 软解，而你以为在测硬解 —— 排查中就因此白跑过一轮。
+
+判据（软解时的表现）：`MOZ_LOG` 里 `VAAPI` 与 `DMABUF` 出现 **0 次**，
+解码器描述只有 `ffmpeg video decoder (RDD remote)`。可靠的核实方法是直接
+查进程：
+
+```shell
+R=$(pgrep -f 'RDD Process' | head -1)
+tr '\0' '\n' < /proc/$R/environ | grep -E 'LIBVA|MOZ_DISABLE_RDD'
+grep -c drv_video /proc/$R/maps        # 应 >0
+ls -l /proc/$R/fd | grep -c video32    # 硬解唯一通路，应 >0
+```
+
+0.4.3 起版本串带 git 短 hash，`vainfo` 能直接确认**实际加载的是哪一版 `.so`**，
+不必靠文件时间戳猜（系统目录与 `LIBVA_DRIVERS_PATH` 常各有一份）。
+
+**② `media.ffmpeg.vaapi.force-surface-zero-copy` 是三态整数，且改它无法隔离问题。**
+
+它不是布尔。Firefox 源码 `modules/libpref/init/StaticPrefList.yaml` 的注释是
+`0 - force disable`、`1 - force enable`、`2 - default`，**默认 2**。
+注释首句 "Force to copy dmabuf video frames" 容易读反 —— 这个 pref 管的是
+「是否强制零拷贝」。
+
+关键在于**设成 0 并不会让 Firefox 改走 CPU 下载路径**。Linux 上
+`DMABufSurfaceYUV::CopyYUVDataImpl` 仍然先 `vaExportSurfaceHandle` 把源
+dmabuf 导入成 EGL 纹理，再 `BlitTextureToTexture` 拷到另一块纹理。
+所以源描述有错时，设 0 **照样绿屏** —— 这个对照实验区分不出
+「驱动导出的几何错」和「Firefox 导入有问题」，不要用它下结论。
+
+**③ `LD_PRELOAD` 拦不到 Firefox 的 `vaExportSurfaceHandle`。**
+
+Firefox 经 libva 的 driver vtable 直接进入驱动回调，不走公共符号。
+实测 RDD 进程确实加载了 hook 库（`/proc/<pid>/maps` 可见），但**没有任何
+记录产生**。要拿它的真实入参只能在驱动内部打日志 —— 这也是 `DMD_VA_LOG`
+会打印导出 flags 的原因。
+
+实测 Firefox 传的是 `flags=0x5`，即
+`VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_READ_ONLY`，
+驱动返回两层：Y 用 `DRM_FORMAT_R8`、UV 用 `DRM_FORMAT_GR88`，
+单个 dmabuf object，modifier 为 `DRM_FORMAT_MOD_LINEAR`。
+另一个要点：**Firefox 在解码之前就会导出** dmabuf 去建纹理，所以驱动的
+export 路径不能等帧就绪（Chrome 同样如此）。
+
+### 5. 判断画面是否真的正常（不必截图）
+
+想客观确认「有没有绿屏」时会撞到两道墙：KWin 对未授权进程返回
+`org.kde.KWin.ScreenShot2.Error.NoAuthorized`；XWayland 的 `xwd -root` 拿不到
+Wayland 原生窗口内容（报 `BadMatch`）。
+
+所以改用驱动内的探针 —— `DMD_VA_LUMA=1` 会在每次导出时抽样打印：
+
+```
+像素: surface=3 Y均值 29.3 UV均值 123.7 UV近零 2%
+像素: surface=1 Y均值 0.0  UV均值 128.0 UV近零 0%   ← 黑帧
+```
+
+**只看 Y 判不出绿屏，判据在 UV**（NV12 的 `UV=0` 是最大色偏，转 RGB 就是纯绿）：
+
+| 画面 | UV 均值 |
+|---|---|
+| 正常彩色 | 123.6 – 124.8 |
+| 纯黑（起播前的合法初值） | 128.0 |
+| 纯绿（异常） | 0.0，且 `UV近零` > 80% 会标 `← 纯绿!` |
+
+0.4.3 在 720p 上的 45 秒长播复测：924 次导出，纯绿 0、截断 0、错误 0，
+送入 3863 单元收到 3863 帧。
 
 ---
 
