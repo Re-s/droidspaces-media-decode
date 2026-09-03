@@ -101,7 +101,7 @@ for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
 `vainfo` 也能用（0.3.x 时代它会挂在 daemon socket 上，0.4.0 起没有 socket 了）：
 
 ```
-vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.2
+vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.3+<git短hash>
       VAProfileH264High               : VAEntrypointVLD
       VAProfileHEVCMain               : VAEntrypointVLD
       VAProfileVP9Profile0            : VAEntrypointVLD

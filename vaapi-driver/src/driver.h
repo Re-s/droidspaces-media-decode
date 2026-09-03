@@ -42,9 +42,16 @@
  * 取帧时的 CAPTURE 背压死锁（`-f null` 场景由 40s 挂死变 3s 正常退出）。
  * 10bit 与 MPEG-2 经实测判定受固件限制，实现置于编译开关后不声明。
  * 详见 CHANGELOG。 */
-#define DMD_DRIVER_VERSION "0.4.2"
+/* 0.4.3：修复浏览器绿屏。根因是 CAPTURE 残留几何——G_FMT(CAPTURE) 总返回
+ * msm_vidc 的默认 1920x1088，覆盖宽高后 bytesperline/sizeimage 驱动不回填，
+ * 而原有保护只查下限，于是 720p 沿用了 1080p 的 stride=1920：每行错位
+ * 640 字节，且 slice_height 被反推成 492（真实 736），每帧截断。
+ * 另修首帧纯绿（NV12 的 UV=0 是最大色偏，转 RGB 恰好是纯绿，应填 128）。
+ * 新增多分辨率与分辨率切换回归——旧回归全是 1080p，恰好等于默认几何，
+ * 永不触发该分支，这个缺陷因此长期未被发现。详见 CHANGELOG。 */
+#define DMD_DRIVER_VERSION "0.4.3"
 /* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
- * 例：0.4.2+b779b235 / 0.4.2+b779b235-dirty。这样 vainfo 能明确报告
+ * 例：0.4.3+60534cf2 / 0.4.3+60534cf2-dirty。这样 vainfo 能明确报告
  * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */
 #ifndef DMD_BUILD_ID
 #define DMD_BUILD_ID "manual"
