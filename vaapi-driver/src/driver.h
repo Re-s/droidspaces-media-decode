@@ -43,7 +43,14 @@
  * 10bit 与 MPEG-2 经实测判定受固件限制，实现置于编译开关后不声明。
  * 详见 CHANGELOG。 */
 #define DMD_DRIVER_VERSION "0.4.2"
-#define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " DMD_DRIVER_VERSION
+/* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
+ * 例：0.4.2+b779b235 / 0.4.2+b779b235-dirty。这样 vainfo 能明确报告
+ * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */
+#ifndef DMD_BUILD_ID
+#define DMD_BUILD_ID "manual"
+#endif
+#define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " \
+                          DMD_DRIVER_VERSION "+" DMD_BUILD_ID
 
 /* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。
  * H.264/HEVC 解码器规格：96x96 ~ 8192x4320，并发实例 16，支持 adaptive-playback。 */
@@ -180,6 +187,15 @@ struct dmd_surface {
     /* 释放 dumb buffer 需要当初分配它的 drm fd。存在 surface 上而不是让
      * 释放函数多收一个参数 —— 这样不可能传错 fd。 */
     int dumb_drm_fd;
+    /* 常驻的 dmabuf fd，仅用于 DMA_BUF_IOCTL_SYNC 做 cache 维护。
+     *
+     * 为什么要常驻：CPU memcpy 写进 dumb buffer 的 mmap 后，数据可能还停在
+     * D-cache 里；GPU 通过 dmabuf 采样会读到旧内容（实测表现为纯绿屏）。
+     * dumb buffer 的映射是 VM_PFNMAP，msync 直接返回 EINVAL，所以必须用
+     * DMA_BUF_IOCTL_SYNC —— 而它需要一个 dmabuf fd。
+     * 与 vaExportSurfaceHandle 交给调用方的那个 fd 分开持有：那个的生命周期
+     * 归调用方（它负责 close），不能拿来做内部同步。-1 = 不可用。 */
+    int dumb_sync_fd;
     /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
      * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
     int state;

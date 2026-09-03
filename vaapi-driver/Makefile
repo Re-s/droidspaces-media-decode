@@ -25,9 +25,16 @@ CFLAGS  ?= -O2 -g
 # 没有这两个选项时，规则只依赖 .c —— 改了 driver.h 后 make 会认为
 # 目标是最新的，产物里仍是旧值（v0.3.7 改 DMD_DRIVER_VERSION 时实测踩到：
 # 版本串没进 .so，必须 make clean 才生效）。
+# 构建 ID：git hash (8位) + dirty 标记，编译进版本串便于判断实际加载的版本
+GITDESC := $(shell cd $(dir $(lastword $(MAKEFILE_LIST))) && \
+                   git rev-parse --short=8 HEAD 2>/dev/null || echo "nogit")
+GITDIRTY := $(shell cd $(dir $(lastword $(MAKEFILE_LIST))) && \
+                    git diff --quiet 2>/dev/null || echo "-dirty")
+BUILD_ID := $(GITDESC)$(GITDIRTY)
+
 CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
            -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) $(DRM_CFLAGS) \
-           -I$(SRCDIR) -MMD -MP
+           -I$(SRCDIR) -MMD -MP -DDMD_BUILD_ID=\"$(BUILD_ID)\"
 
 # AV1=1 声明 AV1 profile（开发/调试用）。发布版默认不声明 —— 像素校验未通过时
 # 声明它就是虚报，见 src/profiles.c 的说明。
