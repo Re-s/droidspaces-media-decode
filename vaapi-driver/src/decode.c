@@ -4085,6 +4085,56 @@ VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface)
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+
+    /* DMD_NO_MAP_WAIT=1：不在 map 时等帧，只报当前状态。
+     *
+     * 这是**验证 Chrome 契约的关键开关**，不是优化项。
+     *
+     * 问题背景：Chrome 从不调 vaSyncSurface / DeriveImage / GetImage，
+     * 它在 CreateSurfaces 之后就导出 dmabuf，之后只 EndPicture，
+     * 靠自己的软件 DPB 决定何时把某个 surface 交给合成器采样。
+     * 也就是说：**像素必须在 EndPicture 返回时就已经写进 surface**。
+     *
+     * 而 ffmpeg 走 DeriveImage/GetImage，那两个入口调本函数兜底等帧
+     * （image.c:169 / :283）。于是 md5 回归即使全绿，也只证明"配对逻辑对"，
+     * 完全不覆盖 Chrome 依赖的那个时序前提 —— 第 2、3 轮我据此误判过两次。
+     *
+     * 打开这个开关后，ffmpeg 仍然送全套参数缓冲（解码正确性有保证），
+     * 但像素必须在 map 那一刻就已就位，否则读到空缓冲 → md5 立刻不一致。
+     * 这就把"Chrome 会不会采到未写完的 surface"变成了一个可自动判定的
+     * 回归测试，不必再靠人眼盯浏览器。
+     *
+     * 判读方式：
+     *   开关打开 + md5 一致 → EndPicture 返回即像素就绪，Chrome 契约满足
+     *   开关打开 + md5 不一致 → 存在采样窗口，Chrome 会看到跳帧
+     * 对照组永远是"开关关闭 + md5 一致"（那是 ffmpeg/Firefox 契约）。 */
+    {
+        static int no_wait = -1;
+        if (no_wait < 0) {
+            const char *e = getenv("DMD_NO_MAP_WAIT");
+            no_wait = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (no_wait) {
+            int state = s->state;
+            VAStatus st = (state == DMD_SURFACE_READY)
+                              ? s->decode_status
+                              : VA_STATUS_ERROR_SURFACE_BUSY;
+            pthread_mutex_unlock(&drv->lock);
+            /* 只有 PENDING 才是真正的"采样窗口"：已提交解码、像素还没到。
+             * IDLE 是 ffmpeg 在任何提交之前做的能力探测（实测每次运行
+             * 恰好 1 次，surface 1），那一次与 Chrome 的跳帧无关，
+             * 不能记进统计，否则会把"探测"误读成"竞态"。 */
+            if (state == DMD_SURFACE_PENDING)
+                dmd_log("NO_MAP_WAIT: surface %u 已提交但像素未到"
+                        " —— Chrome 此刻会采到未写完的缓冲\n",
+                        (unsigned)surface);
+            else if (st != VA_STATUS_SUCCESS)
+                dmd_log("NO_MAP_WAIT: surface %u state=%d（非 PENDING，"
+                        "多为解码前的能力探测，与跳帧无关）\n",
+                        (unsigned)surface, state);
+            return st;
+        }
+    }
     /* ⚠️ IDLE = 从未提交过解码，缓冲里是未初始化内容（或上一帧的残留），
      * 绝不能当画面交出去。
      *
