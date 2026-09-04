@@ -140,6 +140,9 @@ grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数
 然后打开 `chrome://flags`，搜 `Vulkan`，设为 `Disabled`，重启浏览器。
 这一步没有命令行等价物，原因见下方提示。
 
+驱动没有 AV1。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
+驱动 0 配对帧），看起来像"配了没生效"。播放器里选 AVC / HEVC 清晰度。
+
 **Firefox** —— 两步都要做，只写 `user.js` 不会生效。
 
 第一步，给 `.desktop` 注入环境变量：
@@ -237,10 +240,14 @@ sudo mv /usr/share/applications/google-chrome.desktop.bak \
 # Firefox 的 .desktop
 sudo mv /usr/share/applications/firefox.desktop.bak \
         /usr/share/applications/firefox.desktop
-# Firefox：删掉上面那些 user_pref 行
+# Firefox：删掉上面那些 user_pref 行（四处都扫，和安装对称）
 pkill -x firefox 2>/dev/null; sleep 1
-for U in ~/.mozilla/firefox/*/user.js ~/.config/mozilla/firefox/*/user.js; do
-  [ -f "$U" ] && sed -i '/media\.\(hardware-video-decoding\|ffmpeg\|hevc\|video-queue\)/d' "$U"
+for R in ~/.mozilla/firefox ~/.config/mozilla/firefox \
+         ~/snap/firefox/common/.mozilla/firefox \
+         ~/.var/app/org.mozilla.firefox/.mozilla/firefox; do
+  for U in "$R"/*/user.js; do
+    [ -f "$U" ] && sed -i '/media\.\(hardware-video-decoding\|ffmpeg\|hevc\|video-queue\)/d' "$U"
+  done
 done
 ```
 
@@ -257,7 +264,9 @@ Firefox 脚本会自动找 profile，覆盖 `~/.mozilla/firefox`、
 `~/.config/mozilla/firefox`（较新版本遵循 XDG 后的位置）、snap 与 flatpak
 四处，每个找到的 profile 都写一遍；用 `FIREFOX_HOME` 可指定只处理某一个。
 已有其它工具管理的 profile（`user.js` 里带 `>>> DroidSpaces ... >>>` 块）
-会被跳过，不叠加。
+不会整段覆盖，但仍会补上对方不管的
+`media.ffmpeg.disable-software-fallback` —— 缺了它 B 站 1080p 会播几秒
+卡在加载。
 
 驱动目录优先取系统 dri 目录，用 `DMD_DRIVER_DIR` 可指定别处 ——
 `--verify` 第一行会显示实际选中的是哪一个，升级后建议瞄一眼，
@@ -284,8 +293,10 @@ google-chrome \
   --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
 ```
 
-Firefox 把 pref 写进 profile 的 `user.js`。其中三项 `media.video-queue.*`
-不是可选项 —— 1080p30 27Mbps 实测不加丢帧 14.25%，加上降到 0.89%。
+Firefox 把 pref 写进 profile 的 `user.js`。三项 `media.video-queue.*`
+不是可选项（1080p30 27Mbps 不加丢帧 14.25%，加上 0.89%）；
+`media.ffmpeg.disable-software-fallback` 也不是可选项（关掉硬解看门狗，
+否则 B 站 1080p 播几秒卡在加载）。完整清单用上面的粘贴块，不要手抄漏项。
 
 每个参数为什么不能省、Firefox 完整 pref 与其特有的坑、验证三步、实时监视、
 排障速查表，都在 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)。
