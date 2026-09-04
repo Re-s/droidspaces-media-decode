@@ -1,0 +1,128 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MSE 分段喂流帧序校验</title>
+<style>
+ body{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:10px}
+ video,canvas{width:400px;background:#000}
+ pre{background:#1b1b1b;padding:8px;font-size:12px;max-height:300px;overflow:auto}
+</style>
+<h3>MSE 分段喂流帧序校验</h3>
+<p>用 MediaSource 分块 append，复现在线播放路径（而非 file:// 直读）。<br>
+可选 seek 干扰，用来暴露 seek 后的帧序/时间戳问题。</p>
+<video id="v" muted playsinline></video>
+<canvas id="c" width="1280" height="720" style="display:none"></canvas>
+<pre id="l">init</pre>
+<script>
+const q = new URLSearchParams(location.search);
+const SRC   = q.get('src')   || 'h264_frag.mp4';
+const MIME  = q.get('mime')  || 'video/mp4; codecs="avc1.64001f"';
+const FPS   = +(q.get('fps') || 2);
+const TARGET= +(q.get('n')   || 20);
+const CHUNK = +(q.get('chunk') || 65536);
+const DOSEEK= q.get('seek') === '1';
+
+const v=document.getElementById('v'), out=document.getElementById('l');
+const c=document.getElementById('c'), ctx=c.getContext('2d',{willReadFrequently:true});
+const samples=[]; const events=[]; let done=false;
+
+function signature(){
+  ctx.drawImage(v,0,0,c.width,c.height);
+  const seg=128, TH=128;
+  const y0=Math.floor(c.height*0.42), h=Math.floor(c.height*0.16);
+  const d=ctx.getImageData(0,y0,c.width,h).data;
+  const acc=new Array(seg).fill(0), cnt=new Array(seg).fill(0);
+  for(let row=0;row<h;row++)for(let x=0;x<c.width;x++){
+    const i=(row*c.width+x)*4;
+    const lum=(d[i]*299+d[i+1]*587+d[i+2]*114)/1000;
+    const s=Math.floor(x*seg/c.width);
+    acc[s]+=(lum>TH?255:0); cnt[s]++;
+  }
+  const sig=new Array(seg);
+  for(let s=0;s<seg;s++) sig[s]=Math.round(acc[s]/(cnt[s]||1));
+  return sig;
+}
+
+function finish(reason){
+  if(done) return; done=true;
+  const pq=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
+  const idx=samples.map(s=>s.mtIdx);
+  let back=0, jumps=[];
+  for(let i=1;i<idx.length;i++)
+    if(idx[i]<idx[i-1]){back++; if(jumps.length<12)jumps.push(idx[i-1]+'->'+idx[i]);}
+  const rep={
+    label:q.get('mode')||'mse', src:SRC, reason, seekTested:DOSEEK,
+    samples, frameIdx:idx, backwardCount:back, backwardSamples:jumps,
+    monotonic:back===0, events,
+    totalVideoFrames:pq.totalVideoFrames||0,
+    droppedVideoFrames:pq.droppedVideoFrames||0
+  };
+  out.textContent='done '+reason+' 采样'+samples.length+' 回退'+back;
+  fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},
+                   body:JSON.stringify(rep)}).catch(()=>{});
+}
+
+if(!window.MediaSource){ out.textContent='无 MediaSource'; finish('no-mse'); }
+else if(!MediaSource.isTypeSupported(MIME)){ out.textContent='不支持 '+MIME; finish('mime-unsupported'); }
+else {
+  const ms=new MediaSource();
+  v.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', async ()=>{
+    const sb=ms.addSourceBuffer(MIME);
+    let buf;
+    try { buf=new Uint8Array(await (await fetch(SRC)).arrayBuffer()); }
+    catch(e){ out.textContent='取流失败 '+e; return finish('fetch-error'); }
+    events.push('fetched '+buf.length+'B');
+
+    // 分块 append，模拟网络分段到达
+    let off=0;
+    function pump(){
+      if(off>=buf.length){
+        try{ if(ms.readyState==='open') ms.endOfStream(); }catch(e){}
+        events.push('endOfStream');
+        return;
+      }
+      if(sb.updating) return;             // updateend 会再驱动
+      const end=Math.min(off+CHUNK, buf.length);
+      try{ sb.appendBuffer(buf.subarray(off,end)); }
+      catch(e){ events.push('append失败 '+e); return finish('append-error'); }
+      off=end;
+    }
+    sb.addEventListener('updateend', ()=>{
+      pump();
+      if(v.paused && v.readyState>=2) v.play().catch(()=>{});
+    });
+    /* 兜底驱动播放：整段 append 很快就 endOfStream，此后 updateend 不再触发，
+     * 若那时 readyState 还没到 HAVE_CURRENT_DATA 就没人调 play() 了。
+     * 实测症状是只采到 1 帧然后 timeout（totalVideoFrames=4）。 */
+    v.addEventListener('loadeddata', ()=>v.play().catch(()=>{}));
+    v.addEventListener('canplay',    ()=>v.play().catch(()=>{}));
+    const kick=setInterval(()=>{
+      if(done){ clearInterval(kick); return; }
+      if(v.paused && v.readyState>=2) v.play().catch(()=>{});
+    }, 500);
+    sb.addEventListener('error', ()=>events.push('sb error'));
+    pump();
+
+    if(!v.requestVideoFrameCallback) return finish('no-rvfc');
+    let seekDone=false;
+    function cb(now,md){
+      samples.push({mtIdx:Math.round(md.mediaTime*FPS), mt:+md.mediaTime.toFixed(4),
+                    sig:signature()});
+      out.textContent='采样 '+samples.length+'/'+TARGET+'\n'+
+                      samples.map(s=>s.mtIdx).join(' ');
+      // 采到一半时插一次 seek，复现在线播放里的跳转
+      if(DOSEEK && !seekDone && samples.length===Math.floor(TARGET/2)){
+        seekDone=true;
+        const t=Math.max(0, v.currentTime+2);
+        events.push('seek -> '+t.toFixed(2));
+        v.currentTime=t;
+      }
+      if(samples.length>=TARGET) return finish('enough');
+      v.requestVideoFrameCallback(cb);
+    }
+    v.requestVideoFrameCallback(cb);
+    v.addEventListener('ended',()=>finish('ended'));
+    setTimeout(()=>finish('timeout'), 45000);
+  });
+}
+</script>
