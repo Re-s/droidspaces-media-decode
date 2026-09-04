@@ -176,6 +176,7 @@ for R in ~/.mozilla/firefox ~/.config/mozilla/firefox \
       'user_pref("media.ffmpeg.vaapi.enabled", true);' \
       'user_pref("media.hevc.enabled", true);' \
       'user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);' \
+      'user_pref("media.ffmpeg.disable-software-fallback", true);' \
       'user_pref("media.video-queue.hw-accel-size", 10);' \
       'user_pref("media.video-queue.default-size", 10);' \
       'user_pref("media.video-queue.send-to-compositor-size", 6);'
@@ -189,16 +190,25 @@ profile 根目录要遍历这四处：不同安装方式（apt、XDG 新位置�
 放在不同地方，同一台机器上也可能并存多份。只写 `~/.mozilla` 的话，
 Firefox 实际用另一处时就会"配了但没生效"——页面能播、统计正常，实际走软解。
 
-两处不能省：
+三处不能省：
 
-`media.hardware-video-decoding.force-enabled` 同时关掉 Firefox 的硬解性能
-看门狗。它统计解码耗时，判定跟不上就打印 `HW decoding is slow, switching
-back to SW decode`，然后禁用硬解并重建解码器。B 站 1080p 实测：不加这项
-55 次 `NS_ERROR_DOM_MEDIA_FATAL_ERR`，页面表现为"播几秒卡在加载"；
-加上后看门狗 0 次触发。本机固件首帧滞后 4 个输入单元，天然容易被误判。
+`media.ffmpeg.disable-software-fallback` 是**唯一**能关掉硬解性能看门狗的
+开关。FFmpegVideoDecoder 累计 16 帧 `decodeTime > frameDuration` 就打印
+`HW decoding is slow, switching back to SW decode`，然后禁用硬解并重建
+解码器。此前误把 `force-enabled` 当成这个开关 —— 154 源码里看门狗条件
+只有 `IsDecodingSlow() && !media.ffmpeg.disable-software-fallback`，
+`force-enabled` 只绕过 gfxInfo 黑名单，完全不参与判定。B 站 1080p 每个
+解码器建立后立刻 `PORT_SETTINGS(INSUFFICIENT)` 重配，叠固件首帧滞后 4
+个输入单元，看门狗在解码器初期最敏感，于是进入杀解码器 → Seek 回同一
+PTS → 重建 → 再重配 → 再误判的死循环，页面表现为"播几秒卡在加载"。
+实测同一视频：加上后 100s / 3min 的 HW slow、FATAL、Seek 全 0；3min
+配对 4645 帧、送入 3099 收到 3099。代价是真正硬解损坏时不再自动退回软解。
 
-三项 `media.video-queue.*` 同理：1080p30 27Mbps 实测不加丢帧 14.25%，
-加上降到 0.89%。
+`media.hardware-video-decoding.force-enabled` 仍建议开，作用是绕过
+gfxInfo 黑名单，与看门狗无关。
+
+三项 `media.video-queue.*`：1080p30 27Mbps 实测不加丢帧 14.25%，加上
+降到 0.89%。
 
 **验证**：最可靠的判据是驱动日志。带 `DMD_VA_LOG=1` 启动浏览器，
 播一段视频，看有没有 `[v4l2] 会话就绪` 和 `配对: 帧`：
@@ -230,7 +240,7 @@ sudo mv /usr/share/applications/firefox.desktop.bak \
 # Firefox：删掉上面那些 user_pref 行
 pkill -x firefox 2>/dev/null; sleep 1
 for U in ~/.mozilla/firefox/*/user.js ~/.config/mozilla/firefox/*/user.js; do
-  [ -f "$U" ] && sed -i '/media\.\(hardware-video-decoding\|ffmpeg\.vaapi\|hevc\|video-queue\)/d' "$U"
+  [ -f "$U" ] && sed -i '/media\.\(hardware-video-decoding\|ffmpeg\|hevc\|video-queue\)/d' "$U"
 done
 ```
 

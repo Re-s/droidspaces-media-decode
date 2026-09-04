@@ -250,12 +250,15 @@ bash tools/configure-firefox-vaapi.sh --uninstall # 还原
 
 ```js
 user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true); // 绕过 gfxInfo 黑名单，不关看门狗
 user_pref("media.ffmpeg.vaapi.enabled", true);
 user_pref("media.hevc.enabled", true);
 // 零拷贝：解码帧经 dmabuf 直进合成器。缺了它硬解照跑，但每帧要拷回内存
 // 再做 CPU 软件转色，内容进程能吃掉半个到多个核心 ——
 // 表现为"开了硬解 CPU 反而更高"。
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);
+// ⚠️ 唯一能关掉硬解性能看门狗的开关。见下方说明。
+user_pref("media.ffmpeg.disable-software-fallback", true);
 // 播放队列深度：不是可选项。Venus 固件的流水线滞后 4 个输入单元才吐首帧，
 // Firefox 默认队列吸收不了这个抖动。1080p30 27Mbps 实测：
 // 不加丢帧 14.25% / 顺序回退 20.75%，加上降到 0.89% / 4.04%
@@ -268,14 +271,21 @@ user_pref("media.video-queue.send-to-compositor-size", 6);
 > ⚠️ `media.vaapi-dmabuf-textures.enabled` 已废弃 —— 本文此前推荐过它，
 > 但 Firefox 154 的 libxul 里已无此 pref（实测），写了不起作用。
 > 零拷贝现在由 `media.ffmpeg.vaapi.force-surface-zero-copy` 控制。
-> `media.hardware-video-decoding.force-enabled` **是必需项**（此前本文误标为
-> 非必需）。它不只是"强制开启硬解"，还同时关掉 Firefox 的硬解性能看门狗 ——
-> FFmpegVideoDecoder 统计解码耗时，判定跟不上就打印
-> `HW decoding is slow, switching back to SW decode`，接着
-> `disable HW acceleration` 并重建解码器。B 站 1080p 实测：不加 55 次
-> `NS_ERROR_DOM_MEDIA_FATAL_ERR`、解码器反复重建、页面卡在加载；
-> 加上后看门狗 0 次触发。本机固件首帧滞后 4 个输入单元，天然容易被误判。
-> `media.gpu-process-decoding`、`media.rdd-ffmpeg.enabled` 仍然存在但非必需。
+>
+> `media.ffmpeg.disable-software-fallback` **是关掉看门狗的唯一开关**
+> （此前误把 `force-enabled` 当成这个开关）。Firefox 154 源码
+> `FFmpegVideoDecoder.cpp:1662-1671`：累计 16 帧 `decodeTime > frameDuration`
+> 且该 pref 为 false，就返回 `HW decoding is slow, switching back to SW decode`。
+> `force-enabled` 只在 `gfxPlatform.cpp:3029` 绕过 gfxInfo 黑名单，看门狗
+> 条件里没有任何对它的引用。B 站 1080p 每个解码器建立后立刻
+> `PORT_SETTINGS(INSUFFICIENT)` 重配，叠固件首帧滞后 4 个输入单元，
+> 看门狗在解码器初期最敏感 → 杀解码器 → Seek 回同一 PTS → 重建 →
+> 再重配 → 再误判，页面卡在加载。实测加上后 100s / 3min 的 HW slow、
+> FATAL、Seek 全 0；3min 配对 4645 帧、送入 3099 收到 3099。
+> 代价：真正硬解损坏时不再自动退回软解。
+>
+> `media.hardware-video-decoding.force-enabled` 仍建议开（绕过黑名单）。
+> `media.gpu-process-decoding`、`media.rdd-ffmpeg.enabled` 存在但非必需。
 
 ### 2. 关闭 RDD 沙箱（必需，幂等）
 

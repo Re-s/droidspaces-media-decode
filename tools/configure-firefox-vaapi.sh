@@ -135,18 +135,27 @@ rewrite_user_js() {
 $BEGIN_MARKER
 // Managed by configure-firefox-vaapi.sh. Do not edit inside this block.
 user_pref("media.hardware-video-decoding.enabled", true);
-// ⚠️ force-enabled 不是"强制开启硬解"那么简单，它同时关掉 Firefox 的
-// 硬解性能看门狗。FFmpegVideoDecoder 会统计解码耗时，判定跟不上就走
-//   "HW decoding is slow, switching back to SW decode"
-// → NS_ERROR_DOM_MEDIA_DECODE_ERR → disable HW acceleration → 换新解码器。
-// B 站 1080p 实测触发：不加这项 55 次 NS_ERROR_DOM_MEDIA_FATAL_ERR，
-// 解码器被反复销毁重建，页面表现为"播几秒就卡在加载"；
-// 加上之后 "HW decoding is slow" 与 "disable HW acceleration" 都是 0 次。
-// 本机固件首帧滞后 4 个输入单元，天然容易被这个看门狗误判。
+// 绕过 gfxInfo 黑名单。不关看门狗（见下一项）。
 user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.ffmpeg.vaapi.enabled", true);
 user_pref("media.hevc.enabled", true);
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);
+// ⚠️ 唯一能关掉硬解性能看门狗的开关。FFmpegVideoDecoder 累计 16 帧
+// decodeTime > frameDuration 就走
+//   "HW decoding is slow, switching back to SW decode"
+// → disable HW acceleration → 换新解码器 → FATAL_ERR。
+// 此前误把 force-enabled 当成这个开关；154 源码里看门狗条件只有
+// IsDecodingSlow() && !media.ffmpeg.disable-software-fallback，
+// force-enabled 只在 gfxPlatform 绕过黑名单，完全不参与判定。
+// B 站 1080p 每个解码器建立后 2 行内必走 PORT_SETTINGS(INSUFFICIENT)
+// 重配（固件报显示高度 vs 对齐高度），固件首帧再滞后 4 个输入单元，
+// 看门狗在解码器初期最敏感，于是进入
+// 杀解码器 → Seek 回同一 PTS → 重建 → 再重配 → 再误判 的死循环。
+// 实测（同一视频 100s / 3min）：加上后 HW slow、disable HW、FATAL、
+// Seek(43s) 全 0；3min 配对 4645 帧、送入 3099 收到 3099。
+// 代价：真正硬解损坏时 Firefox 不再自动退回软解。对本机（驱动侧
+// 送入=收到、零丢帧）可接受。
+user_pref("media.ffmpeg.disable-software-fallback", true);
 // 播放队列深度：不是可选项。Venus 固件的解码流水线滞后 4 个输入单元才吐首帧
 // （无 B 帧码流同样如此），Firefox 默认队列太浅，吸收不了这个滞后带来的交付
 // 抖动。1080p30 27Mbps 实测：不加丢帧 14.25%、顺序回退 20.75%；加上降到
