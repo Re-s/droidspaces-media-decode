@@ -118,6 +118,14 @@ rewrite_user_js() {
         say "  两套配置的 pref 重叠，叠加会导致重复定义。"
         say "  要改用本脚本，请先删掉 user.js 里 '>>> DroidSpaces ... >>>' 到"
         say "  '<<< ... <<<' 之间的整段，再重新执行。"
+        # 但仍补一条对方不管的关键 pref：关掉硬解看门狗。
+        # 缺了它 B 站 1080p 会播几秒卡在加载（见 README）。
+        k='user_pref("media.ffmpeg.disable-software-fallback", true);'
+        if grep -qxF "$k" "$userjs" 2>/dev/null; then
+            say "  disable-software-fallback 已存在"
+        else
+            printf '%s\n' "$k" >> "$userjs" && say "  已补 $k"
+        fi
         return 2          # 2 = 有意跳过，区别于 0 成功 / 1 失败
     fi
 
