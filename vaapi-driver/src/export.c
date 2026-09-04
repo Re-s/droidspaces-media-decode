@@ -201,5 +201,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
             desc->num_layers > 1
                 ? (const char *)&desc->layers[1].drm_format : "");
 
+    /* 标记这个 surface 走的是"导出 dmabuf 自己采样"的契约。
+     * EndPicture 据此决定是否必须在返回前把像素同步写进 surface ——
+     * 只有这类消费者（Chrome）需要，ffmpeg/Firefox 有 map 兜底。
+     * 重新取指针：上面为了做 ioctl 放过锁。 */
+    pthread_mutex_lock(&drv->lock);
+    s = dmd_find_surface_locked(drv, surface_id);
+    if (s)
+        s->exported = 1;
+    pthread_mutex_unlock(&drv->lock);
+
     return VA_STATUS_SUCCESS;
 }

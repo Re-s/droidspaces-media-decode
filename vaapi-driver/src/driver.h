@@ -203,6 +203,15 @@ struct dmd_surface {
      * 与 vaExportSurfaceHandle 交给调用方的那个 fd 分开持有：那个的生命周期
      * 归调用方（它负责 close），不能拿来做内部同步。-1 = 不可用。 */
     int dumb_sync_fd;
+    /* 曾被 vaExportSurfaceHandle 导出过。
+     *
+     * 用途：区分消费者契约，决定 EndPicture 是否必须立刻把像素写进 surface。
+     * Chrome 会在解码前导出全部 dmabuf，之后只 EndPicture、从不 Sync/GetImage，
+     * 所以它的 surface 必须在 EndPicture 返回前就写好；
+     * ffmpeg/Firefox 走 DeriveImage/GetImage，那里有 dmd_surface_wait 兜底，
+     * 不需要在 EndPicture 里同步 memcpy —— 而那次 memcpy 会让吞吐减半
+     * （实测 jinjie 300 帧：76.8 → 34.8 fps）。 */
+    int exported;
     /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
      * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
     int state;

@@ -2156,6 +2156,25 @@ static int h264_send_param_sets(struct dmd_session *sess,
     return 0;
 }
 
+/* 该 context 的待解码队列里是否有"导出过 dmabuf"的 surface。
+ *
+ * Chrome 在任何解码之前就把整池 surface 逐个 vaExportSurfaceHandle，
+ * 所以只要队列里出现导出记录，就说明消费者属于"自己采样 dmabuf"那一类，
+ * EndPicture 必须在返回前把像素同步写进 surface。
+ * ffmpeg 从不导出（它走 GetImage/DeriveImage，有 dmd_surface_wait 兜底），
+ * 这里命中 0 次，于是省下那次让吞吐减半的 memcpy。 */
+static int dmd_pending_has_exported_locked(struct dmd_driver *drv,
+                                           struct dmd_context *c)
+{
+    for (int k = 0; k < c->pending_count; k++) {
+        int kp = (c->pending_head + k) % DMD_MAX_SURFACES;
+        struct dmd_surface *s = dmd_find_surface_locked(drv, c->pending[kp]);
+        if (s && s->exported)
+            return 1;
+    }
+    return 0;
+}
+
 VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
@@ -3225,8 +3244,34 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 回归必须用 tests/browser/ 下的浏览器像素判据。
      *
      * 只收已经在队列里的帧（next_frame 对 pend_pop 立即返回），
-     * 不额外阻塞等硬件，避免重新引入 Firefox 那种互等死锁。 */
+     * 不额外阻塞等硬件，避免重新引入 Firefox 那种互等死锁。
+     *
+     * ⚠️ 只对导出过 dmabuf 的 surface 做（dmd_pending_has_exported_locked）。
+     * 这次 memcpy 代价实打实：无条件做会让吞吐减半 —— 实测
+     * jinjie_265.mp4 300 帧 76.8 fps → 34.8 fps。25fps 在线流只剩 1.4 倍
+     * 余量，浏览器实测掉 6 帧（dropped 6/34，旧版 0/28）。
+     * ffmpeg/Firefox 走 DeriveImage/GetImage，那里 dmd_surface_wait 会兜底，
+     * 不需要在这里同步写入。 */
+    /* DMD_HARVEST_EXPORTED_ONLY=1：只对导出过 dmabuf 的 surface 收帧。
+     *
+     * 这是一个**尚未验证**的吞吐优化，默认关闭。
+     * 动机是无条件收帧让吞吐减半（实测 jinjie 300 帧 76.8 → 34.8 fps，
+     * 25fps 在线流因此掉 6 帧）。理论上 ffmpeg/Firefox 走 GetImage，
+     * 有 dmd_surface_wait 兜底，不需要在这里同步写入。
+     * ffmpeg 侧已确认：开启后 "返回前写入" 降为 0，双契约回归 9 项全绿，
+     * 吞吐回到 52.9 fps。
+     *
+     * ⚠️ 但 Chrome 侧的像素正确性没验成 —— 那一轮 rvfc 停止回调
+     * （reason=timeout、samples 为空，而同一页面此前能稳定采到 20 帧），
+     * 属于测试工具失效，不是驱动结论。所以默认保持已验证的无条件收帧。
+     * 要启用请先用 tests/browser/verify_pps_fix.sh 拿到 20/20 的像素证据。 */
+    static int exported_only = -1;
+    if (exported_only < 0) {
+        const char *e = getenv("DMD_HARVEST_EXPORTED_ONLY");
+        exported_only = (e && e[0] == '1') ? 1 : 0;
+    }
     if (c->session && !drv->io_busy[idx] &&
+        (!exported_only || dmd_pending_has_exported_locked(drv, c)) &&
         dmd_session_frames_pending(c->session) > 0) {
         struct dmd_session *hsess = c->session;
         drv->io_busy[idx] = 1;
