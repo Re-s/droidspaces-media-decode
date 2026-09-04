@@ -1,5 +1,9 @@
 #!/bin/bash
-# H.264 首份 PPS 修复的 A-B 反证。
+# Chrome 画面错乱修复的 A-B 反证（H.264 与 HEVC）。
+#
+# 支持两种素材，用 SRC/SIG 环境变量切换：
+#   SRC=h264_slow.mp4  SIG=h264_sig.json   （默认）
+#   SRC=order_slow.mp4 SIG=hevc_sig.json   （HEVC）
 #
 # ── 这个脚本存在的理由 ────────────────────────────────────────
 # 被修的 bug 是：I/IDR slice 没有 num_ref_idx_l0/l1_active_minus1 语法元素，
@@ -18,8 +22,17 @@
 # 抓 canvas 像素算签名，与软解基线比对，得出"画面里实际是第几帧"。
 #
 # ── 实测结果（三轮，完全可重复）────────────────────────────
-#   旧版驱动（首份 PPS 9 字节 l0=0）：一致 5/4/5，无法识别 13/13/13（共 20）
-#   新版驱动（首份 PPS 10 字节 l0=2）：一致 20/20/20，不符 0
+# H.264（h264_slow.mp4，三轮）：
+#   旧版（首份 PPS 9 字节 l0=0）：一致 5/4/5，无法识别 13/13/13（共 20）
+#   新版（首份 PPS 10 字节 l0=2）：一致 20/20/20，不符 0
+# HEVC（order_slow.mp4，两轮）：
+#   旧版：一致 3/4，无法识别 13/11（共 20）
+#   新版：一致 20/20，不符 0
+#
+# ⚠️ HEVC 侧的改善**不是** PPS 修复带来的（HEVC 参数集每会话只送 1 次）。
+# 单变量实验确认真正起作用的是 decode.c 里 EndPicture 返回前的收帧块：
+# 把合成 SPS 的 reorder 回退成写 0、仅保留该收帧块的变体，仍然 20/20 全对，
+# 且后台收帧线程 reap=0。详见 decode.c 该处注释。
 #
 # 用法：verify_pps_fix.sh <旧版build目录> <新版build目录> [轮数]
 # 旧版可用 git worktree 构建：
@@ -32,13 +45,16 @@ NEW="${2:?新版 build 目录}"
 ROUNDS="${3:-1}"
 CR=/tmp/cr
 PORT_BASE=8971
+SRC="${SRC:-h264_slow.mp4}"
+SIG="${SIG:-h264_sig.json}"
 
 for d in "$OLD" "$NEW"; do
     [ -f "$d/msm_drm_drv_video.so" ] || { echo "找不到驱动: $d"; exit 2; }
 done
 [ -f "$CR/order_pixel.html" ] || { echo "缺 $CR/order_pixel.html"; exit 2; }
-[ -f "$CR/h264_sig.json" ]    || { echo "缺基准签名表 $CR/h264_sig.json"; exit 2; }
-[ -f "$CR/h264_slow.mp4" ]    || { echo "缺素材 $CR/h264_slow.mp4"; exit 2; }
+[ -f "$CR/$SIG" ] || { echo "缺基准签名表 $CR/$SIG"; exit 2; }
+[ -f "$CR/$SRC" ] || { echo "缺素材 $CR/$SRC"; exit 2; }
+echo "素材: $SRC  基准表: $SIG"
 
 echo "旧版: $(strings "$OLD/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
 echo "新版: $(strings "$NEW/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
@@ -61,7 +77,7 @@ run_one() {
         --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiIgnoreDriverChecks \
         --user-data-dir="$CR/rev/p_$mode" --no-first-run --no-default-browser-check \
         --autoplay-policy=no-user-gesture-required \
-        "http://127.0.0.1:$port/order_pixel.html?mode=$mode&src=h264_slow.mp4" \
+        "http://127.0.0.1:$port/order_pixel.html?mode=$mode&src=$SRC" \
         >"$CR/rev/c_$mode.log" 2>&1 &
     local i
     for i in $(seq 1 28); do
@@ -82,10 +98,10 @@ for r in $(seq 1 "$ROUNDS"); do
     run_one "new$r" $((PORT_BASE + r * 4 + 2)) "$NEW"
 done
 
-python3 - "$ROUNDS" <<'PY'
+SIG="$SIG" python3 - "$ROUNDS" <<'PY'
 import json, os, sys
 CR = '/tmp/cr'
-base = json.load(open(f'{CR}/h264_sig.json'))['sigs']
+base = json.load(open(f"{CR}/{os.environ.get('SIG','h264_sig.json')}"))['sigs']
 def dist(a, b): return sum((x - y) ** 2 for x, y in zip(a, b))
 
 def evaluate(path):

@@ -3195,10 +3195,34 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->sent_l1 = c->pending_l1;
     }
 
-    /* Chrome 不调 vaSyncSurface。send_unit 成功后已经用 5ms recv 把
-     * 解完的帧推进 session 待取队列，但若不在这里写进 surface，
-     * Chrome 在 EndPicture 返回后立刻 SurfaceReady / GPU 采样，
-     * 采到的是空缓冲或上一轮像素 —— 慢速播放仍显示解码序 0→4→2→1。
+    /* ★ 这段是 Chrome 画面错乱的**真正修复点**（已用 A-B 实验定位）。
+     *
+     * Chrome 不调 vaSyncSurface（实测 0 次，Firefox 同场景 1500 次），
+     * 也不调 DeriveImage/GetImage，所以驱动里那些"map 时兜底等帧"的路径
+     * 它一条都不走。send_unit 成功后帧已被 5ms recv 推进 session 待取队列，
+     * 但若不在这里写进 surface，Chrome 在 EndPicture 返回后立刻
+     * SurfaceReady / GPU 采样，采到的是空缓冲或上一轮像素。
+     *
+     * ── A-B 定位实验（order_slow.mp4 HEVC，浏览器像素判据，各 2 轮）──
+     * 三个候选改动分别单独验证，判据是"画面里实际是第几帧"：
+     *
+     *   旧版 9f00b1a6（无本段代码，reorder 写 0）
+     *       画面正确 3/20 与 4/20，无法识别 13 与 11
+     *       日志 "返回前写入" 0 次
+     *   变体（有本段代码，reorder 回退成写 0）
+     *       画面正确 20/20 两轮；"返回前写入" 21 次；后台线程 reap=0
+     *   当前版本（有本段代码，reorder 写 DPB 上限）
+     *       画面正确 20/20 两轮；"返回前写入" 34 次
+     *
+     * 结论：
+     * - 起作用的就是本段代码。变体把 reorder 改回 0 仍然全对，
+     *   证明合成 SPS 的 reorder 值与此无关（与 md5 单变量实测一致）。
+     * - 也不是后台收帧线程：变体的 reap=0，一帧都没经它手，照样全对。
+     *   后台线程只是在 Chrome 长时间不调 EndPicture 时兜底。
+     *
+     * ⚠️ 这个 bug 用 ffmpeg md5 测不出来（旧版驱动同素材 md5 PASS），
+     * 因为 ffmpeg 走 DeriveImage/GetImage，那里有 dmd_surface_wait 兜底。
+     * 回归必须用 tests/browser/ 下的浏览器像素判据。
      *
      * 只收已经在队列里的帧（next_frame 对 pend_pop 立即返回），
      * 不额外阻塞等硬件，避免重新引入 Firefox 那种互等死锁。 */
