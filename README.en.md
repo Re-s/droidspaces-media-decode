@@ -325,6 +325,26 @@ kernel `4.14.336`; container is Debian 13 aarch64 inside DroidSpaces.
 
 AV1 requires newer hardware and is verified on a separate device.
 
+## New-kernel support (0.4.4)
+
+The old msm_vidc generation (nabu / kernel 4.14) uses nominal USERPTR memory plus
+private events plus SESSION_CONTINUE. Newer kernels (Android 12+ / kernel 5.x+;
+verified on Android 15 / kernel 6.6) follow the **standard V4L2 stateful decoder
+semantics**: only `V4L2_MEMORY_DMABUF` is accepted, a standard
+`V4L2_EVENT_SOURCE_CHANGE` is emitted, and CAPTURE must be negotiated after it.
+
+Since 0.4.4 the driver forks automatically based on the `REQBUFS` result, leaving
+the old-kernel behaviour untouched:
+
+- `REQBUFS(DMABUF)` succeeds → new-kernel path: CAPTURE is deferred until the
+  SOURCE_CHANGE event;
+- rejected, falls back to `USERPTR` → old-kernel path: pre-configured CAPTURE +
+  private `PORT_SETTINGS` + `SESSION_CONTINUE`.
+
+Verified on a new-kernel device (Ubuntu 26.04 aarch64 container, libva 1.23,
+ffmpeg 8.0.1): H.264 High (1080p/720p/854x480/640x360) and HEVC Main (1080p)
+hardware decode is **byte-identical (md5)** to software decode.
+
 ## License
 
 See [LICENSE](LICENSE).
