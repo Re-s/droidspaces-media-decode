@@ -42,6 +42,35 @@ google-chrome --ozone-platform=wayland \
 参数：`src` 分段流、`mime` MSE codec 串、`fps` 帧率、`n` 采样数、
 `chunk` 分块字节、`seek=1` 中途插一次 seek。
 
+## 三个测试页
+
+| 页面 | 覆盖路径 | 关键参数 |
+|------|----------|----------|
+| `mse_test.html` | MSE `appendBuffer` 分段喂流 | `src` `mime` `fps` `n` `chunk` `seek=1` |
+| `net_test.html` | 真实 HTTP 在线源直读 | `url` `fps` `n` `seek=1` |
+| `abr_test.html` | ABR 分辨率切换（换 src） | 页内 `srcs` 数组、`PER` 每档帧数 |
+
+### 实测结果（修复版驱动）
+
+真实在线源 `jinjie_265.mp4`（HEVC 1280x720，用户最初报问题的 URL）：
+- 直读播放 24 帧：单调递增、零回退，231 次配对
+- 加 seek 干扰 24 帧：帧号 0-11 连续，seek 后 86-97 连续，零回退零丢帧
+
+ABR 分辨率切换（640x360 → 1280x720 → 640x360）：
+- 三档各采 10 帧，分辨率正确跟随，全部单调、零回退
+- 驱动建 3 个会话（`CAPTURE 就绪` 640x368 两次、1280x720 一次），86 次配对
+
+## 编写这类页面的两个坑
+
+**换 src 会取消 pending 的 `requestVideoFrameCallback`。** 紧跟 `v.src=`
+立刻重新注册也无效 —— 那时新流还没就绪。必须等 `loadeddata` 事件。
+实测症状是整个测试卡住不回传（只建了 1 个会话）。
+
+**MSE 播放推进依赖 `updateend` 驱动 `play()`。** 整段很快 `endOfStream`
+之后 `updateend` 不再触发，若那时 `readyState` 还没到 `HAVE_CURRENT_DATA`
+就没人调 `play()` 了。实测只采到 1 帧就 timeout。补 `loadeddata`/`canplay`
+监听与定时兜底。
+
 ## 已知环境限制
 
 - **Chrome MSE 拒收 HEVC**：同一个 `hevc_frag.mp4` 走 `<video src>` 直读

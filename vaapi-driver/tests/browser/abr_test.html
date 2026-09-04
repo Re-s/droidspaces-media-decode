@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8">
+<style>body{background:#111;color:#eee;font-family:sans-serif}video{width:400px}</style>
+<video id="v" muted playsinline></video><pre id="l">init</pre>
+<script>
+/* ABR 切换验证：连续换 src 到不同分辨率，复现驱动的 CAPTURE 重配路径。
+ * ⚠️ 换 src 会取消 pending 的 requestVideoFrameCallback，
+ * 必须在每次 load 后重新注册，否则只能采到最后一档（实测只有 2 帧）。 */
+const srcs=['abr_640x360.mp4','abr_1280x720.mp4','abr_640x360.mp4'];
+const PER=10;                 // 每档采这么多帧
+const v=document.getElementById('v'),out=document.getElementById('l');
+const FPS=5;const all=[],ev=[];let done=false,si=0,cur=0;
+function fin(r){if(done)return;done=true;
+ const pq=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
+ let back=0,jumps=[];
+ for(const g of all){const idx=g.frames.map(x=>x.i);
+   for(let k=1;k<idx.length;k++)if(idx[k]<idx[k-1]){back++;jumps.push(g.src+':'+idx[k-1]+'->'+idx[k]);}}
+ fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({label:'abr',reason:r,groups:all,events:ev,
+   backwardCount:back,backwardSamples:jumps,monotonic:back===0,samples:[],frameIdx:[],
+   totalVideoFrames:pq.totalVideoFrames||0,droppedVideoFrames:pq.droppedVideoFrames||0})}).catch(()=>{});
+ out.textContent='done '+r;}
+function load(){
+ if(si>=srcs.length) return fin('all-done');
+ const s=srcs[si]; si++; cur=0;
+ all.push({src:s,frames:[]});
+ ev.push('load '+s);
+ v.src=s;
+ /* ⚠️ 必须等 loadeddata 再注册回调。
+  * 换 src 会取消 pending 的 requestVideoFrameCallback，而紧跟 v.src=
+  * 立刻注册也无效 —— 那时新流还没就绪，回调注册在旧的 media element
+  * 状态上，实测表现是整个测试卡住不回传（只建了 1 个会话）。 */
+ v.addEventListener('loadeddata', function once(){
+   v.removeEventListener('loadeddata', once);
+   v.play().catch(e=>ev.push('play '+e));
+   v.requestVideoFrameCallback(cb);
+ });
+}
+function cb(n,md){
+ const g=all[all.length-1];
+ g.frames.push({i:Math.round(md.mediaTime*FPS),w:v.videoWidth,h:v.videoHeight});
+ cur++;
+ out.textContent=all.map(x=>x.src+': '+x.frames.map(y=>y.i).join(' ')).join('\n');
+ if(cur>=PER){ load(); return; }       // 本档采够，换下一档
+ v.requestVideoFrameCallback(cb);
+}
+v.addEventListener('error',()=>{ev.push('err '+(v.error&&v.error.code));load();});
+if(!v.requestVideoFrameCallback)fin('no-rvfc');
+else{ setTimeout(()=>fin('timeout'),50000); load(); }
+</script>
