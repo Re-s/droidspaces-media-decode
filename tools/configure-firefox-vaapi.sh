@@ -135,6 +135,15 @@ rewrite_user_js() {
 $BEGIN_MARKER
 // Managed by configure-firefox-vaapi.sh. Do not edit inside this block.
 user_pref("media.hardware-video-decoding.enabled", true);
+// ⚠️ force-enabled 不是"强制开启硬解"那么简单，它同时关掉 Firefox 的
+// 硬解性能看门狗。FFmpegVideoDecoder 会统计解码耗时，判定跟不上就走
+//   "HW decoding is slow, switching back to SW decode"
+// → NS_ERROR_DOM_MEDIA_DECODE_ERR → disable HW acceleration → 换新解码器。
+// B 站 1080p 实测触发：不加这项 55 次 NS_ERROR_DOM_MEDIA_FATAL_ERR，
+// 解码器被反复销毁重建，页面表现为"播几秒就卡在加载"；
+// 加上之后 "HW decoding is slow" 与 "disable HW acceleration" 都是 0 次。
+// 本机固件首帧滞后 4 个输入单元，天然容易被这个看门狗误判。
+user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.ffmpeg.vaapi.enabled", true);
 user_pref("media.hevc.enabled", true);
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);

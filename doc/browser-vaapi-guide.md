@@ -268,8 +268,14 @@ user_pref("media.video-queue.send-to-compositor-size", 6);
 > ⚠️ `media.vaapi-dmabuf-textures.enabled` 已废弃 —— 本文此前推荐过它，
 > 但 Firefox 154 的 libxul 里已无此 pref（实测），写了不起作用。
 > 零拷贝现在由 `media.ffmpeg.vaapi.force-surface-zero-copy` 控制。
-> `media.hardware-video-decoding.force-enabled`、`media.gpu-process-decoding`、
-> `media.rdd-ffmpeg.enabled` 这三项仍然存在，但不是必需项，脚本没有写入。
+> `media.hardware-video-decoding.force-enabled` **是必需项**（此前本文误标为
+> 非必需）。它不只是"强制开启硬解"，还同时关掉 Firefox 的硬解性能看门狗 ——
+> FFmpegVideoDecoder 统计解码耗时，判定跟不上就打印
+> `HW decoding is slow, switching back to SW decode`，接着
+> `disable HW acceleration` 并重建解码器。B 站 1080p 实测：不加 55 次
+> `NS_ERROR_DOM_MEDIA_FATAL_ERR`、解码器反复重建、页面卡在加载；
+> 加上后看门狗 0 次触发。本机固件首帧滞后 4 个输入单元，天然容易被误判。
+> `media.gpu-process-decoding`、`media.rdd-ffmpeg.enabled` 仍然存在但非必需。
 
 ### 2. 关闭 RDD 沙箱（必需，幂等）
 

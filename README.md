@@ -172,6 +172,7 @@ for R in ~/.mozilla/firefox ~/.config/mozilla/firefox \
     touch "$U"
     for k in \
       'user_pref("media.hardware-video-decoding.enabled", true);' \
+      'user_pref("media.hardware-video-decoding.force-enabled", true);' \
       'user_pref("media.ffmpeg.vaapi.enabled", true);' \
       'user_pref("media.hevc.enabled", true);' \
       'user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);' \
@@ -188,8 +189,16 @@ profile 根目录要遍历这四处：不同安装方式（apt、XDG 新位置�
 放在不同地方，同一台机器上也可能并存多份。只写 `~/.mozilla` 的话，
 Firefox 实际用另一处时就会"配了但没生效"——页面能播、统计正常，实际走软解。
 
-三项 `media.video-queue.*` 不是可选项：1080p30 27Mbps 实测不加丢帧
-14.25%，加上降到 0.89%。
+两处不能省：
+
+`media.hardware-video-decoding.force-enabled` 同时关掉 Firefox 的硬解性能
+看门狗。它统计解码耗时，判定跟不上就打印 `HW decoding is slow, switching
+back to SW decode`，然后禁用硬解并重建解码器。B 站 1080p 实测：不加这项
+55 次 `NS_ERROR_DOM_MEDIA_FATAL_ERR`，页面表现为"播几秒卡在加载"；
+加上后看门狗 0 次触发。本机固件首帧滞后 4 个输入单元，天然容易被误判。
+
+三项 `media.video-queue.*` 同理：1080p30 27Mbps 实测不加丢帧 14.25%，
+加上降到 0.89%。
 
 **验证**：最可靠的判据是驱动日志。带 `DMD_VA_LOG=1` 启动浏览器，
 播一段视频，看有没有 `[v4l2] 会话就绪` 和 `配对: 帧`：
