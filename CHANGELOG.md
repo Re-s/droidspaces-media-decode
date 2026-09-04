@@ -1,5 +1,38 @@
 # 更新日志
 
+## v0.4.5（适配新内核 msm_vidc）
+
+**新增：适配新内核 msm_vidc（Android 12+ / kernel 5.x+，标准 V4L2 stateful 语义）。**
+
+此前只支持老内核（nabu / kernel 4.14：USERPTR 名义内存 + 私有事件 + SESSION_CONTINUE）。
+在 Android 15 / kernel 6.6 的设备上 `REQBUFS(USERPTR)` 直接 EINVAL、会话建立失败，
+ffmpeg/mpv 静默回落软解。
+
+测试环境（新增）：高通新 msm_vidc（Android 15 / kernel 6.6.118，card=`msm_vidc_decoder`，
+`/dev/dma_heap/system`），Ubuntu 26.04 aarch64 容器，libva 1.23，ffmpeg 8.0.1。
+判据与 v0.4.3 相同：硬解与软解 **md5 逐字节一致**。
+
+### ✨ 适配点（按 REQBUFS 结果自动分叉，对老内核零影响）
+
+1. **缓冲内存模式**：先 `REQBUFS(DMABUF)`，被拒再回退 `USERPTR`（老内核 nabu 只认后者）。
+   新内核只接受 DMABUF，dmabuf fd 走 `plane.m.fd`；老内核的 USERPTR 是名义值、fd 走
+   `reserved[0]`（见 v4l2_backend.c 中 `dmd_v4l2_dec.buf_mem`）。
+2. **CAPTURE 协商时机**：DMABUF（新内核）下不再在喂料前预配 CAPTURE，改为等标准
+   `V4L2_EVENT_SOURCE_CHANGE` 事件后再 `G_FMT/S_FMT(CAPTURE)` + REQBUFS + STREAMON；
+   老内核保留原有预配 + 私有 `PORT_SETTINGS` + `SESSION_CONTINUE` 路径。
+3. **事件处理**：标准 `SOURCE_CHANGE`（changes=1=RESOLUTION）单独处理；新内核不发
+   私有 `PORT_SETTINGS`，也不接受 `V4L2_QCOM_CMD_SESSION_CONTINUE`（返回 EINVAL），
+   因此不再对其发送该命令。
+
+### 验证（硬解 vs 软解逐字节 md5）
+
+| 编码 | 分辨率 | 结果 |
+|---|---|---|
+| H.264 High | 1920x1080 / 1280x720 / 854x480 / 640x360 | ✅ 一致 |
+| HEVC Main | 1920x1080 | ✅ 一致 |
+
+`make tests` 单元测试全部通过。
+
 ## v0.4.4
 
 **修复浏览器 seek / 切清晰度时的长时间缓冲。**

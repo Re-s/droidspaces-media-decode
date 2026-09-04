@@ -447,6 +447,21 @@ LIBVA_DRIVER_NAME=msm_drm vainfo 2>&1 | grep 'Driver version'
 
 AV1 需要更新的硬件，在另一台设备上验证。
 
+## 新内核适配（0.4.4）
+
+老内核 msm_vidc（nabu / kernel 4.14）用 USERPTR 名义内存 + 私有事件 + SESSION_CONTINUE；
+新内核（Android 12+ / kernel 5.x+，实测 Android 15 / kernel 6.6）改走**标准 V4L2 stateful
+语义**：只接受 `V4L2_MEMORY_DMABUF`、发标准 `V4L2_EVENT_SOURCE_CHANGE`、在事件后协商
+CAPTURE。
+
+0.4.4 起驱动按 `REQBUFS` 结果自动分叉两条路径，老内核行为不变：
+
+- `REQBUFS(DMABUF)` 成功 → 新内核路径：CAPTURE 延迟到 SOURCE_CHANGE 后配置；
+- 被拒回退 `USERPTR` → 老内核路径：原有预配 + 私有 `PORT_SETTINGS` + `SESSION_CONTINUE`。
+
+实测（新内核设备，Ubuntu 26.04 aarch64 容器，libva 1.23，ffmpeg 8.0.1）：H.264 High
+（1080p/720p/854x480/640x360）与 HEVC Main（1080p）硬解与软解 **md5 逐字节一致**。
+
 ## 许可
 
 见 [LICENSE](LICENSE)。
