@@ -2084,6 +2084,18 @@ static int hevc_send_param_sets(struct dmd_session *sess,
         return -1;
     }
     dmd_log("HEVC: 已送 SPS %zu 字节\n", n);
+    /* DMD_CSD_DUMP=1 时打印合成 SPS 的原始字节。
+     * 需要它是因为 ue(v) 编码下不同取值常占同样位数（例如 2 与 7 都是 5 bit），
+     * 只看 NALU 长度无法判断改动是否真的写进了比特流 —— 实测中就曾因此
+     * 把"开关未生效"误读成"取值无影响"。 */
+    if (getenv("DMD_CSD_DUMP")) {
+        char hex[3 * 64 + 1];
+        size_t m = n < 64 ? n : 64, k;
+        for (k = 0; k < m; k++)
+            snprintf(hex + k * 3, 4, "%02x ", nalu[k]);
+        hex[m ? m * 3 - 1 : 0] = '\0';
+        dmd_log("HEVC SPS 字节: %s\n", hex);
+    }
 
     n = dmd_hevc_build_pps_nalu(pp, nalu, sizeof(nalu));
     if (n == 0) {

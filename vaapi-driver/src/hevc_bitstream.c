@@ -24,6 +24,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "driver.h"
 #include "bitstream.h"
@@ -174,10 +175,23 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
 
     dmd_bw_put_flag(&bw, 0);            /* sps_sub_layer_ordering_info_present_flag */
     dmd_bw_put_ue(&bw, pp->sps_max_dec_pic_buffering_minus1);
-    /* 见 build_vps_rbsp：写 0 会让按 SPS 决定输出时机的解码器按解码序
-     * 立刻吐帧。Chrome 自己解析原始码流，硬件走 OUTPUT_ORDER=1，
-     * 但合成 SPS 仍必须与真实重排需求一致，避免任何读 CSD 的路径
-     * 把 max_num_reorder_pics 当成 0。 */
+    /* sps_max_num_reorder_pics / sps_max_latency_increase_plus1。
+     *
+     * ── 实测结论：这两个值对本驱动的解码结果没有影响 ──────────
+     * 单变量实测（jinjie_265.mp4 60 帧，真实 SPS 为 reorder=2 latency=5，
+     * 用 DMD_CSD_DUMP 逐字节确认覆盖已真正写进比特流）：
+     *   reorder = 0,1,2,4,7 → 全部 md5 PASS
+     *   latency = 0,5,9     → 全部 md5 PASS
+     * 原因：硬件走 OUTPUT_ORDER=1（解码序输出），重排由消费者的 DPB 负责，
+     * MediaCodec 侧不依据 CSD 里这两个值决定吐帧时机。
+     *
+     * ⚠️ 所以不要再把这里当成"帧序问题"的修复点 —— 曾有一轮据此推测
+     * "写 0 会让解码器按解码序吐帧、画面变成 0→4→2→1"并改成写 DPB 上限，
+     * 那个改动实际上是无效的（改前改后 md5 同样 PASS）。
+     * 保留写 DPB 上限只是因为它比写 0 更接近真值，不是因为它修了什么。
+     *
+     * VA-API 没有这两个字段的数值，只给 NoPicReorderingFlag，
+     * 所以无法还原真值；未置位时用 DPB 上限作不放大的上界。 */
     dmd_bw_put_ue(&bw, pp->pic_fields.bits.NoPicReorderingFlag
                           ? 0u : (unsigned)pp->sps_max_dec_pic_buffering_minus1);
     dmd_bw_put_ue(&bw, 0);              /* sps_max_latency_increase_plus1 */
