@@ -8,8 +8,33 @@ set -u
 
 BEGIN_MARKER='// BEGIN DMD MSM VA-API MANAGED PREFS'
 END_MARKER='// END DMD MSM VA-API MANAGED PREFS'
-FIREFOX_HOME="$HOME/.mozilla/firefox"
-PROFILES_INI="$FIREFOX_HOME/profiles.ini"
+# Firefox profile 根目录不能写死 —— 不同安装方式放在不同地方，
+# 而且同一台机器上可能同时存在多处（本机实测 ~/.config/mozilla/firefox
+# 与 ~/.mozilla/firefox 都有真实 profile 和 prefs.js）：
+#
+#   ~/.mozilla/firefox                              apt / tarball（传统位置）
+#   ~/.config/mozilla/firefox                       较新版本遵循 XDG 后的新位置
+#   ~/snap/firefox/common/.mozilla/firefox          snap
+#   ~/.var/app/org.mozilla.firefox/.mozilla/firefox flatpak
+#
+# 策略：对每个存在 profiles.ini 的根目录都写一遍。宁可多写也不能漏
+# —— 写错位置的后果是"配了但没生效"，而这种失败最难排查（页面能播、
+# 统计看着正常，实际静默走软解）。
+# FIREFOX_HOME 环境变量可覆盖，只处理指定的那一个。
+firefox_homes() {
+    if [ -n "${FIREFOX_HOME:-}" ]; then
+        [ -f "$FIREFOX_HOME/profiles.ini" ] && printf '%s\n' "$FIREFOX_HOME"
+        return 0
+    fi
+    for h in \
+        "$HOME/.mozilla/firefox" \
+        "$HOME/.config/mozilla/firefox" \
+        "$HOME/snap/firefox/common/.mozilla/firefox" \
+        "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"
+    do
+        [ -f "$h/profiles.ini" ] && printf '%s\n' "$h"
+    done
+}
 LOCAL_BIN="$HOME/.local/bin"
 WRAPPER="$LOCAL_BIN/firefox-msm-vaapi"
 APPLICATIONS="$HOME/.local/share/applications"
@@ -39,13 +64,17 @@ select_driver_dir() {
     if [ -n "${DMD_DRIVER_DIR:-}" ]; then
         DRIVER_DIR=$DMD_DRIVER_DIR
     else
-        # 挑版本号最大的 release-v* 目录，不要硬编码某个版本 —— 否则升级后
-        # 脚本会继续指向旧驱动。sort -V 按版本序排，取最后一个。
-        DRIVER_DIR=''
-        for d in $(ls -d "$HOME"/Documents/DSHWK/release-v* 2>/dev/null | sort -V); do
-            [ -f "$d/msm_drm_drv_video.so" ] && DRIVER_DIR=$d
-        done
-        [ -n "$DRIVER_DIR" ] || DRIVER_DIR=/usr/lib/aarch64-linux-gnu/dri
+        # 优先系统 dri 目录 —— 那是 `make install` 的正式落点，也是 libva
+        # 默认加载的位置。此前反过来先挑 release-v* 目录，结果用户装了
+        # 0.4.6 到系统目录，脚本却把 LIBVA_DRIVERS_PATH 指向遗留的
+        # release-v0.4.4，配完仍跑旧驱动（实测踩过）。
+        DRIVER_DIR=/usr/lib/aarch64-linux-gnu/dri
+        if [ ! -f "$DRIVER_DIR/msm_drm_drv_video.so" ]; then
+            # 系统目录没装，才退而找版本号最大的 release-v*（sort -V 版本序）。
+            for d in $(ls -d "$HOME"/Documents/DSHWK/release-v* 2>/dev/null | sort -V); do
+                [ -f "$d/msm_drm_drv_video.so" ] && DRIVER_DIR=$d
+            done
+        fi
     fi
 
     if [ ! -f "$DRIVER_DIR/msm_drm_drv_video.so" ]; then
@@ -58,8 +87,9 @@ select_driver_dir() {
 # Print each profile directory. profiles.ini paths can be absolute or relative
 # to ~/.mozilla/firefox and may contain spaces, so do not split the output.
 profile_dirs() {
-    [ -f "$PROFILES_INI" ] || return 1
-    awk -v root="$FIREFOX_HOME" '
+    _home="$1"
+    [ -f "$_home/profiles.ini" ] || return 1
+    awk -v root="$_home" '
         function emit() {
             if (in_profile && path != "") {
                 if (relative == "0" || path ~ /^\//) print path
@@ -70,11 +100,27 @@ profile_dirs() {
         in_profile && /^Path=/ { path=substr($0, 6); next }
         in_profile && /^IsRelative=/ { relative=substr($0, 12); next }
         END { emit() }
-    ' "$PROFILES_INI"
+    ' "$_home/profiles.ini"
 }
+
+# 另一套已知的管理块标记（DroidSpaces 集成器写的）。它管的 pref 与本脚本
+# 高度重叠，两套并存会让同一个 pref 被重复定义 —— Firefox 取最后一次赋值，
+# 行为未必错，但 user.js 变得没法读，改一处不生效很难查。
+# 检测到它就跳过该 profile，把选择权留给用户。
+FOREIGN_BEGIN='// >>> DroidSpaces Firefox VA-API integration >>>'
 
 rewrite_user_js() {
     userjs=$1
+
+    # 已有另一套管理块 → 跳过，不叠加
+    if [ -f "$userjs" ] && grep -qF "$FOREIGN_BEGIN" "$userjs" 2>/dev/null; then
+        say "跳过（已由 DroidSpaces 集成器管理）: $userjs"
+        say "  两套配置的 pref 重叠，叠加会导致重复定义。"
+        say "  要改用本脚本，请先删掉 user.js 里 '>>> DroidSpaces ... >>>' 到"
+        say "  '<<< ... <<<' 之间的整段，再重新执行。"
+        return 2          # 2 = 有意跳过，区别于 0 成功 / 1 失败
+    fi
+
     tmp="$userjs.dsh-vaapi.$$"
     mkdir -p "$(dirname "$userjs")" || return 1
     [ -f "$userjs" ] || : > "$userjs" || return 1
@@ -92,6 +138,13 @@ user_pref("media.hardware-video-decoding.enabled", true);
 user_pref("media.ffmpeg.vaapi.enabled", true);
 user_pref("media.hevc.enabled", true);
 user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);
+// 播放队列深度：不是可选项。Venus 固件的解码流水线滞后 4 个输入单元才吐首帧
+// （无 B 帧码流同样如此），Firefox 默认队列太浅，吸收不了这个滞后带来的交付
+// 抖动。1080p30 27Mbps 实测：不加丢帧 14.25%、顺序回退 20.75%；加上降到
+// 0.89% / 4.04%（软解基线 0.5% / 1.85%，即与软解同量级）。
+user_pref("media.video-queue.hw-accel-size", 10);
+user_pref("media.video-queue.default-size", 10);
+user_pref("media.video-queue.send-to-compositor-size", 6);
 $END_MARKER
 EOF
     mv "$tmp" "$userjs"
@@ -124,6 +177,19 @@ EOF
 
 write_desktop() {
     mkdir -p "$APPLICATIONS" || return 1
+    # 自愈：上一次卸载可能留下指向已删启动器的孤儿 .desktop（那会让图标报
+    # "无法找到程序"）。它不算用户数据，别把它备份成"用户的启动器"。
+    if [ -f "$DESKTOP" ] && grep -q '^Exec=' "$DESKTOP" 2>/dev/null; then
+        _exec=$(sed -n 's/^Exec=//p' "$DESKTOP" | head -1 | awk '{print $1}')
+        case "$_exec" in
+            "$LOCAL_BIN"/*)
+                if [ ! -x "$_exec" ]; then
+                    say "清理失效的启动器条目（Exec 不存在）: $DESKTOP"
+                    rm -f "$DESKTOP"
+                fi
+                ;;
+        esac
+    fi
     # Preserve the user's launcher exactly once. A re-install must not back up
     # our generated launcher as though it were user data.
     if [ -f "$DESKTOP" ] && [ ! -f "$DESKTOP_BACKUP" ]; then
@@ -150,31 +216,53 @@ install() {
         return 1
     fi
     select_driver_dir || return 1
-    if [ ! -f "$PROFILES_INI" ]; then
-        err "profiles.ini not found: $PROFILES_INI"
+
+    homes=$(firefox_homes)
+    if [ -z "$homes" ]; then
+        err "找不到任何 Firefox profile（已查 ~/.mozilla、~/.config/mozilla、snap、flatpak）"
+        err "可用 FIREFOX_HOME 指定包含 profiles.ini 的目录"
         return 1
     fi
 
-    if ! profile_dirs | grep -q .; then
-        err "no [Profile*] Path entries found in $PROFILES_INI"
-        return 1
-    fi
-    # ⚠️ 不要写成 `profile_dirs | while ...`：管道让循环跑在子 shell 里，
+    # ⚠️ 不要写成 `... | while ...`：管道让循环跑在子 shell 里，
     # 循环内的 exit/return 只终止子 shell，写失败会被静默吞掉并照常报
     # "installed"（实测过）。改用重定向喂 while，循环就在当前 shell 里。
-    profile_list=$(profile_dirs) || return 1
     failed=0
-    while IFS= read -r profile; do
-        [ -n "$profile" ] || continue
-        if rewrite_user_js "$profile/user.js"; then
-            say "configured: $profile/user.js"
-        else
-            err "failed to write $profile/user.js"
-            failed=1
-        fi
-    done <<EOF
+    any=0
+    skipped=0
+    while IFS= read -r home; do
+        [ -n "$home" ] || continue
+        profile_list=$(profile_dirs "$home") || continue
+        [ -n "$profile_list" ] || { say "跳过（无 [Profile*] 条目）: $home"; continue; }
+        while IFS= read -r profile; do
+            [ -n "$profile" ] || continue
+            # profiles.ini 可能列出已删除的 profile。目录不存在就跳过，
+            # 否则会凭空造出一个只有我们 pref 的目录，Firefox 根本不读。
+            if [ ! -d "$profile" ]; then
+                say "跳过（目录不存在）: $profile"
+                continue
+            fi
+            rewrite_user_js "$profile/user.js"
+            case $? in
+                0) any=1; say "configured: $profile/user.js" ;;
+                2) skipped=$((skipped + 1)) ;;   # 有意跳过，不算失败也不算成功
+                *) err "failed to write $profile/user.js"; failed=1 ;;
+            esac
+        done <<INNER
 $profile_list
-EOF
+INNER
+    done <<OUTER
+$homes
+OUTER
+    if [ "$any" -eq 0 ]; then
+        if [ "$skipped" -gt 0 ]; then
+            err "所有 profile 都已由 DroidSpaces 集成器管理，未做改动"
+            err "沿用现有配置即可；要换成本脚本管理，按上面提示先清掉那一段"
+        else
+            err "没有可配置的 profile"
+        fi
+        return 1
+    fi
     [ "$failed" -eq 0 ] || return 1
     write_wrapper || return 1
     write_desktop || return 1
@@ -187,9 +275,11 @@ uninstall() {
         return 1
     fi
     failed=0
-    if [ -f "$PROFILES_INI" ]; then
-        # 同 install()：不用管道，避免子 shell 吞掉失败。
-        profile_list=$(profile_dirs) || profile_list=''
+    # 同 install()：遍历所有 profile 根目录，且不用管道（避免子 shell 吞失败）。
+    homes=$(firefox_homes)
+    while IFS= read -r home; do
+        [ -n "$home" ] || continue
+        profile_list=$(profile_dirs "$home") || continue
         while IFS= read -r profile; do
             [ -n "$profile" ] || continue
             if remove_user_js_block "$profile/user.js"; then
@@ -198,18 +288,29 @@ uninstall() {
                 err "failed to rewrite $profile/user.js"
                 failed=1
             fi
-        done <<EOF
+        done <<INNER
 $profile_list
-EOF
-    fi
-    rm -f "$WRAPPER"
+INNER
+    done <<OUTER
+$homes
+OUTER
+    # ⚠️ 顺序要紧：先处理 .desktop，再删启动器。
+    # 反过来的话，一旦 .desktop 这步失败（或被中断），桌面图标就指向一个
+    # 已被删除的 Exec，点击报"无法找到程序" —— 实测踩过，比不卸载更糟，
+    # 因为用户失去的是能用的 Firefox 图标。
     if [ -f "$DESKTOP_BACKUP" ]; then
         mv "$DESKTOP_BACKUP" "$DESKTOP"
         say "restored: $DESKTOP"
-    else
-        rm -f "$DESKTOP"
-        say "removed: $DESKTOP"
+    elif [ -f "$DESKTOP" ]; then
+        # 只删我们生成的那个（Exec 指向本脚本的启动器）；用户自己的不动。
+        if grep -qF "Exec=$WRAPPER" "$DESKTOP" 2>/dev/null; then
+            rm -f "$DESKTOP"
+            say "removed: $DESKTOP"
+        else
+            say "保留（不是本脚本生成的）: $DESKTOP"
+        fi
     fi
+    rm -f "$WRAPPER"
     [ "$failed" -eq 0 ] || return 1
     say "uninstalled Firefox VA-API integration"
 }
@@ -246,7 +347,16 @@ verify() {
         report "driver" "MISSING (set DMD_DRIVER_DIR if needed)"
     fi
     [ -x "$WRAPPER" ] && report "launcher" "OK: $WRAPPER" || report "launcher" "MISSING: $WRAPPER"
-    [ -f "$DESKTOP" ] && report "desktop override" "OK: $DESKTOP" || report "desktop override" "MISSING: $DESKTOP"
+    if [ -f "$DESKTOP" ]; then
+        _e=$(sed -n 's/^Exec=//p' "$DESKTOP" | head -1 | awk '{print $1}')
+        if [ -n "$_e" ] && [ ! -x "$_e" ] && ! command -v "$_e" >/dev/null 2>&1; then
+            report "desktop override" "BROKEN: Exec 不存在（$_e）—— 图标会报"无法找到程序"，重新执行安装或手动删除 $DESKTOP"
+        else
+            report "desktop override" "OK: $DESKTOP"
+        fi
+    else
+        report "desktop override" "MISSING: $DESKTOP"
+    fi
 
     # 找真正在解码的进程。⚠️ 不要用 `pgrep -f 'rdd$'`：RDD 的命令行末尾是
     # -sandboxReporter 之类的参数，不是 "rdd"，实测匹配不到任何进程并误报

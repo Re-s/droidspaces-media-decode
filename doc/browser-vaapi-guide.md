@@ -80,7 +80,6 @@ dmd 日志特征 —— 握手成功但零流量:
 ```shell
 google-chrome \
   --ozone-platform=wayland \
-  --disable-vulkan \
   --render-node-override=/dev/dri/renderD128 \
   --ignore-gpu-blocklist \
   --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
@@ -89,12 +88,42 @@ google-chrome \
 | 参数 | 原理 |
 |---|---|
 | `--ozone-platform=wayland` | 见上节，dmabuf 输出的前提 |
-| `--disable-vulkan` | ozone wayland 与 Vulkan 不兼容（Chrome 硬性检查），必须显式关闭 |
 | `--render-node-override=/dev/dri/renderD128` | **核心**。Chromium `vaapi_wrapper.cc` 的 `PreSandboxInitialization()` 只枚举 PCI 总线 DRM 设备，ARM 平台设备的 renderD128 会被 `if (device->bustype != DRM_BUS_PCI) continue;` 跳过。此开关走 `LoadDrmFD()` 分支绕过白名单 |
 | `--ignore-gpu-blocklist` | ARM GPU 在 Chrome 的软件渲染黑名单里 |
 | `--enable-features=...` | Linux VA-API 解码总开关（DMABUF/GL 两路都开） |
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
+
+### 2.5 关闭 Vulkan：只能在 chrome://flags 里改
+
+ozone wayland 与 Vulkan 硬性冲突，不关掉的话 GPU 进程会报：
+
+```
+ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
+'--ozone-platform=wayland' is not compatible with Vulkan.
+Consider switching to '--ozone-platform=x11' or disabling Vulkan
+```
+
+**唯一可靠的关法是打开 `chrome://flags`，把 Vulkan 设为 `Disabled`，重启浏览器。**
+
+⚠️ 命令行开关关不掉它。本文此前写的 `--disable-vulkan` 是错的 ——
+Chrome 151 的二进制里根本没有这个开关（只有 `enable-vulkan` 与 `use-vulkan`），
+而 Chromium 的 switch 不像 feature flag 那样自动生成 `disable-` 反面，
+传进去既不报错也不生效，纯粹被忽略。实测下列写法**全部无效**，
+GPU 进程照样打印上面那条警告：
+
+```sh
+--disable-vulkan                            # 开关不存在，被忽略
+--disable-features=Vulkan                   # 无效
+--use-vulkan=disabled                       # 无效
+--use-vulkan=disabled --disable-features=Vulkan,VulkanFromANGLE   # 仍然无效
+```
+
+实测环境 Chrome 151.0.7922.173，判据是 GPU 进程还会不会继续打印
+`not compatible with Vulkan`。
+
+后果是这一项**没法写进 `.desktop` 固化**，换机器或重建 profile 后要手动再关一次
+（`chrome://flags` 的选择存在 profile 的 `Local State` 里，备份 profile 会带走）。
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
@@ -104,7 +133,7 @@ google-chrome \
 D=/usr/share/applications/google-chrome.desktop
 if ! grep -q "render-node-override" "$D"; then
     [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
-    FLAGS="--ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
     sudo sed -i \
       -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
       -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
@@ -113,7 +142,7 @@ fi
 grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执行次数增长
 
 # 执行后每个 Exec= 行应形如(注意开头就是 --ozone-platform=wayland):
-# Exec=/usr/bin/google-chrome-stable --ozone-platform=wayland --disable-vulkan --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,... %U
+# Exec=/usr/bin/google-chrome-stable --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,... %U
 ```
 
 容器内没有 sudo 时，从宿主侧改同一个文件
@@ -193,23 +222,54 @@ profile"由 `~/.mozilla/firefox/installs.ini` 的 `Default=` 决定（注意
 `profiles.ini` 里老式 `Default=1` 标记无效，别看错文件）。下面的命令自动
 定位真实 profile、**逐条检查已存在则跳过**，重复执行安全：
 
+推荐直接用脚本，它会自动找到所有 profile 并幂等写入：
+
 ```shell
-P=~/.mozilla/firefox/$(grep -m1 '^Default=' ~/.mozilla/firefox/installs.ini | cut -d= -f2)
-mkdir -p "$P"; touch "$P/user.js"
-add() { grep -qxF "$1" "$P/user.js" || echo "$1" >> "$P/user.js"; }
-add 'user_pref("media.ffmpeg.vaapi.enabled", true);'
-add 'user_pref("media.hardware-video-decoding.force-enabled", true);'
-add 'user_pref("media.gpu-process-decoding", true);'
-add 'user_pref("media.rdd-ffmpeg.enabled", true);'
-# 第五件:解码帧经 dmabuf 零拷贝纹理直进合成器 —— 缺了它硬解照跑,
-# 但每帧都要拷回内存再做 CPU 软件转色,内容进程能吃掉半个到多个核心
-add 'user_pref("media.vaapi-dmabuf-textures.enabled", true);'
-# 顺手清理旧版本命令可能产生的重复行
-awk '!(/^user_pref/ && seen[$0]++)' "$P/user.js" > "$P/user.js.tmp" && mv "$P/user.js.tmp" "$P/user.js"
-grep -c '^user_pref' "$P/user.js"    # 每项应为 1
+bash tools/configure-firefox-vaapi.sh            # 配置（Firefox 需先关闭）
+bash tools/configure-firefox-vaapi.sh --verify   # 查状态
+bash tools/configure-firefox-vaapi.sh --uninstall # 还原
 ```
 
-重启 Firefox 生效。
+⚠️ **profile 路径不能写死。** 不同安装方式放在不同地方，而且同一台机器上
+可能同时存在多处 —— 本机实测 `~/.mozilla/firefox` 与
+`~/.config/mozilla/firefox` 下各有两个真实 profile（都有 `prefs.js`）。
+只写前者的话，Firefox 实际用的是后者时就会"配了但没生效"，
+而这种失败最难排查：页面能播、统计看着正常，实际静默走软解。
+脚本会遍历这四处：
+
+| 位置 | 对应安装方式 |
+|---|---|
+| `~/.mozilla/firefox` | apt / 官方 tarball（传统位置） |
+| `~/.config/mozilla/firefox` | 较新版本遵循 XDG 后的新位置 |
+| `~/snap/firefox/common/.mozilla/firefox` | snap |
+| `~/.var/app/org.mozilla.firefox/.mozilla/firefox` | flatpak |
+
+`FIREFOX_HOME` 可指定只处理某一个，`DMD_DRIVER_DIR` 指定驱动目录。
+
+手动配置的话，pref 清单如下（写进对应 profile 的 `user.js`，重启生效）：
+
+```js
+user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.hevc.enabled", true);
+// 零拷贝：解码帧经 dmabuf 直进合成器。缺了它硬解照跑，但每帧要拷回内存
+// 再做 CPU 软件转色，内容进程能吃掉半个到多个核心 ——
+// 表现为"开了硬解 CPU 反而更高"。
+user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);
+// 播放队列深度：不是可选项。Venus 固件的流水线滞后 4 个输入单元才吐首帧，
+// Firefox 默认队列吸收不了这个抖动。1080p30 27Mbps 实测：
+// 不加丢帧 14.25% / 顺序回退 20.75%，加上降到 0.89% / 4.04%
+// （软解基线 0.5% / 1.85%，即与软解同量级）。
+user_pref("media.video-queue.hw-accel-size", 10);
+user_pref("media.video-queue.default-size", 10);
+user_pref("media.video-queue.send-to-compositor-size", 6);
+```
+
+> ⚠️ `media.vaapi-dmabuf-textures.enabled` 已废弃 —— 本文此前推荐过它，
+> 但 Firefox 154 的 libxul 里已无此 pref（实测），写了不起作用。
+> 零拷贝现在由 `media.ffmpeg.vaapi.force-surface-zero-copy` 控制。
+> `media.hardware-video-decoding.force-enabled`、`media.gpu-process-decoding`、
+> `media.rdd-ffmpeg.enabled` 这三项仍然存在，但不是必需项，脚本没有写入。
 
 ### 2. 关闭 RDD 沙箱（必需，幂等）
 
@@ -422,7 +482,7 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 |---|---|---|
 | 会话建立成功但 0 帧 | Chrome 跑在 X11，dmabuf 输出走不通 | 换 Wayland 模式 |
 | GPU 进程 maps 无 drv_video | PCI 白名单跳过了平台设备 | 确认 `--render-node-override` |
-| 启动即崩报 Vulkan 不兼容 | wayland+vulkan 硬性冲突 | 加 `--disable-vulkan` |
+| 日志报 `not compatible with Vulkan` | wayland 与 Vulkan 硬性冲突 | 在 `chrome://flags` 把 **Vulkan** 设为 Disabled 后重启，命令行开关无效，见下 |
 | Firefox 有进程不解码 | RDD 沙箱拦设备 | `MOZ_DISABLE_RDD_SANDBOX=1` |
 | user.js 写了没生效 | 写错了 profile | 查 installs.ini 的 Default |
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |
