@@ -2836,12 +2836,57 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
          *
          * l0 可以偏大、l1 一位都不能偏大（单变量实测），所以分别取
          * 最大与最小，几帧之内就收敛到唯一一份正确的 PPS。 */
-        unsigned int l0_now = c->have_h264_slice_param
-                              ? c->h264_slice_param.num_ref_idx_l0_active_minus1
-                              : 0;
-        unsigned int l1_now = c->have_h264_slice_param
-                              ? c->h264_slice_param.num_ref_idx_l1_active_minus1
-                              : 0;
+        /* ⚠️ I/IDR slice 报的 num_ref_idx_l0/l1_active_minus1 恒为 0，
+         * 那**不是** PPS 默认值的真值 —— I slice 根本没有这个语法元素。
+         * 盲信它会让**会话的第一份 PPS** 写出 l0=0。
+         *
+         * 实测（h264_slow.mp4，用比特级解析确认真实 PPS 为 l0=2 l1=0）：
+         *   第 1 帧是 IDR   → 送出 PPS 9 字节（l0=0 l1=0，错）
+         *   第 3 帧起是 B slice → 送出 PPS 10 字节（l0=2 l1=0，对）
+         * 于是 unit 1、2 这两帧用错误的 l0 解码，画面不对；第 3 帧起恢复。
+         * 这正是用户报的"前两帧跳跃、从第 3 帧开始正常流畅"，
+         * 而且网络流与本地文件表现一致（与 MSE/ABR 无关）。
+         *
+         * 修法：I slice（或还没有 slice param）时改用 num_ref_frames-1 当 l0。
+         * l0 可以偏大（单变量实测 l0_m1=2,3,4,15 均正确），而
+         * num_ref_frames-1 必然 >= 真实默认值，所以既安全又覆盖真值。
+         * l1 仍取 0：l1 一位都不能偏大，I slice 场景下 0 就是最小值。
+         *
+         * 注意这与"把 PPS 收敛成单一份"是两件事 —— 那次尝试回归过
+         * （long3000.h264 只解出 15/1323 帧后卡死）。这里只改第一份的取值，
+         * P/B slice 的重送行为完全不变，覆盖真值的振荡仍然保留。 */
+        int slice_is_i = c->have_h264_slice_param &&
+                         (c->h264_slice_param.slice_type % 5) == 2;
+        unsigned int l0_now, l1_now;
+        if (!c->have_h264_slice_param || slice_is_i) {
+            unsigned int nref = c->h264_pic_param.num_ref_frames;
+            l0_now = nref > 0 ? nref - 1 : 0;
+            l1_now = 0;
+        } else {
+            l0_now = c->h264_slice_param.num_ref_idx_l0_active_minus1;
+            l1_now = c->h264_slice_param.num_ref_idx_l1_active_minus1;
+        }
+        /* ⚠️ 不要在这里对 l0 做"只增不减"的单调化。已实测证伪。
+         *
+         * 动机看似合理：修完首帧后 PPS 序列是 10,9,10,10,...，那份 9 字节
+         * （l0=0，来自 IDR 后第一个 P slice）似乎仍会污染后续帧。
+         * 于是尝试 `if (param_sets_sent && l0_now < sent_l0) l0_now = sent_l0;`
+         *
+         * 结果是明确回归（h264_slow.mp4 40 帧，逐帧比对软解）：
+         *   旧版驱动          md5 PASS
+         *   加单调化          帧 0、1 一致，帧 2 起全部不同（Y 平面差异 5%~12%）
+         *   PPS 重送 12 次 → 3 次，全部收敛为 l0=2
+         * 也就是说收敛本身就是病因，与 h264_bitstream.c 记录的
+         * long3000.h264 回归（15/1323 帧后卡死）是同一个坑。
+         *
+         * 原因：重送次数在承担纠错作用。不同 slice 需要不同的 PPS 默认值，
+         * 振荡让解码器总能收到匹配当前 slice 的那一份；一旦收敛成单一份，
+         * 不匹配的那些 slice 就再没机会被正确解码。
+         * 要真正消除振荡，得能在首个 slice 之前确定真实默认值，
+         * 而 VA-API 只给每个 slice 的生效值 —— 目前无可靠推导途径。
+         *
+         * 所以这里只修"会话第一份 PPS"（I slice 报 0 不是真值），
+         * P/B slice 的重送行为保持原样。 */
         /* l0/l1 直接用 slice param 报的生效值。
          *
          * ⚠️ 曾尝试"消除 PPS 振荡"：改用 SPS 的 num_ref_frames-1 推导 l0、
