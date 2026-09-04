@@ -140,7 +140,25 @@ grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数
 然后打开 `chrome://flags`，搜 `Vulkan`，设为 `Disabled`，重启浏览器。
 这一步没有命令行等价物，原因见下方提示。
 
-**Firefox** —— 写进每个 profile 的 `user.js`（先完全退出 Firefox）：
+**Firefox** —— 两步都要做，只写 `user.js` 不会生效。
+
+第一步，给 `.desktop` 注入环境变量：
+
+```bash
+D=/usr/share/applications/firefox.desktop
+grep -q MOZ_DISABLE_RDD_SANDBOX "$D" || {
+  sudo cp "$D" "$D.bak"
+  sudo sed -i 's|^Exec=|Exec=env MOZ_DISABLE_RDD_SANDBOX=1 LIBVA_DRIVER_NAME=msm_drm |' "$D"
+}
+grep -c MOZ_DISABLE_RDD_SANDBOX "$D"   # 每个 Exec 行 1 次
+```
+
+`MOZ_DISABLE_RDD_SANDBOX=1` 是必需的：Firefox 把解码放在 RDD 进程里，
+它的沙箱会挡掉 `/dev/video32`，日志里表现为
+`Sandbox: Couldn't open video device`。这一项和 `user.js` 里的
+pref 是两回事 —— pref 只开 Firefox 自己的硬解开关，不解决设备访问。
+
+第二步，写进每个 profile 的 `user.js`（先完全退出 Firefox）：
 
 ```bash
 pkill -x firefox 2>/dev/null; sleep 1
@@ -173,13 +191,23 @@ Firefox 实际用另一处时就会"配了但没生效"——页面能播、统�
 三项 `media.video-queue.*` 不是可选项：1080p30 27Mbps 实测不加丢帧
 14.25%，加上降到 0.89%。
 
-**验证**：
+**验证**：最可靠的判据是驱动日志。带 `DMD_VA_LOG=1` 启动浏览器，
+播一段视频，看有没有 `[v4l2] 会话就绪` 和 `配对: 帧`：
 
 ```bash
-# 硬解是否真在跑（解码期间应为 enabled）
+DMD_VA_LOG=1 firefox 2>&1 | grep -E '会话就绪|配对: 帧'
+```
+
+播放中另开一个终端看硬件门控（解码期间应为 `enabled`，空闲时 `disabled`，
+所以要在播放时查）：
+
+```bash
 for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
   [ "$(cat $r/name)" = mvs0_gdsc ] && echo "mvs0_gdsc=$(cat $r/state)"; done
 ```
+
+不要只看播放是否流畅，也不要用 `vainfo` —— 前者软解一样流畅，
+后者只证明驱动能加载。
 
 **还原**：
 
@@ -187,6 +215,9 @@ for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
 # Chrome
 sudo mv /usr/share/applications/google-chrome.desktop.bak \
         /usr/share/applications/google-chrome.desktop
+# Firefox 的 .desktop
+sudo mv /usr/share/applications/firefox.desktop.bak \
+        /usr/share/applications/firefox.desktop
 # Firefox：删掉上面那些 user_pref 行
 pkill -x firefox 2>/dev/null; sleep 1
 for U in ~/.mozilla/firefox/*/user.js ~/.config/mozilla/firefox/*/user.js; do
