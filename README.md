@@ -174,6 +174,17 @@ LIBVA_DRIVERS_PATH=/path/to/vaapi-driver/build vainfo
 
 调试日志：`DMD_VA_LOG=1`。
 
+### 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `DMD_VA_LOG=1` | 关 | 输出驱动日志到 stderr。排查任何问题的第一步。 |
+| `DMD_TRACE_ORDER=1` | 关 | 额外打印 surface 提交/收帧的配对时序（`ORDER submit` / `ORDER reap`）。 |
+| `DMD_HARVEST_EXPORTED_ONLY=0` | **开** | 关闭"仅对导出过 dmabuf 的 surface 收帧"。默认开启可省下每帧一次 memcpy（33.0 → 56.1 fps）；只有怀疑某个消费者未经 `vaExportSurfaceHandle` 却直接采样 surface 时才需要关。详见 0.4.6 变更日志。 |
+| `DMD_NO_MAP_WAIT=1` | 关 | 取消 `DeriveImage`/`GetImage` 里的兜底等帧，让 ffmpeg 在"像素必须在 `EndPicture` 返回时就位"的前提下跑，即 Chrome 的处境。**测试用**，见 `tests/regress_chrome_contract.sh`。 |
+| `DMD_CSD_DUMP=1` | 关 | 打印合成 SPS 的原始字节。改动参数集合成逻辑时用来确认改动真的写进了比特流 —— ue(v) 下不同取值常占同样位数，只看 NALU 长度会误判。 |
+| `DMD_VA_TOLERATE_MISSING=1` | 关 | 取不到帧时也报成功。**纯诊断**，打开后画面必然是错的，只用于让 ffmpeg 跑完整条流采样。 |
+
 ## 容器内浏览器调用 VA-API
 
 先确认后端能出帧（上一节的 ffmpeg 自检），**这一步不通就别碰浏览器**。

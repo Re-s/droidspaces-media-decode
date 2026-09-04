@@ -3252,23 +3252,27 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      * 余量，浏览器实测掉 6 帧（dropped 6/34，旧版 0/28）。
      * ffmpeg/Firefox 走 DeriveImage/GetImage，那里 dmd_surface_wait 会兜底，
      * 不需要在这里同步写入。 */
-    /* DMD_HARVEST_EXPORTED_ONLY=1：只对导出过 dmabuf 的 surface 收帧。
+    /* 只对导出过 dmabuf 的 surface 收帧（默认开启）。
+     * DMD_HARVEST_EXPORTED_ONLY=0 可关闭，退回无条件收帧。
      *
-     * 这是一个**尚未验证**的吞吐优化，默认关闭。
-     * 动机是无条件收帧让吞吐减半（实测 jinjie 300 帧 76.8 → 34.8 fps，
-     * 25fps 在线流因此掉 6 帧）。理论上 ffmpeg/Firefox 走 GetImage，
-     * 有 dmd_surface_wait 兜底，不需要在这里同步写入。
-     * ffmpeg 侧已确认：开启后 "返回前写入" 降为 0，双契约回归 9 项全绿，
-     * 吞吐回到 52.9 fps。
+     * 动机：无条件收帧让吞吐减半 —— 每帧多一次 memcpy 进 dumb buffer。
+     * 2fps 素材每帧 500ms 预算感觉不到，25fps 在线流只剩 40ms，实测掉 6 帧。
+     * 而 ffmpeg/Firefox 走 DeriveImage/GetImage，那里 dmd_surface_wait 会
+     * 兜底等帧，本来就不需要在 EndPicture 里同步写入；只有 Chrome 这种
+     * "解码前导出 dmabuf、之后只 EndPicture" 的消费者才必须。
      *
-     * ⚠️ 但 Chrome 侧的像素正确性没验成 —— 那一轮 rvfc 停止回调
-     * （reason=timeout、samples 为空，而同一页面此前能稳定采到 20 帧），
-     * 属于测试工具失效，不是驱动结论。所以默认保持已验证的无条件收帧。
-     * 要启用请先用 tests/browser/verify_pps_fix.sh 拿到 20/20 的像素证据。 */
+     * 实测（jinjie_265.mp4 300 帧，三次取最快）：
+     *   关闭 9.09s → 33.0 fps
+     *   开启 5.35s → 56.1 fps
+     * Chrome 像素正确性（order_slow.mp4 HEVC 三轮 + h264_slow.mp4）：
+     *   开启后一致 20/20、20/20、20/20，H.264 20/20，不符与无法识别均为 0；
+     *   日志确认 ExportSurfaceHandle 命中 19 次、"返回前写入" 28~32 次，
+     *   即门控确实识别出了 Chrome 的 surface 并照常写入。
+     * ffmpeg 侧 "返回前写入" 降为 0，双契约回归 9 项全绿。 */
     static int exported_only = -1;
     if (exported_only < 0) {
         const char *e = getenv("DMD_HARVEST_EXPORTED_ONLY");
-        exported_only = (e && e[0] == '1') ? 1 : 0;
+        exported_only = (e && e[0] == '0') ? 0 : 1;   /* 默认开启 */
     }
     if (c->session && !drv->io_busy[idx] &&
         (!exported_only || dmd_pending_has_exported_locked(drv, c)) &&

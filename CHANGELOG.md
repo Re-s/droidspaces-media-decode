@@ -63,27 +63,37 @@ l0 可以偏大（单变量实测 `l0_m1` 取 2/3/4/15 均正确），而 `num_r
 
 HEVC 侧不存在此问题（PPS 不含随帧变化字段，参数集每会话只送 1 次）。
 
-### ⚠️ 已知代价：吞吐下降
+### 3. 顺带解决收帧带来的吞吐损失
 
-`EndPicture` 收帧每帧多一次 memcpy 进 dumb buffer，代价实打实：
+`EndPicture` 收帧每帧多一次 memcpy 进 dumb buffer。若无条件执行，代价实打实：
 
 | | ffmpeg 解 300 帧（jinjie_265.mp4） |
 |---|---|
-| v0.4.4 | 3.85s → 78.0 fps |
-| 本版本 | 8.61s → 34.8 fps |
+| v0.4.4（不收帧） | 3.85s → 78.0 fps |
+| 无条件收帧 | 8.61s → 34.8 fps |
 
 2fps 素材每帧有 500ms 预算感觉不到；25fps 在线流只剩 40ms 预算，
 真实在线源实测掉 6 帧（dropped 6/34，v0.4.4 为 0/28）。
 
-提供 `DMD_HARVEST_EXPORTED_ONLY=1` 门控（新增 `s->exported` 标记，
-仅对导出过 dmabuf 的 surface 收帧）。ffmpeg 从不导出，命中 0 次，
-吞吐回到 52.9 fps，双契约回归 9 项全绿。
+修法：新增 `s->exported` 标记（`vaExportSurfaceHandle` 成功时置位），
+只对导出过 dmabuf 的 surface 收帧。依据是消费者契约的差别 ——
+ffmpeg/Firefox 走 `DeriveImage`/`GetImage`，那里 `dmd_surface_wait` 会兜底
+等帧，本来就不需要在 `EndPicture` 里同步写入；只有 Chrome 这种
+"解码前导出 dmabuf、之后只 EndPicture" 的消费者才必须。
 
-**该门控默认关闭**，因为 Chrome 侧像素正确性尚未验成 —— 那一轮
-`requestVideoFrameCallback` 停止回调（`reason=timeout`、samples 为空，
-而同一页面此前能稳定采到 20 帧），属测试工具失效，不构成驱动结论。
-默认路径保持已验证的无条件收帧。启用前请先用
-`tests/browser/verify_pps_fix.sh` 拿到 20/20 的像素证据。
+实测（三次取最快）：
+
+| | 吞吐 | ffmpeg `返回前写入` |
+|---|---|---|
+| 关闭门控 | 9.09s → 33.0 fps | 29 次 |
+| 开启门控（默认） | 5.35s → 56.1 fps | 0 次 |
+
+Chrome 侧画面正确性不受影响（order_slow.mp4 HEVC 三轮 + h264_slow.mp4）：
+一致 20/20、20/20、20/20，H.264 20/20，不符与无法识别均为 0。
+日志确认 `ExportSurfaceHandle` 命中 19 次、`返回前写入` 28~32 次，
+即门控确实识别出了 Chrome 的 surface 并照常写入。
+
+`DMD_HARVEST_EXPORTED_ONLY=0` 可关闭该门控，退回无条件收帧。
 
 ### 🧪 新增测试
 

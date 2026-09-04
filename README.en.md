@@ -184,6 +184,17 @@ for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
 
 Debug logging: `DMD_VA_LOG=1`.
 
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DMD_VA_LOG=1` | off | Driver log to stderr. First step for any investigation. |
+| `DMD_TRACE_ORDER=1` | off | Also print surface submit/harvest pairing (`ORDER submit` / `ORDER reap`). |
+| `DMD_HARVEST_EXPORTED_ONLY=0` | **on** | Disable "harvest only for surfaces exported as dmabuf". Enabled by default, saving one memcpy per frame (33.0 → 56.1 fps); only turn it off if you suspect a consumer samples a surface without calling `vaExportSurfaceHandle`. See the 0.4.6 changelog. |
+| `DMD_NO_MAP_WAIT=1` | off | Drop the fallback frame wait inside `DeriveImage`/`GetImage`, so ffmpeg runs under Chrome's premise: pixels must be in place when `EndPicture` returns. **Testing only**, see `tests/regress_chrome_contract.sh`. |
+| `DMD_CSD_DUMP=1` | off | Dump synthesized SPS bytes. Use it when changing parameter-set synthesis to confirm the change actually reached the bitstream — under ue(v) different values often occupy the same number of bits, so NALU length alone is misleading. |
+| `DMD_VA_TOLERATE_MISSING=1` | off | Report success even when no frame arrives. **Diagnostic only** — the picture will be wrong; used solely to let ffmpeg run a whole stream for sampling. |
+
 ## Browser setup
 
 Full instructions, flags, profile configuration and verification steps are in
