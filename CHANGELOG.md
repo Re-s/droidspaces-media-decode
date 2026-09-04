@@ -1,5 +1,131 @@
 # 更新日志
 
+## v0.4.6（修复 Chrome 硬解画面错乱）
+
+**修复 Chrome 硬解时画面前后帧跳跃。** 表现为开头几帧顺序错乱，
+之后恢复正常流畅；同一文件软解正常，网络流与本地文件表现一致。
+
+根因有两处，互相独立。
+
+### 1. Chrome 采到未写入的 surface（影响所有编码）
+
+Chrome 的消费者契约与 ffmpeg/Firefox 完全不同：它在任何解码之前就把整池
+surface 逐个 `vaExportSurfaceHandle` 拿到 dmabuf，之后只调
+`vaBeginPicture`/`vaRenderPicture`/`vaEndPicture`，**从不调**
+`vaSyncSurface`、`vaQuerySurfaceStatus`、`vaDeriveImage`、`vaGetImage`
+（实测 Sync 调用 0 次，Firefox 同场景 1500 次），靠自己的软件 DPB
+决定何时把某个 surface 交给合成器采样。
+
+于是驱动里所有"map 时兜底等帧"的路径 Chrome 一条都不走。帧虽已被
+`send_unit` 的 5ms recv 推进 session 待取队列，但没人写进 surface，
+Chrome 在 `EndPicture` 返回后立刻采样，拿到的是空缓冲或上一轮像素。
+
+修法：`dmd_EndPicture` 返回前把已就绪的帧写进 surface。只收已在队列里的帧
+（`next_frame` 对 pend_pop 立即返回），不额外阻塞等硬件，
+避免重新引入 Firefox 那种互等死锁。
+
+**单变量 A-B 验证**（order_slow.mp4 HEVC，浏览器像素判据，各 3 轮，
+判据是"画面里实际是第几帧"而非帧号单调性）：
+
+| 驱动 | 画面正确 | 无法识别 | `返回前写入` | 配对 |
+|---|---|---|---|---|
+| v0.4.4（无本修复） | 1/4/3（共 20） | 15/12/13 | 0 次 | 40 |
+| 本版本 | 20/20/20 | 0 | 28~33 次 | 40 |
+
+配对数相同，唯一差别就是这段收帧代码。同时排除了两个曾被误认的原因：
+- **不是**合成 SPS 的 `max_num_reorder_pics`。把它回退成写 0 的变体仍然
+  20/20 全对；单变量实测 reorder 取 0/1/2/4/7、latency 取 0/5/9 全部 md5 PASS
+  （硬件走 `OUTPUT_ORDER=1`，重排由消费者 DPB 负责）。
+- **不是**后台收帧线程。该变体的 `ORDER reap` 为 0，一帧未经其手，照样全对。
+  该线程只在 Chrome 长时间不调 `EndPicture` 时兜底。
+
+### 2. H.264 会话首份 PPS 用了 I slice 的 num_ref_idx=0
+
+I/IDR slice 没有 `num_ref_idx_l0/l1_active_minus1` 语法元素，VA-API 对它
+恒报 0。而会话第一帧必然是 IDR，于是驱动把 0 当成 PPS 默认值的真值写出去。
+
+实测（h264_slow.mp4，比特级解析确认真实 PPS 为 `l0=2 l1=0`）：
+
+```
+第 1 帧 IDR      → 送出 PPS 9 字节（l0=0，错）
+第 3 帧起 B slice → 送出 PPS 10 字节（l0=2，对）
+```
+
+unit 1、2 因此用错误的 l0 解码，第 3 帧 PPS 修正后恢复 —— 正是用户报的
+"前两帧跳跃、从第 3 帧起正常流畅"。
+
+修法：I slice（或尚无 slice param）时用 `num_ref_frames-1` 当 l0，不盲信 0。
+l0 可以偏大（单变量实测 `l0_m1` 取 2/3/4/15 均正确），而 `num_ref_frames-1`
+必然 >= 真实默认值。l1 仍取 0（l1 一位都不能偏大）。
+
+浏览器 A-B 验证（三轮）：v0.4.4 画面正确 5/4/5、无法识别 13/13/13；
+本版本 20/20/20。
+
+HEVC 侧不存在此问题（PPS 不含随帧变化字段，参数集每会话只送 1 次）。
+
+### ⚠️ 已知代价：吞吐下降
+
+`EndPicture` 收帧每帧多一次 memcpy 进 dumb buffer，代价实打实：
+
+| | ffmpeg 解 300 帧（jinjie_265.mp4） |
+|---|---|
+| v0.4.4 | 3.85s → 78.0 fps |
+| 本版本 | 8.61s → 34.8 fps |
+
+2fps 素材每帧有 500ms 预算感觉不到；25fps 在线流只剩 40ms 预算，
+真实在线源实测掉 6 帧（dropped 6/34，v0.4.4 为 0/28）。
+
+提供 `DMD_HARVEST_EXPORTED_ONLY=1` 门控（新增 `s->exported` 标记，
+仅对导出过 dmabuf 的 surface 收帧）。ffmpeg 从不导出，命中 0 次，
+吞吐回到 52.9 fps，双契约回归 9 项全绿。
+
+**该门控默认关闭**，因为 Chrome 侧像素正确性尚未验成 —— 那一轮
+`requestVideoFrameCallback` 停止回调（`reason=timeout`、samples 为空，
+而同一页面此前能稳定采到 20 帧），属测试工具失效，不构成驱动结论。
+默认路径保持已验证的无条件收帧。启用前请先用
+`tests/browser/verify_pps_fix.sh` 拿到 20/20 的像素证据。
+
+### 🧪 新增测试
+
+**`tests/regress_chrome_contract.sh`** —— 双契约回归。
+新增 `DMD_NO_MAP_WAIT=1` 开关关掉 map 时的兜底等帧，让 ffmpeg 在
+"像素必须在 EndPicture 返回时就位"的前提下跑，即 Chrome 的处境。
+9 项全绿（H.264 / HEVC / VP9 / VP8 / HEVC B帧 150 与 300 / 慢速编号流 /
+无B帧对照 / extra_hw_frames=16），真实采样窗口（PENDING）为 0。
+
+**`tests/browser/`** —— 浏览器侧帧序验证，覆盖 ffmpeg 测不到的路径：
+
+| 页面 | 覆盖 | 实测结果 |
+|---|---|---|
+| `mse_test.html` | MSE 分段 append、可插 seek | 像素 20/20 一致；加 seek 干扰 20/20 |
+| `net_test.html` | 真实 HTTP 在线源 | 在线 HEVC 24 帧单调零回退，231 次配对 |
+| `abr_test.html` | ABR 分辨率切换 | 640x360→1280x720→640x360 各 10 帧全单调 |
+| `verify_pps_fix.sh` | 新旧驱动 A-B 反证 | 见上方表格 |
+
+### ⚠️ 验证方法上的教训（写进了代码注释）
+
+**ffmpeg md5 回归证明不了 Chrome 路径。** ffmpeg 走
+`vaDeriveImage`/`vaGetImage`，两者都在驱动里调 `dmd_surface_wait` 兜底等帧
+（image.c），所以即使 `EndPicture` 返回时像素还没写进 surface，
+ffmpeg 也会在 map 时等到，md5 照样全绿。
+
+具体地，本次两个 bug 都测不出来：v0.4.4 驱动跑 h264_slow.mp4 前 8 帧与软解
+逐字节一致、md5 PASS，加 `DMD_NO_MAP_WAIT` 仍 PASS。原因是提交节奏——
+ffmpeg 一次灌 6 帧以上（日志 `pend` 涨到 6），驱动在 unit 1 送出错的 PPS、
+unit 3 就送出了对的，硬件真正开始解码时正确那份已经到了。
+Chrome 逐帧提交，第一帧解码时只有错的那份。
+
+**帧号单调性判据不足。** `requestVideoFrameCallback` 会漏采（实测漏采率 7%），
+且 v0.4.4 与本版本跑出的帧号序列逐值相同、都单调递增。必须做像素比对。
+
+**fMP4 有时间轴偏移。** `-movflags frag_keyframe+empty_moov` 生成的分段流
+`start_time=1.0`（原始流 0.0），@2fps 恒定偏移 2 帧。未扣除时 20/20 全部
+"不符"，看着像严重乱序，实际是封装差异。
+
+其他：新增 `DMD_CSD_DUMP=1` 打印合成 SPS 原始字节。ue(v) 下不同取值常占
+同样位数（2 与 7 都是 5 bit），只看 NALU 长度会把"开关未生效"误读成
+"取值无影响"。
+
 ## v0.4.5（适配新内核 msm_vidc）
 
 **新增：适配新内核 msm_vidc（Android 12+ / kernel 5.x+，标准 V4L2 stateful 语义）。**

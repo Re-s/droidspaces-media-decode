@@ -105,8 +105,11 @@ tests: $(TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
+# 必须带 $(VA_CFLAGS)：被测的 av1_bitstream.c 等都 #include <va/va.h>。
+# libva 头不在默认搜索路径时（例如只装在 sysroot 里），不传这个变量会
+# fatal error。既有问题，v0.4.4 及更早同样失败。
 $(TESTBIN): $(TEST_SRCS) | $(BUILD)
-	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
 
 # 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
 gen:

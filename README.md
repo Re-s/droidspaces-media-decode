@@ -151,7 +151,7 @@ for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
 `vainfo` 也能用（0.3.x 时代它会挂在 daemon socket 上，0.4.0 起没有 socket 了）：
 
 ```
-vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.4+<git短hash>
+vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.6+<git短hash>
       VAProfileH264High               : VAEntrypointVLD
       VAProfileHEVCMain               : VAEntrypointVLD
       VAProfileVP9Profile0            : VAEntrypointVLD
@@ -161,7 +161,7 @@ vainfo: Driver version: DroidSpaces V4L2 VA-API driver 0.4.4+<git短hash>
 但它只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧 ——
 验真实解码用上面的 ffmpeg 命令。
 
-版本串从 0.4.3 起带构建 ID，当前形如 `0.4.4+<git短hash>`，工作区有未提交改动时
+版本串从 0.4.3 起带构建 ID，当前形如 `0.4.6+<git短hash>`，工作区有未提交改动时
 带 `-dirty`。这是排查工具 —— 浏览器把解码放在单独的 RDD/GPU 进程里，
 系统目录和 `LIBVA_DRIVERS_PATH` 可能各有一份 `.so`，靠这个后缀能直接确认
 实际 `dlopen` 的是哪一版，而不是你以为的那一版。
