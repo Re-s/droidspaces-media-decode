@@ -2859,6 +2859,18 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
          * 这正是用户报的"前两帧跳跃、从第 3 帧开始正常流畅"，
          * 而且网络流与本地文件表现一致（与 MSE/ABR 无关）。
          *
+         * ⚠️ 这个 bug 在 ffmpeg 路径上**测不出来**，别用 md5 回归验证它。
+         * 旧版驱动跑同一素材前 8 帧与软解逐字节一致、md5 PASS，
+         * 加 DMD_NO_MAP_WAIT 也 PASS。原因是提交节奏：ffmpeg 一次灌 6 帧
+         * 以上（日志 pend 涨到 6），驱动在 unit 1 送错的 PPS、unit 3 就送出
+         * 对的，硬件真正开始解码时正确的那份已经到了。Chrome 逐帧提交，
+         * 第一帧解码时只有错的那份。
+         *
+         * 验证必须用浏览器 + 像素判据，见
+         * tests/browser/verify_pps_fix.sh。三轮 A-B 实测：
+         *   旧版（首份 PPS l0=0）：画面正确 5/4/5，无法识别 13/13/13（共 20）
+         *   新版（首份 PPS l0=2）：画面正确 20/20/20，不符 0
+         *
          * 修法：I slice（或还没有 slice param）时改用 num_ref_frames-1 当 l0。
          * l0 可以偏大（单变量实测 l0_m1=2,3,4,15 均正确），而
          * num_ref_frames-1 必然 >= 真实默认值，所以既安全又覆盖真值。
