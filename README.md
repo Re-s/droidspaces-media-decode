@@ -140,8 +140,10 @@ grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数
 然后打开 `chrome://flags`，搜 `Vulkan`，设为 `Disabled`，重启浏览器。
 这一步没有命令行等价物，原因见下方提示。
 
-驱动没有 AV1。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
-驱动 0 配对帧），看起来像"配了没生效"。播放器里选 AVC / HEVC 清晰度。
+本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该
+profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
+驱动 0 配对帧），看起来像"配了没生效"。播放器里选 AVC / HEVC。
+别的机型以编码表和 `vainfo` 为准，不要把这条当成驱动通用限制。
 
 **Firefox** —— 两步都要做，只写 `user.js` 不会生效。
 
