@@ -62,6 +62,10 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
 
     dmd_log("Terminate\n");
 
+    /* 先停后台收帧线程：它会碰 contexts / surfaces，
+     * 必须在下面回收这些对象之前退出。停止时不能持锁（要 join）。 */
+    dmd_reaper_stop(drv);
+
     /* 释放全部对象：消费者理应自己销毁，但异常退出路径下不会。
      * driver 被 dlclose 后这些内存就再也回收不了，所以必须在这里兜。
      *

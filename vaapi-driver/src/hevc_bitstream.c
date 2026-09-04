@@ -120,7 +120,13 @@ static size_t build_vps_rbsp(const VAPictureParameterBufferHEVC *pp,
     dmd_bw_put_flag(&bw, 0);            /* vps_sub_layer_ordering_info_present_flag */
     /* 只有 sub_layer 0：三个 ue(v) */
     dmd_bw_put_ue(&bw, pp->sps_max_dec_pic_buffering_minus1);
-    dmd_bw_put_ue(&bw, 0);              /* vps_max_num_reorder_pics */
+    /* ⚠️ 不要写 0：Chrome H265Decoder 按 sps_max_num_reorder_pics 决定
+     * 何时 OutputPicture。写 0 会让它每解一帧就立刻输出，画面变成
+     * 解码序 0→4→2→1。VA-API 没有这个字段的绝对值，只给
+     * NoPicReorderingFlag；未置位时用 DPB 上限作不放大的上界
+     * （与 H.264 合成 SPS 用 num_ref_frames 同一策略）。 */
+    dmd_bw_put_ue(&bw, pp->pic_fields.bits.NoPicReorderingFlag
+                          ? 0u : (unsigned)pp->sps_max_dec_pic_buffering_minus1);
     dmd_bw_put_ue(&bw, 0);              /* vps_max_latency_increase_plus1 */
 
     dmd_bw_put_bits(&bw, 0, 6);         /* vps_max_layer_id */
@@ -168,7 +174,12 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
 
     dmd_bw_put_flag(&bw, 0);            /* sps_sub_layer_ordering_info_present_flag */
     dmd_bw_put_ue(&bw, pp->sps_max_dec_pic_buffering_minus1);
-    dmd_bw_put_ue(&bw, 0);              /* sps_max_num_reorder_pics */
+    /* 见 build_vps_rbsp：写 0 会让按 SPS 决定输出时机的解码器按解码序
+     * 立刻吐帧。Chrome 自己解析原始码流，硬件走 OUTPUT_ORDER=1，
+     * 但合成 SPS 仍必须与真实重排需求一致，避免任何读 CSD 的路径
+     * 把 max_num_reorder_pics 当成 0。 */
+    dmd_bw_put_ue(&bw, pp->pic_fields.bits.NoPicReorderingFlag
+                          ? 0u : (unsigned)pp->sps_max_dec_pic_buffering_minus1);
     dmd_bw_put_ue(&bw, 0);              /* sps_max_latency_increase_plus1 */
 
     dmd_bw_put_ue(&bw, pp->log2_min_luma_coding_block_size_minus3);

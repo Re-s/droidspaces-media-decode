@@ -504,8 +504,27 @@ struct dmd_driver {
      * 用数组下标而非 ID，查找更快。 */
     int io_busy[DMD_MAX_CONTEXTS];
 
+    /* 后台收帧线程：Chrome 只调 EndPicture，从不 vaSyncSurface。
+     *
+     * 慢速播放实测（2fps 编号流 × 0.25 倍速 ≈ 每帧 2 秒）：硬件早已解完，
+     * 但两次 EndPicture 之间没有任何 VA 调用，帧就一直压在 V4L2 的
+     * CAPTURE 队列里 —— 驱动没有任何执行机会把像素写进 surface，
+     * Chrome 采样到的是空缓冲或上一轮内容，画面表现为前后帧跳跃。
+     *
+     * 所以要有一条不依赖调用方节奏的收帧路径。线程惰性启动（第一次
+     * CreateContext 时），只做"取帧 → 按 unit_seq 配对 → 写 surface"，
+     * 与 EndPicture / SyncSurface 共用 io_busy 串行化，不改变配对逻辑。 */
+    pthread_t reaper;
+    int reaper_started;
+    int reaper_stop;
+
     int drm_fd; /* 来自 ctx->drm_state，仅记录，当前不做 ioctl */
 };
+
+/* 启动后台收帧线程（惰性，重复调用无副作用）。调用方持锁。 */
+void dmd_reaper_start_locked(struct dmd_driver *drv);
+/* 停止并回收后台收帧线程。调用方**不得**持锁。 */
+void dmd_reaper_stop(struct dmd_driver *drv);
 
 /* 从 VADriverContext 取私有数据；ctx 或 pDriverData 为空时返回 NULL。 */
 struct dmd_driver *dmd_get_driver(VADriverContextP ctx);

@@ -138,6 +138,124 @@ void dmd_context_reset_locked(struct dmd_context *c)
     c->current_target = VA_INVALID_ID;
 }
 
+/* ========================== 后台收帧（Chrome 路径） ==========================
+ *
+ * 为什么必须有：Chrome 从不调 vaSyncSurface（实测 0 次，Firefox 是 1500 次），
+ * 也不调 QuerySurfaceStatus。驱动唯一的执行机会就是 EndPicture。
+ * 慢速播放时两次 EndPicture 相隔约 2 秒，硬件早解完的帧却压在 CAPTURE
+ * 队列里没人取 —— Chrome 侧 dmabuf 里是空的或上一轮的像素。
+ *
+ * 这个线程只做一件事：把已经就绪的帧按 unit_seq 配对写进对应 surface。
+ * 配对逻辑与 EndPicture / SyncSurface 完全一致（dmd_pending_take_locked），
+ * 所以不会改变任何"哪一帧属于哪个 surface"的语义。
+ */
+static void *dmd_reaper_thread(void *arg)
+{
+    struct dmd_driver *drv = (struct dmd_driver *)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&drv->lock);
+        if (drv->reaper_stop) {
+            pthread_mutex_unlock(&drv->lock);
+            break;
+        }
+
+        int worked = 0;
+        for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
+            struct dmd_context *c = &drv->contexts[i];
+            if (!c->in_use || !c->session || drv->io_busy[i])
+                continue;
+            if (c->pending_count <= 0)
+                continue;
+
+            /* ⚠️ 必须**主动向 V4L2 取帧**，不能只清 session 待取队列。
+             *
+             * 第一版只在 dmd_session_frames_pending() > 0 时才收，实测
+             * ORDER reap 恒为 0 —— 因为那个计数只反映"已 DQBUF 到 session
+             * 待取队列"的帧，而队列里的帧在 send_unit 里就被顺手收走了。
+             * 真正卡住的帧还在 V4L2 CAPTURE 队列里，必须 DQBUF 才拿得到，
+             * 而 DQBUF 只发生在 next_frame 内部。
+             *
+             * 所以这里无条件调 next_frame：pending_count > 0 就意味着
+             * 还有提交在等结果，poll 一小片是有意义的。超时无帧会返回
+             * DMD_ERR_TIMEOUT，正常现象。 */
+            VAContextID cid = c->id;
+            struct dmd_session *sess = c->session;
+            drv->io_busy[i] = 1;
+            pthread_mutex_unlock(&drv->lock);
+
+            struct dmd_frame f;
+            memset(&f, 0, sizeof(f));
+            /* 20ms 与 session 内部的 poll 分片同粒度：再细也不会更快
+             * 拿到帧（实测记录见 dmd_v4l2_session.c 的 slice 注释），
+             * 而额外唤醒会抢走解码需要的 CPU。 */
+            int rc = dmd_session_next_frame(sess, &f, 20);
+
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[i] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+
+            c = dmd_find_context_locked(drv, cid);
+            if (!c) {
+                if (rc == DMD_OK)
+                    dmd_session_release_frame(sess, &f);
+                continue;
+            }
+            if (rc != DMD_OK)
+                continue;
+
+            VASurfaceID id = dmd_pending_take_locked(c, f.unit_seq);
+            struct dmd_surface *s = dmd_find_surface_locked(drv, id);
+            if (s) {
+                surface_store_frame_locked(s, &f);
+                s->state = DMD_SURFACE_READY;
+                c->frames_out++;
+                worked = 1;
+                if (dmd_trace_order())
+                    dmd_log("ORDER reap   surf=%u unit_seq=%u pend=%d\n",
+                            (unsigned)id, f.unit_seq, c->pending_count);
+            }
+            dmd_session_release_frame(sess, &f);
+        }
+        pthread_mutex_unlock(&drv->lock);
+
+        /* next_frame 自带 20ms poll，本身就是节流，所以只在完全没活干
+         * （所有 context 都没有在飞的提交）时才额外睡一下。 */
+        if (!worked)
+            usleep(2000);
+    }
+
+    return NULL;
+}
+
+void dmd_reaper_start_locked(struct dmd_driver *drv)
+{
+    if (drv->reaper_started)
+        return;
+    drv->reaper_stop = 0;
+    if (pthread_create(&drv->reaper, NULL, dmd_reaper_thread, drv) != 0) {
+        dmd_log("后台收帧线程启动失败，回落到只在 EndPicture 收帧\n");
+        return;
+    }
+    drv->reaper_started = 1;
+    dmd_log("后台收帧线程已启动\n");
+}
+
+void dmd_reaper_stop(struct dmd_driver *drv)
+{
+    pthread_mutex_lock(&drv->lock);
+    if (!drv->reaper_started) {
+        pthread_mutex_unlock(&drv->lock);
+        return;
+    }
+    drv->reaper_stop = 1;
+    pthread_t t = drv->reaper;
+    drv->reaper_started = 0;
+    pthread_mutex_unlock(&drv->lock);
+    pthread_join(t, NULL);
+    dmd_log("后台收帧线程已停止\n");
+}
+
 /* ================================ surface ================================ */
 
 /* 按显示尺寸分配一个 surface 的 NV12 缓冲。
@@ -714,6 +832,9 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
     /* 会话建不起来不让 CreateContext 失败：daemon 可能只是暂时不可用，
      * 首次 EndPicture 会重试。失败时报的错更贴近真实原因。 */
     c->session_failed = sess ? 0 : 1;
+    /* 只调 EndPicture 的消费者（Chrome）需要一条不依赖它调用节奏的
+     * 收帧路径，否则慢速播放时帧会一直压在 V4L2 队列里。 */
+    dmd_reaper_start_locked(drv);
     pthread_mutex_unlock(&drv->lock);
 
     *context = new_id;
@@ -1177,6 +1298,15 @@ VAStatus dmd_BeginPicture(VADriverContextP ctx, VAContextID context,
         dmd_log("BeginPicture: 上一帧未 EndPicture，丢弃 %zu 字节残留\n",
                 c->slice_len);
 
+    /* ⚠️ 0.4.5 已否证：不要在这里拒绝复用 READY 的 surface。
+     *
+     * 动机是对的（Chrome 不调 Sync，READY 的 surface 可能在被采样前就被复用），
+     * 但拒绝会破坏 ffmpeg/Firefox：它们走 DeriveImage/MapBuffer 读像素，
+     * 那条路径读完不会把 state 改回 IDLE，于是第二轮复用全被拒，
+     * 实测 md5 回归 H.264/HEVC/VP9 全部 FAIL、ffmpeg 报 I/O error。
+     *
+     * VA-API 的契约是：surface 的复用时机由**调用方**负责，
+     * 驱动不该反过来限制。谁复用得太早，就是谁的资源管理问题。 */
     c->current_target = render_target;
     c->slice_len = 0;
     c->av1_tile_count = 0;   /* tile 边界随帧重置，与 slice_len 同生命周期 */
@@ -1331,6 +1461,18 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->hevc_pic_param, b->data,
                        sizeof(VAPictureParameterBufferHEVC));
                 c->hevc_pic_param_valid = 1;
+                {
+                    static int logged;
+                    if (!logged) {
+                        logged = 1;
+                        dmd_log("HEVC pic_param: DPB=%u NoPicReordering=%u "
+                                "NoBiPred=%u POC=%d\n",
+                                (unsigned)c->hevc_pic_param.sps_max_dec_pic_buffering_minus1,
+                                (unsigned)c->hevc_pic_param.pic_fields.bits.NoPicReorderingFlag,
+                                (unsigned)c->hevc_pic_param.pic_fields.bits.NoBiPredFlag,
+                                (int)c->hevc_pic_param.CurrPic.pic_order_cnt);
+                    }
+                }
                 c->current_poc = c->hevc_pic_param.CurrPic.pic_order_cnt;
                 /* HEVC 没有 frame_num；用 IRAP 判定新序列：
                  * IDR 会把 POC 重置，配对时必须按 seq 分段。 */
@@ -2463,6 +2605,75 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 (unsigned)c->av1_send_surface);
     }
 
+    /* ⚠️ 复用尚未收帧的 surface 会造成同一块内存先后装两帧。
+     *
+     * 实测（Chrome + jinjie_265.mp4，HEVC has_b_frames=2）：
+     *     提交 surf=5 unit=4       ← 期望装 POC 1
+     *     提交 surf=5 unit=18      ← 仅 14 个单元后 Chrome 又拿它当目标
+     *     收帧 surf=5 unit=4 POC=1 ← POC 1 此刻才写进来
+     * Chrome 采样时拿到哪一帧取决于时序竞争，表现为画面前后帧跳跃。
+     *
+     * 成因：EndPicture 是异步的，返回成功只代表码流已送进解码器，
+     * 帧还在硬件流水线里。Chrome 靠自己的 DPB 引用计数判断可回收，
+     * 不调 vaSyncSurface（实测 0 次；Firefox 是 1500 次），
+     * 也不调 QuerySurfaceStatus —— 驱动没有任何机会告知"还没写完"。
+     *
+     * 修法：复用前先把该 surface 那一帧收回来。不能像 0.4.5 第一次尝试那样
+     * 直接拒绝复用（返回 SURFACE_BUSY）—— 那会破坏 ffmpeg/Firefox：
+     * 它们走 DeriveImage 读像素、读完不改 state，第二轮复用全被拒，
+     * md5 回归四码流全 FAIL。这里只阻塞到帧到手，不改变契约。 */
+    for (int k = 0; k < c->pending_count; k++) {
+        int kp = (c->pending_head + k) % DMD_MAX_SURFACES;
+        if (c->pending[kp] != target)
+            continue;
+        /* 目标 surface 仍在队列里等帧：先收帧，避免被本次解码覆盖。 */
+        dmd_log("EndPicture: surface %u 仍待收帧（unit %llu），先排空\n",
+                (unsigned)target, (unsigned long long)c->pending_unit[kp]);
+        struct dmd_session *ds = c->session;
+        int di = (int)(c - drv->contexts);
+        if (!ds || drv->io_busy[di])
+            break;
+        drv->io_busy[di] = 1;
+        for (int guard = 0; guard < DMD_MAX_SURFACES; guard++) {
+            /* 目标是否还在队列里？不在就收够了。 */
+            int still = 0;
+            for (int m = 0; m < c->pending_count; m++) {
+                int mp = (c->pending_head + m) % DMD_MAX_SURFACES;
+                if (c->pending[mp] == target) { still = 1; break; }
+            }
+            if (!still)
+                break;
+
+            pthread_mutex_unlock(&drv->lock);
+            struct dmd_frame rf;
+            memset(&rf, 0, sizeof(rf));
+            int rrc = dmd_session_next_frame(ds, &rf, DMD_FRAME_TIMEOUT_MS);
+            pthread_mutex_lock(&drv->lock);
+
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                if (rrc == DMD_OK)
+                    dmd_session_release_frame(ds, &rf);
+                pthread_mutex_unlock(&drv->lock);
+                free(scratch);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+            if (rrc != DMD_OK)
+                break;
+
+            VASurfaceID got = dmd_pending_take_locked(c, rf.unit_seq);
+            struct dmd_surface *gs = dmd_find_surface_locked(drv, got);
+            if (gs) {
+                surface_store_frame_locked(gs, &rf);
+                gs->state = DMD_SURFACE_READY;
+            }
+            dmd_session_release_frame(ds, &rf);
+        }
+        drv->io_busy[di] = 0;
+        pthread_cond_broadcast(&drv->io_done);
+        break;
+    }
+
     int qpos = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
     /* AV1 延迟一帧：本次送出的是上一帧的数据，登记它的 surface。
      * 其余 codec 送的就是当前帧，直接用 target。 */
@@ -2490,11 +2701,29 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         if (c->pending[kp] == reg_surf) { dup_pending = 1; break; }
     }
     if (dup_pending)
-        dmd_log("EndPicture: ⚠️ surface=%u 已在待配对队列（重复项）\n",
+        dmd_log("EndPicture: surface=%u 已在待配对队列（unit 号不同，照常入队）\n",
                 (unsigned)reg_surf);
 
     /* ⚠️ 只跳过入队，**数据照送**。送料在下方 dmd_session_send_unit，
-     * 这里 early-return 就等于不送 —— 本会话已踩过两次，别再犯。 */
+     * 这里 early-return 就等于不送 —— 本会话已踩过两次，别再犯。
+     *
+     * ⚠️ 0.4.5 已否证的两种做法，别再重来：
+     *
+     * 1. 只打 warning 不去重（0.4.4 及更早的实际行为，与上面注释不符）：
+     *    重复项进队后，按 unit 号精确匹配其实**仍然正确**（每个登记项的
+     *    pending_unit 互不相同），所以它本身不致命。
+     *
+     * 2. 让重复项跳过入队（0.4.5 首次尝试）：**错得更狠**。硬件照样会为
+     *    这次提交回传一个 unit 号，而队列里没有对应登记项，于是从那一刻起
+     *    每一帧都 "unit_seq=N 无匹配项" 落到顺序推断上。Chrome 实测
+     *    98.6%（1292/1310）配对失败，画面持续前后跳跃。
+     *    日志指纹：submit unit=16 → 两条 unit=0 → submit unit=19，
+     *    随后 unit_seq=17 起全部无匹配。
+     *
+     * 结论：**队列登记必须与提交一一对应，不能制造空洞**。
+     * 同一 surface 允许有多个登记项 —— 它们的 unit 号不同，
+     * 精确配对靠 unit 号区分，dmd_pending_take_locked 取的是首个
+     * unit 号匹配项，不看 surface 是否重复。 */
     c->pending[qpos] = reg_surf;
     /* ⚠️ 这里**不要**打印 c->av1_pic_param 的 show_frame/order_hint：
      * 那是当前帧的参数，而登记的 surface 属于上一帧（延迟一帧送料）。
@@ -2542,6 +2771,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     c->pending_unit[qpos] = ++c->units_submitted;
     if (!av1_no_output)
         c->pending_count++;
+
     c->have_current_poc = 0;
     c->current_target = VA_INVALID_ID;
 
@@ -2895,6 +3125,52 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->sent_l0 = c->pending_l0;
         c->sent_l1 = c->pending_l1;
     }
+
+    /* Chrome 不调 vaSyncSurface。send_unit 成功后已经用 5ms recv 把
+     * 解完的帧推进 session 待取队列，但若不在这里写进 surface，
+     * Chrome 在 EndPicture 返回后立刻 SurfaceReady / GPU 采样，
+     * 采到的是空缓冲或上一轮像素 —— 慢速播放仍显示解码序 0→4→2→1。
+     *
+     * 只收已经在队列里的帧（next_frame 对 pend_pop 立即返回），
+     * 不额外阻塞等硬件，避免重新引入 Firefox 那种互等死锁。 */
+    if (c->session && !drv->io_busy[idx] &&
+        dmd_session_frames_pending(c->session) > 0) {
+        struct dmd_session *hsess = c->session;
+        drv->io_busy[idx] = 1;
+        int harvested = 0;
+        while (dmd_session_frames_pending(hsess) > 0) {
+            pthread_mutex_unlock(&drv->lock);
+            struct dmd_frame hf;
+            memset(&hf, 0, sizeof(hf));
+            int hrc = dmd_session_next_frame(hsess, &hf, 1);
+            pthread_mutex_lock(&drv->lock);
+            c = dmd_find_context_locked(drv, context);
+            if (!c) {
+                if (hrc == DMD_OK)
+                    dmd_session_release_frame(hsess, &hf);
+                drv->io_busy[idx] = 0;
+                pthread_cond_broadcast(&drv->io_done);
+                pthread_mutex_unlock(&drv->lock);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+            if (hrc != DMD_OK)
+                break;
+            VASurfaceID hid = dmd_pending_take_locked(c, hf.unit_seq);
+            struct dmd_surface *hs = dmd_find_surface_locked(drv, hid);
+            if (hs) {
+                surface_store_frame_locked(hs, &hf);
+                hs->state = DMD_SURFACE_READY;
+                harvested++;
+            }
+            dmd_session_release_frame(hsess, &hf);
+        }
+        drv->io_busy[idx] = 0;
+        pthread_cond_broadcast(&drv->io_done);
+        if (harvested)
+            dmd_log("EndPicture: 返回前写入 %d 帧（session 待取 %d）\n",
+                    harvested, dmd_session_frames_pending(c->session));
+    }
+
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;
