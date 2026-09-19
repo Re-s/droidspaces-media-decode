@@ -1,5 +1,51 @@
 # 更新日志
 
+# 更新日志（未发布 · 分支 feat/msm-vidc-512-upstream）
+
+## v0.4.7-wip（AV1 适配推进 · 本设备固件能力实测）
+
+### MPEG-2：本设备固件不支持，无法适配（结论性实测）
+
+内核 6.6 的新 msm_vidc 上 `VIDIOC_ENUM_FMT(OUTPUT)` 只列
+H264 / HEVC / VP90 / HEIC / AV10 —— **MPG2 与 VP80 不在列**。
+S_FMT 送 MPG2/VP80 时内核报 `msm_vdec_try_fmt: unsupported codec`
+（dmesg）并**静默回落 H.264 默认参数**（320x240）。旧文档里
+"MPG2/VP80 在列"是小米平板 5（nabu，内核 4.14 venus）的情况。
+探测脚本：`tools/probe_mp2_feed.c`（另含送料粒度对照）。
+因此 DMD_ENABLE_MPEG2 在本设备无意义；码流合成器保留，留给
+固件支持 MPG2 的设备。
+
+### VP8：运行时能力门控（修复虚报）
+
+VP8 在本设备固件上同样不支持，但 0.4.2 起静态声明了该 profile。
+`dmd_QueryConfigProfiles` / `dmd_profile_supported` 现按
+`dmd_v4l2_probe`（ENUM_FMT）运行时过滤 VP8 / MPEG2 / AV1 ——
+固件不支持的 profile 不再声明，消费者自动回落软解。
+
+### AV1：修复 fourcc 不匹配并打通端到端（大幅推进，尚未完成）
+
+- **fourcc**：本内核 AV1 的 fourcc 是非标准的 `AV10`
+  （`v4l2_fourcc('A','V','1','0')`），不是主线的 `AV01`。新增
+  `dmd_v4l2_pick_fourcc`：按设备 OUTPUT 枚举在标准/非标准两个候选里
+  挑，probe 与 open 都走挑选结果。此前 probe 直接失败，AV1 会话起不来。
+- **show_frame 强制置 1**：硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，
+  而 ffmpeg 的 VA-API 后端为每个提交帧的 surface 要像素（show_frame=0
+  的帧日后由 show_existing_frame 复显 = 重用同一 surface）。合成帧头
+  现在把 show_frame 写成 1，每个提交帧都有一帧硬件输出、一张 surface。
+- **迟到发现**：ffmpeg 会**回收复用 surface**（同一 VASurfaceID 先后
+  属于不同帧），surface 不能当帧身份用。新增 frame_seq 帧号与
+  surface→"最近拥有者帧号"表（dmd_av1_frame_of / remember_surface）。
+- **非标准实现清除**：enable_restoration / skip_mode_present /
+  allow_warped_motion 等字段原先按 av1_1080p.obu 单条流的实测拟合
+  （恒 1、uniform_ref 置 0 等），换码流即错。除 VA-API 完全不提供的
+  序列级 enable_superres/enable_restoration 外，一律转写 VA-API 值。
+- **flush 修复队列**：暂存帧被 sync 提前冲出时按 refresh=0 送出
+  （不占槽、不破坏 DPB），字节进修复队列；下一帧反算出真实 refresh 后
+  重发一次补上 DPB，重发输出用哨兵 pending（surface=0xFFFFFFFE）丢弃。
+- **现状**：dav1d 软解逐帧比对 91/150 显示帧像素精确一致（起点 3/150），
+  帧数 150/150。剩余差异集中在部分 GOP 后段的 SEF 复显位置
+  （奇偶交替模式），待查。
+
 ## v0.4.6（修复 Chrome 硬解画面错乱）
 
 **修复 Chrome 硬解时画面前后帧跳跃。** 表现为开头几帧顺序错乱，

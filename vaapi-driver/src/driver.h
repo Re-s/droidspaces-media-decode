@@ -402,6 +402,23 @@ struct dmd_context {
      *   av1_send_surface：build_unit 本次实际送出的那一帧的 surface */
     VASurfaceID    av1_hold_surface;
     VASurfaceID    av1_send_surface;
+    /* 暂存帧在影子 DPB 里的帧号（frame_seq，见 av1_bitstream.h）。
+     * refresh 的影子登记发生在下一帧的 patch（那时才知道源码流把本帧
+     * 放进了哪个槽），登记时用这个号。 */
+    int            av1_hold_frame;
+    /* ---- flush 修复队列 ----
+     *
+     * 暂存帧被 sync 提前冲出（消费者等它的 surface 像素）时，refresh
+     * 尚未反算，按 0 送出（不占任何槽，绝不破坏 DPB），同时把字节留进
+     * 修复队列。下一帧 EndPicture 时 diff 已经能算出源码流的真实
+     * refresh，把修复缓冲就地改写后**重发一次**：硬件重新解码本帧
+     * （输出内容不变，surface 被再次写入同样的像素，无害），DPB 因此
+     * 补上正确的槽位。重发的输出用哨兵 pending（surface=0）丢弃，
+     * 不参与配对。 */
+    unsigned char *av1_repair_buf;
+    size_t         av1_repair_len;
+    size_t         av1_repair_bitpos;
+    int            av1_repair_frame;
     /* 最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接像素。 */
     VASurfaceID    av1_last_ready;
 

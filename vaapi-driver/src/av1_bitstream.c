@@ -921,25 +921,15 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     if (enable_order_hint)
         dmd_bw_put_bits(&bw, p->order_hint_bits_minus_1, 3);
 
-    /* ⚠️ enable_superres / enable_restoration 也不提供，用帧级反推：
-     *   use_superres（:432）
-     *   三个 *frame_restoration_type（:608-610，非 0 即启用）
-     * 这两个**必须如实反映**，与 warped_motion 的处理不同 —— 它们会改变
-     * 帧头的语法结构（多读或少读字段），置错会直接让帧头错位。 */
-    const int use_superres = (int)p->pic_info_fields.bits.use_superres;
-
-    dmd_bw_put_flag(&bw, use_superres);
+    /* enable_superres：VA-API 不提供序列级字段，用帧级 use_superres 反推。
+     * enable_restoration：VA-API 同样不提供，恒写 1 并在每帧 lr_params
+     * 里写 lr_type=0 —— 自洽且语义等价于"不用 restoration"。
+     * ⚠️ 代价：帧头比 enable_restoration=0 的源码流多 6 位，但这 6 位
+     * 写在我们自己的码流里，tile_group 位置自洽，不影响解码正确性。
+     * ⚠️ 真正使用 loop restoration（lr_type≠0）的码流不受支持 ——
+     * VA-API 完全不提供 LR 参数，像素会差一个滤波环节。 */
+    dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.use_superres);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_cdef);
-    /* enable_restoration 恒 1。
-     *
-     * ⚠️ 曾按"三个 frame_restoration_type 是否全为 0"来推导，实测错误：
-     * trace_headers 显示真实码流 enable_restoration=1，且帧头位 204 起
-     * **确实写了 lr_type[0..2] 共 6 位**（值恰好全为 0）。
-     * 也就是说"本帧不用 restoration"是通过 lr_type=0 表达的，而不是通过
-     * 序列级 enable_restoration=0 —— 后者会让整个 lr_params 段消失，
-     * 帧头因此短 6 位，tile_group 起始位置随之前移，解码器读到错位数据。
-     *
-     * 取 1 是安全侧：它只是允许，具体每帧仍由 lr_type 决定。 */
     dmd_bw_put_flag(&bw, 1);
 
     put_color_config(&bw, p);
@@ -963,6 +953,48 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     return hdr + body_len;
 }
 
+/* ---- surface -> 帧号 的"最近拥有者"表 ----
+ *
+ * ffmpeg 的 surface 池会回收复用 surface id：一帧显示完且不再被引用后，
+ * 它的 surface 会被新的解码帧拿走（实测 160 帧样本里 oh1 与 oh7 先后
+ * 同用 surface 6）。因此 surface 不能直接当帧身份用；但"最近拥有某
+ * surface 的帧"总是唯一且还活着的。所有从 surface 出发的身份判断
+ * 都经过这里。 */
+static int dmd_av1_frame_of(struct dmd_av1_dpb *dpb, VASurfaceID surf)
+{
+    if (!dpb || surf == VA_INVALID_ID || surf == 0)
+        return -1;
+    for (int i = dpb->surf_hist_n - 1; i >= 0; i--)
+        if (dpb->surf_hist[i].surf == surf)
+            return dpb->surf_hist[i].frame;
+    return -1;
+}
+
+static void dmd_av1_remember_surface(struct dmd_av1_dpb *dpb,
+                                     VASurfaceID surf, int frame)
+{
+    if (!dpb || surf == VA_INVALID_ID || surf == 0)
+        return;
+    for (int i = dpb->surf_hist_n - 1; i >= 0; i--) {
+        if (dpb->surf_hist[i].surf == surf) {
+            dpb->surf_hist[i].frame = frame;
+            return;
+        }
+    }
+    if (dpb->surf_hist_n < (int)(sizeof(dpb->surf_hist) /
+                                 sizeof(dpb->surf_hist[0]))) {
+        dpb->surf_hist[dpb->surf_hist_n].surf = surf;
+        dpb->surf_hist[dpb->surf_hist_n].frame = frame;
+        dpb->surf_hist_n++;
+    } else {
+        /* 表满：覆盖最早一项（最老的拥有关系最不可能再被查询）。 */
+        for (int i = 1; i < dpb->surf_hist_n; i++)
+            dpb->surf_hist[i - 1] = dpb->surf_hist[i];
+        dpb->surf_hist[dpb->surf_hist_n - 1].surf = surf;
+        dpb->surf_hist[dpb->surf_hist_n - 1].frame = frame;
+    }
+}
+
 /* 把 uncompressed_header() 写进 bw，不含结尾的 trailing_bits /
  * byte_alignment —— 由调用方按封装形式决定：
  *   OBU_FRAME_HEADER(3) 用 trailing_bits（规范 5.9.1）
@@ -977,6 +1009,30 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 都是计数器。所以"拷入 → 写 → 拷回"是安全的，函数体内得以保留
      * 已与真实码流逐字段对齐过的 `&bw` 写法，不必逐行改动引入笔误。 */
     struct dmd_bitwriter bw = *bwp;
+
+    /* ---- show_frame 强制置 1（方向 A 的落地，见本文件 SEF 长注释）----
+     *
+     * 硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，而 ffmpeg 的 VA-API 后端
+     * 会为**每个**提交帧的 surface 要像素（show_frame=0 的帧日后靠 SEF
+     * 复显，复显就是重用同一个 surface）。之前这些帧拿不到硬件像素，
+     * 任何"从别的 surface 拷像素"的承接都被实测否证（信息根本不存在）。
+     *
+     * 修法：合成头里把 show_frame 写成 1，让硬件为每个提交帧都出一帧
+     * （OUTPUT_ORDER=1 下按解码序输出，与 pending 登记顺序一致），
+     * 每张 surface 拿到**自己那一帧**的真实像素。SEF 复显由 ffmpeg
+     * 重用 surface 完成，驱动无需合成任何 SEF 头。
+     *
+     * show_frame 只控制"是否输出"，不影响 DPB/参考语义
+     * （槽位刷新由 refresh_frame_flags 决定，与本位无关）。
+     * 头内所有依赖它的语法分支（showable 位、error_resilient 推断、
+     * KEY 帧的 refresh 推断、film_grain 出现条件）都统一用这个生效值，
+     * 保证码流自身自洽。影子 DPB（decode.c）仍按原始值记账。
+     *
+     * DMD_AV1_NO_SHOWFORCE=1 恢复旧行为，供 A/B 对照。 */
+    const int no_showforce = getenv("DMD_AV1_NO_SHOWFORCE")
+                             && getenv("DMD_AV1_NO_SHOWFORCE")[0] == '1';
+    const int show_frame_eff = no_showforce
+        ? (int)p->pic_info_fields.bits.show_frame : 1;
 
     const uint32_t frame_type   = p->pic_info_fields.bits.frame_type;
     const int is_key            = (frame_type == 0);   /* KEY_FRAME */
@@ -1048,8 +1104,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "frame_type", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_bits(&bw, frame_type, 2);
-    dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.show_frame);
-    if (!p->pic_info_fields.bits.show_frame)
+    dmd_bw_put_flag(&bw, show_frame_eff);
+    if (!show_frame_eff)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.showable_frame);
 
     /* error_resilient_mode：KEY_FRAME 且 show_frame 时恒 1、不写入。 */
@@ -1058,7 +1114,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      *     → infer 1（不写入码流）
      *   否则 flag(error_resilient_mode) */
     const int er_inferred = (frame_type == 3) ||
-                            (is_key && p->pic_info_fields.bits.show_frame);
+                            (is_key && show_frame_eff);
     if (!er_inferred) {
         if (getenv("DMD_AV1_BITS"))
             fprintf(stderr, "[bits] err_res @ %zu\n",
@@ -1135,7 +1191,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * 或不作为参考的帧的正常情形，比 0xFF 安全得多 —— 宁可少声明刷新，
      * 也不要谎称刷新了全部而让解码器丢弃仍在使用的参考帧。 */
     const int refresh_all = (frame_type == 3) ||
-                            (is_key && p->pic_info_fields.bits.show_frame);
+                            (is_key && show_frame_eff);
 
     /* ===================== 自洽 DPB（影子参考帧管理）=====================
      *
@@ -1177,16 +1233,40 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     unsigned refresh_mask = 0;
     int my_slot = -1;
     if (!refresh_all) {
-        my_slot = (int)(dpb->dpb_next_slot & 7u);
+        /* 占位 refresh：轮转槽。真实值要等下一帧的 map 差分反算
+         * （dmd_av1_patch_prev_refresh），届时就地改写这 8 位；
+         * 若帧被 sync 提前冲出（flush），改写为 0 并进修复队列。
+         * 影子登记也不在这里 —— 等真实值出来才登记（见 patch）。 */
+        my_slot = dpb ? (int)(dpb->dpb_next_slot & 7u) : 0;
         refresh_mask = 1u << my_slot;
-        /* 记录本字段在帧头里的位偏移，供上层"延迟一帧后就地改写"使用。
-         * 正确的 refresh 值要等下一帧的 ref_frame_map 才能算出（见
-         * dmd_av1_dpb 说明），而那时本帧已经合成完毕。 */
+        if (dpb) {
+            /* 帧号与 surface 归属此刻登记（后续帧的引用翻译要用），
+             * 槽位放置则等 patch 反算出真实 refresh 后再做。 */
+            const int me = ++dpb->frame_seq;
+            dmd_av1_remember_surface(dpb, p->current_frame, me);
+        }
         dpb->last_refresh_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
         if (getenv("DMD_AV1_BITS"))
             fprintf(stderr, "[bits] refresh_mask=0x%02x @ %zu\n",
                     refresh_mask, bw.byte_pos * 8 + bw.bit_pos);
         dmd_bw_put_bits(&bw, refresh_mask, 8);
+    } else if (dpb) {
+        /* KEY / SWITCH 帧全刷：refresh 不写入码流（规范 7.20 推断），
+         * 影子表立即登记 —— KEY 帧直送、无延迟，本帧 placement 即最终值。 */
+        const int me = ++dpb->frame_seq;
+        dmd_av1_remember_surface(dpb, p->current_frame, me);
+        for (int k2 = 0; k2 < 8; k2++) {
+            dpb->dpb_shadow[k2] = me;
+            dpb->dpb_order_hint[k2] = p->order_hint;
+        }
+        dpb->dpb_next_slot = 0;
+    }
+    if (dpb && getenv("DMD_AV1_DBG")) {
+        fprintf(stderr, "[dbg] shadow(cur=oh%u cur_surf=%u):",
+                p->order_hint, (unsigned)p->current_frame);
+        for (int k2 = 0; k2 < 8; k2++)
+            fprintf(stderr, " %u", (unsigned)dpb->dpb_shadow[k2]);
+        fprintf(stderr, "\n");
     }
 
     /* ref_order_hint[i]（规范 5.9.2）：条件是
@@ -1209,26 +1289,49 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 显式给出全部 7 个 ref_frame_idx（VA-API 提供的正是这个数组）。 */
         if (enable_order_hint)
             dmd_bw_put_flag(&bw, 0);
-        /* 把 VA-API 的槽号翻成**我的**槽号：
-         * VA-API 的 ref_frame_idx[i] 是它自己 DPB 里的槽号，
-         * 经 ref_frame_map[] 得到真正的 surface id，
-         * 再在影子 DPB 里找该 surface 现在占我的哪个槽。 */
+        /* 把 VA-API 的槽号经影子 DPB 翻译成**本合成流**的槽号。
+         *
+         * 本合成流的 DPB 槽位分配与源码流无关（KEY/全刷帧占全部 8 槽，
+         * 其余帧按 dpb_next_slot 轮转，见 build_frame 末尾的影子登记），
+         * 而 VA-API 的 ref_frame_idx[i] 是 ffmpeg 按源码流维护的槽号。
+         * 翻译规则：源槽 s → ref_frame_map[s]（surface id，即"想要哪一帧
+         * 的内容"）→ 在影子 DPB 里查该 surface 现在占本流的哪个槽。
+         *
+         * 为什么必须翻译而不是透传：透传只在合成流的槽位分配与源码流
+         * 逐帧一致时才成立，那要求 refresh_frame_flags 也逐帧等于源真值
+         * —— 而真值要等下一帧的 map 差分才能算出，导致每帧必须延迟一帧
+         * 送料；ffmpeg 又会在 EndPicture 后立刻 Sync 叶帧的 surface，
+         * 暂存帧被 flush 提前送出、带着错误的 refresh，参考链全断
+         * （实测 160 帧样本 147 帧像素错误，KEY 帧全对、帧间帧全错）。
+         * 翻译之后合成流自身自洽，每帧可立即送出，整个延迟/反算/flush
+         * 机制都不再需要。
+         *
+         * CDF 继承也跟着对：解码器从 ref_frame_idx[primary_ref_frame]
+         * 指向的槽加载 CDF，翻译保证那仍是"同一帧内容"，于是 CDF 演化
+         * 链与源码流逐帧相同，源码流的 tile 数据可原样解码。
+         *
+         * 影子 DPB 里同一 surface 可能占多个槽（KEY/全刷帧刷新 8 槽），
+         * 取哪个都等价（内容与 CDF 相同），取扫描到的第一个。 */
         for (int i = 0; i < 7; i++) {
             unsigned va_slot = p->ref_frame_idx[i];
-            unsigned my = va_slot < 8 ? va_slot : 0;
-            /* 直接沿用 VA-API 的槽号。
-             *
-             * 先前试过"经 ref_frame_map 翻成 surface id 再查影子 DPB"，
-             * 实测第 2 帧即解码失败：VA-API 给的是槽 2，影子表查得槽 0。
-             * 两者都指向同一个 KEY 帧 surface，但 dav1d 按规范推断出的
-             * DPB 状态里槽 0 与槽 2 的 order hint 不同 —— 我们无法让
-             * 影子表与解码器的推断状态保持一致（KEY+show 帧的
-             * refresh_frame_flags 不写入码流，由双方各自推断）。
-             *
-             * 于是放弃重映射：VA-API 的槽号本就与源码流一致（实测
-             * ref_frame_idx 全为 2，与源码流 trace_headers 相同），
-             * 直接透传最安全。影子 DPB 仅用于 refresh_frame_flags 的
-             * 槽位轮转，不再参与引用翻译。 */
+            unsigned my;
+            int want_frame = -1;
+            if (va_slot < 8 && dpb)
+                want_frame = dmd_av1_frame_of(dpb, p->ref_frame_map[va_slot]);
+            if (want_frame > 0) {
+                my = va_slot;   /* 查不到时退回透传 */
+                for (int k = 0; k < 8; k++) {
+                    if (dpb->dpb_shadow[k] == want_frame) {
+                        my = (unsigned)k;
+                        break;
+                    }
+                }
+            } else {
+                my = va_slot < 8 ? va_slot : 0;
+            }
+            if (getenv("DMD_AV1_DBG"))
+                fprintf(stderr, "[dbg] ref[%d]: va_slot=%u want_frame=%d "
+                                "-> my_slot=%u\n", i, va_slot, want_frame, my);
             dmd_bw_put_bits(&bw, my, 3);
         }
         /* frame_id_numbers_present=0，不写 delta_frame_id。 */
@@ -1403,20 +1506,15 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         fprintf(stderr, "]\n");
     }
     if (!intra_only && p->mode_control_fields.bits.reference_select) {
-        /* ⚠️ 不能直接转写 VA-API 的 skip_mode_present。
+        /* 直接转写 VA-API 的 skip_mode_present。
          *
-         * 实测（av1_1080p.obu 前 6 帧，逐位反解源码流）：
-         *   帧2 VA-API 0 / 源 1     ← 唯一不一致的一帧
-         *   帧3..帧6 VA-API 1 / 源 1
-         * 帧2 的 VA-API 值"讲道理"：该帧 7 个参考全指向同一 slot
-         * （idx=[2,2,2,2,2,2,2] ref_oh 全 0），按规范 5.9.22
-         * skipModeAllowed 需前向+后向两个不同参考，故报 0。
-         * 但 libaom 编码时写的是 1，照抄 VA-API 会与码流不符。
-         *
-         * 走到这里已满足 reference_select=1（规范 5.9.22 的前置条件），
-         * 此时 libaom 恒写 1。本实现据此恒写 1 —— 6 帧样本全部
-         * 逐字节与源相同，合成流 dav1d 软解 2 帧 = 源码流基线 2 帧。 */
-        dmd_bw_put_flag(&bw, 1);
+         * 旧实现恒写 1（拟合 av1_1080p.obu 的"frame2 VA=0 源=1"观察）。
+         * 那个不一致是当时其他位错位缺陷的假象 —— ffmpeg 的
+         * mode_control_fields 是 CBS 从源码流逐字段解析出来的，
+         * 忠实于源码流。恒写 1 会让 skip_mode 允许时少 1 位、不允许时
+         * 多 1 位，tile_group 起始随之前移或后移。 */
+        dmd_bw_put_flag(&bw,
+            (int)p->mode_control_fields.bits.skip_mode_present);
     }
 
     /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
@@ -1424,91 +1522,11 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "warp", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only &&
         p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
-        /* ⚠️ 同样不能直接转写 VA-API 的 allow_warped_motion：
-         * 实测帧2 VA-API 给 1 而源码流写 0，与 skip_mode_present
-         * 恰好方向相反（两者相邻，位 147/148）。
-         * 两个字段必须同时修正，单改任一个都无法与源逐字节一致
-         * （穷举验证：skip=1&warp=0 → 帧2..5 全对；只改一个 → 帧2 错）。
-         *
-         * ⚠️⚠️ 但恒 0 也是错的 —— 那只拟合了前 6 帧！
-         * 把样本扩到 24 帧后实测：23/24 逐字节相同，唯独帧18 差 1 位，
-         * 正是位 148 这一位（源 1、合成 0）。
-         * 所以 allow_warped_motion 逐帧变化，必须找出真正的取值规则。
-         *
-         * ---- 60 帧样本上的实测（本轮）----
-         * 恒 0                       → 56/61 相同，错帧 [18,26,30,48,60]
-         * 写 use_ref_frame_mvs       → 56/61 相同，错帧 [26,30,32,56,60]
-         * 后者修好了 18/48 却弄坏 32/56，所以 use_ref_frame_mvs
-         * **不是**正确规则（虽然在帧2/帧18 两个样本上恰好吻合 ——
-         * 又一次小样本巧合，别再上钩）。
-         * DMD_AV1_WARP=m 可复现这个对照。
-         *
-         * 三帧样本的 VA-API 字段全同（mms=1 err=0 prim=0 gm 全 0），
-         * 唯一差异是 use_ref_frame_mvs，但它不足以解释全部。
-         *
-         * ---- 60 帧样本的完整对照（DMD_AV1_WARP 开关）----
-         * 只有 6 帧到达此写入点（其余 mms=0 或 err_res 被跳过）：
-         *   oh = 16, 24, 28, 46, 54, 58
-         *   va =  1,  1,  0,  1,  1,  0
-         * 三种写法的结果：
-         *   恒 0（现状，最优）  57/61，错帧 [18,30,48,60]
-         *   写 VA-API 值（=v）  57/61，错帧 [2,30,32,60]
-         *   写 use_ref_frame_mvs(=m) 56/61
-         * 恒 0 与转写 VA-API 各修好对方错的那两帧，都是 57/61。
-         * （帧30/60 属另一类缺陷 —— refresh 占位值，与本字段无关。）
-         *
-         * 所以真实规则既不是常量、也不是 VA-API 字段的直接转写，
-         * 而 60 帧样本只提供"不等于"的约束，不足以定出唯一解。
-         * 未查明就不猜 —— 保持恒 0（当前最优），把证据留在这里。
-         * 下一步应查 libaom 编码器侧 allow_warped_motion 的决策条件。 */
-        {
-            /* 假设待验证：allow_warped_motion 与 use_ref_frame_mvs 相关。
-             * 两帧样本吻合（ref_mvs=0→源0、ref_mvs=1→源1），需大样本确认。 */
-            /* ---- 取值规则（150 帧样本实测得出）----
-             * 只有 15 帧到达此写入点（其余 mms=0 或 err_res 被跳过），
-             * 呈 5 组 × 3 帧、每组 va = 1,1,0 的规律。
-             * 逐帧比对源码流后发现：需要写 1 的恰是每组第二帧，
-             * 而它们的判别特征是 ref_frame_idx **不全相同**：
-             *   oh=16 idx=[2,2,2,2,2,2,2] va=1 → 源 0（全同，单一参考）
-             *   oh=24 idx=[0,1,0,0,0,0,0] va=1 → 源 1（不全同）
-             *   oh=28 idx=[1,2,1,1,1,0,1] va=0 → 源 0
-             * 于是规则是：ref_frame_idx 全同 → 写 0，否则转写 VA-API 值。
-             *
-             * 语义上讲得通：allow_warped_motion 描述的是能否用
-             * 局部翘曲运动补偿，而所有参考都指向同一帧时无从翘曲。
-             *
-             * 实测效果（逐字节比对）：
-             *   恒 0            140/150（错 18,30,48,60,78,90,108,120,138,150）
-             *   转写 VA-API     140/150（错帧集合不同）
-             *   本规则          145/150（warp 类 5 帧全部修好）
-             * 剩下的 5 帧属 refresh 占位值那一类，与本字段无关。
-             *
-             * ⚠️ 仍是单码流上归纳出来的规则，不是从规范推导的。
-             * 换码流可能失效 —— 若再遇到 warp 位不符，先回来复查这里。 */
-            int uniform_ref = 1;
-            for (int q = 1; q < 7; q++)
-                if (p->ref_frame_idx[q] != p->ref_frame_idx[0]) {
-                    uniform_ref = 0;
-                    break;
-                }
-            int wm = uniform_ref
-                   ? 0
-                   : (int)p->pic_info_fields.bits.allow_warped_motion;
-            if (getenv("DMD_AV1_BITS"))
-                fprintf(stderr, "[warp] oh=%u va=%u mms=%u ref_mvs=%u "
-                        "intra=%u err=%d prim=%u gm=[%u,%u,%u,%u,%u,%u,%u]\n",
-                        p->order_hint,
-                        p->pic_info_fields.bits.allow_warped_motion,
-                        p->pic_info_fields.bits.is_motion_mode_switchable,
-                        p->pic_info_fields.bits.use_ref_frame_mvs,
-                        p->pic_info_fields.bits.frame_type == 0 ||
-                        p->pic_info_fields.bits.frame_type == 2,
-                        err_res, p->primary_ref_frame,
-                        p->wm[0].wmtype, p->wm[1].wmtype, p->wm[2].wmtype,
-                        p->wm[3].wmtype, p->wm[4].wmtype, p->wm[5].wmtype,
-                        p->wm[6].wmtype);
-            dmd_bw_put_flag(&bw, wm);
-        }
+        /* 直接转写 VA-API 的 allow_warped_motion（理由同上：
+         * ffmpeg CBS 解析值忠实于源码流，旧"uniform_ref 置 0"规则是
+         * 对抗位错位时拟合出来的，换码流即错）。 */
+        dmd_bw_put_flag(&bw,
+            (int)p->pic_info_fields.bits.allow_warped_motion);
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
@@ -1526,8 +1544,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     /* film_grain_params()（5.9.30）：序列头里 film_grain_params_present
      * 为 0 时整段不出现。我们如实转写该标志，故此处同样条件。 */
     if (p->seq_info_fields.fields.film_grain_params_present &&
-        (p->pic_info_fields.bits.show_frame ||
-         p->pic_info_fields.bits.showable_frame))
+        (show_frame_eff || p->pic_info_fields.bits.showable_frame))
         dmd_bw_put_flag(&bw, 0);         /* apply_grain = 0 */
 
     /* 结尾不写 trailing_bits / byte_alignment —— 交给调用方按封装形式决定。 */
@@ -1709,23 +1726,9 @@ size_t dmd_av1_build_frame(const void *pic_v,
     /* 帧已合成成功 —— 把本帧登记进影子 DPB，供后续帧的 ref_frame_idx 查询。
      * 必须在成功路径的末尾做：合成失败时不能污染 DPB 状态，
      * 否则后续帧会引用一个从未真正写入解码器的槽。 */
-    if (dpb) {
-        const VADecPictureParameterBufferAV1 *pp = pic_v;
-        int is_key_frame = (pp->pic_info_fields.bits.frame_type == 0);
-        if (is_key_frame && pp->pic_info_fields.bits.show_frame) {
-            /* KEY + show 帧刷新全部 8 槽（规范如此，字段不写入码流）。 */
-            for (int k = 0; k < 8; k++) {
-                dpb->dpb_shadow[k] = pp->current_frame;
-                dpb->dpb_order_hint[k] = pp->order_hint;
-            }
-            dpb->dpb_next_slot = 0;
-        } else {
-            unsigned sl = dpb->dpb_next_slot & 7u;
-            dpb->dpb_shadow[sl] = pp->current_frame;
-            dpb->dpb_order_hint[sl] = pp->order_hint;
-            dpb->dpb_next_slot = (sl + 1u) & 7u;
-        }
-    }
+    /* 影子 DPB 登记已移入 put_uncompressed_header 的 refresh 写入处：
+     * 全刷帧（KEY/SWITCH）在那里清空 8 槽，其余帧在那里占一个
+     * "确定已死"的受害者槽。此处不再登记，避免同帧双重写入。 */
 
     return hdr + payload_len;
 }
@@ -1767,7 +1770,8 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
                                 size_t prev_len,
-                                size_t prev_bitpos)
+                                size_t prev_bitpos,
+                                int prev_frame)
 {
     /* ⚠️ 不能因 prev_frame_bytes 为空就提前返回。
      *
@@ -1778,6 +1782,34 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
      * 无论本次是否有帧可改写，都必须保存 map 作为下一次差分的基准。 */
     if (!dpb || !cur_pic) return;
     const VADecPictureParameterBufferAV1 *p = cur_pic;
+    if (getenv("DMD_AV1_DBG"))
+        fprintf(stderr, "[dbg] patch: cur_oh=%u prev_valid=%d hold=%s bitpos=%zd\n",
+                p->order_hint, dpb->prev_valid,
+                prev_frame_bytes ? "yes" : "NO",
+                prev_bitpos == (size_t)-1 ? -1 : (ssize_t)prev_bitpos);
+
+    /* ---- 计算源 DPB 上一帧踢出的帧 E（供本帧的槽位分配）----
+     *
+     * 本帧的 map 与上一帧的 map 的差异 = 上一帧解码时对 DPB 的改动：
+     * 被改的槽里，旧内容就是源编码器踢出的帧（E）。源编码器保证被踢出的
+     * 帧不再被任何后续帧引用 —— 它是当前时刻唯一"确定已死"的帧，
+     * 让本帧占它的槽永远不会覆盖活引用（滞后一帧淘汰）。
+     * 差分为 0（上一帧 refresh=0，没动 DPB）或多槽（KEY 全刷）时置
+     * evict_valid=0，由 put_uncompressed_header 的兜底规则选槽。 */
+    dpb->evict_valid = 0;
+    for (int i = 0; i < 8; i++) {
+        if (p->ref_frame_map[i] != dpb->prev_ref_map[i]) {
+            const int fr = dmd_av1_frame_of(dpb, dpb->prev_ref_map[i]);
+            if (fr > 0) {
+                dpb->evict_frame = fr;
+                dpb->evict_valid = 1;
+            }
+            break;
+        }
+    }
+    if (getenv("DMD_AV1_DBG"))
+        fprintf(stderr, "[dbg] patch: evict_valid=%d frame=%d\n",
+                dpb->evict_valid, dpb->evict_frame);
 
     /* ⚠️ prev_valid 必须在 KEY 帧那次调用就置位。
      *
@@ -1849,6 +1881,9 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
         if (getenv("DMD_AV1_LOG"))
             fprintf(stderr, "[av1] 反算上帧 refresh=0x%02x (bitpos=%zu len=%zu)\n",
                     mask, prev_bitpos, prev_len);
+        if (getenv("DMD_AV1_DBG"))
+            fprintf(stderr, "[dbg] patch: cur_oh=%u mask=0x%02x %s\n",
+                    p->order_hint, mask, mask ? "WRITTEN" : "ZERO");
         size_t bp = prev_bitpos;
         if ((bp + 8 + 7) / 8 <= prev_len) {
             for (int k = 0; k < 8; k++) {
@@ -1859,6 +1894,16 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                 if (v) prev_frame_bytes[byi] |=  (unsigned char)(1 << bii);
                 else   prev_frame_bytes[byi] &= (unsigned char)~(1u << bii);
             }
+        }
+        /* 影子登记：源码流把上一帧放进了 mask 的那些槽，我们的槽位
+         * 与源一致（合成流的 refresh 已改写为源真值），影子表照抄。
+         * 之后的引用翻译据此进行。 */
+        if (prev_frame > 0) {
+            for (int k = 0; k < 8; k++)
+                if (mask >> k & 1u) {
+                    dpb->dpb_shadow[k] = prev_frame;
+                    dpb->dpb_order_hint[k] = 0;
+                }
         }
     }
 

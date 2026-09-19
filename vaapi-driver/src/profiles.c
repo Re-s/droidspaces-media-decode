@@ -13,6 +13,8 @@
 
 #include <string.h>
 
+#include "dmd_client.h"
+#include "v4l2_backend.h"
 #include "driver.h"
 
 /* 本驱动支持的 profile 集合。顺序即 vainfo 的输出顺序。
@@ -138,7 +140,16 @@ static const VAProfile dmd_profiles[] = {
 
 int dmd_profile_supported(VAProfile profile)
 {
-    for (int i = 0; i < DMD_NUM_PROFILES; i++) {
+    /* 与 dmd_QueryConfigProfiles 的运行时过滤保持一致：固件不支持的
+     * codec 即使在静态表里也不算支持。 */
+    if (profile == VAProfileMPEG2Main && !dmd_v4l2_probe(DMD_CODEC_MPEG2))
+        return 0;
+    if (profile == VAProfileVP8Version0_3 && !dmd_v4l2_probe(DMD_CODEC_VP8))
+        return 0;
+    if (profile == VAProfileAV1Profile0 && !dmd_v4l2_probe(DMD_CODEC_AV1))
+        return 0;
+    for (int i = 0; i < DMD_NUM_PROFILES; i++)
+    {
         if (dmd_profiles[i] == profile)
             return 1;
     }
@@ -191,8 +202,37 @@ VAStatus dmd_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
     if (!ctx || !profile_list || !num_profiles)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    memcpy(profile_list, dmd_profiles, sizeof(dmd_profiles));
-    *num_profiles = DMD_NUM_PROFILES;
+    /* 运行时能力过滤：静态表只是"驱动实现了码流重建"的声明，最终能不能
+     * 解还要看本机固件。内核 6.6 的新 msm_vidc 上 MPG2/VP80 已从 OUTPUT
+     * 枚举消失（S_FMT 静默回落 H.264，dmesg 报 "unsupported codec"），
+     * 按静态表声明的 VP8 会让消费者把任务交过来然后失败 —— 比不声明
+     * 更糟。probe 用 ENUM_FMT 一次拿全，代价可忽略。 */
+    static int probed = 0;
+    static unsigned probed_mask = 0;   /* bit: DMD_CODEC_* 值 */
+    if (!probed) {
+        static const struct { VAProfile p; int codec; } map[] = {
+            { VAProfileMPEG2Main, DMD_CODEC_MPEG2 },
+            { VAProfileVP8Version0_3, DMD_CODEC_VP8 },
+            { VAProfileAV1Profile0, DMD_CODEC_AV1 },
+        };
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+            if (dmd_v4l2_probe(map[i].codec))
+                probed_mask |= 1u << map[i].codec;
+        probed = 1;
+    }
+
+    int n = 0;
+    for (int i = 0; i < DMD_NUM_PROFILES; i++) {
+        VAProfile p = dmd_profiles[i];
+        if (p == VAProfileMPEG2Main && !(probed_mask & (1u << DMD_CODEC_MPEG2)))
+            continue;
+        if (p == VAProfileVP8Version0_3 && !(probed_mask & (1u << DMD_CODEC_VP8)))
+            continue;
+        if (p == VAProfileAV1Profile0 && !(probed_mask & (1u << DMD_CODEC_AV1)))
+            continue;
+        profile_list[n++] = p;
+    }
+    *num_profiles = n;
     return VA_STATUS_SUCCESS;
 }
 

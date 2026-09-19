@@ -280,4 +280,9 @@ void dmd_v4l2_close(struct dmd_v4l2_dec *d);
  */
 int dmd_v4l2_probe(int codec_id);
 
+/* codec_id → 设备 OUTPUT 枚举里实际存在的 fourcc（AV1 在 'AV01'/'AV10'
+ * 两个候选里按枚举结果挑，其余 codec 用标准值）。返回 0 = 该 codec
+ * 不被本设备固件支持。 */
+uint32_t dmd_v4l2_pick_fourcc(int codec_id);
+
 #endif /* DMD_V4L2_BACKEND_H */

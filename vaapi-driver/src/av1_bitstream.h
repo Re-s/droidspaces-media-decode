@@ -109,11 +109,23 @@ size_t dmd_av1_build_sequence_header(const void *pic,
  * 新建 context 时整体清零即为初始状态。
  */
 struct dmd_av1_dpb {
-    VASurfaceID dpb_shadow[8];     /* 槽 -> 该槽当前存的 surface id */
+    /* ⚠️ 影子表存**本驱动的帧号**（frame_seq，从 1 起），不是 surface id。
+     * ffmpeg 会回收复用 surface：同一个 VASurfaceID 先后属于不同帧
+     * （实测 160 帧样本里 oh1 与 oh7 同用 surface 6），surface 做身份
+     * 会把死帧和复用它的活帧混为一谈。0 表示空槽。 */
+    int         dpb_shadow[8];     /* 槽 -> 该槽当前存的帧号 */
     unsigned    dpb_order_hint[8]; /* 槽 -> 该槽帧的 order hint。
                                     * error_resilient 帧的帧头要逐槽写出
                                     * （规范 5.9.2 的 ref_order_hint[i]）。 */
     unsigned    dpb_next_slot;     /* 下一个要写入的槽，8 槽轮转 */
+    int         frame_seq;         /* 已合成帧计数，本帧号 = ++frame_seq */
+
+    /* surface -> 最近拥有它的帧号。引用翻译与 E 识别都要经过它：
+     * ref_frame_map 里给的是 surface，而同一 surface 可能属于多个
+     * 历史帧，"最近拥有者"正是还活着的那个（死帧的 surface 被回收后
+     * 归新帧所有）。表满时线性替换最旧一项。 */
+    struct { VASurfaceID surf; int frame; } surf_hist[64];
+    int         surf_hist_n;
 
     /* 上一帧 refresh_frame_flags 字段在其帧头内的**位**偏移。
      * 正确值要等下一帧的 ref_frame_map 才能算出，届时用它就地改写。
@@ -123,6 +135,13 @@ struct dmd_av1_dpb {
     /* 上一帧的 ref_frame_map 快照，用于与本帧的 map 做差分。 */
     VASurfaceID prev_ref_map[8];
     int         prev_valid;
+
+    /* 源 DPB 在上一帧解码时踢出的帧（E_{k-1} = map_{k-1} \ map_k），
+     * 以帧号表示。源编码器保证被踢出的帧不会再被任何后续帧引用
+     * （死了），本驱动让当前帧占它的影子槽，就永远不会覆盖活引用。
+     * 单槽差分算不出（如 KEY 全刷后的多槽变化）时置 valid=0。 */
+    int         evict_frame;
+    int         evict_valid;
 };
 
 /*
@@ -165,7 +184,8 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
                                 size_t prev_len,
-                                size_t prev_bitpos);
+                                size_t prev_bitpos,
+                                int prev_frame);
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {
