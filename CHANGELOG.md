@@ -2,6 +2,31 @@
 
 # 更新日志（未发布 · 分支 feat/msm-vidc-512-upstream）
 
+## WIP · AV1 flush+repair 路径专项排查(第 2 天)
+
+**根因已锁定**:全部剩余像素问题(640 宽帧间帧、SEF 复显流、
+B 站 1080p60)都发生在 **flush+repair 送帧路径**;从不触发 flush 的流
+(1280x720/960x540/1024x576/704x480)逐字节 0 差异。
+ffmpeg 对 AV1 每帧都 sync surface,小分辨率解码快、sync 先于
+下一帧 EndPicture 到达,暂存帧被迫提前冲出(refresh 未反算),
+由此产生 r=0 副本 + 修复重发的双解码流。
+
+**本轮已否证(勿重复):**
+1. 合成码流结构错误 —— trace_headers 逐字段对拍,除已知中性差异
+   (level/restoration/chroma_pos)外完全一致;dav1d 接受全部字节;
+2. seq_level_idx / force_integer_mv / enable_restoration 字段转写 ——
+   逐项修正后像素无任何变化;
+3. 修复重发输出(哨兵帧)的 CAPTURE 缓冲被过早回收 —— 延迟归还
+   (4-FIFO)与按"源 DPB 踢出事件"(E)精确归还,像素均无变化;
+   哨兵缓冲的生命周期与坏帧完全无关(21 holds/19 releases 验证)。
+4. show_frame=0 修复副本(位插入消输出)—— 更差(20/24),
+   已放弃,回退到哨兵方案。
+
+**当前最优**:哨兵方案(640 宽 9/24,SEF 流 91/150,起点 3/150)。
+**下一步方向**:坏帧与 ffmpeg 的 8-surface 池回绕精确重合
+(第二轮复用起坏),应排查 surface 复用时驱动的 pending/
+surface 状态机,或让消费者的 surface 池变大(mpv 池更大可作对照)。
+
 ## v0.4.7-wip（AV1 适配推进 · 本设备固件能力实测）
 
 ### MPEG-2：本设备固件不支持，无法适配（结论性实测）

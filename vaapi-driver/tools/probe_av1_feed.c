@@ -34,7 +34,32 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <linux/videodev2.h>
+
+/* dma-heap 分配（本内核 OUTPUT/CAPTURE 都只收 DMABUF）。 */
+struct dma_heap_allocation_data {
+    __u64 len;
+    __u32 fd;
+    __u32 fd_flags;
+    __u64 heap_flags;
+};
+#define DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0, struct dma_heap_allocation_data)
+
+static int heap_fd = -1;
+static int dmabuf_alloc(size_t len)
+{
+    if (heap_fd < 0) {
+        heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+        if (heap_fd < 0) return -1;
+    }
+    struct dma_heap_allocation_data a;
+    memset(&a, 0, sizeof(a));
+    a.len = len;
+    a.fd_flags = O_RDWR | O_CLOEXEC;
+    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) return -1;
+    return (int)a.fd;
+}
 
 #define OBU_TEMPORAL_DELIMITER 2
 
@@ -114,28 +139,27 @@ int main(int argc, char **argv)
     printf("  S_FMT(OUTPUT/AV10) ok，sizeimage=%zu\n", isz);
 
     struct v4l2_requestbuffers rb;
-    const unsigned mems[] = { V4L2_MEMORY_DMABUF, V4L2_MEMORY_USERPTR,
-                              V4L2_MEMORY_MMAP };
-    const char *mnm[] = { "DMABUF", "USERPTR", "MMAP" };
-    unsigned mem = 0;
-    for (int i = 0; i < 3; i++) {
-        memset(&rb, 0, sizeof(rb));
-        rb.count = 8; rb.type = f.type; rb.memory = mems[i];
-        if (ioctl(fd, VIDIOC_REQBUFS, &rb) == 0) {
-            mem = mems[i];
-            printf("  REQBUFS(%s) ok，count=%u\n", mnm[i], rb.count);
-            break;
+    memset(&rb, 0, sizeof(rb));
+    rb.count = 64; rb.type = f.type; rb.memory = V4L2_MEMORY_DMABUF;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
+        printf("  REQBUFS(OUTPUT/DMABUF) 失败: %s\n", strerror(errno));
+        close(fd); free(data); return 1;
+    }
+    printf("  REQBUFS(DMABUF) ok，count=%u\n", rb.count);
+    /* 8 个 OUTPUT dmabuf（本内核 OUTPUT 只收 DMABUF，不支持 MMAP）。 */
+    void *bufs[64];
+    int ofd[64];
+    for (int i = 0; i < 64; i++) {
+        ofd[i] = dmabuf_alloc(isz);
+        if (ofd[i] < 0) {
+            printf("  dma_heap 分配 OUTPUT %d 失败: %s\n", i, strerror(errno));
+            close(fd); free(data); return 1;
         }
-    }
-    if (!mem) {
-        printf("  三种内存类型的 REQBUFS 全失败: %s\n", strerror(errno));
-        close(fd); free(data); return 1;
-    }
-    if (mem != V4L2_MEMORY_USERPTR) {
-        printf("  ⚠️ 本探针只实现了 USERPTR 喂料；当前设备给的是 %s\n",
-               mem == V4L2_MEMORY_DMABUF ? "DMABUF" : "MMAP");
-        printf("  → 需要 DMABUF 时请参考 v4l2_backend.c 的 dmabuf_alloc\n");
-        close(fd); free(data); return 1;
+        bufs[i] = mmap(NULL, isz, PROT_READ | PROT_WRITE, MAP_SHARED, ofd[i], 0);
+        if (bufs[i] == MAP_FAILED) {
+            printf("  mmap(OUTPUT dmabuf %d) 失败: %s\n", i, strerror(errno));
+            close(fd); free(data); return 1;
+        }
     }
 
     struct v4l2_event_subscription sub;
@@ -149,9 +173,7 @@ int main(int argc, char **argv)
         close(fd); free(data); return 1;
     }
 
-    /* 切分并 burst 灌入。 */
-    void *bufs[8];
-    for (int i = 0; i < 8; i++) bufs[i] = aligned_alloc(4096, isz);
+    /* 切分并 burst 灌入（缓冲已映射）。 */
 
     size_t pos = 0, sent = 0;
     int got_sc = 0;
@@ -161,16 +183,16 @@ int main(int argc, char **argv)
         size_t len = end - pos;
         if (!len || len > isz) break;
 
-        int idx = (int)(sent % 8);
+        int idx = (int)(sent % 64);
         memcpy(bufs[idx], data + pos, len);
 
         struct v4l2_buffer b; struct v4l2_plane pl[1];
         memset(&b, 0, sizeof(b)); memset(pl, 0, sizeof(pl));
-        b.type = f.type; b.memory = V4L2_MEMORY_USERPTR; b.index = idx;
+        b.type = f.type; b.memory = V4L2_MEMORY_DMABUF; b.index = idx;
         b.m.planes = pl; b.length = 1;
         b.timestamp.tv_usec = (long)(sent + 1);
-        pl[0].m.userptr = (unsigned long)bufs[idx];
-        pl[0].length = isz; pl[0].bytesused = len;
+        pl[0].m.fd = ofd[idx];
+        pl[0].length = (unsigned)isz; pl[0].bytesused = len;
 
         if (ioctl(fd, VIDIOC_QBUF, &b) < 0) {
             /* 队列满是正常的，回收一个再试。 */
@@ -186,7 +208,7 @@ int main(int argc, char **argv)
             }
             struct v4l2_buffer d; struct v4l2_plane dp[1];
             memset(&d, 0, sizeof(d)); memset(dp, 0, sizeof(dp));
-            d.type = f.type; d.memory = V4L2_MEMORY_USERPTR;
+            d.type = f.type; d.memory = V4L2_MEMORY_DMABUF;
             d.m.planes = dp; d.length = 1;
             if (ioctl(fd, VIDIOC_DQBUF, &d) < 0) {
                 printf("  第 %zu 个单元 QBUF 失败且无缓冲可回收: %s\n",
@@ -232,22 +254,30 @@ int main(int argc, char **argv)
     cf.fmt.pix_mp.pixelformat = v4l2_fourcc('N', 'V', '1', '2');
     ioctl(fd, VIDIOC_S_FMT, &cf);
     const size_t csz = cf.fmt.pix_mp.plane_fmt[0].sizeimage;
+    printf("  S_FMT(CAPTURE): %ux%u stride=%u sizeimage=%zu\n",
+           cf.fmt.pix_mp.width, cf.fmt.pix_mp.height,
+           cf.fmt.pix_mp.plane_fmt[0].bytesperline, csz);
 
     struct v4l2_requestbuffers crb;
     memset(&crb, 0, sizeof(crb));
-    crb.count = 12; crb.type = cf.type; crb.memory = V4L2_MEMORY_USERPTR;
+    crb.count = 64; crb.type = cf.type; crb.memory = V4L2_MEMORY_DMABUF;
     if (ioctl(fd, VIDIOC_REQBUFS, &crb) < 0) {
         printf("  REQBUFS(CAPTURE) 失败: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
-    void *cb[12];
-    for (unsigned i = 0; i < crb.count && i < 12; i++) {
-        cb[i] = aligned_alloc(4096, csz);
+    void *cb[64];
+    int cfd[64];
+    for (unsigned i = 0; i < crb.count && i < 64; i++) {
+        cfd[i] = dmabuf_alloc(csz);
+        if (cfd[i] < 0) break;
+        cb[i] = mmap(NULL, csz, PROT_READ | PROT_WRITE, MAP_SHARED, cfd[i], 0);
+        if (cb[i] == MAP_FAILED) break;
         struct v4l2_buffer b; struct v4l2_plane pl[1];
         memset(&b, 0, sizeof(b)); memset(pl, 0, sizeof(pl));
-        b.type = cf.type; b.memory = V4L2_MEMORY_USERPTR; b.index = i;
+        b.type = cf.type; b.memory = V4L2_MEMORY_DMABUF; b.index = i;
         b.m.planes = pl; b.length = 1;
-        pl[0].m.userptr = (unsigned long)cb[i]; pl[0].length = csz;
+        pl[0].m.fd = cfd[i];
+        pl[0].length = (unsigned)csz;
         ioctl(fd, VIDIOC_QBUF, &b);
     }
     unsigned ct = cf.type;
@@ -260,10 +290,16 @@ int main(int argc, char **argv)
         if (!(pf.revents & POLLIN)) break;
         struct v4l2_buffer d; struct v4l2_plane dp[1];
         memset(&d, 0, sizeof(d)); memset(dp, 0, sizeof(dp));
-        d.type = cf.type; d.memory = V4L2_MEMORY_USERPTR;
+        d.type = cf.type; d.memory = V4L2_MEMORY_DMABUF;
         d.m.planes = dp; d.length = 1;
         if (ioctl(fd, VIDIOC_DQBUF, &d) < 0) break;
         frames++;
+        if (getenv("DMP_DUMP") && frames <= 999) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "/tmp/dmdwork/av1_cap_%03zu.yuv", frames);
+            FILE *df = fopen(nm, "wb");
+            if (df) { fwrite(cb[d.index], 1, csz, df); fclose(df); }
+        }
         ioctl(fd, VIDIOC_QBUF, &d);          /* 立刻还回去继续收 */
     }
 
