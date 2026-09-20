@@ -209,6 +209,11 @@ struct dmd_v4l2_dec {
     unsigned ion_mask;                        /* ION system heap 的 mask */
 
     int      out_w, out_h;                    /* OUTPUT 侧协商出的对齐尺寸 */
+    /* 码流位深 >8bit。CAPTURE 协商时据此选 P010（10bit 半平面）而不是
+     * NV12：固件对 10bit 流若被强配 NV12，会**照解不误地吐出 10bit 采样**，
+     * 但把每个采样的低 8 位当成一个像素写进缓冲（实测 a_10b：像素值恰好
+     * 等于 v10 & 0xFC，结构全对、数值全错）。所以位深必须在协商前告知。 */
+    int      ten_bit;
     int      w, h;                            /* 协商后的对齐尺寸 */
     int      crop_w, crop_h;                  /* 有效显示区域 */
     unsigned in_size;                         /* OUTPUT 单缓冲字节数 */

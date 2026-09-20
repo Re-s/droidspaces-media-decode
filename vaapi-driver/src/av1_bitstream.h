@@ -132,6 +132,29 @@ struct dmd_av1_dpb {
      * SIZE_MAX 表示上一帧没有该字段（KEY+show 帧不写入）。 */
     size_t      last_refresh_bitpos;
 
+    /* 上一帧（即 last_refresh_bitpos 所属那一帧）的 order hint。
+     * patch 反算出真实 refresh 后要把该帧登记进影子槽，槽的 order hint
+     * 是解码器推导 skipModeAllowed（5.9.22）的输入，必须一起记。 */
+    unsigned    last_oh;
+
+    /* 同理记录 disable_frame_end_update_cdf 的位偏移。
+     *
+     * 为什么需要：双趟解码（第一趟 refresh=0 只取像素，第二趟带真实
+     * refresh 补 DPB）会让 AV1 的**帧上下文回写**发生两次。规范 7.19
+     * 里帧解码结束时执行
+     *     if ( !disable_frame_end_update_cdf )
+     *         SetFrameContext( ref_frame_idx[ primary_ref_frame ] )
+     * 把本帧的 CDF/delta-q/环路滤波等终态**拷贝**进 primary 参考帧所在
+     * 槽的上下文。第一趟已经把它改成本帧终态，第二趟再读就是错的起点
+     * —— 于是第二趟解出一帧垃圾并放进 DPB，后续引用全废。
+     *
+     * 修法：第一趟把这一位强制写 1（不回写），第二趟还原成源码流真值
+     * （由它完成唯一一次回写）。两趟的起点上下文相同 → 第二趟像素与
+     * 第一趟逐位相同，DPB 与 CDF 同时正确。
+     * SIZE_MAX 表示码流里没有这个字段（disable_cdf_update=1 时推断为 1，
+     * 本来就不回写，无需处理）。 */
+    size_t      last_endupd_bitpos;
+
     /* 上一帧的 ref_frame_map 快照，用于与本帧的 map 做差分。 */
     VASurfaceID prev_ref_map[8];
     int         prev_valid;

@@ -704,8 +704,45 @@ static int setup_capture(struct dmd_v4l2_dec *d)
      * export）全都假设 8bit NV12：每像素字节数、UV 平面偏移、
      * DRM_FORMAT_NV12 都是按 8bit 写死的，所以开了它像素必然错乱。
      * 它只回答一个问题：固件在 Main10 码流下会不会吐 CAPTURE 缓冲。 */
-    uint32_t want = V4L2_PIX_FMT_NV12;
+    uint32_t want = d->ten_bit ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
     const char *probe10 = getenv("DMD_PROBE_10BIT");
+    /* DMD_PROBE_10BIT=9：逐个试候选 CAPTURE 格式，只记录固件接受哪个，
+     * 最终仍按 NV12 走正常路径。用于回答"10bit 流固件愿意吐哪种格式"。 */
+    if (probe10 && probe10[0] == '9') {
+        static const uint32_t cand[] = {
+            V4L2_PIX_FMT_NV12,
+            V4L2_PIX_FMT_P010,
+            v4l2_fourcc('Q', 'P', '1', '0'),
+            v4l2_fourcc('Q', '1', '0', 'C'),
+            v4l2_fourcc('T', 'P', '1', '0'),
+            v4l2_fourcc('Q', '1', '2', 'A'),
+            v4l2_fourcc('Q', 'T', '1', '0'),
+        };
+        for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+            struct v4l2_format t = f;
+            t.fmt.pix_mp.width = (unsigned)d->out_w;
+            t.fmt.pix_mp.height = (unsigned)d->out_h;
+            t.fmt.pix_mp.pixelformat = cand[i];
+            if (xioctl(d->fd, VIDIOC_S_FMT, &t, "S_FMT(CAPTURE 探测)") < 0) {
+                V4L2_LOG("探测 %c%c%c%c: S_FMT 失败",
+                         (char)(cand[i] & 0xFF), (char)((cand[i] >> 8) & 0xFF),
+                         (char)((cand[i] >> 16) & 0xFF), (char)((cand[i] >> 24) & 0xFF));
+                continue;
+            }
+            V4L2_LOG("探测 请求 %c%c%c%c -> 实际 %c%c%c%c  %ux%u stride=%u size=%u nplanes=%u",
+                     (char)(cand[i] & 0xFF), (char)((cand[i] >> 8) & 0xFF),
+                     (char)((cand[i] >> 16) & 0xFF), (char)((cand[i] >> 24) & 0xFF),
+                     (char)(t.fmt.pix_mp.pixelformat & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 8) & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 16) & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 24) & 0xFF),
+                     t.fmt.pix_mp.width, t.fmt.pix_mp.height,
+                     t.fmt.pix_mp.plane_fmt[0].bytesperline,
+                     t.fmt.pix_mp.plane_fmt[0].sizeimage,
+                     t.fmt.pix_mp.num_planes);
+        }
+        probe10 = NULL;
+    }
     if (probe10 && (probe10[0] == '1' || probe10[0] == '2')) {
         want = (probe10[0] == '2') ? v4l2_fourcc('Q', '1', '2', 'A')
                                    : v4l2_fourcc('Q', 'P', '1', '0');

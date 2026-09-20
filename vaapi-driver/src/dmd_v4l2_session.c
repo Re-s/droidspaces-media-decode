@@ -152,8 +152,7 @@ int dmd_format_display_width(const struct dmd_format *fmt)
     return fmt->buf_width;
 }
 
-int dmd_format_display_height(const struct dmd_format *fmt)
-{
+int dmd_format_display_height(const struct dmd_format *fmt){
     if (!fmt || !fmt->valid) return 0;
     if (fmt->crop_bottom > fmt->crop_top)
         return fmt->crop_bottom - fmt->crop_top + 1;
@@ -161,6 +160,20 @@ int dmd_format_display_height(const struct dmd_format *fmt)
 }
 
 /* ------------------------------------------------------------ 会话生命周期 */
+
+void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit)
+{
+    if (!s)
+        return;
+    /* 只在 CAPTURE 还没配好时有效：配好之后再改几何就没人重协商了，
+     * 那种情况（同一会话内位深变化）本驱动不支持，宁可留个日志。 */
+    if (s->dec.cap_size && !!ten_bit != !!s->dec.ten_bit) {
+        sess_log(s, "警告: 会话内位深变化(%d→%d)但 CAPTURE 已配好，忽略",
+                 s->dec.ten_bit, ten_bit);
+        return;
+    }
+    s->dec.ten_bit = ten_bit ? 1 : 0;
+}
 
 struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
                                        struct dmd_error *err)
@@ -198,6 +211,8 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         free(s);
         return NULL;
     }
+    /* open 里 memset 过 d，位深必须在它之后落。 */
+    s->dec.ten_bit = cfg->ten_bit ? 1 : 0;
 
     sess_log(s, "会话建立: codec=%d %dx%d（V4L2 直通，无 daemon）",
              cfg->codec, cfg->width, cfg->height);

@@ -129,12 +129,17 @@ void dmd_surface_reset_locked(struct dmd_surface *s)
 void dmd_context_reset_locked(struct dmd_context *c)
 {
     /* session_destroy 会 close socket。它不阻塞（close 不等对端），
-     * 所以在这里做是安全的。 */
+     * 所以在这里做是安全的。
+     * ⚠️ 它在末尾 memset 整个 context，修复缓冲的释放必须在它**之前**。 */
+    free(c->av1_repair_buf);
+    free(c->av1_next_repair_buf);
+    c->av1_repair_buf = c->av1_next_repair_buf = NULL;
     if (c->session)
         dmd_session_destroy(c->session);
     free(c->slice_data);
     memset(c, 0, sizeof(*c));
     c->av1_dpb.last_refresh_bitpos = (size_t)-1;
+    c->av1_dpb.last_endupd_bitpos = (size_t)-1;
     c->id = VA_INVALID_ID;
     c->current_target = VA_INVALID_ID;
 }
@@ -280,29 +285,33 @@ void dmd_reaper_stop(struct dmd_driver *drv)
  * 失败返回 -1，调用方回落到普通 heap（ffmpeg 的 hwdownload 路径不需要导出）。
  */
 static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
-                              unsigned int bw, unsigned int bh, size_t size)
+                              unsigned int stride, unsigned int bh,
+                              unsigned int sample_bytes, size_t size)
 {
     if (drm_fd < 0)
         return -1;
 
     struct drm_mode_create_dumb creq;
     memset(&creq, 0, sizeof(creq));
-    creq.width  = bw;
-    /* NV12 总行数 = Y 的 bh 再加 UV 的 bh/2。按 8bpp 单平面申请，
-     * 我们自己按 offset 切分 Y/UV。 */
+    /* 参数名叫 width，但内核按 width*bpp/8 算行字节数，这里 bpp=8，
+     * 所以直接传**行字节数**就是想要的 stride。10bit 时同理
+     * （P010 的一行是 样本宽×2 字节），整个缓冲仍按 8bpp 单平面申请，
+     * Y/UV 由我们自己按 offset 切分。 */
+    creq.width  = stride;
+    /* 总行数 = Y 的 bh 再加 UV 的 bh/2。 */
     creq.height = bh * 3 / 2;
     creq.bpp    = 8;
     if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) != 0)
         return -1;
 
     /* pitch 必须正好是我们期望的 stride，否则几何对不上 daemon 的帧。 */
-    if (creq.pitch != bw || creq.size < size) {
+    if (creq.pitch != stride || creq.size < size) {
         struct drm_mode_destroy_dumb dreq;
         memset(&dreq, 0, sizeof(dreq));
         dreq.handle = creq.handle;
         ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
         dmd_log("dumb buffer 几何不符：pitch=%u 期望 %u，size=%llu 需要 %zu\n",
-                creq.pitch, bw, (unsigned long long)creq.size, size);
+                creq.pitch, stride, (unsigned long long)creq.size, size);
         return -1;
     }
 
@@ -337,10 +346,25 @@ static int surface_alloc_dumb(struct dmd_surface *s, int drm_fd,
      * 与视频起播前的画面一致，不会闪一下绿。
      *
      * 实测（1280x720，230 次导出）：改前 6 个 surface 的首次导出有 3 次判定
-     * 纯绿；后续 781 次导出全部正常（UV 均值约 123.6）。 */
-    memset(map, 0, (size_t)bw * bh);                       /* Y 平面：黑 */
-    memset((unsigned char *)map + (size_t)bw * bh, 0x80,
-           creq.size - (size_t)bw * bh);                   /* UV 平面：无色偏 */
+     * 纯绿；后续 781 次导出全部正常（UV 均值约 123.6）。
+     *
+     * 10bit(P010) 不能沿用同一个 memset：样本是 16-bit 小端，整字节填 0x80
+     * 得到的是 0x8080=32896，远超 10bit 量程。中性 128 的字节序列是
+     * 0x80 0x00，必须逐样本写。Y 平面（黑=0）两种位深一致。 */
+    memset(map, 0, (size_t)stride * bh);                    /* Y 平面：黑 */
+    {
+        unsigned char *uv = (unsigned char *)map + (size_t)stride * bh;
+        size_t uv_bytes = creq.size - (size_t)stride * bh;
+        if (sample_bytes == 2) {
+            /* P010：U/V 各 16bit 小端，中性 128 = {0x80, 0x00} 交替 */
+            for (size_t k = 0; k + 1 < uv_bytes; k += 2) {
+                uv[k] = 0x80;
+                uv[k + 1] = 0x00;
+            }
+        } else {
+            memset(uv, 0x80, uv_bytes);                    /* NV12：无色偏 */
+        }
+    }
 
     s->dumb_handle = creq.handle;
     s->dumb_size = creq.size;
@@ -428,15 +452,25 @@ static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
                                      unsigned int width, unsigned int height,
                                      unsigned int format, int drm_fd)
 {
+    /* 每样本字节数：NV12=1，P010=2。
+     * 10bit 只由 RTFormat 区分（VA 没有把 fourcc 传进 v1 的
+     * vaCreateSurfaces，v2 的 PixelFormat 在 create_surfaces_common 里
+     * 统一折算成 RTFormat），所以下面全部几何都以**字节**为单位算：
+     * stride = 行字节数 = 对齐后的样本宽 × bpp。
+     * 好处是 Y/UV 切分、size=stride*slice*3/2、入帧的扁平 memcpy
+     * 全都不用再分支 —— 实测 Venus 对 640x384 P010 给的正是
+     * stride=1280 sizeimage=737280(=1280*384*3/2)。 */
+    const unsigned int bpp = (format == VA_RT_FORMAT_YUV420_10) ? 2u : 1u;
     unsigned int bw = dmd_align_up(width, DMD_WIDTH_ALIGN);
     unsigned int bh = dmd_align_up(height, DMD_HEIGHT_ALIGN);
-    /* NV12：Y 平面 stride*slice_height，UV 平面是它的一半 */
-    size_t size = (size_t)bw * bh * 3 / 2;
+    unsigned int stride = bw * bpp;
+    /* 单平面布局：Y 占 stride*slice，UV 是它的一半 */
+    size_t size = (size_t)stride * bh * 3 / 2;
 
     memset(s, 0, sizeof(*s));
 
     /* 优先用可导出的 dumb buffer；不支持就退回普通 heap。 */
-    if (surface_alloc_dumb(s, drm_fd, bw, bh, size) != 0) {
+    if (surface_alloc_dumb(s, drm_fd, stride, bh, bpp, size) != 0) {
         unsigned char *data = calloc(1, size);
         if (!data)
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -452,7 +486,7 @@ static VAStatus surface_alloc_locked(struct dmd_surface *s, VASurfaceID id,
     s->height = height;
     s->buf_width = bw;
     s->buf_height = bh;
-    s->stride = bw;
+    s->stride = stride;
     s->slice_height = bh;
     s->format = format;
     s->state = DMD_SURFACE_IDLE;
@@ -476,8 +510,12 @@ static VAStatus create_surfaces_common(VADriverContextP ctx,
     if (width < DMD_MIN_WIDTH || height < DMD_MIN_HEIGHT ||
         width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
-    /* 只支持 8-bit 4:2:0。谎报会让消费者选中我们然后拿到花屏。 */
-    if (format != VA_RT_FORMAT_YUV420)
+    /* 8-bit NV12 与 10-bit P010。谎报会让消费者选中我们然后拿到花屏，
+     * 所以真正的门槛在 profiles.c：**只有 AV1 profile 通告
+     * VA_RT_FORMAT_YUV420_10**（V4L2 后端也只在 PPB bit_depth_idx!=0 时
+     * 才把 CAPTURE 设成 P010）。vaCreateSurfaces 不绑定 config，这里无从
+     * 判断 codec，但多分配一倍的缓冲本身不是错 —— 收不到 10bit 帧而已。 */
+    if (format != VA_RT_FORMAT_YUV420 && format != VA_RT_FORMAT_YUV420_10)
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
     VAStatus status = VA_STATUS_SUCCESS;
@@ -520,8 +558,8 @@ static VAStatus create_surfaces_common(VADriverContextP ctx,
     pthread_mutex_unlock(&drv->lock);
 
     if (status == VA_STATUS_SUCCESS)
-        dmd_log("CreateSurfaces: %ux%u fourcc=NV12 n=%u -> id %u..\n", width,
-                height, num_surfaces, (unsigned)surfaces[0]);
+        dmd_log("CreateSurfaces: %ux%u format=0x%x n=%u -> id %u..\n", width,
+                height, format, num_surfaces, (unsigned)surfaces[0]);
     else
         dmd_log("CreateSurfaces: 失败 status=0x%x（已创建 %u 个，已回滚）\n",
                 status, created);
@@ -545,9 +583,12 @@ VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
                              VASurfaceAttrib *attrib_list,
                              unsigned int num_attribs)
 {
-    /* attrib_list 里 ffmpeg 只可能传 PixelFormat（要 NV12）与
+    /* attrib_list 里消费者只可能传 PixelFormat（NV12 或 P010）与
      * MemoryType（要 VA 内部，我们不支持外部内存导入）。
-     * 我们唯一支持的组合就是默认组合，因此校验后忽略。 */
+     * PixelFormat 是位深的**唯一**可靠来源：v2 的 format 参数很多调用方
+     * 仍传 VA_RT_FORMAT_YUV420（Chrome/ffmpeg 实测如此），所以 P010 时
+     * 由这里把 format 提升到 YUV420_10，让 surface_alloc_locked 按
+     * 2 字节/样本分配。 */
     if (num_attribs > 0 && !attrib_list)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
@@ -555,8 +596,12 @@ VAStatus dmd_CreateSurfaces2(VADriverContextP ctx, unsigned int format,
         if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
             if (attrib_list[i].value.type != VAGenericValueTypeInteger)
                 return VA_STATUS_ERROR_INVALID_PARAMETER;
-            if ((unsigned int)attrib_list[i].value.value.i != VA_FOURCC_NV12)
+            unsigned int fcc = (unsigned int)attrib_list[i].value.value.i;
+            if (fcc == VA_FOURCC_P010) {
+                format = VA_RT_FORMAT_YUV420_10;
+            } else if (fcc != VA_FOURCC_NV12) {
                 return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+            }
         } else if (attrib_list[i].type == VASurfaceAttribMemoryType) {
             /* 只支持驱动自己分配的内存。dmabuf/用户指针导入这条路
              * 在容器里走不通（ION 不可用、无 /dev/dma_heap）。 */
@@ -616,7 +661,7 @@ VAStatus dmd_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list,
 /* 建解码会话（打开 /dev/video32 并完成两段式协商）。
  * 调用方**不得持锁** —— 打开与协商是阻塞 IO。 */
 static struct dmd_session *session_open(int codec, unsigned int width,
-                                        unsigned int height)
+                                        unsigned int height, int ten_bit)
 {
     struct dmd_session_config cfg;
     struct dmd_error err;
@@ -626,6 +671,7 @@ static struct dmd_session *session_open(int codec, unsigned int width,
     cfg.width = (int)width;
     cfg.height = (int)height;
     cfg.io_timeout_ms = DMD_FRAME_TIMEOUT_MS;
+    cfg.ten_bit = ten_bit;
 
     /* 端点：固定 /dev/video32，没有可选项。
      *
@@ -687,6 +733,7 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     int codec = c->codec;
     unsigned int w = c->picture_width;
     unsigned int h = c->picture_height;
+    int ten_bit = c->av1_bd_reported == 2;
 
     /* 先摘下旧会话，避免放锁期间别的线程还往里写。 */
     c->session = NULL;
@@ -695,7 +742,7 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     pthread_mutex_unlock(&drv->lock);
     if (old)
         dmd_session_destroy(old);
-    struct dmd_session *ns = session_open(codec, w, h);
+    struct dmd_session *ns = session_open(codec, w, h, ten_bit);
     pthread_mutex_lock(&drv->lock);
     drv->io_busy[idx] = 0;
     pthread_cond_broadcast(&drv->io_done);
@@ -719,7 +766,17 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     c->av1_send_surface = VA_INVALID_ID;
     c->av1_last_ready = VA_INVALID_ID;
     c->av1_dpb.last_refresh_bitpos = (size_t)-1;
-    c->av1_sef_head = 0;
+    c->av1_dpb.last_endupd_bitpos = (size_t)-1;
+    /* 会话重置：两趟交接槽里的字节属于旧会话，既不能留（会被当成本会话的
+     * 上一帧重发）也不能不 free。 */
+    free(c->av1_repair_buf);
+    free(c->av1_next_repair_buf);
+    c->av1_repair_buf = c->av1_next_repair_buf = NULL;
+    c->av1_repair_len = c->av1_next_repair_len = 0;
+    c->av1_repair_frame = c->av1_next_repair_frame = 0;
+    c->av1_repair_bitpos = c->av1_next_repair_bitpos = (size_t)-1;
+    c->av1_repair_endupd_bitpos = c->av1_next_repair_endupd_bitpos = (size_t)-1;
+    c->av1_repair_endupd_val = c->av1_next_repair_endupd_val = -1;
     c->av1_sef_count = 0;
     c->av1_hold_show = 0;
     c->av1_send_show = 0;
@@ -816,9 +873,12 @@ VAStatus dmd_CreateContext(VADriverContextP ctx, VAConfigID config_id,
 
     /* 会话建立在放锁后做 —— connect + 握手是阻塞 IO，持锁做会卡住
      * 其他线程的所有对象操作。 */
+    /* 位深在这里还未知（首个 PPB 才带来），传 0。
+     * CAPTURE 协商发生在第一个单元送出的 SOURCE_CHANGE 里，
+     * dmd_session_set_ten_bit() 敢在那之前写入。 */
     struct dmd_session *sess =
         session_open(codec, (unsigned int)picture_width,
-                     (unsigned int)picture_height);
+                     (unsigned int)picture_height, 0);
 
     pthread_mutex_lock(&drv->lock);
     /* 重新查找：理论上没人能销毁一个还没交给调用方的 context，
@@ -1632,6 +1692,78 @@ static void av1_dump_sent(const unsigned char *buf, size_t n)
     }
 }
 
+/* 送进硬件的每一个单元单独落盘（DMD_AV1_DUMP2=<前缀>）。
+ *
+ * 与 av1_dump_sent 的区别：那个把帧按"正常路径"顺序拼成一个流，
+ * 无法区分同一帧的两趟。这里按标签+计数分文件：
+ *     <前缀>.<tag>.<n>.obu
+ * tag: n=正常送出 / 1=flush 第一趟 / 2=修复趟 / k=KEY。
+ * 用途：拿修复趟的字节与源码流逐帧对拍，判断"内容错"究竟出在
+ * 合成/改写（字节就和源不一样）还是硬件的双趟状态（字节一样但像素不一样）。 */
+static void av1_dump_tagged(const char *tag, const unsigned char *buf, size_t n)
+{
+    const char *pre = getenv("DMD_AV1_DUMP2");
+    if (!pre || !pre[0] || !buf || n == 0)
+        return;
+    static unsigned gseq;
+    char path[512];
+    /* 文件名以**全局送序**编号，按字典序排开就是硬件实际收到顺序。 */
+    snprintf(path, sizeof path, "%s.%04d.%s.obu", pre, ++gseq, tag);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(buf, 1, n, f); fclose(f); }
+}
+
+/* VA-API 逐帧参数落盘（DMD_AV1_RECORD=<路径>）。
+ *
+ * 用途：refresh_frame_flags 的真实值 = 下一帧 map 与本帧 map 的差分，
+ * 因此只要把 (map, ref_frame_idx, current_frame, show, oh, ft) 全序列记下来，
+ * 就能离线复算出逐帧真值，并在离线环境里评估各种"免延迟"槽位分配策略
+ * —— 不必每次改动都重编驱动、重跑硬件。
+ * 只记录、不改变任何行为。 */
+static void av1_record_pic(const VADecPictureParameterBufferAV1 *pp)
+{
+    const char *rp = getenv("DMD_AV1_RECORD");
+    if (!rp || !rp[0])
+        return;
+    static FILE *rf;
+    static int rec_n;
+    if (!rf) {
+        rf = fopen(rp, "w");
+        if (!rf)
+            return;
+    }
+    if (++rec_n == 1)
+        fprintf(rf, "# n ft show oh cur map[8] idx[7]\n");
+    fprintf(rf, "%d %u %u %u %u", rec_n,
+            pp->pic_info_fields.bits.frame_type,
+            pp->pic_info_fields.bits.show_frame, pp->order_hint,
+            (unsigned)pp->current_frame);
+    for (int i = 0; i < 8; i++)
+        fprintf(rf, " %u", (unsigned)pp->ref_frame_map[i]);
+    for (int i = 0; i < 7; i++)
+        fprintf(rf, " %u", pp->ref_frame_idx[i]);
+    fprintf(rf, "\n");
+    fflush(rf);
+}
+
+static void av1_bit_set(unsigned char *buf, size_t len, size_t bitpos, int val)
+{
+    size_t byte = bitpos >> 3;
+    if (!buf || byte >= len)
+        return;
+    unsigned char m = (unsigned char)(1u << (7 - (bitpos & 7)));
+    if (val) buf[byte] |= m;
+    else     buf[byte] &= (unsigned char)~m;
+}
+
+static int av1_bit_get(const unsigned char *buf, size_t len, size_t bitpos)
+{
+    size_t byte = bitpos >> 3;
+    if (!buf || byte >= len)
+        return -1;
+    return (buf[byte] >> (7 - (bitpos & 7))) & 1;
+}
+
 static const unsigned char *build_unit(struct dmd_context *c,
                                        unsigned char **scratch, size_t *out_len)
 {
@@ -1680,24 +1812,28 @@ static const unsigned char *build_unit(struct dmd_context *c,
         const uint32_t want_tiles =
             (uint32_t)pp->tile_cols * (uint32_t)pp->tile_rows;
 
+        /* 位深补告：会话建立时（vaCreateContext）还拿不到位深，而 CAPTURE
+         * 协商在首个单元送出的 SOURCE_CHANGE 里，必须赶在那之前写入。 */
+        if (!c->av1_bd_reported) {
+            c->av1_bd_reported = pp->bit_depth_idx != 0 ? 2 : 1;
+            dmd_session_set_ten_bit(c->session, c->av1_bd_reported == 2);
+        }
+
+        av1_record_pic(pp);
+
         /* patch 必须在**本帧合成之前**执行：它把上一帧的槽位登记进影子
          * DPB，而本帧的引用翻译（put_uncompressed_header）要用这份登记。
          * 曾放在 build_frame 之后 —— 本帧的 remap 因此看不到上一帧的
          * 放置，引用指到旧内容（实测显示 33 起全部错帧）。 */
-        /* patch 的对象：暂存帧（正常路径）或修复缓冲（暂存帧被 sync
-         * 提前冲出后留下的副本）。两者互斥 —— flush 会清空暂存。
-         * ⚠️ 必须无条件调用：两者皆空（KEY 帧与首个帧间帧）时 patch
+        /* patch 的对象是修复缓冲里**上一帧**的字节（把差分发算出的真实
+         * refresh 写回那份已经送过的码流）。
+         * ⚠️ 必须无条件调用：缓冲为空（KEY 帧与首个帧间帧）时 patch
          * 还负责保存 map 快照、推进差分基准，跳过会让后续整个反算
          * 序列错一拍（实测 prev_valid 卡 0，全部 refresh 不反算）。 */
         dmd_av1_patch_prev_refresh(&c->av1_dpb, pp,
-                                   c->av1_hold ? c->av1_hold
-                                               : c->av1_repair_buf,
-                                   c->av1_hold ? c->av1_hold_len
-                                               : c->av1_repair_len,
-                                   c->av1_hold ? c->av1_hold_bitpos
-                                               : c->av1_repair_bitpos,
-                                   c->av1_hold ? c->av1_hold_frame
-                                               : c->av1_repair_frame);
+                                   c->av1_repair_buf, c->av1_repair_len,
+                                   c->av1_repair_bitpos,
+                                   c->av1_repair_frame);
         if (want_tiles == 0 || (uint32_t)c->av1_tile_count != want_tiles) {
             /* tile 数量与帧头声明不符会让解码器从第二个 tile 起全部错位，
              * 与其送出去让 MediaCodec 解出花屏，不如干净回落软解。 */
@@ -1883,47 +2019,85 @@ static const unsigned char *build_unit(struct dmd_context *c,
             c->av1_send_surface = c->current_target;
             c->av1_send_show = 1;
             av1_dump_sent(buf, n);
+            av1_dump_tagged("k", buf, n);
             *scratch = buf;
             *out_len = n;
             return buf;
         }
 
-        if (c->av1_hold) {
-            unsigned char *prev = c->av1_hold;
-            size_t prev_len = c->av1_hold_len;
-            /* 本次送出的是上一帧，配对要用它的 surface。 */
-            if (getenv("DMD_VA_LOG"))
-                dmd_log("送出: 暂存帧(surface=%u, %zu字节) 当前帧surface=%u\n",
-                        (unsigned)c->av1_hold_surface, prev_len,
-                        (unsigned)c->current_target);
-            c->av1_send_surface = c->av1_hold_surface;
-            c->av1_send_show = 1;
-            c->av1_hold_surface = c->current_target;
-            c->av1_hold_frame = c->av1_dpb.frame_seq;
-            c->av1_hold = buf;
-            c->av1_hold_len = n;
-            c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
-                               ? (size_t)-1
-                               : c->av1_dpb.last_refresh_bitpos + frame_off * 8;
-            av1_dump_sent(prev, prev_len);
-            *scratch = prev;
-            *out_len = prev_len;
-            return prev;
+        /* ============ 双趟立即送（取代"延迟一帧 + sync 里被动 flush"）============
+         *
+         * 旧模型的问题不是想法错，是**身份**错：它把 surface 当帧身份，
+         * 而消费者会复用 surface。实测（SVT-AV1 的 RA 结构，640x360）：
+         * 帧 7 拿到的正是帧 6 用过的 surface=6，于是同一个 surface 被登记
+         * 两次、第二次 flush 又覆盖掉修复队列里帧 6 的字节 ——
+         * 帧 6 的真实 refresh 永久丢失，剩一个 pending 再也配不上，
+         * 送 8 收 7 后卡死 5 秒报 DECODING_ERROR。
+         * 直送探针已证明：我们实际送出的那 8 个单元硬件 8 进 8 出，
+         * 缺陷纯在记账侧。
+         *
+         * 新模型把两趟都放到 EndPicture 上，且**永不扣帧**：
+         *   像素趟（本帧立即送）：refresh 写 0 —— 不占任何 DPB 槽，
+         *     因此无论源码流真值是什么都不可能破坏现有槽位；
+         *     同时强制 disable_frame_end_update_cdf=1，抑制本趟的
+         *     帧上下文回写。否则规范 7.19 的 SetFrameContext 执行两次，
+         *     第二趟读到的起点已被第一趟改写，会解出内容错误却带
+         *     正确 refresh 的帧，放进 DPB 后污染所有后续引用。
+         *   DPB 趟（下一帧 EndPicture 开头，见 av1_repair_buf 分支）：
+         *     用"下一帧 map 与本帧 map 的差分"反算出的真实 refresh 重发
+         *     同一帧，并把 endupd 还原成真值，完成唯一一次回写。
+         *     两趟起点相同 → 像素逐位一致。
+         *
+         * refresh=0 的帧（源码流本就不让它占槽）差分得 0，DPB 趟整体跳过，
+         * 所以平均代价小于一倍。 */
+        const size_t rep_bitpos =
+            c->av1_dpb.last_refresh_bitpos == (size_t)-1
+            ? (size_t)-1
+            : c->av1_dpb.last_refresh_bitpos + frame_off * 8;
+        const size_t rep_endupd =
+            c->av1_dpb.last_endupd_bitpos == (size_t)-1
+            ? (size_t)-1
+            : c->av1_dpb.last_endupd_bitpos + frame_off * 8;
+
+        for (int i = 0; i < 8; i++)
+            av1_bit_set(buf, n, rep_bitpos + (size_t)i, 0);
+
+        const int endupd_orig = rep_endupd == (size_t)-1
+                              ? -1 : av1_bit_get(buf, n, rep_endupd);
+        if (endupd_orig >= 0)
+            av1_bit_set(buf, n, rep_endupd, 1);
+
+        /* 本帧的字节要留给**下一帧**的 DPB 趟重发，但 buf 本身是本次
+         * EndPicture 要送出的主单元，送完就 free（见下方 free(tx)），
+         * 所以这里必须**拷贝**一份，不能移交所有权。
+         * ⚠️ 也不能直接写进 av1_repair_buf：build_unit 先跑、DPB 趟后跑，
+         * 覆盖它会让 DPB 趟把本帧当上一帧重发，而 free(rbuf) 又释放掉
+         * 正在返回的主单元（实测 double free）。所以放交接槽。 */
+        unsigned char *rep = malloc(n);
+        free(c->av1_next_repair_buf);
+        c->av1_next_repair_buf = rep;
+        if (rep) {
+            memcpy(rep, buf, n);
+            c->av1_next_repair_len = n;
+            c->av1_next_repair_bitpos = rep_bitpos;
+            c->av1_next_repair_frame = c->av1_dpb.frame_seq;
+            c->av1_next_repair_endupd_bitpos = rep_endupd;
+            c->av1_next_repair_endupd_val = endupd_orig;
+        } else {
+            c->av1_next_repair_len = 0;
+            c->av1_next_repair_bitpos = (size_t)-1;
+            c->av1_next_repair_frame = 0;
+            c->av1_next_repair_endupd_bitpos = (size_t)-1;
+            c->av1_next_repair_endupd_val = -1;
         }
 
-        /* 第一个帧间帧：只入暂存，本次无数据可送。
-         * 用 (unit==NULL && unit_len==0 && av1_hold!=NULL) 与
-         * "码流重建失败"区分开。 */
-        c->av1_hold_surface = c->current_target;
-        c->av1_hold_frame = c->av1_dpb.frame_seq;
-        c->av1_hold = buf;
-        c->av1_hold_len = n;
-        c->av1_hold_bitpos = c->av1_dpb.last_refresh_bitpos == (size_t)-1
-                           ? (size_t)-1
-                           : c->av1_dpb.last_refresh_bitpos + frame_off * 8;
-        *scratch = NULL;
-        *out_len = 0;
-        return NULL;
+        c->av1_send_surface = c->current_target;
+        c->av1_send_show = 1;
+        av1_dump_sent(buf, n);
+        av1_dump_tagged("n", buf, n);
+        *scratch = buf;
+        *out_len = n;
+        return buf;
     }
 
     case DMD_CODEC_VP8: {
@@ -2262,57 +2436,104 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
      *   c) 在 EndPicture 阶段就识别 show_frame=0 并不为其登记 pending
      * ================================================================ */
 
-    /* ---- AV1 修复重发 ----
+    /* ---- AV1 第二趟：DPB 趟（重发上一帧）----
      *
-     * 暂存帧被 sync 提前冲出时按 refresh=0 送出（不占槽、不破坏 DPB），
-     * 字节留在修复队列。此刻（下一帧的 build_unit 入口）diff 已把修复
-     * 缓冲改写为源码流的真实 refresh，重发一次：硬件重新解码本帧（输出
-     * 与首次完全相同），DPB 因此补上正确的槽位。重发的输出经哨兵
-     * pending（surface=0xFFFFFFFE，永不存在的 id）在配对时被丢弃，
-     * 不影响后续帧的配对序。 */
-    if (c->codec == DMD_CODEC_AV1 && c->av1_repair_buf && c->session &&
-        c->pending_count < DMD_MAX_SURFACES) {
-        int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
-        c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
-        c->pending_seq[rq] = c->last_seq;
-        c->pending_poc[rq] = INT32_MAX;
-        c->pending_unit[rq] = ++c->units_submitted;
-        c->pending_count++;
+     * 上一帧的像素趟按 refresh=0、disable_frame_end_update_cdf=1 送出
+     * （不占槽、不回写帧上下文）。此刻本次 EndPicture 开头的
+     * patch_prev_refresh 已把"下一帧 map 与本帧 map 的差分"——即源码流
+     * 的真实 refresh —— 写进修复副本，这里重发一次，让硬件 DPB 补上
+     * 正确槽位、并完成唯一那次帧上下文回写。
+     * 重发的输出经哨兵 pending（surface=0xFFFFFFFE，永不存在的 id）
+     * 在配对时被丢弃，不影响后续帧的配对序。 */
+    if (c->codec == DMD_CODEC_AV1 && c->av1_repair_buf && c->session) {
+        /* 先把上一帧的槽整体摘下，再把本帧的交接槽无条件搬进来。
+         * 无条件搬 —— 万一下面因队列满放弃发送，也不能让上一帧的字节
+         * 留在原地被下一趟重复送出。 */
         unsigned char *rbuf = c->av1_repair_buf;
         const size_t rlen = c->av1_repair_len;
+        const size_t rbp  = c->av1_repair_bitpos;
+        const size_t rend_bp = c->av1_repair_endupd_bitpos;
+        const int    rend_v  = c->av1_repair_endupd_val;
         c->av1_repair_buf = NULL;
         c->av1_repair_len = 0;
         c->av1_repair_bitpos = (size_t)-1;
         c->av1_repair_frame = 0;
-        dmd_log("EndPicture: AV1 修复重发 %zu 字节（哨兵 unit %llu）",
-                rlen, (unsigned long long)c->pending_unit[rq]);
-        const int ridx = (int)(c - drv->contexts);
-        drv->io_busy[ridx] = 1;
-        pthread_mutex_unlock(&drv->lock);
-        (void)dmd_session_send_unit(c->session, rbuf, rlen);
-        pthread_mutex_lock(&drv->lock);
-        drv->io_busy[ridx] = 0;
-        pthread_cond_broadcast(&drv->io_done);
-        c = dmd_find_context_locked(drv, context);
-        if (!c) {
-            free(rbuf);
-            pthread_mutex_unlock(&drv->lock);
-            return VA_STATUS_ERROR_INVALID_CONTEXT;
-        }
-        free(rbuf);
-    }
+        c->av1_repair_endupd_bitpos = (size_t)-1;
+        c->av1_repair_endupd_val = -1;
+        c->av1_repair_buf = c->av1_next_repair_buf;
+        c->av1_repair_len = c->av1_next_repair_len;
+        c->av1_repair_bitpos = c->av1_next_repair_bitpos;
+        c->av1_repair_frame = c->av1_next_repair_frame;
+        c->av1_repair_endupd_bitpos = c->av1_next_repair_endupd_bitpos;
+        c->av1_repair_endupd_val = c->av1_next_repair_endupd_val;
+        c->av1_next_repair_buf = NULL;
+        c->av1_next_repair_len = 0;
+        c->av1_next_repair_bitpos = (size_t)-1;
+        c->av1_next_repair_frame = 0;
+        c->av1_next_repair_endupd_bitpos = (size_t)-1;
+        c->av1_next_repair_endupd_val = -1;
 
-    /* AV1 延迟一帧送料：第一个帧间帧只入暂存，本次没有数据要送。
-     * 这不是错误 —— 用 unit_len==0 且 av1_hold 非空与"码流重建失败"区分。
-     * surface 保持 PENDING，它会在下一帧把本帧送出后才拿到解码结果。 */
-    if (!unit && unit_len == 0 && c->codec == DMD_CODEC_AV1 && c->av1_hold) {
-        c->current_target = VA_INVALID_ID;
-        c->slice_len = 0;
-        c->av1_tile_count = 0;
-        pthread_mutex_unlock(&drv->lock);
-        free(scratch);
-        dmd_log("EndPicture: AV1 帧入暂存，等下一帧反算 refresh\n");
-        return VA_STATUS_SUCCESS;
+        /* 真值与已送出的那趟完全一致时跳过重发：refresh 全 0
+         * （源码流本就没让它占槽）且 endupd 本来就该是 1。
+         * 这类帧在 RA 结构里占相当比例，能省掉一半解码量。 */
+        int need = 0;
+        if (rbp != (size_t)-1) {
+            for (int i = 0; i < 8; i++)
+                if (av1_bit_get(rbuf, rlen, rbp + (size_t)i) == 1) { need = 1; break; }
+        }
+        if (rend_bp != (size_t)-1 && rend_v == 0)
+            need = 1;
+
+        /* 还原 disable_frame_end_update_cdf 真值：像素趟被强制成 1 以
+         * 抑制帧上下文回写，唯一那次回写要由本趟完成。 */
+        if (rend_bp != (size_t)-1 && rend_v >= 0)
+            av1_bit_set(rbuf, rlen, rend_bp, rend_v);
+
+        if (need && c->pending_count < DMD_MAX_SURFACES) {
+            int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
+            c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
+            c->pending_seq[rq] = c->last_seq;
+            c->pending_poc[rq] = INT32_MAX;
+            c->pending_unit[rq] = ++c->units_submitted;
+            c->pending_count++;
+            av1_dump_tagged("2", rbuf, rlen);
+            dmd_log("EndPicture: AV1 修复重发 %zu 字节（哨兵 unit %llu）",
+                    rlen, (unsigned long long)c->pending_unit[rq]);
+            const int ridx = (int)(c - drv->contexts);
+            drv->io_busy[ridx] = 1;
+            pthread_mutex_unlock(&drv->lock);
+            (void)dmd_session_send_unit(c->session, rbuf, rlen);
+            pthread_mutex_lock(&drv->lock);
+            drv->io_busy[ridx] = 0;
+            pthread_cond_broadcast(&drv->io_done);
+            c = dmd_find_context_locked(drv, context);
+            free(rbuf);
+            if (!c) {
+                pthread_mutex_unlock(&drv->lock);
+                free(scratch);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+        } else {
+            if (need && getenv("DMD_AV1_LOG"))
+                dmd_log("EndPicture: AV1 队列满（%d），本帧 DPB 趟跳过\n",
+                        c->pending_count);
+            free(rbuf);
+        }
+    } else if (c->codec == DMD_CODEC_AV1 && c->av1_next_repair_buf) {
+        /* 没有会话可送时也要推进交接槽，否则缓冲一直堆积泄漏。 */
+        free(c->av1_repair_buf);
+        c->av1_repair_buf = c->av1_next_repair_buf;
+        c->av1_repair_len = c->av1_next_repair_len;
+        c->av1_repair_bitpos = c->av1_next_repair_bitpos;
+        c->av1_repair_frame = c->av1_next_repair_frame;
+        c->av1_repair_endupd_bitpos = c->av1_next_repair_endupd_bitpos;
+        c->av1_repair_endupd_val = c->av1_next_repair_endupd_val;
+        c->av1_next_repair_buf = NULL;
+        c->av1_next_repair_len = 0;
+        c->av1_next_repair_bitpos = (size_t)-1;
+        c->av1_next_repair_frame = 0;
+        c->av1_next_repair_endupd_bitpos = (size_t)-1;
+        c->av1_next_repair_endupd_val = -1;
     }
 
     if (!unit) {
@@ -2381,7 +2602,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         /* 放锁重试建会话，避免持锁做 connect。 */
         drv->io_busy[idx] = 1;
         pthread_mutex_unlock(&drv->lock);
-        struct dmd_session *retry = session_open(codec, pw, ph);
+        struct dmd_session *retry =
+            session_open(codec, pw, ph, c->av1_bd_reported == 2);
         pthread_mutex_lock(&drv->lock);
         drv->io_busy[idx] = 0;
         pthread_cond_broadcast(&drv->io_done);
@@ -3718,6 +3940,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         const int held_show = c->av1_hold_show;
         size_t held_len = c->av1_hold_len;
         size_t held_bitpos = c->av1_hold_bitpos;
+        size_t held_endupd = c->av1_hold_endupd_bitpos;
         const VASurfaceID held_surf = c->av1_hold_surface;
         c->av1_hold_surface = VA_INVALID_ID;
         c->av1_hold = NULL;
@@ -3791,6 +4014,30 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
                     c->av1_dpb.dpb_next_slot & 7u,
                     1u << (c->av1_dpb.dpb_next_slot & 7u));
         }
+        /* 抑制这一趟的帧上下文回写。
+         *
+         * 双趟解码（本趟 refresh=0 只为取像素，下一帧到达后再用真实
+         * refresh 重发送补 DPB）会让规范 7.19 的 SetFrameContext 执行
+         * 两次：第一趟结束时把本帧的 CDF/delta-q/滤波终态**拷贝**进
+         * primary 参考帧槽的上下文，第二趟再进来读到的起点已经不是原始
+         * 上下文 —— 于是第二趟解出一帧内容错误却带正确 refresh 的帧，
+         * 放进 DPB 后后续引用全废。这正是旧实现"修复重发仍剩 20/24 错帧"
+         * 的机制。
+         * 所以第一趟强制 disable_frame_end_update_cdf=1（不回写），
+         * 真值存进 av1_repair_endupd_val，由修复趟写回并完成唯一一次
+         * 回写。两趟起点相同 → 第二趟像素与第一趟逐位相同。 */
+        {
+            size_t eb = held_endupd;
+            int orig = (eb == (size_t)-1) ? -1 : av1_bit_get(held, held_len, eb);
+            if (eb != (size_t)-1 && orig >= 0) {
+                av1_bit_set(held, held_len, eb, 1);
+                c->av1_repair_endupd_bitpos = eb;
+                c->av1_repair_endupd_val = orig;
+            } else {
+                c->av1_repair_endupd_bitpos = (size_t)-1;
+                c->av1_repair_endupd_val = -1;
+            }
+        }
         /* 末帧是否入队 —— 两种做法都试过，都不理想，此处保留入队：
          *   入队   → 该 surface 之后被 ffmpeg 复用时会重复登记
          *            （日志 "surface=8 已在待配对队列"），但像素能出 12 帧
@@ -3828,6 +4075,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         dmd_log("sync: 冲出暂存的 AV1 帧（%zu 字节，refresh=0，进修复队列）",
                 held_len);
         av1_dump_sent(held, held_len);
+        av1_dump_tagged("1", held, held_len);
         (void)dmd_session_send_unit(c->session, held, held_len);
         c->av1_flushed++;
         if (held_show) c->av1_flush_show1++;

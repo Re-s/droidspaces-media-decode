@@ -201,7 +201,14 @@ static void put_color_config(struct dmd_bitwriter *bw,
     if (sub_x && sub_y)
         dmd_bw_put_bits(bw, 1, 2);
 
-    dmd_bw_put_flag(bw, 0);                        /* separate_uv_delta_q */
+    /* separate_uv_delta_q 写 **1**（不是源码流的值，但我们只能声明一次：
+     * 序列头随 KEY 帧发一次，而"本帧 U/V 的 delta 是否不同"是逐帧的。
+     * 声明 1 之后每帧用 diff_uv_delta 这一位如实表达：源里 V 继承 U 时
+     * 就写 0（解码器据此把 V 的 delta 取成 U 的，与源推断结果一致），
+     * V 与 U 不同（rav1e 常见）时写 1 并带上 V 的两个 delta。
+     * 声明 0 会把 V 的 delta 丢掉 —— 实测 rav1e 样本 luma 逐字节全对、
+     * 色度 50% 字节错，就是这个字段被吃掉了。 */
+    dmd_bw_put_flag(bw, 1);                        /* separate_uv_delta_q */
 }
 
 /* tile_info()，AV1 规范 5.9.15。
@@ -341,8 +348,12 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
 
     dmd_bw_put_bits(bw, p->base_qindex, 8);
 
-    /* delta_q 用 su(1+6)：1 位存在标志 + 6 位有符号值（规范 5.9.13
-     * read_delta_q）。值为 0 时只写标志位 0。 */
+    /* delta_q：1 位 delta_coded 标志 + 7 位**二进制补码**有符号值。
+     * 曾按规范 4.10.6 的 su(n)="n-1 位幅值 + 1 位符号" 怀疑过这里的写法，
+     * 用 rav1e 样本 bat/rav_720 的原始位流实测定论：真实码流就是补码
+     * （y=10/u_dc=12/u_ac=2/v_dc=-9/v_ac=-15 五组值按补码+diff_uv_delta
+     * 排列能在 payload 第 25 位起逐位命中，按幅值+符号则一处都不命中）。
+     * CBS 的 read_signed 也是纯补码读法，两边一致。 */
     #define PUT_DELTA_Q(v) do {                        \
         if ((v) != 0) { dmd_bw_put_flag(bw, 1);        \
                         dmd_av1_put_su(bw, (v), 7); }  \
@@ -352,11 +363,22 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
     PUT_DELTA_Q(p->y_dc_delta_q);
 
     if (!mono) {
-        /* diff_uv_delta 只在 separate_uv_delta_q 时出现；序列头里我们把
-         * separate_uv_delta_q 写成 0，所以这里不写该标志，
-         * 且 U/V 共用一组 delta（写 U 的即可）。 */
+        /* diff_uv_delta 的位置：紧跟 delta_q_y_dc **之后**、U 的两个 delta
+         * 之前（CBS quantization_params 原文顺序是 y_dc → diff_uv_delta →
+         * u_dc → u_ac → (v_dc, v_ac)）。曾把它写在 U 之后，序列头
+         * separate_uv_delta_q=0 时该位不存在所以没暴露；改成恒 1 后立刻
+         * 整体错位 1 位起，后续字段全乱。
+         * VA-API 的 v_dc/v_ac 是 CBS 的**生效值**（源里 diff_uv_delta=0 时
+         * 它已被推断成 U 的值），于是"V 与 U 是否不同"恰好还原源码流真值。 */
+        const int diff_uv = p->v_dc_delta_q != p->u_dc_delta_q ||
+                            p->v_ac_delta_q != p->u_ac_delta_q;
+        dmd_bw_put_flag(bw, diff_uv);
         PUT_DELTA_Q(p->u_dc_delta_q);
         PUT_DELTA_Q(p->u_ac_delta_q);
+        if (diff_uv) {
+            PUT_DELTA_Q(p->v_dc_delta_q);
+            PUT_DELTA_Q(p->v_ac_delta_q);
+        }
     }
 
     #undef PUT_DELTA_Q
@@ -1246,6 +1268,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
             dmd_av1_remember_surface(dpb, p->current_frame, me);
         }
         dpb->last_refresh_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
+        dpb->last_oh = p->order_hint;
         if (getenv("DMD_AV1_BITS"))
             fprintf(stderr, "[bits] refresh_mask=0x%02x @ %zu\n",
                     refresh_mask, bw.byte_pos * 8 + bw.bit_pos);
@@ -1284,6 +1307,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * hint，需从自洽 DPB 的 dpb_order_hint[] 取。 */
 
     /* 参考帧索引：帧间帧才有。 */
+    unsigned my_idx[7] = { 0, 0, 0, 0, 0, 0, 0 };  /* 翻译后写入码流的槽号 */
     if (!intra_only) {
         /* frame_refs_short_signaling 需要 enable_order_hint；置 0 表示
          * 显式给出全部 7 个 ref_frame_idx（VA-API 提供的正是这个数组）。 */
@@ -1332,6 +1356,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
             if (getenv("DMD_AV1_DBG"))
                 fprintf(stderr, "[dbg] ref[%d]: va_slot=%u want_frame=%d "
                                 "-> my_slot=%u\n", i, va_slot, want_frame, my);
+            my_idx[i] = my;
             dmd_bw_put_bits(&bw, my, 3);
         }
         /* frame_id_numbers_present=0，不写 delta_frame_id。 */
@@ -1418,9 +1443,16 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     /* disable_frame_end_update_cdf：reduced_still_picture_header=0 且
      * disable_cdf_update=0 时出现。 */
-    if (!p->pic_info_fields.bits.disable_cdf_update)
+    if (dpb)
+        dpb->last_endupd_bitpos = (size_t)-1;
+    if (!p->pic_info_fields.bits.disable_cdf_update) {
+        /* 记下位偏移：双趟解码要靠它把第一趟的回写关掉，见
+         * dmd_av1_dpb::last_endupd_bitpos 的说明。 */
+        if (dpb)
+            dpb->last_endupd_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
         dmd_bw_put_flag(&bw,
             (int)p->pic_info_fields.bits.disable_frame_end_update_cdf);
+    }
 
     /* MiCols/MiRows：以 4x4 单元计的画面尺寸（规范 5.9.5 的推导）。
      * 2*((width+7)>>3) 等价于向上取整到 8 像素再折半。 */
@@ -1489,39 +1521,86 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!intra_only)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reference_select);
 
-    /* skip_mode_params()（5.9.22）：skipModeAllowed 的完整推导需要参考帧
-     * order hint 比较，VA-API 已给出结论 skip_mode_present，直接用。
-     * 帧内帧或 reference_select=0 时 skipModeAllowed=0、不写入。 */
-    if (getenv("DMD_AV1_BITS")) {
-        fprintf(stderr, "[skip] oh=%u va_skip=%u refsel=%u ref_oh=[",
-                p->order_hint,
-                p->mode_control_fields.bits.skip_mode_present,
-                p->mode_control_fields.bits.reference_select);
-        for (int i = 0; i < 7; i++)
-            fprintf(stderr, "%u%s", dpb ? dpb->dpb_order_hint[
-                        p->ref_frame_idx[i] & 7] : 0, i < 6 ? "," : "");
-        fprintf(stderr, "] idx=[");
-        for (int i = 0; i < 7; i++)
-            fprintf(stderr, "%d%s", p->ref_frame_idx[i], i < 6 ? "," : "");
-        fprintf(stderr, "]\n");
+    /* skip_mode_params()（5.9.22）：skipModeAllowed 必须按**本合成流**的状态
+     * 推导 —— 解码器也是这么算的。两边结论不一致就会多写或少写 1 位，
+     * 帧头从此错位（实测：源码流 oh=16 那帧 skipModeAllowed=0、码流里没有
+     * skip 位，而我们无条件写 0，整帧后移 1 位，CBS 把我们的 warp 位读成
+     * reduced_tx_set，dav1d 直接 Invalid data）。
+     *
+     * 判据（CBS uncompressed_header 原文）：
+     *   帧内 || !reference_select || !enable_order_hint → allowed = 0
+     *   否则在 7 个参考里找前向（dist<0 里最接近当前的）与后向（dist>0 里
+     *   最远离的）；有后向 → 1；无后向但存在比 forward 更早的"第二前向" → 1；
+     *   否则 → 0。dist = get_relative_dist(ref_hint, 本帧 hint)。
+     *
+     * 参考帧的 order hint 取影子 DPB（我们自己的槽位分配），不是源码流的槽号，
+     * 因为解码器看到的正是我们写进码流的 my_idx。 */
+    int skip_allowed = 0;
+    if (!intra_only && p->mode_control_fields.bits.reference_select &&
+        enable_order_hint && order_hint_bits > 0 && dpb) {
+        const unsigned ohm = 1u << order_hint_bits;
+#define RELD(x, y) ((int)(((x) - (y)) & (ohm - 1u)) - (int)(((x) - (y)) & ohm))
+        int fwd = -1, bwd = -1;
+        unsigned fwd_h = 0, bwd_h = 0;
+        for (int i = 0; i < 7; i++) {
+            const unsigned h = dpb->dpb_order_hint[my_idx[i] & 7u];
+            const int d = RELD(h, p->order_hint);
+            if (d < 0) {
+                if (fwd < 0 || RELD(h, fwd_h) > 0) { fwd = i; fwd_h = h; }
+            } else if (d > 0) {
+                if (bwd < 0 || RELD(h, bwd_h) < 0) { bwd = i; bwd_h = h; }
+            }
+        }
+        if (fwd >= 0) {
+            skip_allowed = bwd >= 0;
+            for (int i = 0; !skip_allowed && i < 7; i++)
+                if (RELD(dpb->dpb_order_hint[my_idx[i] & 7u], fwd_h) < 0)
+                    skip_allowed = 1;
+        }
+#undef RELD
+        if (getenv("DMD_AV1_BITS"))
+            fprintf(stderr, "[skip] oh=%u va_skip=%u refsel=%u allowed=%d"
+                            " fwd=%d fwd_oh=%u bwd=%d my_idx=[%u,%u,%u,%u,%u,%u,%u]"
+                            " ref_oh=[%u,%u,%u,%u,%u,%u,%u]\n",
+                    p->order_hint,
+                    p->mode_control_fields.bits.skip_mode_present,
+                    p->mode_control_fields.bits.reference_select,
+                    skip_allowed, fwd, fwd_h, bwd,
+                    my_idx[0], my_idx[1], my_idx[2], my_idx[3],
+                    my_idx[4], my_idx[5], my_idx[6],
+                    dpb->dpb_order_hint[my_idx[0] & 7u],
+                    dpb->dpb_order_hint[my_idx[1] & 7u],
+                    dpb->dpb_order_hint[my_idx[2] & 7u],
+                    dpb->dpb_order_hint[my_idx[3] & 7u],
+                    dpb->dpb_order_hint[my_idx[4] & 7u],
+                    dpb->dpb_order_hint[my_idx[5] & 7u],
+                    dpb->dpb_order_hint[my_idx[6] & 7u]);
     }
-    if (!intra_only && p->mode_control_fields.bits.reference_select) {
-        /* 直接转写 VA-API 的 skip_mode_present。
-         *
-         * 旧实现恒写 1（拟合 av1_1080p.obu 的"frame2 VA=0 源=1"观察）。
-         * 那个不一致是当时其他位错位缺陷的假象 —— ffmpeg 的
-         * mode_control_fields 是 CBS 从源码流逐字段解析出来的，
-         * 忠实于源码流。恒写 1 会让 skip_mode 允许时少 1 位、不允许时
-         * 多 1 位，tile_group 起始随之前移或后移。 */
+    if (skip_allowed) {
+        /* 值取 VA-API 的 skip_mode_present：ffmpeg 的 mode_control_fields
+         * 是 CBS 从源码流解析出来的，忠实于源码流。 */
         dmd_bw_put_flag(&bw,
             (int)p->mode_control_fields.bits.skip_mode_present);
     }
 
-    /* allow_warped_motion：需 is_motion_mode_switchable、非 error_resilient、
-     * 且序列级 enable_warped_motion（我们写 1）。 */
-    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "warp", bw.byte_pos*8+bw.bit_pos);
-    if (!intra_only &&
-        p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
+    /* allow_warped_motion（5.9.22，紧接 skip_mode_params 之后）：
+     * 权威条件见 CBS cbs_av1_syntax_template.c 的 uncompressed_header：
+     *   if (frame_is_intra || error_resilient_mode || !seq->enable_warped_motion)
+     *       infer(allow_warped_motion, 0);      // 不占码流位
+     *   else
+     *       flag(allow_warped_motion);
+     * 与 is_motion_mode_switchable **无关** —— 那个字段只决定块级的
+     * motion mode 是否需要解析，早在本函数上方 read_mv_mode 处就用掉了。
+     * 旧实现把它加进守卫，于是 mms=0 的帧少写 1 位，其后
+     * reduced_tx_set / is_global[7] / film_grain / tile_group 全体前移，
+     * 软解报 Invalid data、硬解吐垃圾。
+     * 序列级 enable_warped_motion 我们恒写 1（见 :902），故此处不必再判。 */
+    if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu va_warp=%u va_redtx=%u va_mms=%u cf=%u oh=%u\n", "warp", bw.byte_pos*8+bw.bit_pos,
+            (unsigned)p->pic_info_fields.bits.allow_warped_motion,
+            (unsigned)p->mode_control_fields.bits.reduced_tx_set_used,
+            (unsigned)p->pic_info_fields.bits.is_motion_mode_switchable,
+            (unsigned)p->current_frame, (unsigned)p->order_hint);
+    if (!intra_only && !err_res)
         /* 直接转写 VA-API 的 allow_warped_motion（理由同上：
          * ffmpeg CBS 解析值忠实于源码流，旧"uniform_ref 置 0"规则是
          * 对抗位错位时拟合出来的，换码流即错）。 */
@@ -1572,24 +1651,11 @@ static size_t build_frame_header_obu(int tile_size_bytes,
         fprintf(stderr, "[bits] header_end @ %zu\n",
                 bw.byte_pos * 8 + bw.bit_pos);
 
-    /* ⚠️ 这一位是实测必需、但**字段身份尚未查明**的补位，不是规范推导的结果。
-     *
-     * 证据：去掉它，6 帧样本里帧3 与帧6 与源不再逐字节相同（4/6）；
-     * 加上它，6/6 全部相同，且合成流 dav1d 软解 2 帧 = 源码流基线 2 帧。
-     * 补 1~8 位效果相同（byte_align 会吸收多余零位），说明缺的是
-     * "帧头末尾某个值为 0 的字段"，长度 1~8 位。
-     *
-     * 已排除：字段位宽差异（267 项逐项比对零差异）、leb128 编码、
-     * film_grain/apply_grain（序列头 film_grain_params_present=0）、
-     * tile_info 全段、quantization_params、delta_q/delta_lf_params、
-     * tx_mode、reference_select、reduced_tx_set_used、
-     * tile_group 头（tile_start_and_end_present_flag 确实已写）。
-     *
-     * 保留为显式补位而不假装是某个具名字段 —— 前者诚实，
-     * 后者会让下一个读代码的人（包括我自己）以为这里已经查清了。
-     * 待查清后应替换为真正的字段写入。 */
-    dmd_bw_put_flag(&bw, 0);
-
+    /* 此处曾有一个"身份不明的补位"（无条件写 1 个 0  bit）。它不存在于
+     * 规范里，且在帧头真实长度 ≡ 0 (mod 8) 的帧上会把 byte_alignment 撑成
+     * 一整个 0x00 字节 —— tile 数据整体后移 1 字节，熵解码从第一 byte 起
+     * 就是错的（实测 640x360 第 7 帧起 dav1d 直接报 Invalid data）。
+     * 帧头字段现已与源码流逐位对齐，不需要任何补位。 */
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
     else
@@ -1704,6 +1770,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
      * 调用方（decode.c）再叠加 TD 等更外层前缀的长度。 */
     if (dpb && dpb->last_refresh_bitpos != (size_t)-1)
         dpb->last_refresh_bitpos += hdr * 8;
+    if (dpb && dpb->last_endupd_bitpos != (size_t)-1)
+        dpb->last_endupd_bitpos += hdr * 8;
 
     unsigned char *q = out + hdr;
     for (size_t i = 0; i < fh_len; i++)
@@ -1902,7 +1970,7 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
             for (int k = 0; k < 8; k++)
                 if (mask >> k & 1u) {
                     dpb->dpb_shadow[k] = prev_frame;
-                    dpb->dpb_order_hint[k] = 0;
+                    dpb->dpb_order_hint[k] = dpb->last_oh;
                 }
         }
     }

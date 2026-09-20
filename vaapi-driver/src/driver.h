@@ -367,6 +367,10 @@ struct dmd_context {
      * 512 项足以覆盖 8K/多 tile 场景（规范 MAX_TILE_COLS×MAX_TILE_ROWS
      * 名义上 64×64，实际受 MAX_TILE_AREA 约束远小于此）。 */
     int have_av1_pic_param;
+    /* 已向会话报过位深没有：0=还没报，1=报的 8bit，2=报的 10bit。
+     * CAPTURE 协商发生在首个单元送出的 SOURCE_CHANGE 里，而 vaCreateContext
+     * 阶段还拿不到位深，所以只能在首次 EndPicture 见到 PPB 时补告。 */
+    int av1_bd_reported;
     VADecPictureParameterBufferAV1 av1_pic_param;
     VASliceParameterBufferAV1 av1_tile_param[512];
     int    av1_tile_count;
@@ -393,6 +397,9 @@ struct dmd_context {
      * build_frame 覆盖。实测踩过：日志显示 "bitpos=19 len=655"，
      * 而 len=655 是新合成帧的长度，暂存帧长 2686，一眼即知拿错了帧。 */
     size_t         av1_hold_bitpos;
+    /* 暂存帧的 disable_frame_end_update_cdf 位偏移（同上，不能复用
+     * dpb 里的同名字段，会被本帧覆盖）。 */
+    size_t         av1_hold_endupd_bitpos;
     /* AV1 延迟一帧送料，EndPicture 里送出的是**上一帧**的数据，
      * 所以待配对队列必须登记那一帧的 surface 而不是当前 surface。
      * 实测不这样做的后果：回传 unit_seq 在队列里找不到对应项
@@ -419,6 +426,21 @@ struct dmd_context {
     size_t         av1_repair_len;
     size_t         av1_repair_bitpos;
     int            av1_repair_frame;
+    /* 修复趟要还原的 disable_frame_end_update_cdf：第一趟（flush 送出）
+     * 强制写 1 抑制帧上下文回写，真值存这里，修复趟写回真值完成
+     * 唯一一次回写。见 dmd_av1_dpb::last_endupd_bitpos。 */
+    size_t         av1_repair_endupd_bitpos;
+    int            av1_repair_endupd_val;
+    /* 双趟送料的交接槽：EndPicture 里 build_unit 先跑，它把**本帧**的像素趟
+     * 缓冲放这里；等上面的 DPB 趟把 av1_repair_buf（上一帧）送完，再整体搬进
+     * av1_repair_buf。不分开就会重发本帧自己 —— 实测过：帧 2 的合成 4422 字节
+     * 被当成"修复重发 4422 字节"送了两遍，紧接着 double free。 */
+    unsigned char *av1_next_repair_buf;
+    size_t         av1_next_repair_len;
+    size_t         av1_next_repair_bitpos;
+    int            av1_next_repair_frame;
+    size_t         av1_next_repair_endupd_bitpos;
+    int            av1_next_repair_endupd_val;
     /* 最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接像素。 */
     VASurfaceID    av1_last_ready;
 
@@ -722,10 +744,11 @@ void dmd_surface_reset_locked(struct dmd_surface *s);
 void dmd_context_reset_locked(struct dmd_context *c);
 
 /* 按 surface 几何填一个 VAImage 描述（不含 image_id/buf）。
- * 这是 1088-vs-1080 那处几何的唯一真源，derive 与 create 共用。 */
+ * 这是 1088-vs-1080 那处几何的唯一真源，derive 与 create 共用。
+ * stride 传**字节**；ten_bit 决定 fourcc（P010 每样本 2 字节）。 */
 void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
                              unsigned int disp_height, unsigned int stride,
-                             unsigned int slice_height);
+                             unsigned int slice_height, int ten_bit);
 
 /* 对齐辅助 */
 unsigned int dmd_align_up(unsigned int v, unsigned int align);

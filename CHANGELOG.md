@@ -2,7 +2,63 @@
 
 # 更新日志（未发布 · 分支 feat/msm-vidc-512-upstream）
 
-## WIP · AV1 flush+repair 路径专项排查(第 2 天)
+## ✅ AV1 硬解达标：896 帧逐字节一致 + 10bit(P010) 打通
+
+上一节（flush+repair 专项）记录的状态已被本轮取代：那条
+"当前最优 91/150" 的瓶颈正是 **show_frame 强制置 1（方向 A）** 解决的，
+配套是两遍法（pixel pass 用 `refresh_frame_flags=0` + 强制
+`disable_frame_end_update_cdf`，DPB pass 用 `dmd_av1_patch_prev_refresh`
+回写真实 refresh 位）与驱动内的**影子 DPB** 槽位翻译。
+
+**实测（本机构建，全新 `make clean` 后）**
+
+- 14 条 AV1 样本 / **896 帧**，逐帧 md5 命中软解，且每条样本的命中序
+  严格 `0..N-1`（显示序正确，不是靠乱序凑数）：
+  640x360 / 640x360b / 656x480 / 1280x720 各 24，pyr720 48，
+  a_cdef 64，a_g64 96，a_g256 128，a_lag 96，a_tiles 64，
+  svt_360 96，svt_720 96，rav_720 64，a_10b 48（10bit）
+- `verify_driver.sh`：h264 / hevc / vp9 / vp8 / av1 五种格式
+  整条流 md5 与软解逐字节一致（vp8 按固件能力回落软解，一致即正确）
+- `make tests`（AV1 比特流单测）全通过
+
+**10bit（P010）**：固件能正确解 10bit AV1，但 CAPTURE 配成 NV12/Q08C
+时它把样本截断成 `v10 & 0xFC`（表现为"和软解 10bit 对不上"，易误判为
+解码错误）。实测固件对 AV1 10bit 接受**线性 P010**（640x384 →
+stride=1280、sizeimage=737280、1 plane）。全树几何约定统一为
+**stride 以字节计**，于是 `size = stride*slice_height*3/2` 对两种格式
+同时成立。入口开关在 profiles.c：仅 `VAProfileAV1Profile0` 声明
+`VA_RT_FORMAT_YUV420_10` —— 少了这步 FFmpeg 直接报
+"Your platform doesn't support hardware accelerated AV1 decoding"，
+后面代码根本不执行。`QuerySurfaceAttributes`/`QueryImageFormats`
+追加 `VA_FOURCC_P010`，`CreateSurfaces2` 由 PixelFormat 推位深，
+`GetImage` 位深不符直接拒绝（不静默截断）。
+两个有意的取舍：P010 的黑帧初始化不能 `memset(0x80)`（16bit 小端会得
+0x8080，超量程）；`ExportSurfaceHandle` 对 P010 + SEPARATE_LAYERS
+**主动拒绝**（本 libdrm 有 R10 无 GR10，硬撑会被按错比例读、暗约 64 倍），
+Chrome 走 COMPOSED 不受影响，Firefox 10bit 宁可回落软解也不给错色。
+4:4:4（profile 1）仍不在范围内：未声明 4:4:4 surface 格式，
+FFmpeg 在提交前就拒绝。
+
+**单测可否证化**：修好编译（`dmd_av1_patch_prev_refresh` 少传
+`prev_frame` 的 6 个调用点）后，剩余 5 项失败判定为**测试过时** ——
+驱动恒置 `show_frame=1` 使 `showable_frame` 分支在默认路径不再出现。
+处理不是删断言，而是用 A/B 开关 `DMD_AV1_NO_SHOWFORCE=1` 还原规范分支
+再断言，并**另加一条钉住默认强制行为**（两种 PPB 必须产出逐字节相同的
+帧头）。顺带纠正一个错误断言：原"show=0 帧头比 show=1 长**一字节**"
+把字节数当成了位数，只在恰好跨字节边界时成立；改为按 `trailing_bits()`
+停止位的下标测**位数**，再加"第 5 位起整体右移一位"的逐位校验。
+变异验证：无条件写 showable / 删 showable 写 / show_frame 写死 1
+三个变异现在各被**不同**断言抓住（原先三个全部逃脱）。
+
+**教训（本轮自伤，值得记）**：为确认构建干净跑了 `make clean`，把唯一
+端到端验证过的 .so 一起清了；而 A/B 试验期间在 `av1_bitstream.c` 误留
+一行重复的 `dmd_bw_put_flag(showable_frame)` —— 每帧多写一位，固件报
+`av1DecParseFrame: AV1 ERROR code 88000060 obu_error`，14 样本硬解全 0
+帧，而**单测全程全绿**（相对不变量测不出"整体多一位"）。
+结论：改合成码流之后必须跑端到端；工作树全部未提交时，`make clean`
+前先备份二进制。
+
+## WIP · AV1 flush+repair 路径专项排查(第 2 天)（已被上一节取代，保留排查记录）
 
 **根因已锁定**:全部剩余像素问题(640 宽帧间帧、SEF 复显流、
 B 站 1080p60)都发生在 **flush+repair 送帧路径**;从不触发 flush 的流

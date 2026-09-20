@@ -254,6 +254,23 @@ VAStatus dmd_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
     return VA_STATUS_SUCCESS;
 }
 
+/* 该 profile 允许的 RTFormat。
+ *
+ * 只有 AV1 多通告一个 VA_RT_FORMAT_YUV420_10：Venus 在 10bit AV1 码流下
+ * 接受线性 P010 输出（实测 640x384 → stride=1280 sizeimage=737280），
+ * 而其他 codec 的 CAPTURE 一直是 NV12，通告 10bit 就是虚报 ——
+ * 消费者会拿它去建 10bit surface，再收到 8bit 像素。
+ *
+ * 这是整条 10bit 路径的**入口开关**：ffmpeg 的 vaapi 解码器按
+ * avctx->pix_fmt（10bit AV1 → P010）查这里要 RTFormat，拿不到就直接
+ * "Your platform doesn't support hardware accelerated AV1 decoding"。 */
+static uint32_t rt_formats_for_profile(VAProfile profile)
+{
+    if (profile == VAProfileAV1Profile0)
+        return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
+    return VA_RT_FORMAT_YUV420;
+}
+
 VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
                                  VAEntrypoint entrypoint,
                                  VAConfigAttrib *attrib_list, int num_attribs)
@@ -273,8 +290,8 @@ VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
     for (int i = 0; i < num_attribs; i++) {
         switch (attrib_list[i].type) {
         case VAConfigAttribRTFormat:
-            /* MediaCodec 输出 8-bit 4:2:0 NV12。 */
-            attrib_list[i].value = VA_RT_FORMAT_YUV420;
+            /* 8-bit 4:2:0 NV12；AV1 再加一个 10-bit P010。 */
+            attrib_list[i].value = rt_formats_for_profile(profile);
             break;
         case VAConfigAttribMaxPictureWidth:
             attrib_list[i].value = DMD_MAX_WIDTH;
@@ -413,12 +430,13 @@ VAStatus dmd_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
          * CreateConfig 传了什么，RTFormat 一定出现在返回集里。 */
         int n = 0;
         int have_rtformat = 0;
+        const uint32_t rt = rt_formats_for_profile(cfg->profile);
 
         for (int i = 0; i < cfg->num_attribs && n < DMD_MAX_CONFIG_ATTRIBUTES; i++) {
             if (cfg->attribs[i].type == VAConfigAttribRTFormat) {
                 /* 用驱动真实支持的值覆盖调用方传入的值 */
                 attrib_list[n].type = VAConfigAttribRTFormat;
-                attrib_list[n].value = VA_RT_FORMAT_YUV420;
+                attrib_list[n].value = rt;
                 have_rtformat = 1;
             } else {
                 attrib_list[n] = cfg->attribs[i];
@@ -428,7 +446,7 @@ VAStatus dmd_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
 
         if (!have_rtformat && n < DMD_MAX_CONFIG_ATTRIBUTES) {
             attrib_list[n].type = VAConfigAttribRTFormat;
-            attrib_list[n].value = VA_RT_FORMAT_YUV420;
+            attrib_list[n].value = rt;
             n++;
         }
 
@@ -453,13 +471,20 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
 
     /* config 必须有效 —— 消费者据此判断该配置下的 surface 能力。 */
     pthread_mutex_lock(&drv->lock);
-    int valid = find_config_locked(drv, config) != NULL;
+    struct dmd_config *cfg = find_config_locked(drv, config);
+    VAProfile cfg_profile = cfg ? cfg->profile : VAProfileNone;
     pthread_mutex_unlock(&drv->lock);
-    if (!valid)
+    if (!cfg)
         return VA_STATUS_ERROR_INVALID_CONFIG;
 
+    /* P010 与 NV12 是两个并列的 PixelFormat 属性项（VA-API 允许多个同 type
+     * 的项，消费者按 value 匹配自己要的格式）。只给 AV1 多这一项 ——
+     * 与 rt_formats_for_profile() 同一个门槛。 */
+    const int ten_bit = (rt_formats_for_profile(cfg_profile) &
+                         VA_RT_FORMAT_YUV420_10) != 0;
+
     /* VA-API 约定的两段式查询：attrib_list 为 NULL 时只回报数量。 */
-    const unsigned int needed = 5;
+    const unsigned int needed = ten_bit ? 6u : 5u;
     if (!attrib_list) {
         *num_attribs = needed;
         return VA_STATUS_SUCCESS;
@@ -476,6 +501,15 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     attrib_list[n].value.type = VAGenericValueTypeInteger;
     attrib_list[n].value.value.i = VA_FOURCC_NV12;
     n++;
+
+    if (ten_bit) {
+        attrib_list[n].type = VASurfaceAttribPixelFormat;
+        attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE |
+                               VA_SURFACE_ATTRIB_SETTABLE;
+        attrib_list[n].value.type = VAGenericValueTypeInteger;
+        attrib_list[n].value.value.i = VA_FOURCC_P010;
+        n++;
+    }
 
     attrib_list[n].type = VASurfaceAttribMinWidth;
     attrib_list[n].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -511,14 +545,27 @@ VAStatus dmd_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
     if (!ctx || !format_list || !num_formats)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 只支持 NV12：MediaCodec 的输出格式实测为 color-format 21
-     * （COLOR_FormatYUV420SemiPlanar，线性 NV12）。 */
+    /* 线性半平面两种：NV12(8bit) 与 P010(10bit)。
+     *
+     * ⚠️ *num_formats 是**入参时也是数组容量**（libva 的 in/out 约定），
+     * 只在容量够时才写第二项 —— 否则踩调用方的栈。 */
+    const int cap = *num_formats;
+
     memset(&format_list[0], 0, sizeof(format_list[0]));
     format_list[0].fourcc = VA_FOURCC_NV12;
     format_list[0].byte_order = VA_LSB_FIRST;
     format_list[0].bits_per_pixel = 12; /* 平面式 YUV420 每像素 12 bit */
 
     *num_formats = 1;
+    if (cap < 2)
+        return VA_STATUS_SUCCESS;
+
+    memset(&format_list[1], 0, sizeof(format_list[1]));
+    format_list[1].fourcc = VA_FOURCC_P010;
+    format_list[1].byte_order = VA_LSB_FIRST;
+    format_list[1].bits_per_pixel = 12; /* 名义位数；有效 10bit 由 fourcc 表达 */
+
+    *num_formats = 2;
     return VA_STATUS_SUCCESS;
 }
 
