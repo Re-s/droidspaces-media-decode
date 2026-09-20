@@ -1,5 +1,5 @@
 #!/bin/bash
-# AV1 像素回归：多组编码结构逐字节对拍软解。
+# AV1 像素回归：多组编码结构逐字节对拍软解，每条同时验 ffmpeg 与 Chrome 两种契约。
 #
 # 为什么单独一个脚本：verify_driver.sh 只有一条 640x360 的 AV1 流，覆盖不到
 # 长 GOP（B 金字塔深、DPB 趟频繁）、全内帧、10bit、非 128 对齐宽度这些
@@ -43,19 +43,38 @@ check() {
         printf '  %-14s 跳过（编码失败）\n' "$name"
         skip=$((skip + 1)); return
     fi
-    local sw hw
+    local sw hw cr
     $FFMPEG -v error -i "$W/$name.obu" -pix_fmt "$fmt" -f rawvideo \
         "$W/$name.sw.yuv" -y 2>/dev/null
     sw=$(stat_of "$W/$name.sw.yuv" "$fmt" "$size")
     timeout 300 $FFMPEG -v error -hwaccel vaapi -i "$W/$name.obu" \
         -pix_fmt "$fmt" -f rawvideo "$W/$name.hw.yuv" -y 2>/dev/null
     hw=$(stat_of "$W/$name.hw.yuv" "$fmt" "$size")
-    rm -f "$W/$name.sw.yuv" "$W/$name.hw.yuv"
-    if [ "${sw%% *}" = "${hw%% *}" ] && [ "${sw%% *}" != "d41d8cd98f00b204e9800998ecf8427e" ]; then
+    # Chrome 契约：Chrome 只调 BeginPicture/RenderPicture/EndPicture，
+    # 从不 Sync/Derive/GetImage，像素必须在 EndPicture 返回时就位。ffmpeg 走
+    # map 路径，vaMapBuffer 里有 dmd_surface_wait 兜底会把"还没就位"救回来，
+    # 于是 md5 全绿而浏览器跳帧。关掉这个兜底，才测得到那个采样窗口。
+    #
+    # ⚠️ 这一趟**不是万能的**：它只覆盖"像素到位时机"这一类时序缺陷。
+    # 提交节奏差异抓不住 —— ffmpeg 一次灌 6 帧以上，驱动里有问题的东西
+    # 往往在硬件真正用上之前就被后续提交修正了，这类 bug 只有浏览器能暴露
+    # （实例见 decode.c:3177 那段首份 PPS l0=0 的实测记录，以及
+    # tests/browser/verify_pps_fix.sh）。
+    DMD_NO_MAP_WAIT=1 timeout 300 $FFMPEG -v error -hwaccel vaapi \
+        -i "$W/$name.obu" -pix_fmt "$fmt" -f rawvideo \
+        "$W/$name.cr.yuv" -y 2>/dev/null
+    cr=$(stat_of "$W/$name.cr.yuv" "$fmt" "$size")
+    rm -f "$W/$name.sw.yuv" "$W/$name.hw.yuv" "$W/$name.cr.yuv"
+    local empty=d41d8cd98f00b204e9800998ecf8427e
+    if [ "${sw%% *}" = "${hw%% *}" ] && [ "${sw%% *}" != "$empty" ] \
+        && [ "${sw%% *}" = "${cr%% *}" ]; then
         printf '  %-14s ✅ 逐字节一致 (%s 帧, %s)\n' "$name" "${sw##* }" "${sw%% *}"
         pass=$((pass + 1))
     else
-        printf '  %-14s ❌ 软解[%s] 硬解[%s]\n' "$name" "$sw" "$hw"
+        printf '  %-14s ❌ 软解[%s] 硬解[%s]' "$name" "$sw" "$hw"
+        [ "${sw%% *}" = "${hw%% *}" ] && [ "${sw%% *}" != "$empty" ] && \
+            printf ' —— ffmpeg 契约过、Chrome 契约不过（存在采样窗口）[%s]' "$cr"
+        printf '\n'
         fail=$((fail + 1))
     fi
 }
