@@ -6,7 +6,8 @@
 #   不装驱动时: ./verify_driver.sh ../vaapi-driver/build
 #   已安装系统驱动时: ./verify_driver.sh /usr/lib/aarch64-linux-gnu/dri
 set -e
-LIB="${1:-/home/xieyizhou/Documents/piliplus/硬解/vaapi-driver/build}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+LIB="${1:-$HERE/build}"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 export LIBVA_DRIVERS_PATH="$LIB"
