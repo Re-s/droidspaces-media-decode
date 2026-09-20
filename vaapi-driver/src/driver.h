@@ -298,6 +298,20 @@ struct dmd_context {
     uint64_t pending_unit[DMD_MAX_SURFACES];
     int pending_head;
     int pending_count;
+    /* 硬件静默丢帧的检测（仅 AV1 用）。
+     *
+     * 出帧跟随入序，所以"比队首更晚提交的单元都已经出帧了、队首那个却
+     * 迟迟不回"就是队首被硬件吞掉的证据 —— 每越过队首配走一帧加一，
+     * 队首正常配走则清零。实测触发点：1080p60 第 1665 帧（order_hint 回绕
+     * 处），硬件吞掉 unit 3323/3324 且从不回传，调用方在 vaSyncSurface 上
+     * 干等满 5 秒后整条码流中止 —— 一个丢帧不该毁掉整段播放。 */
+    int av1_head_stall;
+    /* 已判定作废的单元号。若硬件之后才把那一帧吐出来，取帧路径据此丢弃；
+     * 不记就会在队列里"无匹配项"而退回顺序推断 —— 那会把后续配对整体
+     * 错位（0.4.5 实测 Chrome 98.6% 配错，见 dmd_pending_take_locked 注释）。 */
+    uint64_t av1_dead_unit[8];
+    int av1_dead_head;
+    int av1_dead_count;
     /* 已提交的数据单元计数，给 pending_unit 发号。 */
     uint64_t units_submitted;
     /* 本会话已交付给消费者的帧数，纯诊断用。

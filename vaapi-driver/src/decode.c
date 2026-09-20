@@ -762,6 +762,9 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
      * 置 0 表示"该项无有效序号"，不会匹配任何回传的 PTS，
      * 只能由回退推断按顺序配掉 —— 这正是需要的语义。 */
     c->units_submitted = 0;
+    c->av1_head_stall = 0;
+    c->av1_dead_head = 0;
+    c->av1_dead_count = 0;
     c->av1_hold_surface = VA_INVALID_ID;
     c->av1_send_surface = VA_INVALID_ID;
     c->av1_last_ready = VA_INVALID_ID;
@@ -2489,7 +2492,15 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         if (rend_bp != (size_t)-1 && rend_v >= 0)
             av1_bit_set(rbuf, rlen, rend_bp, rend_v);
 
-        if (need && c->pending_count < DMD_MAX_SURFACES) {
+        /* DMD_AV1_NO_REPAIR=1：跳过 DPB 趟，只送像素趟。
+         * 纯诊断开关，用来判定"硬件吞掉某个单元"是否由同一帧解码两次
+         * 引起。代价是 DPB 槽位不再修正，像素会随时间退化。 */
+        static int no_repair = -1;
+        if (no_repair < 0) {
+            const char *e = getenv("DMD_AV1_NO_REPAIR");
+            no_repair = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (need && !no_repair && c->pending_count < DMD_MAX_SURFACES) {
             int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
             c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
             c->pending_seq[rq] = c->last_seq;
@@ -3622,11 +3633,51 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
  * 用线性扫描而非堆：队列最多 64 项且实测重排深度只有 2-3，
  * 每帧一次 O(n) 扫描的代价可以忽略。
  */
+static void av1_dead_push(struct dmd_context *c, uint64_t unit)
+{
+    if (c->av1_dead_count < 8) {
+        int t = (c->av1_dead_head + c->av1_dead_count) % 8;
+        c->av1_dead_unit[t] = unit;
+        c->av1_dead_count++;
+        return;
+    }
+    /* 满则丢最老的：作废名单只为兜住"迟到的那一帧"，几帧之后它就
+     * 不可能再出现了，回收最老项不影响判定。 */
+    c->av1_dead_head = (c->av1_dead_head + 1) % 8;
+    c->av1_dead_unit[(c->av1_dead_head + 7) % 8] = unit;
+}
+
+/* unit 在作废名单里？取走并返回 1（每个作废号只挡一次回传）。 */
+static int av1_dead_take(struct dmd_context *c, uint32_t unit)
+{
+    for (int k = 0; k < c->av1_dead_count; k++) {
+        int i = (c->av1_dead_head + k) % 8;
+        if (c->av1_dead_unit[i] != (uint64_t)unit)
+            continue;
+        for (; k + 1 < c->av1_dead_count; k++) {
+            int cur = (c->av1_dead_head + k) % 8;
+            int nxt = (c->av1_dead_head + k + 1) % 8;
+            c->av1_dead_unit[cur] = c->av1_dead_unit[nxt];
+        }
+        c->av1_dead_count--;
+        return 1;
+    }
+    return 0;
+}
+
 static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
                                            uint32_t unit_seq)
 {
     if (c->pending_count <= 0)
         return VA_INVALID_ID;
+
+    /* 硬件丢帧的兜底：这一帧早在 Sync 里被判作废并从队列摘除，
+     * 现在它迟到了 —— 直接丢弃，绝不能落到下面的回退推断上
+     * （制造空洞的后果是之后每一帧都错位，见本函数长注释）。 */
+    if (unit_seq != 0 && av1_dead_take(c, unit_seq)) {
+        dmd_log("配对: unit %u 已判为硬件丢帧，迟到的帧直接丢弃\n", unit_seq);
+        return VA_INVALID_ID;
+    }
 
     int pick = c->pending_head;
 
@@ -3728,6 +3779,11 @@ static VASurfaceID dmd_pending_take_locked(struct dmd_context *c,
     }
 
 found:
+    /* 队首越过计数（见 driver.h av1_head_stall）：配走的是队首之外的项，
+     * 说明有一个更老的单元还没出帧却有更新的单元出了帧。 */
+    if (c->codec == DMD_CODEC_AV1)
+        c->av1_head_stall = (pick == c->pending_head) ? 0 : c->av1_head_stall + 1;
+
     VASurfaceID head = c->pending[pick];
     /* 记下最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接。 */
     c->av1_last_ready = head;
@@ -4318,7 +4374,47 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
 
         if (rc == DMD_ERR_TIMEOUT) {
             /* 帧还没出来。daemon 未开 low-latency，解码器会攒几帧，
-             * 这是正常现象 —— 继续等到总超时。 */
+             * 这是正常现象 —— 继续等到总超时。
+             *
+             * 但有一种情况继续等下去是**永远等不到**的：硬件静默吞掉了
+             * 某个单元。实测（1080p60 第 1669 帧，order_hint 回绕处）
+             * Venus 把 unit 3323/3324 吃进 OUTPUT 队列后既不回传帧、也不
+             * 回传错误标志，之后单元照常出帧 —— CAPTURE 侧 24/24 全在驱动
+             * 手里、OUTPUT 侧 0/8，硬件层面确认是它丢的，不是我们没取。
+             * 后果却是一帧丢不起：调用方在 vaSyncSurface 上干等满 5000ms
+             * 后放弃整条码流（rc=251），等于"一个丢帧 = 播放中止"。
+             *
+             * 判据（只在 AV1 上启用，避免影响另外四个码流的逐字节回归）：
+             * 出帧跟随入序，所以"已有更新的单元出帧、队首那个却始终没回"
+             * 就是队首被吞的证据。越过 3 次、且至少等过 150ms 才动手，
+             * 给真正只是晚到的帧留足余地。
+             *
+             * 处理方式：把队首登记摘掉（不留空洞 —— 作废号记进
+             * av1_dead_unit，迟到的真帧会被丢弃），若被摘的正是调用方
+             * 在等的那张 surface，就以它**当前内容**交付并返回成功。
+             * 于是玩家看到的是该 surface 上一帧的重复，最多错一帧画面，
+             * 而整段播放不再被打断。 */
+            if (c->codec == DMD_CODEC_AV1 && c->av1_head_stall >= 3 &&
+                spent >= 150 && c->pending_count > 0) {
+                int hp = c->pending_head;
+                VASurfaceID dead = c->pending[hp];
+                uint64_t du = c->pending_unit[hp];
+                av1_dead_push(c, du);
+                c->pending_head = (hp + 1) % DMD_MAX_SURFACES;
+                c->pending_count--;
+                c->av1_head_stall = 0;
+                dmd_log("SyncSurface: unit %llu（surface %u）判定被硬件吞掉，"
+                        "已越过它配走 3 帧，作废该登记\n",
+                        (unsigned long long)du, (unsigned)dead);
+                if (dead == target) {
+                    struct dmd_surface *ls =
+                        dmd_find_surface_locked(drv, target);
+                    if (ls && ls->state == DMD_SURFACE_PENDING) {
+                        ls->state = DMD_SURFACE_READY;
+                        ls->decode_status = VA_STATUS_SUCCESS;
+                    }
+                }
+            }
             continue;
         }
 

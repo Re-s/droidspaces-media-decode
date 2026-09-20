@@ -1539,7 +1539,14 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!intra_only && p->mode_control_fields.bits.reference_select &&
         enable_order_hint && order_hint_bits > 0 && dpb) {
         const unsigned ohm = 1u << order_hint_bits;
-#define RELD(x, y) ((int)(((x) - (y)) & (ohm - 1u)) - (int)(((x) - (y)) & ohm))
+        /* 规范 get_relative_dist（5.9.x）：v = (a-b) & (ohm-1)；仅当 v **大于**
+         * ohm/2 才减 ohm。ties（v == ohm/2）保留正值。
+         * 之前写成 `v - (v & ohm)`，等于用 bit order_hint_bits 判符号：只有差值
+         * 恰好 = 3*ohm/4 时才为负，回绕处（如 hint=0 参考 hint=96，ohm=128）
+         * 本应 -32 却算成 +96，skipModeAllowed 少 1 位，帧头整体错位 1 位。 */
+#define RELD(x, y) ((((x) - (y)) & (ohm - 1u)) > (ohm >> 1)                         \
+                    ? (int)((((x) - (y)) & (ohm - 1u)) - ohm)                       \
+                    : (int)(((x) - (y)) & (ohm - 1u)))
         int fwd = -1, bwd = -1;
         unsigned fwd_h = 0, bwd_h = 0;
         for (int i = 0; i < 7; i++) {
