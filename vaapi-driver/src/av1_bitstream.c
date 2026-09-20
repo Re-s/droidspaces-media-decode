@@ -840,7 +840,18 @@ static void put_lr_params(struct dmd_bitwriter *bw,
          * 6 帧样本里 ry=rcb=rcr=0，整个 if 块被跳过，掩盖了缺陷。 */
         const unsigned sh = p->loop_restoration_fields.bits.lr_unit_shift;
         if (p->seq_info_fields.fields.use_128x128_superblock) {
-            dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
+            /* ⚠️ sbs128=1 时码流位是**有效位移减一**（规范 5.9.20：
+             * "When use_128x128_superblock is equal to 1, lr_unit_shift is
+             * set equal to 1 + lr_unit_shift"），有效值只可能是 1 或 2。
+             * VA-API 给的是有效值，所以这里必须写 sh-1，而不是 sh 的非零判定。
+             *
+             * 实测（testsrc 合成流 av1_probe.mp4，帧 oh=16，lr_type[2]=SGRPROJ，
+             * 源码流该位 0 ⇒ 有效位移 1）：旧写法把 0 写成 1 ⇒ 有效位移 2 ⇒
+             * restoration 单元从 64 变成 128 ⇒ **整条流每一帧都错**
+             * （framemd5 128/128 全不匹配，浏览器里表现为满屏坏帧）。
+             * 之所以此前 B 站 1800 帧真流逐字节一致，是它的 restoration 帧
+             * 恰好全是有效位移 2（写 1 蒙对）—— 这个缺陷被样本掩盖了。 */
+            dmd_bw_put_bits(bw, sh > 1 ? 1 : 0, 1);
         } else {
             dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
             if (sh)
