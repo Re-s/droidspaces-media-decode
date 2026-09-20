@@ -48,8 +48,14 @@
  * 640 字节，且 slice_height 被反推成 492（真实 736），每帧截断。
  * 另修首帧纯绿（NV12 的 UV=0 是最大色偏，转 RGB 恰好是纯绿，应填 128）。
  * 新增多分辨率与分辨率切换回归——旧回归全是 1080p，恰好等于默认几何，
- * 永不触发该分支，这个缺陷因此长期未被发现。详见 CHANGELOG。 */
-#define DMD_DRIVER_VERSION "0.4.6"
+ * 永不触发该分支，这个缺陷因此长期未被发现。 */
+/* 0.4.7（预发布 rc1）：AV1 硬解可用。本内核 msm_vidc 的 AV1 fourcc 是非标准
+ * AV10；硬件只对 show_frame=1 的帧吐像素，而 VA-API 不传 refresh_frame_flags，
+ * 故用"像素趟 + DPB 修复趟"两遍法补齐槽位与帧上下文回写；影子 DPB 按本驱动
+ * 帧号记账以适配消费者的 surface 复用。真流（B 站 1080p60，1800 帧）与软解
+ * 逐字节一致，吞吐 120~190fps。另按固件能力运行时门控 VP8/MPEG-2（本机不支持，
+ * 此前虚报 profile）。详见 CHANGELOG。 */
+#define DMD_DRIVER_VERSION "0.4.7"
 /* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
  * 例：0.4.3+60534cf2 / 0.4.3+60534cf2-dirty。这样 vainfo 能明确报告
  * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */

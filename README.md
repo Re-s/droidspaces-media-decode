@@ -36,7 +36,8 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | HEVC Main | ✅ 可用 | 12/12 帧，md5 与软解逐字节一致 |
 | VP9 Profile 0 | ✅ 可用 | 50/50 帧，md5 与软解逐字节一致 |
 | VP8 | ✅ 可用 | 90/90 帧，md5 与软解逐字节一致（0.4.2 新增）|
-| AV1 Profile 0 | 🚧 未完成 | 帧数与 dav1d 一致，**像素未通过**，默认不声明 |
+| AV1 Profile 0 | ✅ 可用（预发布 rc1） | 真流（B 站 1080p60）1800/1800 帧 md5 与软解逐字节一致，120~190fps；另 14 组合成结构回归全过 |
+| AV1 10bit（P010） | 🚧 合成流通过 | 896 帧逐字节一致；真 10bit 网络流未测 |
 | MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
 | HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
 
@@ -55,7 +56,7 @@ AV1 需要 `-DDMD_ENABLE_AV1` 才会声明，MPEG-2 需要 `-DDMD_ENABLE_MPEG2`�
 ```sh
 # 依赖：build-essential pkg-config libva-dev libdrm-dev
 cd vaapi-driver
-make            # 产物 build/msm_drm_drv_video.so
+make AV1=1      # 产物 build/msm_drm_drv_video.so（含 AV1；不带 AV1=1 则不声明）
 make check      # 确认导出了 __vaDriverInit_* 入口
 make tests      # 单元测试
 ```
