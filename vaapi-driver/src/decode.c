@@ -1476,6 +1476,66 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->av1_pic_param, b->data,
                        sizeof(VADecPictureParameterBufferAV1));
                 c->have_av1_pic_param = 1;
+                /* 诊断：把消费者给的**每一个**合成输入打出来。
+                 * 合成流的正确性只能靠"与源码流逐字段对拍"，而对拍要先
+                 * 知道 VA 侧到底给了什么 —— 是消费者没填，还是我们读错。
+                 * DMD_AV1_PICDBG=1 时打前 6 帧。 */
+                if (getenv("DMD_AV1_PICDBG")) {
+                    static int pdbg;
+                    const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
+                    const __typeof__(q->seq_info_fields) *sq = &q->seq_info_fields;
+                    if (++pdbg <= 6) {
+                        const __typeof__(q->pic_info_fields) *pf =
+                            &q->pic_info_fields;
+                        fprintf(stderr,
+                            "[picdbg] #%d ft=%u show=%u showable=%u oh=%u "
+                            "cur=%u scm=%u int_mv=%u intrabc=%u hiprec=%u "
+                            "switchable=%u refmvs=%u err_res=%u cdf_upd=%u "
+                            "endupd=%u unif=%u warp=%u lgt=%u tx=%u "
+                            "tiles=%ux%u ctx_upd=%u prof=%u dbi=%u ohb=%u\n",
+                            pdbg, (unsigned)pf->bits.frame_type,
+                            (unsigned)pf->bits.show_frame,
+                            (unsigned)pf->bits.showable_frame,
+                            (unsigned)q->order_hint,
+                            (unsigned)q->current_frame,
+                            (unsigned)pf->bits.allow_screen_content_tools,
+                            (unsigned)pf->bits.force_integer_mv,
+                            (unsigned)pf->bits.allow_intrabc,
+                            (unsigned)pf->bits.allow_high_precision_mv,
+                            (unsigned)pf->bits.is_motion_mode_switchable,
+                            (unsigned)pf->bits.use_ref_frame_mvs,
+                            (unsigned)pf->bits.error_resilient_mode,
+                            (unsigned)pf->bits.disable_cdf_update,
+                            (unsigned)pf->bits.disable_frame_end_update_cdf,
+                            (unsigned)pf->bits.uniform_tile_spacing_flag,
+                            (unsigned)pf->bits.allow_warped_motion,
+                            (unsigned)pf->bits.large_scale_tile,
+                            (unsigned)0,
+                            (unsigned)q->tile_cols, (unsigned)q->tile_rows,
+                            (unsigned)q->context_update_tile_id,
+                            (unsigned)q->profile, (unsigned)q->bit_depth_idx,
+                            (unsigned)q->order_hint_bits_minus_1);
+                        fprintf(stderr,
+                            "[seqdbg] #%d still=%u sbs128=%u f_intra=%u "
+                            "edge=%u iic=%u mc=%u dual=%u oh_en=%u jnt=%u "
+                            "cdef=%u mono=%u range=%u subs=%u/%u fg=%u\n",
+                            pdbg, (unsigned)sq->fields.still_picture,
+                            (unsigned)sq->fields.use_128x128_superblock,
+                            (unsigned)sq->fields.enable_filter_intra,
+                            (unsigned)sq->fields.enable_intra_edge_filter,
+                            (unsigned)sq->fields.enable_interintra_compound,
+                            (unsigned)sq->fields.enable_masked_compound,
+                            (unsigned)sq->fields.enable_dual_filter,
+                            (unsigned)sq->fields.enable_order_hint,
+                            (unsigned)sq->fields.enable_jnt_comp,
+                            (unsigned)sq->fields.enable_cdef,
+                            (unsigned)sq->fields.mono_chrome,
+                            (unsigned)sq->fields.color_range,
+                            (unsigned)sq->fields.subsampling_x,
+                            (unsigned)sq->fields.subsampling_y,
+                            (unsigned)sq->fields.film_grain_params_present);
+                    }
+                }
                 /* AV1 的显示顺序就是 order_hint（规范 6.8.2），
                  * 作用与 H.264/HEVC 的 POC 相同：解码器按显示序吐帧，
                  * 而 ffmpeg 按解码序提交，配对回退路径需要它。
@@ -3813,6 +3873,25 @@ found:
     return head;
 }
 
+/* 诊断：把**真正交给消费者**的那份像素落盘（DMD_SURF_DUMP2=<前缀>）。
+ *
+ * 文件名带落盘序号、目标 surface、unit 号，因此可以不依赖显示就能判断
+ * "驱动写进 surface 的东西对不对"。用途：同一条码流分别用 ffmpeg 与浏览器
+ * 跑一遍，逐帧比 md5 —— 输入字节相同时，这一步能把缺陷切到
+ * "解码/槽位状态" 还是 "导出与显示路径"。 */
+static void surf_dump_store(struct dmd_surface *s, unsigned unit)
+{
+    const char *pre = getenv("DMD_SURF_DUMP2");
+    if (!pre || !pre[0] || !s->data || s->data_size == 0)
+        return;
+    static unsigned n;
+    char path[512];
+    snprintf(path, sizeof path, "%s.%04u.s%u.u%u.yuv", pre, ++n,
+             (unsigned)s->id, unit);
+    FILE *fp = fopen(path, "wb");
+    if (fp) { fwrite(s->data, 1, s->data_size, fp); fclose(fp); }
+}
+
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
@@ -3889,6 +3968,7 @@ static void surface_store_frame_locked(struct dmd_surface *s,
 
     dumb_sync_end_write(s);
 
+    surf_dump_store(s, (unsigned)f->unit_seq);
     s->decode_status = VA_STATUS_SUCCESS;
 }
 
