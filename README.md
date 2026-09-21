@@ -130,7 +130,7 @@ FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
 
 ```bash
 D=/usr/share/applications/google-chrome.desktop
-F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
 grep -q render-node-override "$D" || {
   sudo cp "$D" "$D.bak"
   sudo sed -i "s|^\(Exec=[^ ]*\)|\1 $F|" "$D"
@@ -138,8 +138,20 @@ grep -q render-node-override "$D" || {
 grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数增长
 ```
 
-然后按机型处理 Vulkan（ nabu 设为 `Disabled`，骁龙 8 Elite 保持 `Enabled`），
-重启浏览器。这一步没有命令行等价物，原因见下方提示与指南第 2.5 节。
+`--use-angle=vulkan` 与 `--enable-features=` 里的 `Vulkan` 两项是**显式打开 Vulkan**：
+新 profile 上它本来就是默认开，写上只是保险 —— 别人的 profile 可能被改过
+（`chrome://flags` 的改动存在 `Local State` 里，会一路跟着 profile 走）。
+注意 `--enable-features` 要**写成一条**、多项用逗号分隔，不要重复出现两次。
+
+nabu（SD855）这一代相反：**必须去掉这两项**并到 `chrome://flags` 里把 Vulkan
+设为 `Disabled`，否则 wayland 与 Vulkan 冲突、硬解与呈现都不正常。
+骁龙 8 Elite 则是关掉就花屏（文字糊成一团并重影），只能保持开启。
+
+命令行只能把 Vulkan **打开**，**关不掉**：这个二进制里没有 `--disable-vulkan`
+（只有 `enable-vulkan`、`use-vulkan`），`--disable-features=Vulkan`
+与 `--use-vulkan=disabled` 实测也全部无效 —— 要关只能手动改 `chrome://flags`。
+原因与逐条实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
+重启浏览器后生效。
 
 本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该
 profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、

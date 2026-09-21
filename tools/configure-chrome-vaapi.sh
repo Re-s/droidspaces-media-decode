@@ -8,17 +8,30 @@
 #      无 sudo 时自动改用 ~/.local/share/applications 下的用户级副本）
 #   2. 生成 ~/.local/bin/chrome-msm-vaapi 包装脚本，方便命令行直接起
 #
-# ⚠️ 有一项本脚本无法代劳，且**结论按机型相反**：Vulkan 只能在 chrome://flags
-# 里手动改。nabu（SD855）上必须关；骁龙 8 Elite 上必须保持开启 —— 关掉会
-# 文字糊成一团、画面重影。判据是显示是否正常，不是日志里有没有
-# "not compatible with Vulkan"（那句 ERROR 两台机器都会打，可以无视）。
-# 另外 Chrome 没有可用的命令行开关：实测 --disable-vulkan（这个开关根本
-# 不存在）、--disable-features=Vulkan、--use-vulkan=disabled 及其组合全部无效。
-# 详见 doc/browser-vaapi-guide.md 第 2.5 节。
+# ⚠️ Vulkan 这项**按机型相反**，脚本用 DMD_VULKAN 开关区分：
+#   默认（开）—— 骁龙 8 Elite 及更新机型必须开，关掉会文字糊成一团、画面重影
+#   DMD_VULKAN=off —— nabu(SD855) 必须关，那里 wayland 与 Vulkan 冲突
+#
+# 不对称的地方：命令行**能打开** Vulkan（--use-angle=vulkan + enable-features 里
+# 加 Vulkan，本脚本默认就这么做），但**关不掉** —— Chrome 151 的二进制里没有
+# --disable-vulkan 这个开关（只有 enable-vulkan、use-vulkan），
+# --disable-features=Vulkan、--use-vulkan=disabled 及其组合实测全部无效。
+# 所以 nabu 除了设 DMD_VULKAN=off，还得手动进 chrome://flags 选 Disabled。
+# 判据是显示是否正常，不是 GPU 进程有没有打 "not compatible with Vulkan"
+# （那句两台机器都会打，可以无视）。详见 doc/browser-vaapi-guide.md 第 2 / 2.5 节。
 
 set -u
 
-FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+# --enable-features 只能出现一次：重复出现时 CommandLine 只取一个值，
+# 后面那份会被丢掉 —— 所以 Vulkan 必须并进同一个逗号列表，不能另起一条。
+FEATURES="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+ANGLE_FLAG=""
+if [ "${DMD_VULKAN:-on}" != "off" ]; then
+    FEATURES="$FEATURES,Vulkan"
+    ANGLE_FLAG="--use-angle=vulkan"
+fi
+
+FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist $ANGLE_FLAG --enable-features=$FEATURES"
 MARKER="render-node-override"
 LOCAL_BIN="$HOME/.local/bin"
 WRAPPER="$LOCAL_BIN/chrome-msm-vaapi"
@@ -30,10 +43,13 @@ err() { printf '%s\n' "error: $*" >&2; }
 usage() {
     cat <<'EOF'
 用法: configure-chrome-vaapi.sh [--verify|--uninstall]
+      DMD_VULKAN=off sh configure-chrome-vaapi.sh    # nabu(SD855)：不注入 Vulkan
 
 默认执行安装。环境变量：
   CHROME_BIN   指定 Chrome 可执行文件（默认自动探测）
   DMD_VA_LOG   设为 1 时，注入的 Exec 会带上 DMD_VA_LOG=1 以便看驱动日志
+  DMD_VULKAN   默认 on（打开 Vulkan，骁龙 8 Elite 及以上必须如此）；
+               设为 off 则不注入 Vulkan 相关参数（nabu / SD855 用这个）
 EOF
 }
 
@@ -127,8 +143,9 @@ install_wrapper() {
     cat > "$WRAPPER" <<EOF
 #!/bin/sh
 # 由 configure-chrome-vaapi.sh 生成。带 msm_drm VA-API 硬解参数启动 Chrome。
-# Vulkan 设置只在 chrome://flags 里改得动（命令行无效）：nabu 要关，
-# 骁龙 8 Elite 保持默认开启。判据见 doc/browser-vaapi-guide.md 第 2.5 节。
+# Vulkan 参数已在下面的 FLAGS 里（DMD_VULKAN=off 生成时则不含）。
+# 注意命令行只能"开"不能"关"：nabu(SD855) 想关还得进 chrome://flags 选 Disabled。
+# 判据见 doc/browser-vaapi-guide.md 第 2.5 节。
 exec env MESA_LOADER_DRIVER_OVERRIDE=msm \\
     "$chrome" $FLAGS "\$@"
 EOF
@@ -150,9 +167,18 @@ do_install() {
     [ "$found" = 0 ] && say "  未找到 Chrome 的 .desktop，跳过桌面图标配置"
     install_wrapper || return 1
     say ""
-    say "还需手动确认一项：chrome://flags 里的 Vulkan。nabu(SD855) 设为 Disabled，"
-    say "骁龙 8 Elite 保持默认 Enabled（关了会文字糊、重影）。改完重启浏览器。"
-    say "这一项没有可用的命令行开关，见 doc/browser-vaapi-guide.md 第 2.5 节。"
+    if [ -n "$ANGLE_FLAG" ]; then
+        say "Vulkan: 本次已按骁龙 8 Elite 的要求打开（--use-angle=vulkan + enable-features 里的 Vulkan）。"
+        say "如果这台是 nabu(SD855)，重跑一次 DMD_VULKAN=off $0 覆盖配置，"
+        say "并且还要手动进 chrome://flags 把 Vulkan 设为 Disabled —— 命令行关不掉它。"
+    else
+        say "Vulkan: 本次按 nabu(SD855) 的处理，没有注入 Vulkan 参数。"
+        say "还必须手动进 chrome://flags 把 Vulkan 设为 Disabled —— 命令行关不掉它。"
+        say "（骁龙 8 Elite 不能这么设：关了会文字糊成一团、画面重影。）"
+    fi
+    say "改完重启浏览器。判据是视频与文字是否正常，不看日志有没有"
+    say "'not compatible with Vulkan'（那句两台机器都会打，可无视）。"
+    say "详见 doc/browser-vaapi-guide.md 第 2.5 节。"
     say ""
     say "验证: bash tools/check-browser-vaapi.sh"
 }
@@ -182,9 +208,11 @@ do_verify() {
     fi
 
     say ""
-    say "无法自动检查的一项：chrome://flags 里的 Vulkan 设置（nabu 应为 Disabled，"
-    say "8 Elite 应为 Enabled）。判据是视频与文字显示是否正常，"
-    say "不看 GPU 进程有没有打印 'not compatible with Vulkan'——那句两台都会打。"
+    say "注入的参数里 Vulkan 部分: ${ANGLE_FLAG:-（本次按 nabu 处理，未注入）}"
+    say "还需人工确认的一项：chrome://flags 里的 Vulkan。**命令行只能开、不能关** —— "
+    say "nabu(SD855) 必须手动设为 Disabled（8 Elite 相反，必须保持 Enabled）。"
+    say "判据是视频与文字显示是否正常，不看 GPU 进程有没有打"
+    say "'not compatible with Vulkan'（那句两台都会打）。"
     return $rc
 }
 

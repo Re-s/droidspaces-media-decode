@@ -206,6 +206,11 @@ Full instructions, flags, profile configuration and verification steps are in
   enumerates DRM devices on the PCI bus, skipping ARM platform devices
 - **Firefox needs `MOZ_DISABLE_RDD_SANDBOX=1`** plus the four VA-API prefs in
   user.js; find the real profile via the Default entry in `installs.ini`
+- **Vulkan is model-dependent**: Snapdragon 8 Elite needs it *on* (add
+  `--use-angle=vulkan --enable-features=...,Vulkan` to be sure — the default is
+  already on for a fresh profile), while nabu / SD855 needs it *off*. It can be
+  enabled from the command line but **not** disabled there: this Chrome build has
+  no `--disable-vulkan` switch, so turning it off means `chrome://flags`
 - Firefox is recommended for HEVC playback (Chrome has a platform-level
   presentation-feedback issue on the anland display bridge)
 - Quick check: `bash tools/check-browser-vaapi.sh`

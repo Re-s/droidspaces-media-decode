@@ -82,7 +82,8 @@ google-chrome \
   --ozone-platform=wayland \
   --render-node-override=/dev/dri/renderD128 \
   --ignore-gpu-blocklist \
-  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+  --use-angle=vulkan \
+  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
 ```
 
 | 参数 | 原理 |
@@ -90,7 +91,16 @@ google-chrome \
 | `--ozone-platform=wayland` | 见上节，dmabuf 输出的前提 |
 | `--render-node-override=/dev/dri/renderD128` | **核心**。Chromium `vaapi_wrapper.cc` 的 `PreSandboxInitialization()` 只枚举 PCI 总线 DRM 设备，ARM 平台设备的 renderD128 会被 `if (device->bustype != DRM_BUS_PCI) continue;` 跳过。此开关走 `LoadDrmFD()` 分支绕过白名单 |
 | `--ignore-gpu-blocklist` | ARM GPU 在 Chrome 的软件渲染黑名单里 |
+| `--use-angle=vulkan` | ANGLE（WebGL 与部分 GL 呈现路径）走 Vulkan 后端 |
 | `--enable-features=...` | Linux VA-API 解码总开关（DMABUF/GL 两路都开） |
+
+最后一条**必须写成一项、多个 feature 用逗号分隔**：`--enable-features` 出现两次时
+不要依赖框架帮你合并，写全在一个列表里最稳。
+
+`Vulkan` 与 `--use-angle=vulkan` 是"显式打开 Vulkan"，按机型取舍：
+新 profile 上 Vulkan 本来默认开，写上只是保险（别人 profile 里的
+`chrome://flags` 设置可能被改过，见第 2.5 节）；**nabu / SD855 必须去掉这两项**，
+否则 wayland 与 Vulkan 冲突。
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
 
@@ -130,9 +140,13 @@ feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不�
 --use-vulkan=disabled --disable-features=Vulkan,VulkanFromANGLE   # 仍然无效
 ```
 
-也就是说这一项**只能手动在 `chrome://flags` 里改**（选择存在 profile 的
-`Local State` 里，备份 profile 会带走），换机器或重建 profile 后要再改一次
-—— 而在 8 Elite 上：**不需要改，保持默认（Enabled）**。
+也就是说**关**这一项只能手动在 `chrome://flags` 里改（选择存在 profile 的
+`Local State` 里，备份 profile 会带走），换机器或重建 profile 后要再改一次。
+
+反过来**开**是有效的：`--enable-features=...,Vulkan --use-angle=vulkan`
+（第 2 节那条命令里就带着）。所以 8 Elite 上不需要去动 `chrome://flags`，
+万一别人的 profile 里 Vulkan 被置成过 `Disabled`，用命令行这两项把它拉回来即可；
+而 nabu 想关就没有这么方便了 —— 只能进 `chrome://flags` 手动设。
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
@@ -142,7 +156,9 @@ feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不�
 D=/usr/share/applications/google-chrome.desktop
 if ! grep -q "render-node-override" "$D"; then
     [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
-    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+    # 骁龙 8 Elite 及更新的机型：带上末尾这两项，确保 Vulkan 是开着的
+    # nabu / SD855：删掉 --use-angle=vulkan 与 ,Vulkan（那代必须关 Vulkan）
+    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
     sudo sed -i \
       -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
       -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
