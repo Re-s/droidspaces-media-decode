@@ -39,7 +39,8 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 | HEVC Main | ✅ Working | 12/12 frames, md5 byte-identical to software |
 | VP9 Profile 0 | ✅ Working | 50/50 frames, md5 byte-identical to software |
 | VP8 | ✅ Working | 90/90 frames, md5 byte-identical to software (new in 0.4.2) |
-| AV1 Profile 0 | 🚧 Incomplete | Frame count matches dav1d, **pixels do not**; not advertised by default |
+| AV1 Profile 0 | ✅ Working (0.4.7) | Real stream (Bilibili 1080p60) 1800/1800 frames md5 byte-identical to software at 120~190 fps, plus 14 synthetic-structure regressions; in Chrome 480p/720p/1080p/**4K** all balance per session, 3-stream concurrency and MSE (seek / in-band resolution change) pass |
+| AV1 10-bit (P010) | 🚧 Decodes, **not usable in browsers** | Real 10-bit streams are byte-identical to software through the ffmpeg path; Chrome/Firefox request `SEPARATE_LAYERS`, and 10-bit two-layer export is not implemented yet, so browsers silently fall back to software (known limitation) |
 | MPEG-2 | 🚧 Incomplete | Synthesis is byte-identical to the original stream, but firmware raises `SYS_ERROR`; not advertised by default |
 | HEVC Main10 / VP9 Profile2 | ❌ Firmware limit | Firmware recognises 10-bit but keeps reporting `INSUFFICIENT` and emits no frames |
 

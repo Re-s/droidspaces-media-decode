@@ -92,10 +92,18 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
      * 判据是 DRM 侧没有能准确表达 P010 的分离层格式：本机的
      * libdrm/drm_fourcc.h 里有 R10（10bit 存进 16bit LE），但没有 GR10，
      * 于是 UV 层只能借用 GR16/GR1616 这类"16bit 原生"格式 —— 那会让
-     * 消费方按 16bit 量程解释采样值，整幅暗 64 倍。COMPOSED 用
-     * DRM_FORMAT_P010 是明确无误的，Chrome 走的正是 COMPOSED。
-     * Firefox 传 SEPARATE，所以对 10bit 流会回落软解（不会花屏）。
-     * 想在 Firefox 上开 10bit，得先在真机确认它的格式解释再放开这里。 */
+     * 消费方按 16bit 量程解释采样值，整幅暗 64 倍。
+     *
+     * ⚠️ 0.4.7 实测更正：这里原来写"Chrome 走的正是 COMPOSED"是**错的**。
+     * Chrome 151 在 8bit 与 10bit 上传的都是 flags=0x5
+     * （SEPARATE_LAYERS | READ_ONLY），日志：
+     *     ExportSurfaceHandle: surface 1 是 P010，SEPARATE_LAYERS 未实现（flags=0x5）
+     *     vaapi_wrapper.cc:2756] vaExportSurfaceHandle failed,
+     *         VA error: the requested RT Format is not supported
+     * 后果要说清：**10bit 硬件本身能解**（ffmpeg 路径真 10bit 流输出 p010le
+     * 与软解逐字节一致），只是浏览器拿不到可导入的 10bit 双层描述，
+     * 于是 Chrome 建了会话、`送入 0` 后静默回落软解。
+     * 想在浏览器里开 10bit，得先把 10bit 的分离层格式定下来再放开这里。 */
     if (ten_bit && !(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
         dmd_log("ExportSurfaceHandle: surface %u 是 P010，"
                 "SEPARATE_LAYERS 未实现（flags=0x%x）\n",
@@ -129,7 +137,8 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     desc->objects[0].size = (uint32_t)total;
     desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 
-    /* Firefox 传 VA_EXPORT_SURFACE_SEPARATE_LAYERS，要求 Y / UV 各成一层。
+    /* Firefox 与 Chrome 都传 VA_EXPORT_SURFACE_SEPARATE_LAYERS（Chrome 实测
+     * flags=0x5），要求 Y / UV 各成一层。
      * 合并成一层（NV12 单 layer）只有在对方传 COMPOSED_LAYERS 时才合适。 */
     if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
         desc->num_layers = 1;
@@ -163,10 +172,13 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 
     /* 诊断黑帧：DMD_VA_LUMA=1 时抽样算 Y 平面亮度均值并打进日志。
      *
-     * 为什么需要在这里量：黑帧只在浏览器路径上出现，而 ffmpeg 路径
-     * （六条流回归）永远看不到 —— 它不会像浏览器那样中途重启解码器。
-     * 导出这一刻是驱动能看到最终像素的最后位置。
-     * 纯诊断，默认关闭，不影响正常路径。 */
+     * ⚠️ 这个计数**只对 Firefox 路径有意义**。Chrome 是在解码之前就导出
+     * surface（见上面第 46 行那段），此刻像素注定是全零 —— 0.4.7 实测
+     * 一次 MSE 压测 162 次采样全部报"黑帧"，而帧本身是正常解出来并写进
+     * surface 的。所以别拿它在 Chrome 上判画质，会得出反的结论。
+     *
+     * 为什么还需要它：Firefox 在 vaSyncSurface 之后才导出，采样点落在
+     * 像素写完之后，这时下面那段"UV 全零 = 纯绿"的判据才成立。 */
     if (getenv("DMD_VA_LUMA")) {
         const unsigned char *y = s->data;
         if (y && s->data_size >= (size_t)stride * 16) {
