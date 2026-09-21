@@ -499,6 +499,12 @@ struct dmd_context {
     unsigned long  av1_flushed;      /* sync flush 送出暂存帧的次数 */
     unsigned long  av1_flush_show1;  /* flush 送出的帧里 show=1 的次数 */
     unsigned long  av1_ep_show1;     /* EndPicture 送出的帧里 show=1 的次数 */
+    /* 参考帧全不在影子 DPB 而被丢掉的帧（拖到 GOP 中间起解、码流截断）。
+     * av1_ref_drop 是累计数，av1_ref_drop_now 只在**本次** EndPicture 内
+     * 有效：build_unit 用它告诉 EndPicture"这次 NULL 是丢帧，不是不支持
+     * 码流重建"，两者的收尾不同（前者要按空壳交付并返回成功）。 */
+    unsigned long  av1_ref_drop;
+    int            av1_ref_drop_now;
     /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
      * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
      * 否则队列里多出永远配不上的条目。 */

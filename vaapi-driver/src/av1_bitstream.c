@@ -1181,6 +1181,54 @@ static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
  *   OBU_FRAME(6)        用 byte_alignment（规范 5.10.1）
  * 这个区别是实测踩出来的：用错会让 tile_group 起始位置偏移，
  * dav1d 报 "Failed to read unit"。 */
+/* 把 VA 的第 i 个参考翻成本合成流的槽号。返回 0 表示**解析不出来**：
+ * 消费者给的 ref_frame_map 项是 VA_INVALID_ID（该槽没有帧），或它指向的帧
+ * 早已被踢出影子 DPB。slot_out 仍会给一个可用的槽号（透传源槽号），
+ * 便于调用方在"照样要送"的路径上保持原有行为。 */
+static int resolve_ref(struct dmd_av1_dpb *dpb,
+                       const VADecPictureParameterBufferAV1 *p,
+                       int i, unsigned *slot_out)
+{
+    const unsigned va_slot = p->ref_frame_idx[i];
+    *slot_out = va_slot < 8 ? va_slot : 0;
+    if (!dpb || va_slot >= 8)
+        return 0;
+    const int want_frame = dmd_av1_frame_of(dpb, p->ref_frame_map[va_slot]);
+    if (want_frame <= 0)
+        return 0;
+    for (int k = 0; k < 8; k++) {
+        if (dpb->dpb_shadow[k] == want_frame) {
+            *slot_out = (unsigned)k;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int dmd_av1_refs_resolvable(const void *pic_v, struct dmd_av1_dpb *dpb)
+{
+    const VADecPictureParameterBufferAV1 *p = pic_v;
+    if (!p)
+        return 1;
+    const uint32_t ft = p->pic_info_fields.bits.frame_type;
+    /* KEY / INTRA_ONLY / SWITCH 都不读参考帧内容（SWITCH 全刷），
+     * allow_intrabc 的帧整帧 intra（规范里直接跳过帧间预测），也不读。
+     * ⚠️ 不要拿 reference_select 当放行条件：规范 5.9.2 里它为 0 只是
+     * "不显式给出 7 个槽号"，帧照样引用 LAST（ref_frame_idx[0]）。 */
+    if (ft != 1 /* INTER_FRAME */ || p->pic_info_fields.bits.allow_intrabc)
+        return 1;
+    /* 真正会被解码器取用的槽位：LAST 恒用；复合参考/skip_mode 再用 ALTREF
+     * （规范 5.9.2 的 ref_alternate_frame = ref_frame_map[ref_frame_idx[3]]）。
+     * VA-API 的 PPB 里没有 reference_mode（它在 slice 参数里），所以这里
+     * 保守地把 3 也算进"用到的参考"。 */
+    unsigned unused_slot;
+    if (!resolve_ref(dpb, p, 0, &unused_slot))
+        return 0;
+    if (!resolve_ref(dpb, p, 3, &unused_slot))
+        return 0;
+    return 1;
+}
+
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     struct dmd_av1_dpb *dpb,
                                     const VADecPictureParameterBufferAV1 *p, int tile_size_bytes)
@@ -1495,25 +1543,21 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 影子 DPB 里同一 surface 可能占多个槽（KEY/全刷帧刷新 8 槽），
          * 取哪个都等价（内容与 CDF 相同），取扫描到的第一个。 */
         for (int i = 0; i < 7; i++) {
-            unsigned va_slot = p->ref_frame_idx[i];
-            unsigned my;
-            int want_frame = -1;
-            if (va_slot < 8 && dpb)
-                want_frame = dmd_av1_frame_of(dpb, p->ref_frame_map[va_slot]);
-            if (want_frame > 0) {
-                my = va_slot;   /* 查不到时退回透传 */
-                for (int k = 0; k < 8; k++) {
-                    if (dpb->dpb_shadow[k] == want_frame) {
-                        my = (unsigned)k;
-                        break;
-                    }
-                }
-            } else {
-                my = va_slot < 8 ? va_slot : 0;
-            }
+            unsigned my = 0;
+            const int ok = resolve_ref(dpb, p, i, &my);
             if (getenv("DMD_AV1_DBG"))
-                fprintf(stderr, "[dbg] ref[%d]: va_slot=%u want_frame=%d "
-                                "-> my_slot=%u\n", i, va_slot, want_frame, my);
+                fprintf(stderr, "[dbg] ref[%d]: va_slot=%u -> my_slot=%u %s\n",
+                        i, (unsigned)p->ref_frame_idx[i], my,
+                        ok ? "" : "未解析");
+            if (getenv("DMD_AV1_REFDBG"))
+                fprintf(stderr, "[refdbg] f=%d t=%u ref[%d]: surf=%u va_slot=%u"
+                                " -> my=%u%s\n",
+                                dpb ? dpb->frame_seq : -1, frame_type, i,
+                                (unsigned)(p->ref_frame_idx[i] < 8
+                                               ? p->ref_frame_map[p->ref_frame_idx[i]]
+                                               : 0),
+                                (unsigned)p->ref_frame_idx[i], my,
+                                ok ? "" : "  <-- 未解析");
             my_idx[i] = my;
             dmd_bw_put_bits(&bw, my, 3);
         }

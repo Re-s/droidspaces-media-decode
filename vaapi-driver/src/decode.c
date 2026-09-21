@@ -1924,6 +1924,31 @@ static const unsigned char *build_unit(struct dmd_context *c,
                                    c->av1_repair_buf, c->av1_repair_len,
                                    c->av1_repair_bitpos,
                                    c->av1_repair_frame);
+
+        /* 引用帧不在影子 DPB 里 —— 这帧硬件不可能解出来，见
+         * dmd_av1_refs_resolvable() 的注释（Venus 对引用空槽的帧不出帧也不
+         * 报错，会把整条码流拖死）。
+         *
+         * ⚠️ 判断必须放在 patch_prev_refresh **之后**。放在之前实测会级联误丢：
+         * 影子槽位的登记就发生在 patch 里（上一帧的真实 refresh 由本帧的
+         * map 差分反算出来，然后登记），跳过 patch 等于让上一帧永远不进
+         * DPB，于是它后面每一帧都"引用不可解析"。mid5.ivf 实测：patch 前
+         * 判断 → 43 帧里丢 37 帧，只有 KEY 与其后继 1 帧出画；patch 后
+         * 判断 → 只丢 KEY 之前的 7 帧。
+         *
+         * 被丢的帧不合成、不送硬件，但它的 map 仍作为差分基准被 patch 记录
+         * ——这是对的：下一帧 patch 拿它做差分算的是"这个被丢的帧在源流里
+         * 踢掉了谁"，用于本帧的占槽选择；而它自己的 refresh 值因修复缓冲为
+         * 空（build 提前返回，没写 av1_next_repair_buf）被自然丢弃。 */
+        if (!dmd_av1_refs_resolvable(pp, &c->av1_dpb)) {
+            c->av1_ref_drop++;
+            dmd_log("EndPicture: AV1 surface=%u 的参考帧不在 DPB"
+                    "（拖到 GOP 中间起解？），跳过提交并按空壳交付\n",
+                    (unsigned)c->current_target);
+            c->av1_ref_drop_now = 1;
+            return NULL;
+        }
+
         if (want_tiles == 0 || (uint32_t)c->av1_tile_count != want_tiles) {
             /* tile 数量与帧头声明不符会让解码器从第二个 tile 起全部错位，
              * 与其送出去让 MediaCodec 解出花屏，不如干净回落软解。 */
@@ -2498,32 +2523,27 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
 
     /* ================================================================
-     * AV1 当前的阻塞点：ffmpeg 对 show_frame=0 的 surface 也要求像素
+     * show_frame=0 这个坑已经填了：合成帧头里 show_frame 恒置 1（"方向 A"）
      * ================================================================
-     * 实测的 surface → 数据 映射（DMD_VA_LOG 的"送出"日志，按字节数认帧）：
-     *   surface1  19258B  oh= 0  show=1
-     *   surface2   2688B  oh=16  show=0
-     *   surface3    649B  oh= 8  show=0
-     *   surface4    245B  oh= 4  show=0
-     *   surface5    183B  oh= 2  show=0
-     *   surface6     87B  oh= 1  show=1
-     * 登记与送出完全一致，无双重登记（曾怀疑此项，实测否证）。
+     * 当时的症状留档，别再当成待办：msm_vidc 只对 show_frame=1 的帧吐 CAPTURE
+     * 缓冲（正确行为），而 ffmpeg 的 VA-API 后端会对**部分** show_frame=0 的
+     * surface 调 Sync 并读像素，驱动又让这类 surface 永久停在 PENDING，于是
+     * 白等 5s 超时后报 "Failed to read image from surface 0x5: internal
+     * decoding error"，硬解停在 2 帧。
+     * 当时实测的 surface → 数据映射（按字节数认帧）：
+     *   surface1 19258B oh= 0 show=1   surface2  2688B oh=16 show=0
+     *   surface3   649B oh= 8 show=0   surface4   245B oh= 4 show=0
+     *   surface5   183B oh= 2 show=0   surface6    87B oh= 1 show=1
+     * ffmpeg 只 Sync 了 1、6、5 三个：前两个配对成功，surface5（show=0）要不到
+     * 像素。登记与送出本身完全一致，无双重登记（曾怀疑此项，实测否证）。
      *
-     * ffmpeg 实测只 Sync 了 surface 1、6、5 三个：
-     *   surface1（show=1）配对成功 ✓
-     *   surface6（show=1）配对成功 ✓
-     *   surface5（show=0）—— 它仍要像素，而该帧本就不产生输出
-     * 于是报 "Failed to read image from surface 0x5: internal decoding error"，
-     * 硬解停在 2 帧（等于 dav1d 对同段码流的基线，说明解码本身没错）。
-     *
-     * 也就是说：msm_vidc 只对 show_frame=1 的帧吐 CAPTURE 缓冲（正确行为），
-     * 而 ffmpeg 的 VA-API 后端会对部分 show_frame=0 的 surface 调 Sync 并读像素。
-     * 驱动目前让这类 surface 永久停在 PENDING，直到超时。
-     *
-     * 待定的修法（需先确认 ffmpeg VA-API 侧的确切期望，不要凭猜实现）：
-     *   a) 把 show_frame=0 的 surface 标为已完成但无像素
-     *   b) 让它复用所引用帧的内容（AV1 的 show_existing_frame 语义）
-     *   c) 在 EndPicture 阶段就识别 show_frame=0 并不为其登记 pending
+     * 现在每个提交单元都产生一次输出，所以每个被 Sync 的 surface 都配得到帧。
+     * 复核（GOP=300 的 1080p 真流前 300 帧，cut300.obu）：300 帧全部交付、
+     * 149 次 Sync、0 次超时、0 次"引用不可解析"、rc=0。
+     * 那 149 次与源流里 show_frame=1 的帧数同量级 —— ffmpeg 只为要显示的帧
+     * 取像素，这部分是预期行为。
+     * 日志里另有一条 "surface_wait: surface 1 从未提交解码，拒绝读取"，位置在
+     * CreateSurfaces 之后、任何解码之前，是 ffmpeg 的一次探测性读取，不是缺陷。
      * ================================================================ */
 
     /* ---- AV1 第二趟：DPB 趟（重发上一帧）----
@@ -2636,6 +2656,24 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     if (!unit) {
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (c->av1_ref_drop_now) {
+            /* 参考帧缺失被丢掉的帧：不能像"不支持码流重建"那样回
+             * UNIMPLEMENTED —— vaEndPicture 报错会让调用方判定整条流失败
+             * （ffmpeg 实测 rc=251、0 帧）。这里与 show_frame=0 走同一条
+             * 语义：surface 标成就绪（内容是这张 surface 上一次的残留），
+             * 流程继续往前推，码流里的下一个 KEY 一到就恢复正常。 */
+            c->av1_ref_drop_now = 0;
+            if (s) {
+                s->state = DMD_SURFACE_READY;
+                s->decode_status = VA_STATUS_SUCCESS;
+            }
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            c->av1_tile_count = 0;
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            return VA_STATUS_SUCCESS;
+        }
         if (s) {
             s->state = DMD_SURFACE_IDLE;
             s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;

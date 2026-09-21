@@ -393,6 +393,113 @@ static void test_patch_prev_refresh(void)
 }
 
 
+/* ------------------------------------------------- 引用帧可解析性判定
+ *
+ * dmd_av1_refs_resolvable() 是"从 GOP 中间起解"那道闸门：引用了硬件 DPB 里
+ * 根本不存在帧的码流，Venus 既不出帧也不报错，会把 vaSyncSurface 拖到超时、
+ * 调用方随后放弃整条码流（实测 rc=251、0 帧）。所以判错的两个方向都有代价：
+ *   该放行却拦 → 正常播放凭空丢帧（画面一直黑到下个关键帧）；
+ *   该拦却放  → 整条码流废掉。
+ * 本用例把这两侧各钉一遍。 */
+static void test_refs_resolvable(void)
+{
+    printf("引用帧可解析性判定（从 GOP 中间起解的闸门）\n");
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+
+    /* 约定：影子表槽 2 存帧号 7，帧 7 属于 surface 100。
+     * surf_hist 是静态接口，测试里直接按它的语义填。 */
+#define SETUP()   do {                                              \
+        memset(&dpb, 0, sizeof(dpb));                               \
+        memset(&pic, 0, sizeof(pic));                               \
+        dpb.dpb_shadow[2] = 7;                                      \
+        dpb.surf_hist[0].surf = 100; dpb.surf_hist[0].frame = 7;    \
+        dpb.surf_hist_n = 1;                                        \
+        dpb.frame_seq = 7;                                          \
+        for (int i = 0; i < 8; i++)                                 \
+            pic.ref_frame_map[i] = (VASurfaceID)100;                \
+        pic.ref_frame_idx[0] = 2;   /* LAST 在槽 2 */               \
+        pic.ref_frame_idx[3] = 2;   /* ALTREF 也在槽 2 */           \
+    } while (0)
+
+    /* 1. 帧间帧、引用都查得到 → 放行 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;   /* INTER_FRAME */
+    check_eq("引用齐全的帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 2. KEY / INTRA_ONLY / SWITCH 不需要参考 → 一律放行，
+     *    哪怕 map 里全是 INVALID（关键帧起解就是这个样子）。 */
+    SETUP();
+    for (int ft = 0; ft <= 3; ft++) {
+        if (ft == 1)
+            continue;
+        memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
+        pic.pic_info_fields.bits.frame_type = (unsigned)ft;
+        check_eq("非帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+    }
+
+    /* 3. allow_intrabc 的帧内帧不引用任何帧 → 放行 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.pic_info_fields.bits.allow_intrabc = 1;
+    memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
+    check_eq("intrabc 帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 4. LAST 指向一个从未解码过的 surface（VA_INVALID_ID）→ 拦。
+     *    这正是"拖到 GOP 中间起解"的头几帧：ffmpeg 的 ref_frame_map 里
+     *    那些槽是 4294967295，硬件 DPB 里对应槽是空的。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.ref_frame_map[2] = 0xffffffffu;
+    check_eq("LAST 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 5. LAST 能解析、ALTREF（槽号 5）解析不出 → 也拦。
+     *    复合参考与 skip_mode 真的会用到的槽，引用不到同样解不出来。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.ref_frame_idx[3] = 5;
+    pic.ref_frame_map[5] = 0xffffffffu;    /* 该槽里没有帧 */
+    check_eq("ALTREF 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 6. ⚠️ reference_select=0 **不能**当成"这帧不引用"放行条件。
+     *    规范 5.9.2：它为 0 只是帧头里不显式给 7 个槽号，帧照样引用 LAST
+     *    （ref_frame_idx[0]）。第一版就是加了这个提前放行，结果该拦的没拦住，
+     *    日志仍显示"合成 2957 字节"、照样 rc=251 卡死。
+     *    两个方向都要钉：引用坏 + reference_select=0 → 拦。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.mode_control_fields.bits.reference_select = 0;
+    pic.ref_frame_map[2] = 0xffffffffu;
+    check_eq("reference_select=0 且引用坏时仍拦截",
+             (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+    /* 引用好 + reference_select=0 → 放行（正常播放里大量帧是这种，
+     * 误拦就会级联：实测 43 帧丢 37 帧）。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.mode_control_fields.bits.reference_select = 0;
+    check_eq("reference_select=0 且引用齐全时放行",
+             (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 7. surface 号复用：ffmpeg 回收 surface 后同一个号属于新帧。
+     *    surf_hist 里 100 号已被帧 9 拥有，而影子表里只有帧 7 → 帧 9 查不到
+     *    → 拦。这条防的是"拿 surface 当身份"那种错法。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    dpb.surf_hist[0].frame = 9;
+    check_eq("surface 已易主时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 8. NULL 保护：没有 pic 时无从判断，放行（交给后面的 tile 检查）；
+     *    没有 dpb 时判"解析不出"→ 拦。真实调用里 dpb 是 context 的常驻
+     *    成员、永不为 NULL，这里只是把语义钉死，别日后改成静默透传。 */
+    SETUP();
+    check_eq("pic 为 NULL 时放行", (long)dmd_av1_refs_resolvable(NULL, &dpb), 1);
+    pic.pic_info_fields.bits.frame_type = 1;
+    check_eq("dpb 为 NULL 时按解析不出处理",
+             (long)dmd_av1_refs_resolvable(&pic, NULL), 0);
+#undef SETUP
+}
+
+
 /* 载荷是按位写的，断言就得按位读。
  * bit_at：第 idx 位（idx=0 是 buf[0] 的最高位），越界返回 -1。 */
 static long bit_at(const unsigned char *buf, size_t n, size_t idx)
@@ -849,6 +956,7 @@ int main(void)
     test_sequence_header();
     test_show_existing();
     test_patch_prev_refresh();
+    test_refs_resolvable();
     test_frame_header_show_frame();
     test_refresh_bitpos_invariants();
     test_global_motion();

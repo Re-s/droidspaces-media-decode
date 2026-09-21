@@ -228,6 +228,26 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 size_t prev_bitpos,
                                 int prev_frame);
 
+/* 本帧的参考帧在影子 DPB 里是否都找得到（即硬件能否解这一帧）。
+ *
+ * 为什么必须问这个：消费者把"槽里没有帧"表达成 ref_frame_map[i] =
+ * VA_INVALID_ID（把进度条拖到 GOP 中间、或码流被截断时就是这种），此时
+ * 合成流只能透传源槽号，硬件于是被要求去引用一个**从未填充过**的 DPB 槽。
+ * msm_vidc 对这种帧的行为是既不吐 CAPTURE 缓冲也不回错误事件 —— 实测
+ * 首帧即 inter 的流：提交 1 单元、取回 0 帧，SyncSurface 等满 5s 超时，
+ * 调用方（ffmpeg）就此放弃整条码流（rc=251）。软解 dav1d 的行为是丢掉这些
+ * 帧、从码流里下一个 KEY 继续出帧。所以调用方遇到本函数返回 0 时应当
+ * **不提交硬件**，直接把 surface 按空壳交付，流程才不会断。
+ *
+ * 只有 INTER 且真会读取参考的帧需要判断：KEY/INTRA_ONLY/SWITCH 不读参考，
+ * allow_intrabc 与 reference_select=0 也不读，一律返回 1。
+ * 判据只覆盖解码器真正取用的槽位（LAST 与 ALTREF，规范 5.9.2），
+ * 其余槽位是填充值，指向空槽不影响解码。
+ *
+ * 实测安全边界：健康码流（1800 帧样本取前 300 帧，2100 个引用）返回 0
+ * 的次数为 **0**，因此不会误伤正常播放。 */
+int dmd_av1_refs_resolvable(const void *pic, struct dmd_av1_dpb *dpb);
+
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {
     const unsigned char *data;
