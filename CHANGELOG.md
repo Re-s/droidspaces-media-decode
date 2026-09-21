@@ -3,6 +3,53 @@
 > 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
 > `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
 
+## 🩹 AV1 从 GOP 中间起解：从"整条码流被放弃"变成"黑到下个关键帧后逐字节正确"
+
+拖动进度条落到非关键帧、或拿到半截码流时，头几帧引用的是硬件 DPB 里根本
+不存在帧。Venus 对这种帧**既不出帧也不报错**，于是 `vaSyncSurface` 白等 2s
+（顺带触发不可逆的 `finish_input`）再等到 5s 超时返 `VA_STATUS_ERROR_TIMEDOUT`，
+ffmpeg 收到错误后放弃整条码流 —— 实测 `rc=251`、输出 0 帧。软解 dav1d 对同
+一段码流是丢掉那 7 帧、照常交出其余 36 帧。
+
+**修法**：合成前先判一次引用可否解析（`dmd_av1_refs_resolvable`），判不过的帧
+不提交、按**空壳**交付（`READY` + `VA_STATUS_SUCCESS`）。返回错误是不行的 ——
+`vaEndPicture` 一返错，调用方就整条放弃。
+
+**两个必须记住的坑**（都是实测踩到的）：
+1. 判断只能放在 `dmd_av1_patch_prev_refresh` **之后**。影子槽位的登记就发生
+   在 patch 里（上一帧的真实 refresh 要等本帧的 `ref_frame_map` 差分才算得
+   出来），放它之前返回会让上一帧永远进不了 DPB，于是其后每一帧都被判成
+   "引用不可解析"而级联误丢 —— 级联版 43 帧里只有关键帧与其后继 1 帧出画。
+2. `reference_select` **不能**当放行条件。规范 5.9.2 里它为 0 只表示帧头不
+   显式给 7 个槽号，帧照样引用 LAST（`ref_frame_idx[0]`）。第一版加了这条
+   提前放行，结果该拦的没拦住，日志照常"合成 2957 字节"、照样卡死。
+
+**新增回归** `tests/regress_av1_midgop.sh` + `tests/ivf_cut.py`。用 IVF 而不是
+裸 `.obu` 是因为 ffmpeg 的 obu 解封装器要求文件第一个 temporal unit 就是关键帧，
+从中间切的 `.obu` 报 "Invalid data found when processing input" 压根喂不进去；
+另记一条踩过的坑：ffprobe 对 IVF 报的 `pos` 指向 12 字节**帧记录头**，而 `size`
+是**载荷长度**、不含那 12 字节，算错就是 dav1d 那句
+`Invalid OBU length: 6564, but only 6552 bytes remaining`。
+脚本自带两个变体：纯截取（头几帧连序列头都没有，ffmpeg 自己丢）与补序列头
+截取（那几帧会真喂到驱动，压的就是上面那条闸门）。
+
+**验证**
+- 新回归 5/5：不卡死、帧数合理、**关键帧之后与软解逐字节一致**，ffmpeg 契约与
+  Chrome 契约（`DMD_NO_MAP_WAIT=1`）各一趟。
+- `tests/regress_av1_pixels.sh` 仍 **17/17 逐字节一致** —— 拦错一帧就会掉帧，
+  这条是"正常码流绝不触发"的护栏（另在真流上数过：前 300 帧 / 2100 个引用，
+  判"不可解析"的次数为 0）。
+- 单测新增 8 组断言（该拦/该放两个方向各钉一遍，含 `reference_select=0` 与
+  surface 号被复用的情形）。`make tests` 全过，`make AV1=1` 无警告。
+- 拖动 seek 全套 13/13（`-ss` 六个时间点逐哈希一致、三条坏流不崩、
+  从 GOP 中间起解）。
+- 顺带把 `decode.c` 里"show_frame=0 是当前阻塞点"那段注释更正为已解决留档：
+  自打合成头里 show_frame 恒置 1 之后，GOP=300 真流前 300 帧是 300 帧全交付、
+  149 次 Sync、0 次超时。
+- 一个尚未解释的观测：修复刚落地时有**一次**跑在 surface 1 上超时（rc=251），
+  之后 110 次连跑（含带日志的 60 次压测）零复现。不当它不存在：先记下，
+  浏览器端复跑时若再出现，从"上一次异常退出后 Venus 会话残留"这条线查。
+
 ## ✅ AV1 全局运动（global motion）合成：带 gm 的码流从整段坏帧变逐字节正确
 
 之前对所有参考帧恒写 `is_global = 0`（`av1_bitstream.c` 的桩），凡是编码端
