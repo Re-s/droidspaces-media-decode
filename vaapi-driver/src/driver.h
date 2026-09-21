@@ -290,6 +290,10 @@ struct dmd_context {
      * EndPicture 重试 —— 建 context 时 daemon 不可用不该让整个初始化失败。 */
     struct dmd_session *session;
     int session_failed; /* 建会话失败过，避免每帧重试拖慢失败路径 */
+    /* 本 context 的会话正在被拆（销毁已挂起或即将挂起）。收帧线程见到它就不
+     * 再对这个槽位开新 IO —— 没有这个标志，交还 io_busy 到"拆"之间的窗口里
+     * 收帧线程会把刚要销毁的会话重新抓起来用。 */
+    int retiring;
 
     /* 待解码队列：EndPicture 提交的 surface。
      * VP9/VP8 取队首；H.264/HEVC 取 pending_poc 最小者（见结构体头注释）。 */
@@ -575,8 +579,16 @@ struct dmd_driver {
     unsigned int next_image_id;
 
     /* 某个 context 正在做 daemon IO（放锁期间的互斥标志）。
-     * 用数组下标而非 ID，查找更快。 */
+     * 用数组下标而非 ID，查找更快。
+     * ⚠️ 语义是"有线程在锁外引用这个会话（包括它手里还没 release 的帧缓冲）"，
+     * 所以**必须撑到最后一次使用之后**才清；清了再拆会话就是拆别人在用的 fd。 */
     int io_busy[DMD_MAX_CONTEXTS];
+
+    /* 交还 io_busy 时发现有线程请求拆本槽位的会话，就先挂在这里，
+     * 由**最后一个用完的人**真正销毁（见 decode.c 的 io_release）。
+     * 直接拆不行：那时收帧线程可能正拿着同一个会话在 ioctl，close 掉它的 fd
+     * 之后 fd 号被宿主进程回收，再动一次动的就是 Chrome 自己的 fd。 */
+    struct dmd_session *io_defer[DMD_MAX_CONTEXTS];
 
     /* 后台收帧线程：Chrome 只调 EndPicture，从不 vaSyncSurface。
      *
