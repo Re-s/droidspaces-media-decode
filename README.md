@@ -138,8 +138,8 @@ grep -q render-node-override "$D" || {
 grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数增长
 ```
 
-然后打开 `chrome://flags`，搜 `Vulkan`，设为 `Disabled`，重启浏览器。
-这一步没有命令行等价物，原因见下方提示。
+然后按机型处理 Vulkan（ nabu 设为 `Disabled`，骁龙 8 Elite 保持 `Enabled`），
+重启浏览器。这一步没有命令行等价物，原因见下方提示与指南第 2.5 节。
 
 本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该
 profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
@@ -278,10 +278,12 @@ Firefox 脚本会自动找 profile，覆盖 `~/.mozilla/firefox`、
 Chrome 脚本在容器内没有 sudo 时，会自动改用
 `~/.local/share/applications` 下的用户级副本。
 
-> ⚠️ **Chrome 有一步脚本代劳不了**：打开 `chrome://flags`，把 **Vulkan** 设为
-> `Disabled`，重启浏览器。ozone wayland 与 Vulkan 硬性冲突，而这一项没有
-> 可用的命令行开关 —— `--disable-vulkan` 这个开关在 Chrome 里根本不存在，
-> `--disable-features=Vulkan`、`--use-vulkan=disabled` 实测同样无效。
+> ⚠️ **Chrome 有一步脚本代劳不了，而且结论按机型相反**：nabu（SD855）上要打开
+> `chrome://flags` 把 **Vulkan** 设为 `Disabled` 并重启；骁龙 8 Elite 上**必须保持
+> 默认（Enabled）**，关掉会文字糊成一团、画面重影。判据是显示是否正常，不是日志里
+> 有没有 `not compatible with Vulkan`。这一项没有可用的命令行开关 ——
+> `--disable-vulkan` 这个开关在 Chrome 里根本不存在，`--disable-features=Vulkan`、
+> `--use-vulkan=disabled` 实测同样无效。
 > 详见[指南第 2.5 节](doc/browser-vaapi-guide.md)。
 
 ### 手动配置

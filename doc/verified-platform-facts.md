@@ -407,6 +407,38 @@ H.264 / HEVC 解码器规格（两者一致）：
 
 结论：**扩展 HEVC/VP9 支持不受硬件限制**，仅是服务端 MIME 配置与客户端协议协商的工作量。
 
+### 5.1 AV1 只有 4:2:0：profile 2（4:2:2）与 3（单色）无输出格式可用
+
+`v4l2-ctl -d /dev/video32 --list-formats`（CAPTURE 多平面侧）实测只有：
+
+```
+[0] 'Q08C'  QCOM Compressed 8-bit     （压缩线性，客户端不取）
+[1] 'NV12'  Y/UV 4:2:0
+[2] 'NV21'  Y/VU 4:2:0
+```
+
+OUTPUT 侧有 `'AV10'`（本设备用的非标准 fourcc），但**解码结果只能落成 4:2:0**。
+10bit 靠运行时切 `T102/P010` 那条通路（已打通，见 CHANGELOG 0.4.6），
+不在这份静态枚举里。
+
+后果：VA-API 只定义了一个 `VAProfileAV1Profile0`，色度子采样是靠
+surface 的 pixel format 区分的。我们把 `QuerySurfaceAttributes` 的
+`VASurfaceAttribPixelFormat` 限在 NV12(+AV1 追加 P010)（`profiles.c:499-512`），
+所以 4:2:2 / 单色 AV1 在** ffmpeg 选格式时就**被拒：
+
+```
+[av1] Your platform doesn't support hardware accelerated AV1 decoding.
+[av1] Failed to get pixel format.
+```
+
+这是正确的拒绝，不是回归：系统里的旧驱动副本（未带 0.4.7 修改）同样如此，
+且拒绝发生在任何码流递交硬件之前，不会污染 DPB、不会花屏。
+设备侧也无法预先问出答案 —— `V4L2_CID_MPEG_VIDEO_AV1_PROFILE` /
+`..._AV1_LEVEL` 在本固件上全部 `EINVAL`（见 `decode.c:2999` 的实测记录）。
+
+因此覆盖面测试里的 `yuv422` / `mono` 两条样本注定不可能通过，
+不要把它们当作待修缺陷；真出现这类流时应回落软解。
+
 ## 6. 容器内 V4L2 编解码节点状态
 
 容器内 `/dev/video*` 已直通（属主 `root:droidspaces-gpu`，容器 root 在该组内）：

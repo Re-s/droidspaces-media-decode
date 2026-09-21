@@ -8,11 +8,12 @@
 #      无 sudo 时自动改用 ~/.local/share/applications 下的用户级副本）
 #   2. 生成 ~/.local/bin/chrome-msm-vaapi 包装脚本，方便命令行直接起
 #
-# ⚠️ 有一项本脚本无法代劳：Vulkan 必须在 chrome://flags 里手动关。
-# ozone wayland 与 Vulkan 硬性冲突，而 Chrome 没有可用的命令行开关
-# —— 实测 --disable-vulkan（这个开关根本不存在）、--disable-features=Vulkan、
-# --use-vulkan=disabled 及其组合全部无效，GPU 进程照样报
-# "'--ozone-platform=wayland' is not compatible with Vulkan"。
+# ⚠️ 有一项本脚本无法代劳，且**结论按机型相反**：Vulkan 只能在 chrome://flags
+# 里手动改。nabu（SD855）上必须关；骁龙 8 Elite 上必须保持开启 —— 关掉会
+# 文字糊成一团、画面重影。判据是显示是否正常，不是日志里有没有
+# "not compatible with Vulkan"（那句 ERROR 两台机器都会打，可以无视）。
+# 另外 Chrome 没有可用的命令行开关：实测 --disable-vulkan（这个开关根本
+# 不存在）、--disable-features=Vulkan、--use-vulkan=disabled 及其组合全部无效。
 # 详见 doc/browser-vaapi-guide.md 第 2.5 节。
 
 set -u
@@ -126,7 +127,8 @@ install_wrapper() {
     cat > "$WRAPPER" <<EOF
 #!/bin/sh
 # 由 configure-chrome-vaapi.sh 生成。带 msm_drm VA-API 硬解参数启动 Chrome。
-# 记得在 chrome://flags 里把 Vulkan 设为 Disabled（命令行关不掉）。
+# Vulkan 设置只在 chrome://flags 里改得动（命令行无效）：nabu 要关，
+# 骁龙 8 Elite 保持默认开启。判据见 doc/browser-vaapi-guide.md 第 2.5 节。
 exec env MESA_LOADER_DRIVER_OVERRIDE=msm \\
     "$chrome" $FLAGS "\$@"
 EOF
@@ -148,7 +150,8 @@ do_install() {
     [ "$found" = 0 ] && say "  未找到 Chrome 的 .desktop，跳过桌面图标配置"
     install_wrapper || return 1
     say ""
-    say "还需手动做一步：打开 chrome://flags，把 Vulkan 设为 Disabled，然后重启浏览器。"
+    say "还需手动确认一项：chrome://flags 里的 Vulkan。nabu(SD855) 设为 Disabled，"
+    say "骁龙 8 Elite 保持默认 Enabled（关了会文字糊、重影）。改完重启浏览器。"
     say "这一项没有可用的命令行开关，见 doc/browser-vaapi-guide.md 第 2.5 节。"
     say ""
     say "验证: bash tools/check-browser-vaapi.sh"
@@ -179,8 +182,9 @@ do_verify() {
     fi
 
     say ""
-    say "无法自动检查的一项：chrome://flags 里 Vulkan 是否已设为 Disabled。"
-    say "判据是启动后 GPU 进程有没有打印 'not compatible with Vulkan'。"
+    say "无法自动检查的一项：chrome://flags 里的 Vulkan 设置（nabu 应为 Disabled，"
+    say "8 Elite 应为 Enabled）。判据是视频与文字显示是否正常，"
+    say "不看 GPU 进程有没有打印 'not compatible with Vulkan'——那句两台都会打。"
     return $rc
 }
 
@@ -202,7 +206,7 @@ do_uninstall() {
         [ -f "$f" ] && grep -q "$MARKER" "$f" 2>/dev/null && rm -f "$f" && say "  ✓ 已删除用户级副本: $f"
     done
     [ -f "$WRAPPER" ] && rm -f "$WRAPPER" && say "  ✓ 已删除: $WRAPPER"
-    say "chrome://flags 里的 Vulkan 设置请自行还原。"
+    say "chrome://flags 里的 Vulkan 设置请自行还原（改过才需要，8 Elite 本就不该改）。"
 }
 
 case "${1:-}" in

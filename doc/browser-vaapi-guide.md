@@ -94,9 +94,9 @@ google-chrome \
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
 
-### 2.5 关闭 Vulkan：只能在 chrome://flags 里改
+### 2.5 Vulkan：要不要关，**分机型**（结论相反）
 
-ozone wayland 与 Vulkan 硬性冲突，不关掉的话 GPU 进程会报：
+GPU 进程可能打这么一条：
 
 ```
 ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
@@ -104,13 +104,24 @@ ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
 Consider switching to '--ozone-platform=x11' or disabling Vulkan
 ```
 
-**唯一可靠的关法是打开 `chrome://flags`，把 Vulkan 设为 `Disabled`，重启浏览器。**
+它给的两个建议里，`--ozone-platform=x11` 在两台实测机型上都不可用
+（本地只有 wayland，X11 起不来），能选的只有"关不关 Vulkan"，而答案按机型分：
 
-⚠️ 命令行开关关不掉它。本文此前写的 `--disable-vulkan` 是错的 ——
-Chrome 151 的二进制里根本没有这个开关（只有 `enable-vulkan` 与 `use-vulkan`），
-而 Chromium 的 switch 不像 feature flag 那样自动生成 `disable-` 反面，
-传进去既不报错也不生效，纯粹被忽略。实测下列写法**全部无效**，
-GPU 进程照样打印上面那条警告：
+| 机型 | 结论 | 实测依据 |
+|---|---|---|
+| nabu（SD855 / Adreno 640） | **必须关** | 不关时 wayland 与 Vulkan 冲突，硬解/呈现不正常 |
+| 骁龙 8 Elite（Adreno 830，2026-09-21 实测） | **必须留** | 关掉后画面错乱：文字糊成一团并且整体重影；wayland + Vulkan 同时开才正常，那条 ERROR 属可无视噪音 |
+
+判据都一样：**看视频与文字是否正常**，不要看那条日志有没有出现。
+在 8 Elite 上照本文早期版本（只写了 nabu 的结论）去关 Vulkan，会得到
+一个"配置全对但显示是坏的"的局面 —— 早期版本那句"必须关"是机型局限，
+已在 0.4.7 按上表分开说明。
+
+另有一条与机型无关的实测结论仍然成立（当年就是为了关 Vulkan 才试出来的）：
+**命令行开关关不掉 Vulkan**。Chrome 151 的二进制里根本没有 `--disable-vulkan`
+这个开关（只有 `enable-vulkan` 与 `use-vulkan`），而 Chromium 的 switch 不像
+feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不生效，纯粹被忽略。
+实测下列写法全部无效，GPU 进程照样打印上面那条警告：
 
 ```sh
 --disable-vulkan                            # 开关不存在，被忽略
@@ -119,11 +130,9 @@ GPU 进程照样打印上面那条警告：
 --use-vulkan=disabled --disable-features=Vulkan,VulkanFromANGLE   # 仍然无效
 ```
 
-实测环境 Chrome 151.0.7922.173，判据是 GPU 进程还会不会继续打印
-`not compatible with Vulkan`。
-
-后果是这一项**没法写进 `.desktop` 固化**，换机器或重建 profile 后要手动再关一次
-（`chrome://flags` 的选择存在 profile 的 `Local State` 里，备份 profile 会带走）。
+也就是说这一项**只能手动在 `chrome://flags` 里改**（选择存在 profile 的
+`Local State` 里，备份 profile 会带走），换机器或重建 profile 后要再改一次
+—— 而在 8 Elite 上：**不需要改，保持默认（Enabled）**。
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
@@ -498,7 +507,8 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 |---|---|---|
 | 会话建立成功但 0 帧 | Chrome 跑在 X11，dmabuf 输出走不通 | 换 Wayland 模式 |
 | GPU 进程 maps 无 drv_video | PCI 白名单跳过了平台设备 | 确认 `--render-node-override` |
-| 日志报 `not compatible with Vulkan` | wayland 与 Vulkan 硬性冲突 | 在 `chrome://flags` 把 **Vulkan** 设为 Disabled 后重启，命令行开关无效，见下 |
+| 日志报 `not compatible with Vulkan` | Chromium 的固定提示，两台机型的处置**相反** | 按视频与文字是否正常决定：nabu 要关，骁龙 8 Elite 必须留（关了会文字糊、重影），见 §2.5 |
+| 配置全对但文字糊成一团、画面重影 | 在骁龙 8 Elite 上把 Vulkan 关了 | 到 `chrome://flags` 把 Vulkan 恢复 Enabled（默认值）并重启，见 §2.5 |
 | Firefox 有进程不解码 | RDD 沙箱拦设备 | `MOZ_DISABLE_RDD_SANDBOX=1` |
 | user.js 写了没生效 | 写错了 profile | 查 installs.ini 的 Default |
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |

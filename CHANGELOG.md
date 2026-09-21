@@ -3,6 +3,51 @@
 > 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
 > `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
 
+## ✅ AV1 全局运动（global motion）合成：带 gm 的码流从整段坏帧变逐字节正确
+
+之前对所有参考帧恒写 `is_global = 0`（`av1_bitstream.c` 的桩），凡是编码端
+用了全局运动的流，运动补偿整体丢失：自制的平移样本 `gm-pan`（24 帧、其中
+8 帧带 `is_global=1`）第 4 帧起 13% 像素偏差，第 5~23 帧 100% 偏差。
+
+**为什么不是"照抄 VA 的值"就行**：VA-API 的 `wm[i].wmmat[]` 是**重建后**的
+参数（ffmpeg `vaapi_av1.c` 直接抄 `AV1Frame.gm_params`），而码流里是
+recentering + `sub_exp` 的**差分符号**，且差分的基准 prev 取自
+`ref_frame_idx[primary_ref_frame]` 那个槽里"解码器当时那份"参数。所以要
+逆解 `inverse_recenter`、按 `abs_bits/prec_bits` 分档还原符号，还要按槽
+镜像一份 prev（`dmd_av1_dpb.gm_slot`）与影子 DPB 同步 —— 两遍法保证时序
+一致：`EndPicture(k+1)` 先 patch 让第 k 帧进槽，再合成第 k+1 帧，硬件也是
+先收 repair(k) 再收 pixel(k+1)。写位次序也不是下标升序：ROTZOOM 是
+`[2][3][0][1]`，AFFINE 是 `[2][3][4][5][0][1]`。
+
+**踩到的坑（值得留）**：`increment(v, max)` 是"v 个 1，v<max 时再补一个 0"，
+不是"v+1 个 1 再补 0"。写错时每个符号恰好都多一个前导 1 又各自被终止符重新
+对齐 —— 症状是"只有 gm 的数值全错、帧头其余部分照常"，源符号 118 被读成
+237（= 2v+1）。只看像素完全推不出来。
+
+**验证**
+- 单测新增 4 组断言（默认 prev / 非默认 prev 差分 / hp=0 档 / 编不出来时整帧
+  退回 IDENTITY）。期望位串**逐字抄自源码流的 ffmpeg CBS trace**，另用一个
+  独立写的 Python 读侧回解出 CBS 打印的同一批符号（118/31/936/2873、
+  2/5/512/1541）双向核对。
+- `tests/regress_av1_pixels.sh` 新增 `gm-pan`、`tiles2x1`、`screen-10b`
+  三条样本：**17/17 逐字节一致**（ffmpeg 契约与 Chrome 契约各一趟）。
+- `make clean && make AV1=1` 无警告，原有单测全通过。
+
+## 🩹 AV1 环路滤波 `lr_unit_shift` 编码：屏幕内容类码流从"全坏"变逐帧正确
+
+规范 5.9.20：`use_128x128_superblock=1` 时码流位是**有效位移减一**
+（`lr_unit_shift = 1 + 该位`，有效值只可能 1 或 2），而 VA-API 的
+`lr_unit_shift` 给的是**有效值**。旧写法在 sbs128 分支写 `sh ? 1 : 0`，
+把有效位移 1 写成 2 —— restoration 单元从 64 变 128，凡"128 超块 +
+restoration"的码流每一帧都错，Chrome 里表现为整片坏帧。
+
+此前 1800 帧 B 站真流逐字节一致没暴露它：那条流的 restoration 帧恰好全是
+有效位移 2，写 1 属于蒙对。复现流是 libaom 编的 testsrc（屏幕内容类，
+128 超块 + 有效位移 1）。
+
+**验证**：`av1_probe.mp4` 120 帧硬解与软解 rawvideo 逐字节一致
+（md5 `535433d98da5a85842d3db3252391cda`）；真流 1800/1800 不回归。
+
 ## ⚡ AV1 1080p60 真流帧率修好：51fps → 120~190fps（像素逐字节不变）
 
 上一条达标记录里留了个诚实附注：1800 帧只跑 51fps，**低于 60fps，播放仍会卡**。

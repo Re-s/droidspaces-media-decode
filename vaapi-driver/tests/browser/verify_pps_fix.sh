@@ -63,6 +63,9 @@ echo
 mkdir -p "$CR/rev"
 
 run_one() {
+    # 注意不要加 --disable-vulkan：Chrome 151 没这个开关（纯被忽略），且
+    # 骁龙 8 Elite 上关 Vulkan 会让显示错乱，只有 nabu 需要关、且只能在
+    # chrome://flags 里关。见 doc/browser-vaapi-guide.md 第 2.5 节。
     local mode="$1" port="$2" drv="$3"
     rm -f "$CR/rev/$mode.json"
     OUT="$CR/rev/$mode.json" ROOT="$CR" WANT_REPORTS=1 \
@@ -72,7 +75,7 @@ run_one() {
     rm -rf "$CR/rev/p_$mode"
     env XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY=wayland-0 \
         LIBVA_DRIVER_NAME=msm_drm LIBVA_DRIVERS_PATH="$drv" DMD_VA_LOG=1 \
-        nohup /usr/bin/google-chrome --ozone-platform=wayland --disable-vulkan \
+        nohup /usr/bin/google-chrome --ozone-platform=wayland \
         --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist \
         --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiIgnoreDriverChecks \
         --user-data-dir="$CR/rev/p_$mode" --no-first-run --no-default-browser-check \
