@@ -3,6 +3,52 @@
 > 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
 > `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
 
+## ✅ Chrome 那个 FD 崩溃修好了：IO 所有权必须覆盖到最后一次使用
+
+`Crashing due to FD ownership violation` / `GPU process exited unexpectedly:
+exit_code=5` 的根因是驱动内部把 V4L2 槽位的"有人在用"标记（`io_busy[]`）提前
+交还了：收帧线程还攥着会话指针和帧缓冲，`DestroyContext` 就已经把会话拆掉、
+`close()` 掉 fd，宿主进程随后把同号 fd 复用成别的文件，那次 QBUF 就打到了别人
+的 fd 上（`dmd_DestroyContext` 里 `io_busy` 检查与置位之间还有一段放锁的空窗）。
+
+改法是把不变量写清楚并贯彻到全部 12 处 IO：`io_busy` 表示"有线程在锁外引用这个
+会话，含它尚未 release 的帧缓冲"，必须覆盖**最后一次**使用；会话销毁延后挂进
+`io_defer[]`，由最后一个使用者在 `io_release()` 里真正拆；`c->retiring` 阻止收帧
+线程复活将死的会话；会话指针一律在拿到所有权**之后**再快照。
+
+**A/B 实测（骁龙 8 Elite + Chrome 151，同一台机、同一压测页）**
+
+压测页每 0.9 秒在 480P↔720P 之间换一次源，专打"边收帧边销毁上下文"这条路径：
+
+| 驱动 | 结果 |
+|---|---|
+| `0.4.7+232600f8`（修复前） | 启动约 **26 秒**后 `GPU process exited unexpectedly: exit_code=5` |
+| `0.4.7+5b415fc8`（本版） | **61 个 `CreateContext`、60 场会话正常收尾、0 次崩溃**；60 场全部"送入 N == 收到 M"（无掉帧），`等 IO 所有权超时` 0 次，ENOTTY 0 次 |
+
+本机回归同步全绿：`make tests`、`regress_av1_pixels.sh` 17/17、
+`regress_av1_midgop.sh` 5/5、`regress_av1_reschange.sh` 5/5、
+`verify_driver.sh` 5 种编码逐字节、`cmp2.sh final` 1800/1800 逐字节等于软解。
+
+## 🔧 文档纠错：`--enable-features=Vulkan` 会让 Chrome 完全不建硬解上下文
+
+上一轮补 Vulkan 参数时把两件事混成了一件，实测（8 Elite + Chrome 151，唯一变量是
+参数，判据 = 驱动日志里 `CreateContext` 次数）：
+
+| `--enable-features` | 额外 `--use-angle=vulkan` | `CreateContext` |
+|---|---|---|
+| 三项 Vaapi… | 无 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 无 | **0 ✗** |
+| 三项 Vaapi… | 有 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 有 | **0 ✗** |
+
+即：`--enable-features=Vulkan`（等同 `chrome://flags` 里那个 "Vulkan"）任何机型都
+不能开 —— 开了 GPU 进程仍会探测、仍给每个 profile 建满 config，然后直接
+`vaTerminate`，一个解码上下文都不建，视频静默走软解，看着像"配了没生效"。
+显示需要的是 `--use-angle=vulkan`（只切 ANGLE 后端，实测不影响硬解，8 Elite 不给
+它会文字糊加重影）。已改：`tools/configure-chrome-vaapi.sh`（不再注入该项，且遇到
+老版本注入过的 `.desktop` 会**自动改写**回来）、`README.md`、`README.en.md`、
+`doc/browser-vaapi-guide.md` 第 2 / 2.5 / 3 节、`doc/release-v0.3.4-notes.md`。
+
 ## 🧪 浏览器实测：AV1 硬解在 Chrome 里跑通（同时挂出两条新问题）
 
 装到系统路径后（不带 `LIBVA_DRIVERS_PATH`，与浏览器同一条件）在 Chrome 里放

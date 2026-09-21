@@ -83,7 +83,7 @@ google-chrome \
   --render-node-override=/dev/dri/renderD128 \
   --ignore-gpu-blocklist \
   --use-angle=vulkan \
-  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
+  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
 ```
 
 | 参数 | 原理 |
@@ -91,22 +91,21 @@ google-chrome \
 | `--ozone-platform=wayland` | 见上节，dmabuf 输出的前提 |
 | `--render-node-override=/dev/dri/renderD128` | **核心**。Chromium `vaapi_wrapper.cc` 的 `PreSandboxInitialization()` 只枚举 PCI 总线 DRM 设备，ARM 平台设备的 renderD128 会被 `if (device->bustype != DRM_BUS_PCI) continue;` 跳过。此开关走 `LoadDrmFD()` 分支绕过白名单 |
 | `--ignore-gpu-blocklist` | ARM GPU 在 Chrome 的软件渲染黑名单里 |
-| `--use-angle=vulkan` | ANGLE（WebGL 与部分 GL 呈现路径）走 Vulkan 后端 |
+| `--use-angle=vulkan` | ANGLE（WebGL 与部分 GL 呈现路径）走 Vulkan 后端。骁龙 8 Elite 上不给它就**文字糊成一团并且重影**；实测不影响硬解，所以保留 |
 | `--enable-features=...` | Linux VA-API 解码总开关（DMABUF/GL 两路都开） |
 
 最后一条**必须写成一项、多个 feature 用逗号分隔**：`--enable-features` 出现两次时
 不要依赖框架帮你合并，写全在一个列表里最稳。
 
-`Vulkan` 与 `--use-angle=vulkan` 是"显式打开 Vulkan"，按机型取舍：
-新 profile 上 Vulkan 本来默认开，写上只是保险（别人 profile 里的
-`chrome://flags` 设置可能被改过，见第 2.5 节）；**nabu / SD855 必须去掉这两项**，
-否则 wayland 与 Vulkan 冲突。
+⚠️ **`--enable-features` 的列表里绝对不能有 `Vulkan`** —— 那是"打开 Vulkan 图形
+后端"的开关，实测会让 Chrome 完全不创建 VA-API 解码上下文（对照表见第 2.5 节）。
+`--use-angle=vulkan` 是另一回事，只管 ANGLE 后端，照留。
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
 
-### 2.5 Vulkan：要不要关，**分机型**（结论相反）
+### 2.5 `Vulkan`：两个参数别混为一谈（0.4.7 实测纠正）
 
-GPU 进程可能打这么一条：
+先说这条 GPU 进程日志，它**不是**故障：
 
 ```
 ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
@@ -115,23 +114,40 @@ Consider switching to '--ozone-platform=x11' or disabling Vulkan
 ```
 
 它给的两个建议里，`--ozone-platform=x11` 在两台实测机型上都不可用
-（本地只有 wayland，X11 起不来），能选的只有"关不关 Vulkan"，而答案按机型分：
+（本地只有 wayland，X11 起不来），那条 ERROR 两台都会打，可以无视。
+判据始终是**视频与文字显示是否正常**，外加驱动日志里有没有 `CreateContext`。
 
-| 机型 | 结论 | 实测依据 |
+真正要分清的是这两项，它们名字像、作用相反：
+
+| 项 | 管什么 | 对硬解的影响 |
 |---|---|---|
-| nabu（SD855 / Adreno 640） | **必须关** | 不关时 wayland 与 Vulkan 冲突，硬解/呈现不正常 |
-| 骁龙 8 Elite（Adreno 830，2026-09-21 实测） | **必须留** | 关掉后画面错乱：文字糊成一团并且整体重影；wayland + Vulkan 同时开才正常，那条 ERROR 属可无视噪音 |
+| `--use-angle=vulkan` | 只切 ANGLE 的后端 | **无影响**，实测照常建上下文；8 Elite 不给它还花屏 |
+| `--enable-features=Vulkan`（等于 `chrome://flags` 里的 "Vulkan"） | 打开 Vulkan 图形后端 | **硬解直接没有** |
 
-判据都一样：**看视频与文字是否正常**，不要看那条日志有没有出现。
-在 8 Elite 上照本文早期版本（只写了 nabu 的结论）去关 Vulkan，会得到
-一个"配置全对但显示是坏的"的局面 —— 早期版本那句"必须关"是机型局限，
-已在 0.4.7 按上表分开说明。
+骁龙 8 Elite + Chrome 151 + 本驱动，2026-09-21 逐项对照实测（同一素材、同一套
+驱动，唯一变量是参数；判据 = 驱动日志里 `CreateContext` 次数）：
 
-另有一条与机型无关的实测结论仍然成立（当年就是为了关 Vulkan 才试出来的）：
-**命令行开关关不掉 Vulkan**。Chrome 151 的二进制里根本没有 `--disable-vulkan`
-这个开关（只有 `enable-vulkan` 与 `use-vulkan`），而 Chromium 的 switch 不像
-feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不生效，纯粹被忽略。
-实测下列写法全部无效，GPU 进程照样打印上面那条警告：
+| `--enable-features` | 额外的 `--use-angle=vulkan` | `CreateContext` |
+|---|---|---|
+| 三项 Vaapi… | 无 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 无 | **0 ✗** |
+| 三项 Vaapi… | 有 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 有 | **0 ✗** |
+
+踩了这个坑时的表现很阴：GPU 进程照样加载驱动、照样给每个 profile 建满 config
+（`CreateConfig: profile=32 …` 全都在），紧接着一个 `vaTerminate`，
+**一个 `CreateContext` 都没有**。页面播放流畅、CPU 不降，看起来就是
+"参数配了没生效"。所以别照搬 `chrome://flags` 教程里"把 Vulkan 打开"那一步。
+
+本文早期版本（0.4.6 及之前）写的"显式开 Vulkan 更保险 / 8 Elite 必须开 Vulkan"，
+是把上面两项混成了一项，0.4.7 起按本表纠正。nabu / SD855 那一代还要额外去掉
+`--use-angle=vulkan`（wayland 与 Vulkan 冲突），那是机型差异；而**不进
+`--enable-features=Vulkan` 是所有机型的共同要求**，属 Chrome 侧行为，与本驱动无关。
+
+另有一条与机型无关的实测结论仍然成立：**命令行关不掉 Vulkan**。Chrome 151 的二进制里
+根本没有 `--disable-vulkan` 这个开关（只有 `enable-vulkan` 与 `use-vulkan`），而
+Chromium 的 switch 不像 feature flag 那样自动生成 `disable-` 反面，传进去既不报错
+也不生效，纯粹被忽略。实测下列写法全部无效，GPU 进程照样打印上面那条警告：
 
 ```sh
 --disable-vulkan                            # 开关不存在，被忽略
@@ -140,13 +156,13 @@ feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不�
 --use-vulkan=disabled --disable-features=Vulkan,VulkanFromANGLE   # 仍然无效
 ```
 
-也就是说**关**这一项只能手动在 `chrome://flags` 里改（选择存在 profile 的
-`Local State` 里，备份 profile 会带走），换机器或重建 profile 后要再改一次。
+也就是说，如果 `chrome://flags` 里那个 "Vulkan" 已经被开成 `Enabled`，命令行
+拉不回来（选择存在 profile 的 `Local State` 里，跟着 profile 走），只能手动设回
+`Disabled`。而正确配置本来就不需要开它 —— 显示要正常靠的是 `--use-angle=vulkan`。
 
-反过来**开**是有效的：`--enable-features=...,Vulkan --use-angle=vulkan`
-（第 2 节那条命令里就带着）。所以 8 Elite 上不需要去动 `chrome://flags`，
-万一别人的 profile 里 Vulkan 被置成过 `Disabled`，用命令行这两项把它拉回来即可；
-而 nabu 想关就没有这么方便了 —— 只能进 `chrome://flags` 手动设。
+nabu / SD855 上还有一层：那一代连 ANGLE 的 Vulkan 后端都不能用，
+`--use-angle=vulkan` 也要去掉（`tools/configure-chrome-vaapi.sh` 用
+`DMD_VULKAN=off` 区分两种机型）。
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
@@ -156,15 +172,17 @@ feature flag 那样自动生成 `disable-` 反面，传进去既不报错也不�
 D=/usr/share/applications/google-chrome.desktop
 if ! grep -q "render-node-override" "$D"; then
     [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
-    # 骁龙 8 Elite 及更新的机型：带上末尾这两项，确保 Vulkan 是开着的
-    # nabu / SD855：删掉 --use-angle=vulkan 与 ,Vulkan（那代必须关 Vulkan）
-    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
+    # 骁龙 8 Elite 及更新的机型：保留 --use-angle=vulkan（不给就文字糊、重影）
+    # nabu / SD855：删掉 --use-angle=vulkan（那代 wayland 与 Vulkan 冲突）
+    # ⚠️ 两种情况都**不要**在 --enable-features 里加 Vulkan，加了就没有硬解（见 2.5 节）
+    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
     sudo sed -i \
       -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
       -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
       "$D"
 fi
 grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执行次数增长
+grep -c "features=[^ ]*Vulkan" "$D"    # 必须是 0；非 0 就踩了 2.5 节那个坑
 
 # 执行后每个 Exec= 行应形如(注意开头就是 --ozone-platform=wayland):
 # Exec=/usr/bin/google-chrome-stable --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,... %U

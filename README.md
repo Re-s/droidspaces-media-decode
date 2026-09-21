@@ -130,7 +130,7 @@ FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
 
 ```bash
 D=/usr/share/applications/google-chrome.desktop
-F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,Vulkan"
+F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
 grep -q render-node-override "$D" || {
   sudo cp "$D" "$D.bak"
   sudo sed -i "s|^\(Exec=[^ ]*\)|\1 $F|" "$D"
@@ -138,19 +138,19 @@ grep -q render-node-override "$D" || {
 grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数增长
 ```
 
-`--use-angle=vulkan` 与 `--enable-features=` 里的 `Vulkan` 两项是**显式打开 Vulkan**：
-新 profile 上它本来就是默认开，写上只是保险 —— 别人的 profile 可能被改过
-（`chrome://flags` 的改动存在 `Local State` 里，会一路跟着 profile 走）。
-注意 `--enable-features` 要**写成一条**、多项用逗号分隔，不要重复出现两次。
+`--enable-features` 要**写成一条**、多项用逗号分隔，不要重复出现两次（重复时
+只有一份生效）。**里面绝对不能有 `Vulkan`**：骁龙 8 Elite + Chrome 151 实测，
+加上它之后 GPU 进程照常探测、照常给每个 profile 建 config，然后 `vaTerminate`，
+**一个 `CreateContext` 都没有** —— 视频静默回落软解，页面流畅、驱动 0 配对帧，
+看起来就像"配了没生效"。
 
-nabu（SD855）这一代相反：**必须去掉这两项**并到 `chrome://flags` 里把 Vulkan
-设为 `Disabled`，否则 wayland 与 Vulkan 冲突、硬解与呈现都不正常。
-骁龙 8 Elite 则是关掉就花屏（文字糊成一团并重影），只能保持开启。
+`--use-angle=vulkan` 是另一回事：它只把 ANGLE（WebGL / GL 呈现）切到 Vulkan 后端，
+骁龙 8 Elite 上少了它文字糊成一团并重影，而实测**不影响**硬解，所以保留。
+nabu（SD855）这一代连它也要去掉（wayland 与 Vulkan 冲突）。
 
-命令行只能把 Vulkan **打开**，**关不掉**：这个二进制里没有 `--disable-vulkan`
-（只有 `enable-vulkan`、`use-vulkan`），`--disable-features=Vulkan`
-与 `--use-vulkan=disabled` 实测也全部无效 —— 要关只能手动改 `chrome://flags`。
-原因与逐条实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
+同理，`chrome://flags` 里那个 "Vulkan" 开关（等价于 `--enable-features=Vulkan`）
+也要保持 `Disabled`；`--use-angle=vulkan` 才是显示正常需要的那一项。
+逐条对照实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
 重启浏览器后生效。
 
 本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该

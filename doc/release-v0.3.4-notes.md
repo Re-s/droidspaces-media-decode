@@ -27,9 +27,12 @@ grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不随执行�
 
 > ⚠️ 上面这段是 0.3.4 当时的原文，**其中 `--disable-vulkan` 是无效的**：
 > Chrome 151 的二进制里没有这个开关（只有 `enable-vulkan`、`use-vulkan`），
-> 传进去被静默忽略，所以这行既不报错也不起作用。Vulkan 的取舍按机型分，
-> 且只能靠 `chrome://flags` 或 `--enable-features=...,Vulkan --use-angle=vulkan`
-> 处理，见 [`browser-vaapi-guide.md`](browser-vaapi-guide.md) 第 2 / 2.5 节。
+> 传进去被静默忽略，所以这行既不报错也不起作用。
+> Vulkan 的处理方式后来改过两次，现行结论（0.4.7 实测）是：
+> `--enable-features=Vulkan`（以及 `chrome://flags` 里那个 "Vulkan"）**任何机型都别开**，
+> 开了 Chrome 就不建 VA-API 解码上下文；显示需要的是另一项 `--use-angle=vulkan`，
+> 只切 ANGLE 后端、不影响硬解。细节见
+> [`browser-vaapi-guide.md`](browser-vaapi-guide.md) 第 2 / 2.5 节。
 > 现行配置以该指南为准，本文只作历史记录。
 
 > 为什么是这几个参数：解码帧经 **linux-dmabuf 协议**提交 → 必须 Wayland
