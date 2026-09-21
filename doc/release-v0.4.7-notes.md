@@ -2,7 +2,9 @@
 
 设备：骁龙 8 Elite / Adreno 830，内核 6.6.118-android15，DroidSpaces 容器，
 Chrome 151.0.7922.169，libva 2.23（libva 1.23），Wayland 宿主。
-产物版本串：`DroidSpaces V4L2 VA-API driver 0.4.7+d92e4299`。
+产物版本串形如 `DroidSpaces V4L2 VA-API driver 0.4.7+<8 位 git 短 hash>` ——
+构建号随提交变化，装完以 `vainfo` 打印的那一行为准核对；
+产物本身的唯一标识是 GitHub Release 上附带的 `.so` 及其 sha256。
 
 ## 这一版解决什么
 
