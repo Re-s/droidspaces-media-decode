@@ -159,6 +159,24 @@ struct dmd_av1_dpb {
     VASurfaceID prev_ref_map[8];
     int         prev_valid;
 
+    /* ---- 全局运动参数的按槽备份（规范 5.9.24 / 7.11.3.6）----
+     *
+     * gm_params 是**差分编码**：本帧的符号相对 primary 参考帧的参数算出，
+     * 解码器用的那份 prev 存在它自己 DPB 的槽里。我们合成码流时若按别的
+     * 值编码，硬件重建出来的参数就和源码流不同，运动补偿（进而像素）就错。
+     * 所以必须按槽镜像一份，与 dpb_shadow 同步更新：槽 k 存的是哪一帧，
+     * gm_slot[k] 就是那一帧的 7×6 参数（**重建后**的值，即 VA 的 wmmat）。
+     *
+     * 两份表都只在"帧真正进槽"时更新：
+     *   - 普通帧：像素趟 refresh=0 不进槽，等 DPB 趟（patch_prev_refresh
+     *     反算出真值后就地改写）才登记，故新增 gm_pending 暂存本帧参数；
+     *   - KEY/全刷帧：规范推断全刷，build_frame 里直接写满 8 槽。
+     * 时序与硬件一致：EndPicture(k+1) 先 patch（本帧进槽）再合成 k+1，
+     * 硬件也是先收 repair(k) 再收 pixel(k+1)。 */
+    struct dmd_av1_gm { int32_t p[7][6]; } gm_slot[8];
+    struct dmd_av1_gm gm_pending;      /* 最近合成帧的参数 */
+    int               gm_pending_frame;/* 它属于哪一帧（frame_seq），0=无 */
+
     /* 源 DPB 在上一帧解码时踢出的帧（E_{k-1} = map_{k-1} \ map_k），
      * 以帧号表示。源编码器保证被踢出的帧不会再被任何后续帧引用
      * （死了），本驱动让当前帧占它的影子槽，就永远不会覆盖活引用。
