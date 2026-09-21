@@ -380,12 +380,23 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     }
     const unsigned int spb = surf_ten_bit ? 2u : 1u;
 
-    /* 请求区域必须落在 surface 缓冲内。stride 是字节，先折回样本坐标。 */
-    if ((unsigned int)x + width > s->stride / spb ||
-        (unsigned int)y + height > s->slice_height) {
+    /* 起点必须落在 surface 内；尺寸超出则**裁到真实帧并把余下填 0**，
+     * 而不是整笔拒绝。
+     *
+     * 为什么不能按旧行为要求"请求区域完全落在 surface 缓冲内"：
+     * AV1 换分辨率时 ffmpeg 复用同一个 VA context，surface 池与 VAImage
+     * 仍是建池时的 1920x1080，而帧回来时 surface 已缩到 1280x736。
+     * 此时两种做法都错：
+     *   - 报错 → 客户端拿不到任何像素，整个会话废掉；
+     *   - 不裁剪地按 surface 行距整块搬 → 色度平面按 slice_height=1088
+     *     去读，而真数据的色度在 736 行处，结果是每帧色度全错
+     *     （实测换分辨率后 25/25 帧 md5 不符，而 surface 缓冲本身逐字节
+     *      正确 —— 缺陷就在这一拷）。
+     * 裁剪 + 补零后，客户端按自己声明的行距取左上角的真实区域，像素对得上。 */
+    if ((unsigned int)x >= s->stride / spb || (unsigned int)y >= s->slice_height) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("GetImage: 区域 %d,%d %ux%u 超出 surface 缓冲 %u×%u(%u 字节行)\n",
-                x, y, width, height, s->stride / spb, s->slice_height, s->stride);
+        dmd_log("GetImage: 起点 %d,%d 已在 surface 之外 %u×%u(%u 字节行)\n",
+                x, y, s->stride / spb, s->slice_height, s->stride);
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     /* 目标 image 必须装得下请求的尺寸。 */
@@ -400,10 +411,48 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         return VA_STATUS_SUCCESS;
     }
 
+    unsigned int copy_w = width, copy_h = height;
+    const unsigned int src_w_samp = s->stride / spb;
+    if ((unsigned int)x + copy_w > src_w_samp)
+        copy_w = src_w_samp - (unsigned int)x;
+    if ((unsigned int)y + copy_h > s->slice_height)
+        copy_h = s->slice_height - (unsigned int)y;
+    /* 色度 2x2 采样，奇数宽高会把 U/V 对拆开，向下取偶。 */
+    copy_w &= ~1u;
+    copy_h &= ~1u;
+
+    /* 兜底：色度源平面在 src + stride*slice，只有 data_size 能证明它存在。
+     * 正常情况下 surface_store_frame_locked 已保证 stride*slice*3/2 ≤
+     * data_size（装不下的帧根本不会入库），这里防的是别的路径漏改。 */
+    {
+        unsigned int avail_rows =
+            (unsigned int)(s->data_size / ((size_t)s->stride * 3 / 2));
+        if (copy_h > avail_rows) copy_h = avail_rows & ~1u;
+    }
+
     nv12_copy(img->data, img->image.pitches[0],
               img->image.offsets[1] / img->image.pitches[0], s->data, s->stride,
-              s->slice_height, (unsigned int)x, (unsigned int)y, width, height,
+              s->slice_height, (unsigned int)x, (unsigned int)y, copy_w, copy_h,
               spb);
+
+    if (copy_w < width || copy_h < height) {
+        const unsigned int dp = img->image.pitches[0];
+        const unsigned int ds = img->image.offsets[1] / dp;
+        const size_t tail = ((size_t)width - copy_w) * spb;
+        unsigned char *duv = img->data + (size_t)dp * ds;
+        for (unsigned int r = 0; r < copy_h; r++)
+            memset(img->data + ((size_t)y + r) * dp + ((size_t)x + copy_w) * spb,
+                   0, tail);
+        for (unsigned int r = copy_h; r < height; r++)
+            memset(img->data + ((size_t)y + r) * dp + (size_t)x * spb, 0,
+                   (size_t)width * spb);
+        for (unsigned int r = 0; r < copy_h / 2; r++)
+            memset(duv + ((size_t)y / 2 + r) * dp + ((size_t)x + copy_w) * spb,
+                   128, tail);
+        for (unsigned int r = copy_h / 2; r < height / 2; r++)
+            memset(duv + ((size_t)y / 2 + r) * dp + (size_t)x * spb, 128,
+                   (size_t)width * spb);
+    }
 
     pthread_mutex_unlock(&drv->lock);
 

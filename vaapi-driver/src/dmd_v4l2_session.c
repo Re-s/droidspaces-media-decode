@@ -84,6 +84,28 @@ struct dmd_session {
 };
 
 static void publish_format(struct dmd_session *s);
+static void sess_log(struct dmd_session *s, const char *fmt, ...);
+
+/* 需要发布几何就发布；几何发布前先把待取队列丢掉。
+ *
+ * 为什么必须丢：CAPTURE 重配（流中换分辨率、INSUFFICIENT 扩容）会
+ * REQBUFS(0) + bufs_free()，把旧缓冲 munmap 掉。待取队列里存的是**指向
+ * 那些缓冲的裸指针**，重配后再 pop 就是读已解除映射的地址。
+ * 实测这条路径上队列通常是空的（帧被 reaper/next_frame 及时取走），
+ * 所以代价最多是切换瞬间的一两帧，换来的是不会读到野内存。 */
+static void maybe_publish_format(struct dmd_session *s)
+{
+    if (s->dec.fmt_dirty) {
+        s->dec.fmt_dirty = 0;
+        if (s->pend_count > 0)
+            sess_log(s, "重配后丢弃 %d 帧陈旧缓冲（已 munmap）", s->pend_count);
+        s->pend_head = s->pend_tail = s->pend_count = 0;
+        memset(s->held, 0, sizeof(s->held));
+        publish_format(s);
+        return;
+    }
+    if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
+}
 
 /* 把一帧放进待取队列。返回 0 成功，-1 队列满（不应发生）。 */
 static int pend_push(struct dmd_session *s, uint8_t *data, size_t len,
@@ -379,7 +401,7 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
                 uint8_t *pd = NULL; size_t pl = 0; uint64_t pp = 0; int pi = -1;
                 int pr = dmd_v4l2_recv(&s->dec, &pd, &pl, &pp, &pi, 1);
                 if (pr == 1) {
-                    if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
+                    maybe_publish_format(s);
                     if (pend_push(s, pd, pl, pp, pi) < 0) {
                         dmd_v4l2_release(&s->dec, pi);
                         break;
@@ -411,7 +433,7 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
                 set_err(s, DMD_ERR_STATE, "待取帧队列溢出");
                 return DMD_ERR_STATE;
             }
-            if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
+            maybe_publish_format(s);
             continue;      /* 队列腾出了缓冲，立刻重试送料 */
         }
         if (rr == 2) {
@@ -591,8 +613,7 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
 
         int r = dmd_v4l2_recv(&s->dec, &fdata, &flen, &fpts, &fidx, slice);
 
-        if (s->dec.cap_ready && !s->fmt.valid)
-            publish_format(s);
+        maybe_publish_format(s);
 
         if (r < 0) {
             set_err(s, DMD_ERR_IO, "V4L2 收帧出错");

@@ -3957,6 +3957,41 @@ static void surf_dump_store(struct dmd_surface *s, unsigned unit)
     if (fp) { fwrite(s->data, 1, s->data_size, fp); fclose(fp); }
 }
 
+/* surface 比帧小的时候：逐行搬能装下的左上角，其余补成合法的黑。
+ * 只在 dumb buffer（尺寸建池时定死）装不下帧时走这里。 */
+static void store_clipped_locked(struct dmd_surface *s, const struct dmd_frame *f,
+                                 unsigned int src_stride, unsigned int src_slice)
+{
+    if (!f->data || !s->data)
+        return;
+
+    const size_t plane = (size_t)src_stride * src_slice;   /* 源 Y 平面字节数 */
+    if (f->size < plane + plane / 2)
+        return;                      /* 源连一整帧都不够，宁可不写 */
+
+    unsigned int cols = src_stride < s->stride ? src_stride : s->stride;
+    unsigned int rows = src_slice < s->slice_height ? src_slice : s->slice_height;
+    cols &= ~1u;                     /* 色度 2x2，奇数会拆开 U/V 对 */
+    rows &= ~1u;
+
+    dumb_sync_begin_write(s);
+
+    for (unsigned int r = 0; r < rows; r++)
+        memcpy(s->data + (size_t)r * s->stride,
+               f->data + (size_t)r * src_stride, cols);
+    for (unsigned int r = rows; r < s->slice_height; r++)
+        memset(s->data + (size_t)r * s->stride, 0, s->stride);
+
+    unsigned char *duv = s->data + (size_t)s->stride * s->slice_height;
+    const unsigned char *suv = f->data + plane;
+    for (unsigned int r = 0; r < rows / 2; r++)
+        memcpy(duv + (size_t)r * s->stride, suv + (size_t)r * src_stride, cols);
+    for (unsigned int r = rows / 2; r < s->slice_height / 2; r++)
+        memset(duv + (size_t)r * s->stride, 128, s->stride); /* UV 中性是 128 不是 0 */
+
+    dumb_sync_end_write(s);
+}
+
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
@@ -3981,12 +4016,8 @@ static void surface_store_frame_locked(struct dmd_surface *s,
                                  : (unsigned int)f->height;
 
     /* 以解码器给的几何为准更新 surface：VAImage 的 offsets[1] 必须
-     * 用 slice_height（1088）而不是显示高（1080），否则色度平面错位。 */
-    s->stride = src_stride;
-    s->slice_height = src_slice;
-    s->buf_width = (unsigned int)f->width;
-    s->buf_height = (unsigned int)f->height;
-
+     * 用 slice_height（1088）而不是显示高（1080），否则色度平面错位。
+     * ⚠️ 赋值必须等"这帧装得下"确认之后 —— 见下面 need > data_size 分支。 */
     size_t need = (size_t)src_stride * src_slice * 3 / 2;
     if (need > s->data_size) {
         /* 解码器给的缓冲比预分配的大（流内分辨率变大）。
@@ -3999,23 +4030,55 @@ static void surface_store_frame_locked(struct dmd_surface *s,
          *   __GI___libc_realloc (oldmem=0x7fafda3000, bytes=3136320)
          *   → surface_store_frame_locked → sync_surface_locked
          *   → dmd_SyncSurface2 → vaSyncSurface → av_hwframe_transfer_data
-         * dumb buffer 的尺寸在 surface 创建时按对齐几何定好，正常容得下
-         * 解码器输出；真不够就只拷放得下的部分，而不是崩掉整个进程。 */
+         *
+         * dumb buffer 装不下时原先的做法是"记新几何、只拷放得下的部分"，
+         * 那是错的：stride/slice 记成 1920/1088 而映射仍是 1280x736 的大小，
+         * 之后任何按 stride*slice 定位色度平面的读都越界。实测 grow 用例
+         * （720p 建池 → 1080p 码流）SIGSEGV 在 nv12_copy 取
+         * UV = src + 1920*1088 处。
+         *
+         * 真正的根子在客户端：surface 池按建池时的尺寸分配，AV1 换到更大
+         * 分辨率时 ffmpeg 不重建池（实测仍按 1280x720 调 vaGetImage），
+         * 整帧本来就没法交出去。驱动能做的是让这一帧明确失败，而不是拖崩
+         * 整个进程 —— surface 保留旧几何与旧内容，读的人拿到的是上一帧。 */
         if (s->exportable) {
-            dmd_log("surface %u: 帧需 %zu 字节 > dumb buffer %zu 字节，"
-                    "截断（stride=%u slice=%u）\n",
-                    (unsigned)s->id, need, s->data_size, src_stride, src_slice);
-            need = s->data_size;
-        } else {
-            unsigned char *mem = realloc(s->data, need);
-            if (!mem) {
-                s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
-                return;
-            }
-            s->data = mem;
-            s->data_size = need;
+            /* dumb buffer 不能长个（ realloc 会 SIGSEGV，见上），但也不能
+             * "记新几何 + 截断拷" —— 那会让 stride/slice(1920/1088) 与实际
+             * 映射(1280×736 大小)不符，之后任何按 stride*slice 定位色度平面
+             * 的读都越界。实测 grow 用例（720p 建池 → 1080p 码流）
+             * SIGSEGV 在 nv12_copy 取 UV = src + 1920*1088 处。
+             *
+             * 也不能直接判该帧失败：实测 ffmpeg 收到
+             * VA_STATUS_ERROR_OPERATION_FAILED 就整条流放弃（125 帧只出 25
+             * 帧，rc=-5），真实场景里等于播放器一升清晰度就停住。
+             *
+             * 所以按 VA-API 对"surface 小于图像"的通行语义处理：**裁到
+             * surface 能装下的左上角**，几何保持不变。客户端拿到的是能用的
+             * 画面（放大观感）而不是错误。
+             *
+             * 根子在客户端：surface 池按建池时的尺寸分配，AV1 换到更大分辨率
+             * 时 ffmpeg 不重建池（实测仍按 1280x720 调 vaGetImage）。 */
+            dmd_log("surface %u: 帧 %ux%u 大于池 %ux%u，按 surface 裁剪存入"
+                    "（客户端换分辨率后未重建 surface 池）\n",
+                    (unsigned)s->id, src_stride, src_slice,
+                    s->stride, s->slice_height);
+            store_clipped_locked(s, f, src_stride, src_slice);
+            s->decode_status = VA_STATUS_SUCCESS;
+            return;
         }
+        unsigned char *mem = realloc(s->data, need);
+        if (!mem) {
+            s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            return;
+        }
+        s->data = mem;
+        s->data_size = need;
     }
+
+    s->stride = src_stride;
+    s->slice_height = src_slice;
+    s->buf_width = (unsigned int)f->width;
+    s->buf_height = (unsigned int)f->height;
 
     /* ⚠️ CPU 对 dumb buffer 的写入必须被 DMA_BUF_IOCTL_SYNC 的 START/END
      * 包住，否则数据可能停在 D-cache 里，GPU 通过导出的 dmabuf 采样时

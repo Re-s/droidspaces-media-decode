@@ -1016,6 +1016,11 @@ static int cap_reconfig(struct dmd_v4l2_dec *d)
         V4L2_LOG("重配完成并已补发 SESSION_CONTINUE");
     else
         V4L2_LOG("重配完成（SESSION_CONTINUE 补发返回 %s）", strerror(errno));
+    /* 几何变了。会话层缓存的 s->fmt（stride/slice/crop）是首次协商时发布的，
+     * 不置脏就永远不会重发，后续帧会带着**旧 stride** 交给驱动 —— 实测
+     * 1080p→720p 后 surface 仍按 stride=1920/slice=1088 解释 1280 行的数据，
+     * 整帧被按错位的行距搬走。 */
+    d->fmt_dirty = 1;
     return 0;
 }
 

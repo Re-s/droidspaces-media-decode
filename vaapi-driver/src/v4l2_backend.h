@@ -234,6 +234,7 @@ struct dmd_v4l2_dec {
     /* 1 = 本次 setup_capture 是流中换分辨率触发的，几何以 G_FMT 报回的新值为准，
      * 不得再用 OUTPUT 协商值覆盖（那是首次协商防残留用的，方向正好相反）。 */
     int      trust_gfmt;
+    int      fmt_dirty;                       /* 1 = 重配后几何已变，会话层须重发格式 */
     int      out_streaming, cap_streaming;
     int      buf_mem;                         /* 队列内存模式 V4L2_MEMORY_* */
     int      draining;                        /* 已送 EOS，等剩余帧 */
