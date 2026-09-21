@@ -1272,8 +1272,11 @@ int dmd_v4l2_drain(struct dmd_v4l2_dec *d)
 
 void dmd_v4l2_close(struct dmd_v4l2_dec *d)
 {
-    bufs_free(d->extra, DMD_V4L2_MAX_CAP);
     if (!d) return;
+
+    /* 原来 bufs_free(d->extra, ...) 写在 NULL 判断之前，d 为空直接解引用。 */
+    if (d->extra)
+        bufs_free(d->extra, DMD_V4L2_MAX_CAP);
 
     if (d->fd >= 0) {
         int type;
