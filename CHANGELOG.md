@@ -3,10 +3,50 @@
 > 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
 > `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
 
-## ✅ Chrome 那个 FD 崩溃修好了：IO 所有权必须覆盖到最后一次使用
+## ✅ FD 崩溃的真凶找到了：每次拆会话无条件 `close(0)` 24 次（不是竞态）
+
+`dmd_v4l2_open()` 开头 `memset(d, 0, sizeof(*d))`，随后把 `out[]`、`cap[]` 的
+`dbuf_fd` 置 -1，**唯独漏了 `extra[]`**。而 `dmd_v4l2_close()` 不看条件就执行
+`bufs_free(d->extra, DMD_V4L2_MAX_CAP)`，`bufs_free` 的判据是 `dbuf_fd >= 0`
+—— 于是 24 个"未分配"槽全被当成有效 fd，**每拆一次会话就对 fd 0 调 24 次
+`close()`**（`v4l2_backend.h:199` 的注释本来就写着"-1 表示未分配"，漏的正是
+这个不变量）。
+
+**判据不是"这次没崩"，是 strace 直接数到**（同一条 1280x720 AV1、ffmpeg 路径）：
+修复前 `close(0)` 24 次 —— 第 1 次返回 0（真的把宿主进程的 stdin 关掉了），
+后 23 次 `EBADF`；修复后 **0 次**。
+
+为什么 ffmpeg 永远看不出问题、Chrome 必崩：Chromium **拦截 `close()` 并按
+`ScopedFD` 记账检查归属** —— `base/files/scoped_file_linux.cc`:
+
+```cpp
+extern "C" int close(int fd) {
+  if (base::IsFDOwned(fd) && g_is_ownership_enforced) CrashOnFdOwnershipViolation();
+```
+
+fd 0 只要被 Chrome 自己复用一次（它把某个文件开到 0 号），我们下一次拆会话的
+`close(0)` 就当次打死 GPU 进程。所以它的表现是"时有时无"，取决于 fd 0 此刻在
+谁手里 —— 这正是我上一轮把它误判成"IO 竞态没修干净"的原因。
+
+**同强度 A/B（400 ms 换一次源，专打边收帧边拆会话）**
+
+| 驱动 | 结果 |
+|---|---|
+| `0.4.7+232600f8`（未做 io_busy 修复） | 启动约 **26 秒**后崩，`exit_code=5` |
+| `0.4.7+5b415fc8`（上一节的修复） | 约 17 分钟内崩 **3 次**（900 ms 强度下干净 —— 竞态确实收窄了） |
+| `0.4.7+d92e4299`（本版） | **548 秒：1352 个上下文 / 1351 场会话正常收尾 / FD 崩溃 0 / 崩溃退出 0 / ENOTTY 0 / 等 IO 所有权超时 0** |
+
+像素回归同步复测（防"修崩溃修坏画质"）：AV1 **480p / 720p / 1080p 与软解逐字节
+一致**，H.264 逐字节一致，另一条 AV1 probe 流前 100 帧逐字节一致。
+
+## ✅ Chrome FD 崩溃的第一步：IO 所有权必须覆盖到最后一次使用
+
+⚠️ **本节当初的标题写的是"修好了"，那是过早的。** 它修掉的是真实存在的第一个
+问题，但 400 ms 强度下仍崩 3 次；真凶见上一节。下面的 A/B 只在 900 ms 强度下
+成立，那个强度恰好碰不到 fd 0 被 Chrome 复用的时机。
 
 `Crashing due to FD ownership violation` / `GPU process exited unexpectedly:
-exit_code=5` 的根因是驱动内部把 V4L2 槽位的"有人在用"标记（`io_busy[]`）提前
+exit_code=5` 的根因之一是驱动内部把 V4L2 槽位的"有人在用"标记（`io_busy[]`）提前
 交还了：收帧线程还攥着会话指针和帧缓冲，`DestroyContext` 就已经把会话拆掉、
 `close()` 掉 fd，宿主进程随后把同号 fd 复用成别的文件，那次 QBUF 就打到了别人
 的 fd 上（`dmd_DestroyContext` 里 `io_busy` 检查与置位之间还有一段放锁的空窗）。
