@@ -688,7 +688,7 @@ static int setup_capture(struct dmd_v4l2_dec *d)
      * msm_vidc 不支持缩放（capability.scale_x/y 为 0，
      * msm_vidc_common.c:5613-5625 要求两侧像素数严格相等），
      * 两侧本来就必须一致。 */
-    if (d->out_w > 0 && d->out_h > 0 &&
+    if (!d->trust_gfmt && d->out_w > 0 && d->out_h > 0 &&
         ((unsigned)d->out_w != f.fmt.pix_mp.width ||
          (unsigned)d->out_h != f.fmt.pix_mp.height)) {
         V4L2_LOG("CAPTURE 残留 %ux%u，改用 OUTPUT 协商值 %dx%d",
@@ -949,7 +949,7 @@ static int cap_reconfig(struct dmd_v4l2_dec *d)
             memset(&v, 0, sizeof(v));
             memset(p, 0, sizeof(p));
             v.type = ct;
-            v.memory = V4L2_MEMORY_USERPTR;
+            v.memory = (unsigned int)d->buf_mem;
             v.m.planes = p;
             v.length = (unsigned)(d->cap_planes > 0 ? d->cap_planes : 1);
             if (ioctl(d->fd, VIDIOC_DQBUF, &v) < 0) break;
@@ -988,7 +988,10 @@ static int cap_reconfig(struct dmd_v4l2_dec *d)
     struct v4l2_requestbuffers rb0;
     memset(&rb0, 0, sizeof(rb0));
     rb0.type = ct;
-    rb0.memory = V4L2_MEMORY_USERPTR;
+    /* 内存模式必须与申请时一致。这里原先写死 USERPTR，而本机这代内核走
+     * DMABUF（见 open 里 d->buf_mem 的选择），REQBUFS(0) 直接 EINVAL，
+     * 等于 cap_reconfig 在 DMABUF 路径上从没成功过。 */
+    rb0.memory = (unsigned int)d->buf_mem;
     rb0.count = 0;
     if (xioctl(d->fd, VIDIOC_REQBUFS, &rb0, "REQBUFS(CAPTURE,0)") < 0)
         return -1;
@@ -1155,27 +1158,46 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                 if (!d->cap_ready) {
                     if (setup_capture(d) < 0) return -1;
                 } else {
-                    /* 流中换分辨率：cap_ready 已为 1，这里只看内核报回来的
-                     * 新几何，不改任何状态。用于判定第二次事件该用 G_FMT 的
-                     * 尺寸、还是仍得用 OUTPUT 协商值 —— setup_capture 里那个
-                     * "用 out_w/out_h 覆盖 G_FMT"是为首次协商的残留值加的，
-                     * 流中变化时它会把新分辨率压回旧尺寸。 */
+                    /* 流中换分辨率（同一会话内的第二次 SOURCE_CHANGE）。
+                     *
+                     * 实测：这次事件之后 G_FMT 报回的是**新**几何
+                     * （1080p→720p 报 1280x736），而 OUTPUT 侧协商值仍是旧的
+                     * 1920x1088。所以这里必须信 G_FMT —— setup_capture 里那段
+                     * "用 out_w/out_h 覆盖 G_FMT"是防首次协商残留值的，流中变化
+                     * 时方向正好相反，会把新分辨率压回旧尺寸。
+                     *
+                     * ffmpeg 侧只有 AV1 会走到这条路径：h264/hevc 换分辨率时
+                     * 上层新建 VA context，每个会话只遇到第一次事件；AV1 复用
+                     * context，于是同一会话收到第二次。 */
                     struct v4l2_format nf;
                     memset(&nf, 0, sizeof(nf));
                     nf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                    if (ioctl(d->fd, VIDIOC_G_FMT, &nf) == 0)
-                        V4L2_LOG("SOURCE_CHANGE(第2次): G_FMT=%ux%u fourcc=%c%c%c%c "
-                                 "size=%u | OUTPUT 协商=%dx%d",
-                                 nf.fmt.pix_mp.width, nf.fmt.pix_mp.height,
-                                 (char)(nf.fmt.pix_mp.pixelformat & 0xFF),
-                                 (char)((nf.fmt.pix_mp.pixelformat >> 8) & 0xFF),
-                                 (char)((nf.fmt.pix_mp.pixelformat >> 16) & 0xFF),
-                                 (char)((nf.fmt.pix_mp.pixelformat >> 24) & 0xFF),
-                                 nf.fmt.pix_mp.plane_fmt[0].sizeimage,
-                                 d->out_w, d->out_h);
-                    else
-                        V4L2_LOG("SOURCE_CHANGE(第2次): G_FMT 失败: %s",
+                    if (ioctl(d->fd, VIDIOC_G_FMT, &nf) != 0) {
+                        V4L2_LOG("SOURCE_CHANGE(流中): G_FMT 失败: %s",
                                  strerror(errno));
+                        return -1;
+                    }
+                    if ((int)nf.fmt.pix_mp.width == d->w &&
+                        (int)nf.fmt.pix_mp.height == d->h) {
+                        V4L2_LOG("SOURCE_CHANGE(流中): 几何未变（%dx%d），不重配",
+                                 d->w, d->h);
+                    } else {
+                        V4L2_LOG("SOURCE_CHANGE(流中): %dx%d → %ux%u，重配 CAPTURE",
+                                 d->w, d->h,
+                                 nf.fmt.pix_mp.width, nf.fmt.pix_mp.height);
+                        d->trust_gfmt = 1;
+                        int r = cap_reconfig(d);
+                        d->trust_gfmt = 0;
+                        if (r < 0) {
+                            V4L2_LOG("SOURCE_CHANGE(流中): 重配失败，会话保持原几何");
+                            return -1;
+                        }
+                        /* 同步 OUTPUT 协商值：out_w/out_h 只被 setup_capture 的
+                         * 覆盖逻辑读，留着旧值会让后续任何一次非 trust_gfmt 的
+                         * 重配（如 INSUFFICIENT）又把分辨率压回旧的。 */
+                        d->out_w = (int)d->w;
+                        d->out_h = (int)d->h;
+                    }
                 }
             } else if (ev.type == DMD_EV_MSM_VIDC(2) ||
                        ev.type == DMD_EV_MSM_VIDC(3)) {

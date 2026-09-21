@@ -231,6 +231,9 @@ struct dmd_v4l2_dec {
     int      reconfig_done;                   /* 保留：曾用于一次性 CONTINUE 闩锁，现已不再置位 */
     int      cap_recfg_count;                 /* CAPTURE 重配次数（诊断用） */
     int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
+    /* 1 = 本次 setup_capture 是流中换分辨率触发的，几何以 G_FMT 报回的新值为准，
+     * 不得再用 OUTPUT 协商值覆盖（那是首次协商防残留用的，方向正好相反）。 */
+    int      trust_gfmt;
     int      out_streaming, cap_streaming;
     int      buf_mem;                         /* 队列内存模式 V4L2_MEMORY_* */
     int      draining;                        /* 已送 EOS，等剩余帧 */
