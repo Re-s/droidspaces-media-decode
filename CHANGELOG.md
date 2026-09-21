@@ -3,6 +3,55 @@
 > 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
 > `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
 
+## 🧪 浏览器实测：AV1 硬解在 Chrome 里跑通（同时挂出两条新问题）
+
+装到系统路径后（不带 `LIBVA_DRIVERS_PATH`，与浏览器同一条件）在 Chrome 里放
+B站 AV1：驱动 `0.4.7+b6270ec8-dirty`，AV1 合成 2514 次、修复重发 2501 次，
+建了 1280x720 与 1920x1080 两路 `profile=32` 上下文。关键计数**全为 0**：
+空壳丢帧 0、等帧超时(≥1000ms) 0、会话重建 0、`TIMEDOUT`/rc=251 0；
+`next_frame 超时 20 ms` 2670 次全是轮询节拍。此前那个约 130 次零复现的偶发
+rc=251，在浏览器里也没有复现。
+
+⚠️ 不要把这条当成"中间起解已修"的浏览器证据：空壳丢帧 0 次说明拖进度条根本没
+走到新闸门 —— B站走 MSE，seek 会落到关键帧再喂，驱动看不到 GOP 中间起解。
+浏览器这轮只证明"稳定不死锁"，中间起解仍只有 `regress_av1_midgop.sh` 5/5 背书。
+
+### 挂账一：AV1 流中换分辨率必死（AV1 专有，可稳定复现）
+
+单进程 ffmpeg 把 1080p/720p/480p 三段 concat 起来喂硬解即可复现：
+
+    会话就绪 → SOURCE_CHANGE → CAPTURE 就绪 1920x1088
+    → 第二次 SOURCE_CHANGE → Failed to sync surface 0x2: 38 → 整条 abort (rc=-5)
+
+根因形状在 `v4l2_backend.c:1155`：第二次 `SOURCE_CHANGE` 时 `d->cap_ready` 已为
+1，`if (!d->cap_ready && setup_capture(d) < 0)` 直接跳过，CAPTURE 仍停在
+1920x1088，固件不再出帧，sync 超时。该处注释写明这套语义是按"首次分辨率协商"
+设计的（"配好 CAPTURE 后固件自动继续出帧"），真·流中换分辨率未覆盖。
+
+**AV1 专有**：同样 1080p→720p 的 concat，HEVC 与 H.264 都完整出 50/50 帧、
+与软解字节数一致、rc=0；只有 AV1 死。所以不是通用 session 层坏了，而是 AV1
+没走到那条恢复路径（`session_rebuild_locked` 被刻意收紧——重建会摧毁参考链、
+要黑到下个 IDR，见 decode.c:708 的注释）。
+
+### 挂账二：Chrome 换清晰度时 GPU 进程崩溃
+
+`Crashing due to FD ownership violation` → `GPU process exited unexpectedly:
+exit_code=5`，用户侧表现为"切换失败黑屏一下，随后恢复"。两轮各复现一次
+（15:42:41、16:08:11），都在连着 4 次 1920x1080/1280x720 来回切的
+`CreateContext` 之后。**不是** 站点播放器的锅。
+
+FD 假设已逐条排除（全阴性）：所有 `open()` 带 `O_CLOEXEC`；驱动从不 `close()`
+Chrome 传入的 DRM fd；`plane.m.fd` 传的是自己 `dmabuf_alloc()` 出的 fd，不经手
+调用方 fd 故无双重关闭；实测单进程连切 6 轮 × 3 分辨率，fd 50→49、同时只有
+1 个 `video32` + 1 个 `dma_heap`，**无泄漏**。栈全是 `<unknown>`，暂时归不了因；
+先把挂账一修掉再看崩溃是否跟着消失。
+
+## 🔧 `dmd_v4l2_close()` 在判空之前就解引用 `d`
+
+`bufs_free(d->extra, ...)` 写在 `if (!d) return` 之前，`d` 为空时直接崩。
+把判空提到最前（`extra` 是内联数组、不会为空，判空只是把语义写全）。
+该函数同时是错误路径的清理入口，所以这条影响所有建会话失败的场景。
+
 ## 🩹 AV1 从 GOP 中间起解：从"整条码流被放弃"变成"黑到下个关键帧后逐字节正确"
 
 拖动进度条落到非关键帧、或拿到半截码流时，头几帧引用的是硬件 DPB 里根本
