@@ -1546,6 +1546,33 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                  *
                  * KEY 帧会重置 order_hint 序列，用 frame_type 判新序列：
                  * frame_type 0=KEY，与 H.264 的 frame_num==0 同义。 */
+                /* 全局运动参数对拍：只在有非恒等变换时打，逐参考帧一行。
+                 * 用来确认 VA 侧 wmmat[] 是否就是源码流里的 gm_params[][]
+                 * （规范 5.9.24），据此反推 subexp 符号。 */
+                if (getenv("DMD_AV1_WMDBG")) {
+                    const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
+                    int any = 0;
+                    for (int i = 0; i < 7; i++)
+                        if (q->wm[i].wmtype != VAAV1TransformationIdentity ||
+                            q->wm[i].invalid) any = 1;
+                    if (any) {
+                        fprintf(stderr, "[wm] oh=%u hp=%u prim=%u warp=%u\n",
+                                q->order_hint,
+                                (unsigned)q->pic_info_fields.bits
+                                        .allow_high_precision_mv,
+                                (unsigned)q->primary_ref_frame,
+                                (unsigned)q->pic_info_fields.bits
+                                        .allow_warped_motion);
+                        for (int i = 0; i < 7; i++)
+                            fprintf(stderr, "[wm]  i=%d type=%d inv=%u "
+                                    "m=%d,%d,%d,%d,%d,%d\n",
+                                    i, (int)q->wm[i].wmtype,
+                                    (unsigned)q->wm[i].invalid,
+                                    q->wm[i].wmmat[0], q->wm[i].wmmat[1],
+                                    q->wm[i].wmmat[2], q->wm[i].wmmat[3],
+                                    q->wm[i].wmmat[4], q->wm[i].wmmat[5]);
+                    }
+                }
                 if (getenv("DMD_AV1_SEFPROBE")) {
                     const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
                     fprintf(stderr, "[sef] oh=%u ft=%u show=%u showable=%u "
