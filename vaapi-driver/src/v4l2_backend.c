@@ -1152,7 +1152,31 @@ int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
             if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
                 const unsigned *ed = (const unsigned *)ev.u.data;
                 V4L2_LOG("SOURCE_CHANGE: changes=0x%x", ed[0]);
-                if (!d->cap_ready && setup_capture(d) < 0) return -1;
+                if (!d->cap_ready) {
+                    if (setup_capture(d) < 0) return -1;
+                } else {
+                    /* 流中换分辨率：cap_ready 已为 1，这里只看内核报回来的
+                     * 新几何，不改任何状态。用于判定第二次事件该用 G_FMT 的
+                     * 尺寸、还是仍得用 OUTPUT 协商值 —— setup_capture 里那个
+                     * "用 out_w/out_h 覆盖 G_FMT"是为首次协商的残留值加的，
+                     * 流中变化时它会把新分辨率压回旧尺寸。 */
+                    struct v4l2_format nf;
+                    memset(&nf, 0, sizeof(nf));
+                    nf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    if (ioctl(d->fd, VIDIOC_G_FMT, &nf) == 0)
+                        V4L2_LOG("SOURCE_CHANGE(第2次): G_FMT=%ux%u fourcc=%c%c%c%c "
+                                 "size=%u | OUTPUT 协商=%dx%d",
+                                 nf.fmt.pix_mp.width, nf.fmt.pix_mp.height,
+                                 (char)(nf.fmt.pix_mp.pixelformat & 0xFF),
+                                 (char)((nf.fmt.pix_mp.pixelformat >> 8) & 0xFF),
+                                 (char)((nf.fmt.pix_mp.pixelformat >> 16) & 0xFF),
+                                 (char)((nf.fmt.pix_mp.pixelformat >> 24) & 0xFF),
+                                 nf.fmt.pix_mp.plane_fmt[0].sizeimage,
+                                 d->out_w, d->out_h);
+                    else
+                        V4L2_LOG("SOURCE_CHANGE(第2次): G_FMT 失败: %s",
+                                 strerror(errno));
+                }
             } else if (ev.type == DMD_EV_MSM_VIDC(2) ||
                        ev.type == DMD_EV_MSM_VIDC(3)) {
                 const unsigned *ed = (const unsigned *)ev.u.data;
@@ -1274,9 +1298,7 @@ void dmd_v4l2_close(struct dmd_v4l2_dec *d)
 {
     if (!d) return;
 
-    /* 原来 bufs_free(d->extra, ...) 写在 NULL 判断之前，d 为空直接解引用。 */
-    if (d->extra)
-        bufs_free(d->extra, DMD_V4L2_MAX_CAP);
+    bufs_free(d->extra, DMD_V4L2_MAX_CAP);
 
     if (d->fd >= 0) {
         int type;
