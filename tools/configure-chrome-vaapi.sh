@@ -73,10 +73,14 @@ find_chrome() {
 }
 
 # 列出候选 .desktop（系统级 + 用户级）
+# 桌面文件名不止 google-chrome.desktop：Chrome 自己会在 ~/.local/share/applications
+# 注册 com.google.Chrome.desktop（Labels 里 Name=Google Chrome），用户点图标启动时
+# DE 用的正是这份。只匹配 google-chrome*.desktop 会漏掉它 —— 实测那份里残留着
+# --enable-features=Vulkan，等于点图标打开的 Chrome 一个硬解上下文都不建。
 desktop_files() {
     for d in /usr/share/applications "$USER_APPS"; do
         [ -d "$d" ] || continue
-        for f in "$d"/google-chrome*.desktop "$d"/chromium*.desktop; do
+        for f in "$d"/google-chrome*.desktop "$d"/com.google.Chrome*.desktop "$d"/chromium*.desktop; do
             [ -f "$f" ] && printf '%s\n' "$f"
         done
     done
@@ -220,7 +224,10 @@ do_verify() {
     found=0
     for f in $(desktop_files); do
         found=1
-        n=$(grep -c "$MARKER" "$f" 2>/dev/null || echo 0)
+        # grep -c 无匹配时本身就输出 0 并以 1 退出，不能再 || echo 0，
+        # 否则 n 变成两行的 "0\n0"，下面的 [ "$n" -gt 0 ] 会报 Illegal number。
+        n=$(grep -c "$MARKER" "$f" 2>/dev/null || true)
+        [ -n "$n" ] || n=0
         if configured "$f"; then
             say "  ✓ $f （$n 处）"
         elif [ "$n" -gt 0 ]; then
