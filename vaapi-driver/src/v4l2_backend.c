@@ -422,7 +422,17 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     d->heap_kind = HEAP_NONE;
     d->ion_mask = 0;
     for (int i = 0; i < DMD_V4L2_MAX_OUT; i++) d->out[i].dbuf_fd = -1;
-    for (int i = 0; i < DMD_V4L2_MAX_CAP; i++) d->cap[i].dbuf_fd = -1;
+    for (int i = 0; i < DMD_V4L2_MAX_CAP; i++) {
+        d->cap[i].dbuf_fd = -1;
+        /* ⚠️ extra 不能漏：上面的 memset 让它停在 0，而 dmd_v4l2_close 无条件
+         * bufs_free(d->extra, MAX_CAP)，于是每次拆会话都 close(0) 24 次。
+         * strace 实测：第 1 次成功（关掉宿主进程的 stdin），后 23 次 EBADF。
+         * ffmpeg 里它只是偷走 fd 0；Chrome 的 GPU 进程里 fd 0 由 ScopedFD
+         * 记账，close() 被 Chromium 拦截并检查归属
+         * （base/files/scoped_file_linux.cc: IsFDOwned(fd) → CrashOnFdOwnership
+         * Violation），当场 exit_code=5。 */
+        d->extra[i].dbuf_fd = -1;
+    }
 
     uint32_t fourcc = dmd_v4l2_pick_fourcc(codec_id);
     if (!fourcc) {
