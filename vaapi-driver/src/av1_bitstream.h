@@ -109,20 +109,62 @@ size_t dmd_av1_build_sequence_header(const void *pic,
  * 新建 context 时整体清零即为初始状态。
  */
 struct dmd_av1_dpb {
-    VASurfaceID dpb_shadow[8];     /* 槽 -> 该槽当前存的 surface id */
+    /* ⚠️ 影子表存**本驱动的帧号**（frame_seq，从 1 起），不是 surface id。
+     * ffmpeg 会回收复用 surface：同一个 VASurfaceID 先后属于不同帧
+     * （实测 160 帧样本里 oh1 与 oh7 同用 surface 6），surface 做身份
+     * 会把死帧和复用它的活帧混为一谈。0 表示空槽。 */
+    int         dpb_shadow[8];     /* 槽 -> 该槽当前存的帧号 */
     unsigned    dpb_order_hint[8]; /* 槽 -> 该槽帧的 order hint。
                                     * error_resilient 帧的帧头要逐槽写出
                                     * （规范 5.9.2 的 ref_order_hint[i]）。 */
     unsigned    dpb_next_slot;     /* 下一个要写入的槽，8 槽轮转 */
+    int         frame_seq;         /* 已合成帧计数，本帧号 = ++frame_seq */
+
+    /* surface -> 最近拥有它的帧号。引用翻译与 E 识别都要经过它：
+     * ref_frame_map 里给的是 surface，而同一 surface 可能属于多个
+     * 历史帧，"最近拥有者"正是还活着的那个（死帧的 surface 被回收后
+     * 归新帧所有）。表满时线性替换最旧一项。 */
+    struct { VASurfaceID surf; int frame; } surf_hist[64];
+    int         surf_hist_n;
 
     /* 上一帧 refresh_frame_flags 字段在其帧头内的**位**偏移。
      * 正确值要等下一帧的 ref_frame_map 才能算出，届时用它就地改写。
      * SIZE_MAX 表示上一帧没有该字段（KEY+show 帧不写入）。 */
     size_t      last_refresh_bitpos;
 
+    /* 上一帧（即 last_refresh_bitpos 所属那一帧）的 order hint。
+     * patch 反算出真实 refresh 后要把该帧登记进影子槽，槽的 order hint
+     * 是解码器推导 skipModeAllowed（5.9.22）的输入，必须一起记。 */
+    unsigned    last_oh;
+
+    /* 同理记录 disable_frame_end_update_cdf 的位偏移。
+     *
+     * 为什么需要：双趟解码（第一趟 refresh=0 只取像素，第二趟带真实
+     * refresh 补 DPB）会让 AV1 的**帧上下文回写**发生两次。规范 7.19
+     * 里帧解码结束时执行
+     *     if ( !disable_frame_end_update_cdf )
+     *         SetFrameContext( ref_frame_idx[ primary_ref_frame ] )
+     * 把本帧的 CDF/delta-q/环路滤波等终态**拷贝**进 primary 参考帧所在
+     * 槽的上下文。第一趟已经把它改成本帧终态，第二趟再读就是错的起点
+     * —— 于是第二趟解出一帧垃圾并放进 DPB，后续引用全废。
+     *
+     * 修法：第一趟把这一位强制写 1（不回写），第二趟还原成源码流真值
+     * （由它完成唯一一次回写）。两趟的起点上下文相同 → 第二趟像素与
+     * 第一趟逐位相同，DPB 与 CDF 同时正确。
+     * SIZE_MAX 表示码流里没有这个字段（disable_cdf_update=1 时推断为 1，
+     * 本来就不回写，无需处理）。 */
+    size_t      last_endupd_bitpos;
+
     /* 上一帧的 ref_frame_map 快照，用于与本帧的 map 做差分。 */
     VASurfaceID prev_ref_map[8];
     int         prev_valid;
+
+    /* 源 DPB 在上一帧解码时踢出的帧（E_{k-1} = map_{k-1} \ map_k），
+     * 以帧号表示。源编码器保证被踢出的帧不会再被任何后续帧引用
+     * （死了），本驱动让当前帧占它的影子槽，就永远不会覆盖活引用。
+     * 单槽差分算不出（如 KEY 全刷后的多槽变化）时置 valid=0。 */
+    int         evict_frame;
+    int         evict_valid;
 };
 
 /*
@@ -165,7 +207,8 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 const void *cur_pic,
                                 unsigned char *prev_frame_bytes,
                                 size_t prev_len,
-                                size_t prev_bitpos);
+                                size_t prev_bitpos,
+                                int prev_frame);
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {

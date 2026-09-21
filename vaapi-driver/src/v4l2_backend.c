@@ -84,7 +84,15 @@ struct dma_heap_allocation_data {
  *   [0] MPG2  [1] H264  [2] HEVC  [3] VP80  [4] VP90
  * （driver=msm_vidc_driver card=msm_vidc_vdec）
  *
- * ⚠️ 0.4.2：VP8 加入映射。此前注释说"VP8 不在驱动的枚举里"，实测不成立。 */
+ * ⚠️ 0.4.2：VP8 加入映射。此前注释说"VP8 不在驱动的枚举里"，实测不成立。
+ *
+ * ⚠️ 0.4.7（本设备，内核 6.6 新 msm_vidc）：该内核的枚举变成了
+ *   H264 / HEVC / VP90 / HEIC / AV10 —— MPG2 与 VP80 **不在列**
+ * （S_FMT 送入报 "unsupported codec" 并静默回落 H.264，见 dmesg），
+ * 且 AV1 的 fourcc 是**非标准**的 v4l2_fourcc('A','V','1','0')，
+ * 不是主线的 V4L2_PIX_FMT_AV1('AV01')。送 'AV01' 会被当成不支持的
+ * 编码拒绝。所以 AV1 要按设备枚举结果在两个候选里挑（见
+ * dmd_v4l2_pick_fourcc），probe 与 open 都必须走挑选结果。 */
 static uint32_t codec_to_fourcc(int codec_id)
 {
     switch (codec_id) {
@@ -363,20 +371,39 @@ static int qbuf_userptr(int fd, enum v4l2_buf_type type, int index,
 
 int dmd_v4l2_probe(int codec_id)
 {
-    uint32_t want = codec_to_fourcc(codec_id);
+    uint32_t want = dmd_v4l2_pick_fourcc(codec_id);
     if (!want) return 0;
+
+    return 1;   /* pick_fourcc 已确认枚举里存在该格式 */
+}
+
+/* codec_id → 设备实际支持的 fourcc。
+ *
+ * 按设备 OUTPUT 侧的 VIDIOC_ENUM_FMT 枚举结果在候选表里挑：主线内核
+ * 用 V4L2_PIX_FMT_AV1('AV01')，本设备（内核 6.6 新 msm_vidc）用非标准
+ * 的 'AV10'。其余 codec 只有标准一个候选，等价于直接查表，但统一走
+ * 枚举可以在固件不支持（如本设备的 MPG2/VP80）时给出确定的"不支持"，
+ * 而不是等到 S_FMT 静默回落 H.264 之后解出垃圾。返回 0 = 不支持。 */
+uint32_t dmd_v4l2_pick_fourcc(int codec_id)
+{
+    uint32_t cands[2] = { codec_to_fourcc(codec_id), 0 };
+    if (codec_id == DMD_V4L2_CODEC_AV1)
+        cands[1] = v4l2_fourcc('A', 'V', '1', '0');
+    if (!cands[0]) return 0;
 
     int fd = open(DEC_NODE_PRIMARY, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return 0;
 
-    int found = 0;
+    uint32_t found = 0;
     for (unsigned i = 0; i < 64 && !found; i++) {
         struct v4l2_fmtdesc fd_desc;
         memset(&fd_desc, 0, sizeof(fd_desc));
         fd_desc.index = i;
         fd_desc.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         if (ioctl(fd, VIDIOC_ENUM_FMT, &fd_desc) < 0) break;
-        if (fd_desc.pixelformat == want) found = 1;
+        for (int k = 0; k < 2; k++)
+            if (cands[k] && fd_desc.pixelformat == cands[k])
+                found = cands[k];
     }
     close(fd);
     return found;
@@ -397,9 +424,9 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     for (int i = 0; i < DMD_V4L2_MAX_OUT; i++) d->out[i].dbuf_fd = -1;
     for (int i = 0; i < DMD_V4L2_MAX_CAP; i++) d->cap[i].dbuf_fd = -1;
 
-    uint32_t fourcc = codec_to_fourcc(codec_id);
+    uint32_t fourcc = dmd_v4l2_pick_fourcc(codec_id);
     if (!fourcc) {
-        V4L2_LOG("不支持的 codec_id=%d", codec_id);
+        V4L2_LOG("codec_id=%d 不被本设备 OUTPUT 枚举支持", codec_id);
         return -1;
     }
 
@@ -677,8 +704,45 @@ static int setup_capture(struct dmd_v4l2_dec *d)
      * export）全都假设 8bit NV12：每像素字节数、UV 平面偏移、
      * DRM_FORMAT_NV12 都是按 8bit 写死的，所以开了它像素必然错乱。
      * 它只回答一个问题：固件在 Main10 码流下会不会吐 CAPTURE 缓冲。 */
-    uint32_t want = V4L2_PIX_FMT_NV12;
+    uint32_t want = d->ten_bit ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
     const char *probe10 = getenv("DMD_PROBE_10BIT");
+    /* DMD_PROBE_10BIT=9：逐个试候选 CAPTURE 格式，只记录固件接受哪个，
+     * 最终仍按 NV12 走正常路径。用于回答"10bit 流固件愿意吐哪种格式"。 */
+    if (probe10 && probe10[0] == '9') {
+        static const uint32_t cand[] = {
+            V4L2_PIX_FMT_NV12,
+            V4L2_PIX_FMT_P010,
+            v4l2_fourcc('Q', 'P', '1', '0'),
+            v4l2_fourcc('Q', '1', '0', 'C'),
+            v4l2_fourcc('T', 'P', '1', '0'),
+            v4l2_fourcc('Q', '1', '2', 'A'),
+            v4l2_fourcc('Q', 'T', '1', '0'),
+        };
+        for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+            struct v4l2_format t = f;
+            t.fmt.pix_mp.width = (unsigned)d->out_w;
+            t.fmt.pix_mp.height = (unsigned)d->out_h;
+            t.fmt.pix_mp.pixelformat = cand[i];
+            if (xioctl(d->fd, VIDIOC_S_FMT, &t, "S_FMT(CAPTURE 探测)") < 0) {
+                V4L2_LOG("探测 %c%c%c%c: S_FMT 失败",
+                         (char)(cand[i] & 0xFF), (char)((cand[i] >> 8) & 0xFF),
+                         (char)((cand[i] >> 16) & 0xFF), (char)((cand[i] >> 24) & 0xFF));
+                continue;
+            }
+            V4L2_LOG("探测 请求 %c%c%c%c -> 实际 %c%c%c%c  %ux%u stride=%u size=%u nplanes=%u",
+                     (char)(cand[i] & 0xFF), (char)((cand[i] >> 8) & 0xFF),
+                     (char)((cand[i] >> 16) & 0xFF), (char)((cand[i] >> 24) & 0xFF),
+                     (char)(t.fmt.pix_mp.pixelformat & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 8) & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 16) & 0xFF),
+                     (char)((t.fmt.pix_mp.pixelformat >> 24) & 0xFF),
+                     t.fmt.pix_mp.width, t.fmt.pix_mp.height,
+                     t.fmt.pix_mp.plane_fmt[0].bytesperline,
+                     t.fmt.pix_mp.plane_fmt[0].sizeimage,
+                     t.fmt.pix_mp.num_planes);
+        }
+        probe10 = NULL;
+    }
     if (probe10 && (probe10[0] == '1' || probe10[0] == '2')) {
         want = (probe10[0] == '2') ? v4l2_fourcc('Q', '1', '2', 'A')
                                    : v4l2_fourcc('Q', 'P', '1', '0');

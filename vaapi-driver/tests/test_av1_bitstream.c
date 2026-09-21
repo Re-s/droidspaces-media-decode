@@ -12,6 +12,7 @@
  *   gcc -o test_av1 tests/test_av1_bitstream.c src/av1_bitstream.c src/bitstream.c
  */
 #include <stdio.h>
+#include <stdlib.h>      /* setenv/unsetenv：切 DMD_AV1_NO_SHOWFORCE */
 #include <string.h>
 
 #include <va/va.h>
@@ -339,7 +340,10 @@ static void test_show_existing(void)
  *   1. dpb 为 NULL 或 cur_pic 为 NULL 时不得崩、不得改写
  *   2. 首次调用（prev_valid=0）不改写，但必须保存 map 并置 prev_valid
  *      —— 这正是第 76 轮那个"序列 —,8,32,64 首值丢失"的根因
- *   3. 第二次调用时按 ref_frame_map 的差分位写入指定 bitpos */
+ *   3. 第二次调用时按 ref_frame_map 的差分位写入指定 bitpos
+ *
+ * 末位实参是 prev_frame（被改写那一帧的帧号），只用于影子 DPB 登记，
+ * 本用例断言的是码流字节与 map 基准，传 0 表示"不登记影子"。 */
 static void test_patch_prev_refresh(void)
 {
     printf("refresh_frame_flags 原地改写\n");
@@ -350,8 +354,8 @@ static void test_patch_prev_refresh(void)
     /* 1. NULL 保护 */
     memset(&dpb, 0, sizeof(dpb));
     memset(&pic, 0, sizeof(pic));
-    dmd_av1_patch_prev_refresh(NULL, &pic, frame, sizeof(frame), 0);
-    dmd_av1_patch_prev_refresh(&dpb, NULL, frame, sizeof(frame), 0);
+    dmd_av1_patch_prev_refresh(NULL, &pic, frame, sizeof(frame), 0, 0);
+    dmd_av1_patch_prev_refresh(&dpb, NULL, frame, sizeof(frame), 0, 0);
     check_eq("NULL 参数不置 prev_valid", (long)dpb.prev_valid, 0);
 
     /* 2. 首次调用：不改写，但保存 map 并置 prev_valid */
@@ -359,7 +363,7 @@ static void test_patch_prev_refresh(void)
     memset(&pic, 0, sizeof(pic));
     for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
     memset(frame, 0, sizeof(frame));
-    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0);
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0, 0);
     check_eq("首次调用置 prev_valid", (long)dpb.prev_valid, 1);
     check_eq("首次调用不改写码流", (long)frame[0], 0);
     check_eq("首次调用保存 map", (long)dpb.prev_ref_map[0], 0xff);
@@ -369,7 +373,7 @@ static void test_patch_prev_refresh(void)
     pic.ref_frame_map[0] = 0x11;   /* 变了 */
     pic.ref_frame_map[3] = 0x22;   /* 变了 */
     memset(frame, 0, sizeof(frame));
-    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0);
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0, 0);
     check_eq("差分改写 mask 槽0|槽3", (long)frame[0], 0x09);
 
     /* 4. bitpos 非字节对齐时也要写对：bitpos=4 → 跨 frame[0]/frame[1]。
@@ -379,20 +383,43 @@ static void test_patch_prev_refresh(void)
     memset(&dpb, 0, sizeof(dpb));
     memset(&pic, 0, sizeof(pic));
     for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
-    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4);
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4, 0);
     pic.ref_frame_map[0] = 0x11;
     pic.ref_frame_map[3] = 0x22;
     memset(frame, 0, sizeof(frame));
-    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4);
+    dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4, 0);
     check_eq("bitpos=4 低半字节", (long)(frame[0] & 0x0f), 0x00);
     check_eq("bitpos=4 高半字节", (long)(frame[1] & 0xf0), 0x90);
 }
 
 
+/* 载荷是按位写的，断言就得按位读。
+ * bit_at：第 idx 位（idx=0 是 buf[0] 的最高位），越界返回 -1。 */
+static long bit_at(const unsigned char *buf, size_t n, size_t idx)
+{
+    if (idx >= n * 8)
+        return -1;
+    return (long)((buf[idx / 8] >> (7 - (idx % 8))) & 1u);
+}
+
+/* 最后一个置 1 的位的下标；trailing_bits()（规范 5.3.4）在 payload 末尾
+ * 写一个 1 再补零到字节边界，所以这个下标 + 1 就是 payload 的**位数**。
+ * 用它比较长度不受字节取整影响 —— 这是本用例的关键观察。
+ * 全零时返回 -1。 */
+static long last_set_bit(const unsigned char *buf, size_t n)
+{
+    for (size_t i = n * 8; i-- > 0; )
+        if (bit_at(buf, n, i) == 1)
+            return (long)i;
+    return -1;
+}
+
+
 /* ------------------------------------------------- frame_header 的 show_frame 位
  *
- * 为什么单独测这两位：AV1 剩余缺陷的候选修法（"方向 A"）是把
- * show_frame=0 的帧改写成 1，骗硬件把不显示帧也吐出来。
+ * 为什么单独测这两位：驱动把合成头里的 show_frame **恒置 1**（"方向 A"，
+ * 已落地）—— 硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，而 ffmpeg 的后端
+ * 会为每个提交帧的 surface 要像素。
  * 而规范 5.9.2 规定 showable_frame **只在 show_frame==0 时才出现**：
  *     frame_type          f(2)
  *     show_frame          f(1)
@@ -402,15 +429,22 @@ static void test_patch_prev_refresh(void)
  * 且 refresh_frame_flags 的改写位置（patch_prev_refresh 用的 bitpos）
  * 也会跟着失效。
  *
- * 这里把"两种 show_frame 取值下帧头长度差恰好一位"钉死，
- * 让日后真去做方向 A 时，一旦漏了这个联动就立刻失败而不是产出花屏。
+ * 所以本用例分两段：先在 A/B 开关（DMD_AV1_NO_SHOWFORCE）下把规范的
+ * 条件分支钉死（多一位、右移一位、那两位的取值），
+ * 再验证默认路径确实把两种 PPB 合成了逐字节相同的头（强制生效）。
  *
- * ⚠️ 本测试只验证结构性不变量（长度差、前若干位的取值），
+ * ⚠️ 本测试只验证结构性不变量（位数、逐位偏移、特定位的取值），
  * 不构造完整的参考帧头 —— 那需要一整套 VA 参数与 DPB 状态，
- * 用真实码流做端到端比对更有效（设备恢复后做）。 */
+ * 端到端比对由 verify_driver.sh 与 14 样本回归覆盖。 */
 static void test_frame_header_show_frame(void)
 {
     printf("frame_header 的 show_frame / showable_frame 联动（规范 5.9.2）\n");
+
+    /* 驱动默认把 show_frame **恒置 1**（两遍法的地基：硬件只对 show=1 的帧
+     * 吐 CAPTURE 缓冲），那样本用例要测的 showable_frame 分支根本不会出现。
+     * 先打开 A/B 开关 DMD_AV1_NO_SHOWFORCE 还原规范分支再断言语法，
+     * 末尾再单独钉住"默认强制置 1"这个行为本身。 */
+    setenv("DMD_AV1_NO_SHOWFORCE", "1", 1);
 
     unsigned char buf_show[512], buf_noshow[512];
     struct dmd_av1_dpb dpb;
@@ -445,49 +479,27 @@ static void test_frame_header_show_frame(void)
         return;
     }
 
-    /* ⚠️ 断言必须是可否证的。第一版这里写的是
-     *     if (n_show == n_noshow) { ...memcmp... }
-     *     if (first_diff >= 8) fails++;
-     * 两条在真实数据下都恒不成立（实测 11 vs 12 字节、首差在第 1 字节），
-     * 于是三种变异（删条件写入 / 无条件写入 / show_frame 写死 1）
-     * 全部未被捕获 —— 测试是摆设。改成下面的正面断言。
+    /* ⚠️ 断言必须是可否证的，而且不能把"字节数"当"位数"用。
      *
-     * 规范 5.9.2：show_frame==0 时多出一位 showable_frame，
-     * 所以 show=0 的帧头必须**恰好比 show=1 多一位**。
-     * 位数无法直接观察，但两者同为字节对齐输出，
-     * 差一位在这组参数下表现为差一字节。 */
-    check_eq("show=0 帧头比 show=1 长一字节",
-             (long)n_noshow, (long)n_show + 1);
-
-    /* show_frame 那一位就在 frame_type 之后，
-     * 所以差异必须出现在**第 1 个字节**（第 0 字节是 OBU 头/前导字段）。
-     * 写死首差位置，任何改动前导字段布局的变更都会立刻暴露。 */
-    size_t first_diff = 0;
-    while (first_diff < n_show && first_diff < n_noshow &&
-           buf_show[first_diff] == buf_noshow[first_diff])
-        first_diff++;
-    check_eq("show_frame 差异出现在第 1 字节", (long)first_diff, 1);
-
-    /* 差异字节的具体取值：show=1 与 show=0 在该字节必须不同，
-     * 且 show=0 那份的后续字节整体右移一位 —— 用末字节佐证。
-     * （只断言"不同"仍是弱断言，所以连同长度与位置三项一起。） */
-    if (buf_show[first_diff] == buf_noshow[first_diff]) {
-        fails++;
-        printf("  ✗ 首差字节取值相同，show_frame 位未真正参与合成\n");
-    }
-
-    /* ⚠️ 上面三条仍抓不到"show_frame 被写死成常量 1"这种变异：
-     * 写死后两次调用该位都是 1，而 showable_frame 的条件分支若仍读
-     * 真实字段，长度差恰好还是 1、首差位置也不变 —— 实测确实逃脱。
-     * 所以必须直接检验那一位的取值。
+     * 第一版写的是 `n_noshow == n_show + 1`（差一字节）与
+     * "首差在第 1 字节"。两条都建立在"这次恰好跨了字节边界"之上：
+     * 帧头末尾是 trailing_bits()（规范 5.3.4：一个 1 再补零到边界），
+     * 多写一位到底需不需要多一个字节，取决于该位前面已有几位。
+     * 实测随实现微调在 11/12 与 12/12 之间变过 —— 断言本身是错的，
+     * 一旦不成立就把一个正确的实现判成失败。
      *
-     * ⚠️ 定位时踩过的坑：我先假设"首差字节就是含 show_frame 的字节"，
-     * 断言写完在正常代码上就失败了。实测前 4 字节：
-     *     show=1:  1a 09 30 00
-     *     show=0:  1a 0a 28 00
-     * 第 0 字节是 OBU 头 0x1a，第 1 字节是 **obu_size**（9 与 10，
-     * 正是 11-2 与 12-2）—— 首差在第 1 字节只是因为长度不同。
-     * 真正的帧头载荷从第 2 字节开始，show_frame 在那里。
+     * 规范 5.9.2 真正的不变量是：show_frame==0 时多写一位 showable_frame，
+     * 所以 show=0 的 payload **恰好比 show=1 多一位**，且第 5 位起整体右移一位。
+     * 位数可以观察：payload 结束标记（trailing_bits 的那个 1）是缓冲区里
+     * 最后一个置 1 的位，它之后全是补零。于是"最后一个 1 的下标"就是
+     * payload 的位数，与字节取整无关。 */
+    const size_t PAYLOAD = 2;           /* OBU 头 1 字节 + obu_size 1 字节 */
+    const long stop_s = (long)last_set_bit(buf_show, n_show);
+    const long stop_t = (long)last_set_bit(buf_noshow, n_noshow);
+    check_eq("show=0 的 payload 恰好比 show=1 多一位",
+             stop_t, stop_s + 1);
+
+    /* show_frame 那一位在 frame_type 之后，载荷内第 3 位（从最高位数）。
      *
      * 载荷第 0 字节（= buf[2]）的位布局（帧间帧、非 KEY）：
      *     show_existing_frame f(1)=0
@@ -495,14 +507,63 @@ static void test_frame_header_show_frame(void)
      *     show_frame          f(1)
      *     [!show_frame 时] showable_frame f(1)
      *     ...
-     * 所以 show_frame 是从最高位数的第 4 位（bit 4，掩码 0x10）。
-     * 实测吻合：0x30 = 0011_0000 该位为 1；0x28 = 0010_1000 该位为 0。 */
-    const size_t PAYLOAD = 2;           /* OBU 头 1 字节 + obu_size 1 字节 */
+     * 所以 show_frame 是字节内 bit 4（掩码 0x10），showable_frame 是 bit 3。
+     * 实测吻合：show=1 → 0x30 = 0011_0000；show=0 → 0x28 = 0010_1000。 */
     if (n_show > PAYLOAD && n_noshow > PAYLOAD) {
         check_eq("show_frame 位（载荷 bit4）在 show=1 时为 1",
                  (long)((buf_show[PAYLOAD] >> 4) & 1u), 1);
         check_eq("show_frame 位（载荷 bit4）在 show=0 时为 0",
                  (long)((buf_noshow[PAYLOAD] >> 4) & 1u), 0);
+        check_eq("showable_frame 位（载荷 bit3）在 show=0 时为 1",
+                 (long)((buf_noshow[PAYLOAD] >> 3) & 1u), 1);
+    }
+
+    /* 右移一位：showable_frame 之后的所有位，show=0 与 show=1 必须逐位错开一格。
+     * 这条抓的是"只多写了位但后续字段没跟着挪"那类错（挪错就是整段错位花屏）。 */
+    {
+        size_t mism = 0, checked = 0;
+        for (long i = (long)PAYLOAD * 8 + 5; i <= stop_s + 1; i++) {
+            long a = bit_at(buf_noshow, n_noshow, (size_t)i);
+            long b = bit_at(buf_show, n_show, (size_t)(i - 1));
+            if (a < 0 || b < 0)
+                break;
+            checked++;
+            if (a != b)
+                mism++;
+        }
+        if (checked < 16) {
+            fails++;
+            printf("  ✗ 右移校验只覆盖了 %zu 位，太少，测试未能覆盖目标\n",
+                   checked);
+        } else if (mism != 0) {
+            fails++;
+            printf("  ✗ show=0 的后续位未整体右移一位：%zu/%zu 位不符\n",
+                   mism, checked);
+        }
+    }
+
+    /* ---- 再钉住**默认行为**本身：恒置 show_frame=1 ----
+     * 上面整段是在 A/B 开关下验证规范分支；真实跑的是另一种：
+     * 驱动把 show_frame 写成 1（硬件只对 show=1 吐 CAPTURE 缓冲，
+     * 两遍法的地基）。所以两种 PPB 必须产出**逐字节相同**的帧头。
+     * 谁哪天把这个强制去掉，896 帧回归立刻在这里先炸。 */
+    unsetenv("DMD_AV1_NO_SHOWFORCE");
+
+    pic.pic_info_fields.bits.show_frame = 1;
+    memset(&dpb, 0, sizeof(dpb));
+    size_t f_show = dmd_av1_build_frame_header(&pic, buf_show,
+                                              sizeof(buf_show), &dpb);
+    pic.pic_info_fields.bits.show_frame = 0;
+    memset(&dpb, 0, sizeof(dpb));
+    size_t f_noshow = dmd_av1_build_frame_header(&pic, buf_noshow,
+                                                 sizeof(buf_noshow), &dpb);
+    check_eq("默认：show=0 与 show=1 帧头等长（被强制置 1）",
+             (long)f_noshow, (long)f_show);
+    if (f_show > 0 && f_show == f_noshow) {
+        check_eq("默认：两种 PPB 帧头逐字节相同",
+                 (long)memcmp(buf_show, buf_noshow, f_show), 0);
+        check_eq("默认：载荷 bit4 恒为 1",
+                 (long)((buf_noshow[PAYLOAD] >> 4) & 1u), 1);
     }
 }
 
@@ -526,6 +587,14 @@ static void test_frame_header_show_frame(void)
 static void test_refresh_bitpos_invariants(void)
 {
     printf("refresh_frame_flags 位偏移的不变量（规范 5.9.2）\n");
+
+    /* 本用例遍历 show_frame 的 0/1 两种取值，断言的是**规范分支**下的
+     * 位偏移关系。驱动默认把 show_frame 恒置 1（见 build_frame_header），
+     * 那会让 KEY(show=0) 走进 KEY+show 的 refresh_all 分支、
+     * 整个 show=0 维度全部塌缩成 show=1 —— 断言就失去意义。
+     * 所以先开 A/B 开关还原规范行为。默认行为由
+     * test_frame_header_show_frame 末尾单独钉住。 */
+    setenv("DMD_AV1_NO_SHOWFORCE", "1", 1);
 
     struct dmd_av1_dpb dpb;
     VADecPictureParameterBufferAV1 pic;
@@ -597,6 +666,8 @@ static void test_refresh_bitpos_invariants(void)
         printf("  ✗ 三因素已能造成 %zu 位差（>=8），"
                "则实测的 8 位差可能就是它们，需重新排查\n", mx - mn);
     }
+
+    unsetenv("DMD_AV1_NO_SHOWFORCE");
 }
 
 int main(void)

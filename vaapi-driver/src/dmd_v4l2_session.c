@@ -152,8 +152,7 @@ int dmd_format_display_width(const struct dmd_format *fmt)
     return fmt->buf_width;
 }
 
-int dmd_format_display_height(const struct dmd_format *fmt)
-{
+int dmd_format_display_height(const struct dmd_format *fmt){
     if (!fmt || !fmt->valid) return 0;
     if (fmt->crop_bottom > fmt->crop_top)
         return fmt->crop_bottom - fmt->crop_top + 1;
@@ -161,6 +160,20 @@ int dmd_format_display_height(const struct dmd_format *fmt)
 }
 
 /* ------------------------------------------------------------ 会话生命周期 */
+
+void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit)
+{
+    if (!s)
+        return;
+    /* 只在 CAPTURE 还没配好时有效：配好之后再改几何就没人重协商了，
+     * 那种情况（同一会话内位深变化）本驱动不支持，宁可留个日志。 */
+    if (s->dec.cap_size && !!ten_bit != !!s->dec.ten_bit) {
+        sess_log(s, "警告: 会话内位深变化(%d→%d)但 CAPTURE 已配好，忽略",
+                 s->dec.ten_bit, ten_bit);
+        return;
+    }
+    s->dec.ten_bit = ten_bit ? 1 : 0;
+}
 
 struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
                                        struct dmd_error *err)
@@ -198,6 +211,8 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         free(s);
         return NULL;
     }
+    /* open 里 memset 过 d，位深必须在它之后落。 */
+    s->dec.ten_bit = cfg->ten_bit ? 1 : 0;
 
     sess_log(s, "会话建立: codec=%d %dx%d（V4L2 直通，无 daemon）",
              cfg->codec, cfg->width, cfg->height);
@@ -349,12 +364,20 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
              * ⚠️ 超时不能用 0：poll(timeout=0) 立即返回，几乎永远拿不到帧，
              * 这个循环就形同虚设 —— 实测表现与"完全不收"一样（送 6 收 2）。
              * 对照 tools/pattern 试验：用 50~100ms 时两种送料节奏都 6/6。
-             * 取 5ms 是折中：足够让已解好的帧被 DQBUF 取到，又不明显拖慢
-             * 送料路径（真正的等待仍在 next_frame）。 */
+             *
+             * ⚠️ 但这个值也**不能大**：它是每次成功送料的固定死等 —— 帧没
+             * 好就整段白等，而且每送一个单元付一次。原先取 5ms，实测
+             * 1080p60 真流每次 send_unit 平均耗 3.9ms（就是这一下），两遍法
+             * 每帧两次提交 ⇒ 每帧纯等约 8ms，整条流只跑到 51fps（低于 60，
+             * 实际播放会卡）。改成 1ms 后同一条流 120~190fps，像素逐字节不变。
+             *
+             * 取 1 而不是 0：0 会让这个循环形同虚设（见上）。这里只要求
+             * "顺手摘掉已经好的帧"，真正的等待在 next_frame 和驱动的 reaper
+             * 线程（dmd_reaper_thread，20ms 一轮）里，不在这个路径上。 */
             for (;;) {
                 if (s->pend_count >= DMD_V4L2_MAX_CAP - 1) break;
                 uint8_t *pd = NULL; size_t pl = 0; uint64_t pp = 0; int pi = -1;
-                int pr = dmd_v4l2_recv(&s->dec, &pd, &pl, &pp, &pi, 5);
+                int pr = dmd_v4l2_recv(&s->dec, &pd, &pl, &pp, &pi, 1);
                 if (pr == 1) {
                     if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
                     if (pend_push(s, pd, pl, pp, pi) < 0) {

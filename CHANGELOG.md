@@ -1,4 +1,226 @@
-# 更新日志
+# 更新日志（v0.4.7-rc1 预发布 · 分支 feat/msm-vidc-512-upstream）
+
+> 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
+> `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
+
+## ⚡ AV1 1080p60 真流帧率修好：51fps → 120~190fps（像素逐字节不变）
+
+上一条达标记录里留了个诚实附注：1800 帧只跑 51fps，**低于 60fps，播放仍会卡**。
+本轮定位并修掉，同一条流现在 2~3 倍实时。
+
+**根因不在两处最可疑的地方，而在第三处**：
+- 不是两遍法 —— 像素趟 + DPB 趟翻倍的只是提交数，硬件吞吐足够；
+- 不是队列深度 —— 输入缓冲 8→16 实测在噪声内（交错 3 轮：
+  8 缓冲 9.9/13.6/16.1s，16 缓冲 9.4/10.7/16.2s），且多占 ~70MB DMA 堆，
+  已放弃，`DMD_V4L2_MAX_OUT` 保持 8；
+- **是 `dmd_session_send_unit` 里那次"顺手收帧"的 poll 超时取 5ms**。
+  它在每次成功送料后固定死等，帧没好就整段白等；实测每次 send_unit 平均
+  3.9ms 全花在这一下，两遍法每帧两次提交 ⇒ 每帧纯等约 8ms。
+  改成 1ms 即达标：0ms 反而退化（poll 立即返回，形同虚设，见该处注释）。
+
+**验证**（改动后全量重跑）
+- 真流 1800 帧 `framemd5` 与软解 **1800/1800 逐字节一致**，rc=0，
+  全程日志只有 2 次正常的 `next_frame 超时 20 ms`，零丢帧兜底、零错误位。
+- 12 个截断点（1/12 ~ 12/12）：每点输出都是软解结果的**前缀**，无崩溃、无乱帧。
+- `tests/regress_av1_pixels.sh` 14/14 通过；`verify_driver.sh`
+  h264/hevc/vp9/vp8/av1 五码种全部逐字节一致。
+
+## ✅ AV1 真流达标：1080p60 缓存流 1800/1800 帧逐字节一致
+
+第一条真实互联网 AV1 流（B 站 1080p60，1800 输出帧、6 关键帧、300 帧 GOP、
+`order_hint_bits=7`、132 个 `show_existing_frame`、840 个 `show_frame=0`）
+首次全帧对拍通过。修复前 **1410/1800 帧不一致**，且不一致是从第 98 个编码帧
+起的连续大段 —— 不是随机噪声，是参考链污染。
+
+**根因（一位之差）**：`av1_bitstream.c` 推导 `skipModeAllowed` 的 `RELD()`
+写成 `v - (v & ohm)`，等于用第 `order_hint_bits` 位判符号；规范
+`get_relative_dist` 是 `v > ohm/2` 才减 `ohm`（恰好等于 `ohm/2` 算正向）。
+order hint 回绕处（本帧 hint=0、参考 hint=96、ohm=128）本应 +32 却算成 −96，
+`skip_mode_present` 的出现位被判定为"不允许"，**少写 1 位**，帧头从
+`tx_mode` 起整体错位 1 位：源码流是 `skip_mode_present@244=0`、
+`allow_warped_motion@245=1`，我们写成 `@245=1`、`allow_warped_motion@246=0`。
+该帧是参考帧，错误沿链传到 GOP 结尾，所以坏的是 1410 帧而不是 1 帧。
+
+**方法（本轮建的两件离线工具，值得留）**：`DMD_AV1_DUMP2` 逐单元落盘 +
+按 dump 序规则重建"真 mask 流"，喂 dav1d 当oracle；再用 `trace_headers`
+逐帧比对字段序列与位位置。可以在**不碰硬件**的前提下把这类"少一位/多一位"
+的缺陷定位到具体帧、具体字段、具体位。教训：单靠像素对拍只能知道"坏了"，
+字段序列一比才能看出"从哪一位开始坏的"。
+
+**验证**
+- 离线模拟 135 个 `[skip]` 判定点：旧公式与源码流差 1 处（正是第 97 显示帧），
+  改后差 0 处。
+- `cut1800.obu`：软解/硬解 1800 帧 framemd5 全一致，rc=0，日志中 0 次丢帧兜底、
+  0 次错误标记（是真写对了，不是靠掩盖糊过去的）。
+- 截断扫描 12 个截断点（300/600/…/1668/1800）全部 rc=0、帧数不差、
+  抽到的 5 条长度逐帧一致 —— 下一节的两遍法与丢帧兜底没有回退。
+- `verify_driver.sh` 五格式仍逐字节一致；AV1 像素回归 14/14（见下）。
+
+**吞吐现状（当时的记录，已由本页顶部那条修复）**：该流实测 **48 fps < 60 fps**，
+当时归因于两遍法（每个像素帧额外再发一遍"DPB 修复帧"，硬件实际解码约 3300 次）。
+这个归因是**错的** —— 后续测出真正的瓶颈是 send_unit 里一次 5ms 死等，
+与提交次数无关。单遍化仍是值得做的结构性优化（能再省一半硬件解码量），
+但不再是达标的前提。
+
+**回归补强**：`tests/regress_av1_pixels.sh` 原先每条样本只有 24 帧，
+`order_hint` 根本走不到回绕，这类 bug 全程隐身。新增 3 条长 GOP 深 B 金字塔
+用例（`--wrap` / `WRAPFRAMES`，默认 200 帧）。**反向验证过有效性**：把 `RELD`
+临时退回旧公式重编，`wrap-svt-ra` 立刻 ❌（两条 aom 用例仍 ✅，说明只有
+SVT 那种深层级结构才踩得到），改回来 ✅。顺带修了该脚本的帧数统计
+（原先按 md5 行误算）。
+
+## ➕ AV1 硬件静默丢帧的兜底（一个丢帧不该中止整条码流）
+
+同一真流的第 1669 帧附近（也是 order_hint 回绕处）另有一个独立问题：
+Venus 把 unit 3323/3324 收进 OUTPUT 队列后**既不回传帧、也不回传错误标志**，
+之后单元照常出帧。CAPTURE 侧 24/24 全在驱动手里、OUTPUT 侧 0/8，
+硬件层面确认是它丢的。后果是一帧丢不起：调用方在 `vaSyncSurface` 上干等满
+5000ms 后放弃整条码流（rc=251），等于"一个丢帧 = 播放中止"。
+
+判据只在 AV1 上启用（不动另外四个码流的逐字节回归）：出帧跟随入序，所以
+"比队首更晚提交的单元都已出帧、队首那个却始终没回"就是队首被吞的证据。
+越过队首配走 3 帧、且至少等过 150ms 才动手，给真正只是晚到的帧留余地。
+处理：摘掉队首登记，作废号记进 `av1_dead_unit`（迟到真帧由取帧路径丢弃，
+绝不留队列空洞 —— 空洞会让之后每一帧都错位，0.4.5 实测 Chrome 98.6% 配错）；
+若被摘的正是调用方在等的那张 surface，就以它当前内容交付并返回成功，
+玩家看到的是上一帧的重复，最多错一帧画面，整段播放不再被打断。
+
+## ✅ AV1 硬解达标：896 帧逐字节一致 + 10bit(P010) 打通
+
+上一节（flush+repair 专项）记录的状态已被本轮取代：那条
+"当前最优 91/150" 的瓶颈正是 **show_frame 强制置 1（方向 A）** 解决的，
+配套是两遍法（pixel pass 用 `refresh_frame_flags=0` + 强制
+`disable_frame_end_update_cdf`，DPB pass 用 `dmd_av1_patch_prev_refresh`
+回写真实 refresh 位）与驱动内的**影子 DPB** 槽位翻译。
+
+**实测（本机构建，全新 `make clean` 后）**
+
+- 14 条 AV1 样本 / **896 帧**，逐帧 md5 命中软解，且每条样本的命中序
+  严格 `0..N-1`（显示序正确，不是靠乱序凑数）：
+  640x360 / 640x360b / 656x480 / 1280x720 各 24，pyr720 48，
+  a_cdef 64，a_g64 96，a_g256 128，a_lag 96，a_tiles 64，
+  svt_360 96，svt_720 96，rav_720 64，a_10b 48（10bit）
+- `verify_driver.sh`：h264 / hevc / vp9 / vp8 / av1 五种格式
+  整条流 md5 与软解逐字节一致（vp8 按固件能力回落软解，一致即正确）
+- `make tests`（AV1 比特流单测）全通过
+
+**10bit（P010）**：固件能正确解 10bit AV1，但 CAPTURE 配成 NV12/Q08C
+时它把样本截断成 `v10 & 0xFC`（表现为"和软解 10bit 对不上"，易误判为
+解码错误）。实测固件对 AV1 10bit 接受**线性 P010**（640x384 →
+stride=1280、sizeimage=737280、1 plane）。全树几何约定统一为
+**stride 以字节计**，于是 `size = stride*slice_height*3/2` 对两种格式
+同时成立。入口开关在 profiles.c：仅 `VAProfileAV1Profile0` 声明
+`VA_RT_FORMAT_YUV420_10` —— 少了这步 FFmpeg 直接报
+"Your platform doesn't support hardware accelerated AV1 decoding"，
+后面代码根本不执行。`QuerySurfaceAttributes`/`QueryImageFormats`
+追加 `VA_FOURCC_P010`，`CreateSurfaces2` 由 PixelFormat 推位深，
+`GetImage` 位深不符直接拒绝（不静默截断）。
+两个有意的取舍：P010 的黑帧初始化不能 `memset(0x80)`（16bit 小端会得
+0x8080，超量程）；`ExportSurfaceHandle` 对 P010 + SEPARATE_LAYERS
+**主动拒绝**（本 libdrm 有 R10 无 GR10，硬撑会被按错比例读、暗约 64 倍），
+Chrome 走 COMPOSED 不受影响，Firefox 10bit 宁可回落软解也不给错色。
+4:4:4（profile 1）仍不在范围内：未声明 4:4:4 surface 格式，
+FFmpeg 在提交前就拒绝。
+
+**单测可否证化**：修好编译（`dmd_av1_patch_prev_refresh` 少传
+`prev_frame` 的 6 个调用点）后，剩余 5 项失败判定为**测试过时** ——
+驱动恒置 `show_frame=1` 使 `showable_frame` 分支在默认路径不再出现。
+处理不是删断言，而是用 A/B 开关 `DMD_AV1_NO_SHOWFORCE=1` 还原规范分支
+再断言，并**另加一条钉住默认强制行为**（两种 PPB 必须产出逐字节相同的
+帧头）。顺带纠正一个错误断言：原"show=0 帧头比 show=1 长**一字节**"
+把字节数当成了位数，只在恰好跨字节边界时成立；改为按 `trailing_bits()`
+停止位的下标测**位数**，再加"第 5 位起整体右移一位"的逐位校验。
+变异验证：无条件写 showable / 删 showable 写 / show_frame 写死 1
+三个变异现在各被**不同**断言抓住（原先三个全部逃脱）。
+
+**教训（本轮自伤，值得记）**：为确认构建干净跑了 `make clean`，把唯一
+端到端验证过的 .so 一起清了；而 A/B 试验期间在 `av1_bitstream.c` 误留
+一行重复的 `dmd_bw_put_flag(showable_frame)` —— 每帧多写一位，固件报
+`av1DecParseFrame: AV1 ERROR code 88000060 obu_error`，14 样本硬解全 0
+帧，而**单测全程全绿**（相对不变量测不出"整体多一位"）。
+结论：改合成码流之后必须跑端到端；工作树全部未提交时，`make clean`
+前先备份二进制。
+
+## WIP · AV1 flush+repair 路径专项排查(第 2 天)（已被上一节取代，保留排查记录）
+
+**根因已锁定**:全部剩余像素问题(640 宽帧间帧、SEF 复显流、
+B 站 1080p60)都发生在 **flush+repair 送帧路径**;从不触发 flush 的流
+(1280x720/960x540/1024x576/704x480)逐字节 0 差异。
+ffmpeg 对 AV1 每帧都 sync surface,小分辨率解码快、sync 先于
+下一帧 EndPicture 到达,暂存帧被迫提前冲出(refresh 未反算),
+由此产生 r=0 副本 + 修复重发的双解码流。
+
+**本轮已否证(勿重复):**
+1. 合成码流结构错误 —— trace_headers 逐字段对拍,除已知中性差异
+   (level/restoration/chroma_pos)外完全一致;dav1d 接受全部字节;
+2. seq_level_idx / force_integer_mv / enable_restoration 字段转写 ——
+   逐项修正后像素无任何变化;
+3. 修复重发输出(哨兵帧)的 CAPTURE 缓冲被过早回收 —— 延迟归还
+   (4-FIFO)与按"源 DPB 踢出事件"(E)精确归还,像素均无变化;
+   哨兵缓冲的生命周期与坏帧完全无关(21 holds/19 releases 验证)。
+4. show_frame=0 修复副本(位插入消输出)—— 更差(20/24),
+   已放弃,回退到哨兵方案。
+
+**当前最优**:哨兵方案(640 宽 9/24,SEF 流 91/150,起点 3/150)。
+**下一步方向**:坏帧与 ffmpeg 的 8-surface 池回绕精确重合
+(第二轮复用起坏),应排查 surface 复用时驱动的 pending/
+surface 状态机,或让消费者的 surface 池变大(mpv 池更大可作对照)。
+
+## v0.4.7-wip（AV1 适配推进 · 本设备固件能力实测）
+
+### MPEG-2：本设备固件不支持，无法适配（结论性实测）
+
+内核 6.6 的新 msm_vidc 上 `VIDIOC_ENUM_FMT(OUTPUT)` 只列
+H264 / HEVC / VP90 / HEIC / AV10 —— **MPG2 与 VP80 不在列**。
+S_FMT 送 MPG2/VP80 时内核报 `msm_vdec_try_fmt: unsupported codec`
+（dmesg）并**静默回落 H.264 默认参数**（320x240）。旧文档里
+"MPG2/VP80 在列"是小米平板 5（nabu，内核 4.14 venus）的情况。
+探测脚本：`tools/probe_mp2_feed.c`（另含送料粒度对照）。
+因此 DMD_ENABLE_MPEG2 在本设备无意义；码流合成器保留，留给
+固件支持 MPG2 的设备。
+
+### VP8：运行时能力门控（修复虚报）
+
+VP8 在本设备固件上同样不支持，但 0.4.2 起静态声明了该 profile。
+`dmd_QueryConfigProfiles` / `dmd_profile_supported` 现按
+`dmd_v4l2_probe`（ENUM_FMT）运行时过滤 VP8 / MPEG2 / AV1 ——
+固件不支持的 profile 不再声明，消费者自动回落软解。
+
+### AV1：修复 fourcc 不匹配并打通端到端（大幅推进，尚未完成）
+
+- **fourcc**：本内核 AV1 的 fourcc 是非标准的 `AV10`
+  （`v4l2_fourcc('A','V','1','0')`），不是主线的 `AV01`。新增
+  `dmd_v4l2_pick_fourcc`：按设备 OUTPUT 枚举在标准/非标准两个候选里
+  挑，probe 与 open 都走挑选结果。此前 probe 直接失败，AV1 会话起不来。
+- **show_frame 强制置 1**：硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，
+  而 ffmpeg 的 VA-API 后端为每个提交帧的 surface 要像素（show_frame=0
+  的帧日后由 show_existing_frame 复显 = 重用同一 surface）。合成帧头
+  现在把 show_frame 写成 1，每个提交帧都有一帧硬件输出、一张 surface。
+- **迟到发现**：ffmpeg 会**回收复用 surface**（同一 VASurfaceID 先后
+  属于不同帧），surface 不能当帧身份用。新增 frame_seq 帧号与
+  surface→"最近拥有者帧号"表（dmd_av1_frame_of / remember_surface）。
+- **非标准实现清除**：enable_restoration / skip_mode_present /
+  allow_warped_motion 等字段原先按 av1_1080p.obu 单条流的实测拟合
+  （恒 1、uniform_ref 置 0 等），换码流即错。除 VA-API 完全不提供的
+  序列级 enable_superres/enable_restoration 外，一律转写 VA-API 值。
+- **flush 修复队列**：暂存帧被 sync 提前冲出时按 refresh=0 送出
+  （不占槽、不破坏 DPB），字节进修复队列；下一帧反算出真实 refresh 后
+  重发一次补上 DPB，重发输出用哨兵 pending（surface=0xFFFFFFFE）丢弃。
+- **现状**：dav1d 软解逐帧比对 91/150 显示帧像素精确一致（起点 3/150），
+  帧数 150/150。**无 SEF 的流已整流逐字节一致**（1280x720/960x540/
+  1024x576/704x480 实测 24~40 帧 0 差异）。
+- **遗留问题 1（宽度相关）**：640 宽（640x360/480/368）的帧间帧从
+  GOP 中段起出现垃圾像素，帧内帧与配对全部正常；704/960/1024/1280
+  宽全部通过。CAPTURE 协商（stride=640 slice_h=480）与 sizeimage 均正常。
+  头号嫌疑：`RELEASE_BUFFER_REFERENCE`（私有事件 +6）只订阅未处理 ——
+  会话在拷贝出 surface 后立即归还 CAPTURE 缓冲，固件可能仍将其作为
+  AV1 参考帧持有（AV1 金字塔同时持有 7~8 个参考），缓冲被覆盖即出
+  垃圾参考。H.264/HEVC/VP9 因参考保持节奏宽松未暴露。
+- **遗留问题 2（SEF 相关）**：带 alt-ref 复显的流（150 帧 59 个 SEF）
+  显示 33~59、109+ 区间像素错误（数量与 SEF 数一致、奇偶交替），
+  显示 0~32 与 60~108 全对。修复重发的输出/配对经日志核验完全正确，
+  差异在像素层 —— 与遗留问题 1 可能为同一根因（参考缓冲被过早回收）。
+  两问题修复后 AV1 即可声明。
 
 ## v0.4.6（修复 Chrome 硬解画面错乱）
 

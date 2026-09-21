@@ -81,10 +81,27 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     unsigned int slice_h = s->slice_height;
     unsigned int disp_w = s->width;
     unsigned int disp_h = s->height;
+    int ten_bit = s->format == VA_RT_FORMAT_YUV420_10;
     uint32_t handle = s->dumb_handle;
     int drm_fd = s->dumb_drm_fd;
     size_t total = s->dumb_size;
     pthread_mutex_unlock(&drv->lock);
+
+    /* 10bit 的 SEPARATE_LAYERS 暂不支持，宁可不给也别给错。
+     *
+     * 判据是 DRM 侧没有能准确表达 P010 的分离层格式：本机的
+     * libdrm/drm_fourcc.h 里有 R10（10bit 存进 16bit LE），但没有 GR10，
+     * 于是 UV 层只能借用 GR16/GR1616 这类"16bit 原生"格式 —— 那会让
+     * 消费方按 16bit 量程解释采样值，整幅暗 64 倍。COMPOSED 用
+     * DRM_FORMAT_P010 是明确无误的，Chrome 走的正是 COMPOSED。
+     * Firefox 传 SEPARATE，所以对 10bit 流会回落软解（不会花屏）。
+     * 想在 Firefox 上开 10bit，得先在真机确认它的格式解释再放开这里。 */
+    if (ten_bit && !(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
+        dmd_log("ExportSurfaceHandle: surface %u 是 P010，"
+                "SEPARATE_LAYERS 未实现（flags=0x%x）\n",
+                (unsigned)surface_id, flags);
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
 
     /* 导出 fd 时不持锁：ioctl 是内核调用，且调用方拿到 fd 后由它负责 close。 */
     struct drm_prime_handle prime;
@@ -102,7 +119,7 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         (VADRMPRIMESurfaceDescriptor *)descriptor;
     memset(desc, 0, sizeof(*desc));
 
-    desc->fourcc = VA_FOURCC_NV12;
+    desc->fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     desc->width = disp_w;
     desc->height = disp_h;
 
@@ -116,7 +133,8 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
      * 合并成一层（NV12 单 layer）只有在对方传 COMPOSED_LAYERS 时才合适。 */
     if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
         desc->num_layers = 1;
-        desc->layers[0].drm_format = DRM_FORMAT_NV12;
+        desc->layers[0].drm_format =
+            ten_bit ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
         desc->layers[0].num_planes = 2;
         desc->layers[0].object_index[0] = 0;
         desc->layers[0].offset[0] = 0;
@@ -126,7 +144,8 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[0].pitch[1] = stride;
     } else {
         desc->num_layers = 2;
-        /* Y 平面：8bpp 单通道 */
+        /* Y 平面：8bpp 单通道。走到这里必然是 8bit ——
+         * 上面已把 10bit 的 SEPARATE 请求挡掉。 */
         desc->layers[0].drm_format = DRM_FORMAT_R8;
         desc->layers[0].num_planes = 1;
         desc->layers[0].object_index[0] = 0;

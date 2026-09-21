@@ -88,6 +88,11 @@ struct dmd_session_config {
     int      height;            /* 96..4320 */
     int      connect_timeout_ms;/* <=0 表示用默认 2000 */
     int      io_timeout_ms;     /* 单次收发的默认超时，<=0 表示用默认 5000 */
+    /* 码流位深 >8bit 时置 1：CAPTURE 侧要 P010 而不是 NV12。
+     * 会话建立时通常还不知道（vaCreateContext 不带位深），所以留一个
+     * 后置设置口 dmd_session_set_ten_bit()，在首次 EndPicture 拿到
+     * 逐帧参数后写进来 —— CAPTURE 协商发生在更晚的 SOURCE_CHANGE。 */
+    int      ten_bit;
 };
 
 /* 用默认值填充 cfg（H.264、2s/5s 超时）。cfg 为 NULL 时无操作。 */
@@ -168,6 +173,12 @@ struct dmd_frame {
 
 /* ------------------------------------------------------------ 会话 */
 struct dmd_session;
+
+/* 会话建立之后再告知位深：vaCreateContext 阶段还拿不到位深（AV1 的
+ * bit_depth_idx 在首个 PPB 里），而 CAPTURE 协商要等首个单元送出后的
+ * SOURCE_CHANGE，所以必须赶在那之前调这里。ten_bit 非 0 → CAPTURE 用
+ * P010。CAPTURE 已配好后再调用是无效操作（会打日志）。 */
+void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit);
 
 /*
  * 建立会话：连接 daemon、完成握手、（若请求）领取共享内存池。

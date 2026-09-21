@@ -27,14 +27,23 @@
 
 #include "driver.h"
 
+/* NV12 与 P010 共用同一套几何算式，因为**这里的 stride 一律是字节**：
+ * P010 的一行是 样本宽×2 字节，于是 data_size = stride*slice*3/2、
+ * offsets[1] = stride*slice 对两种位深都成立，不用分支。
+ * 只有 fourcc 与 bits_per_pixel 要分开报 —— 消费者靠 fourcc 判断
+ * 每样本几个字节，报错了它就会按错宽度重采样（症状是画面横向压扁）。 */
 void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
                              unsigned int disp_height, unsigned int stride,
-                             unsigned int slice_height)
+                             unsigned int slice_height, int ten_bit)
 {
     memset(img, 0, sizeof(*img));
 
-    img->format.fourcc = VA_FOURCC_NV12;
+    img->format.fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     img->format.byte_order = VA_LSB_FIRST;
+    /* VA 的 bits_per_pixel 记的是**布局名义值**，不是有效位数：
+     * P010 每像素 1.5×16 = 24 bit？不 —— 各家驱动（含 Mesa）对 P010
+     * 沿用 12，与 NV12 相同，有效位数由 fourcc 本身表达。跟着惯例走，
+     * 免得消费者拿它做量程校验时把我们拒掉。 */
     img->format.bits_per_pixel = 12;
 
     /* 报显示尺寸：ffmpeg 按 sw_format 的尺寸校验，报缓冲尺寸会不匹配。 */
@@ -119,21 +128,24 @@ VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
-    /* 只支持 NV12：MediaCodec 输出 color-format 21（线性 NV12），
-     * 其他格式要在 driver 里做色彩转换，那属于 VPP，本驱动不声明。 */
-    if (format->fourcc != VA_FOURCC_NV12)
+    /* NV12(8bit) 与 P010(10bit) 两种线性半平面。其余格式要在驱动里做
+     * 色彩/位深转换，那属于 VPP，本驱动不声明。 */
+    if (format->fourcc != VA_FOURCC_NV12 && format->fourcc != VA_FOURCC_P010)
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    const int ten_bit = format->fourcc == VA_FOURCC_P010;
 
     /* 这里拿不到 surface，只能按解码器的对齐规则推导几何 ——
      * 与 surface 的预分配用同一套规则（宽 128、高 32）。真实几何在
      * GetImage 时按 surface 的实际 stride/slice_height 逐行搬运，
-     * 所以即使解码器给了不同对齐也不会错位。 */
-    unsigned int stride = dmd_align_up((unsigned int)width, DMD_WIDTH_ALIGN);
+     * 所以即使解码器给了不同对齐也不会错位。
+     * stride 一律是**字节**，所以 10bit 只要把它翻倍。 */
+    unsigned int stride =
+        dmd_align_up((unsigned int)width, DMD_WIDTH_ALIGN) * (ten_bit ? 2u : 1u);
     unsigned int slice_h = dmd_align_up((unsigned int)height, DMD_HEIGHT_ALIGN);
 
     VAImage desc;
     dmd_fill_image_geometry(&desc, (unsigned int)width, (unsigned int)height,
-                            stride, slice_h);
+                            stride, slice_h, ten_bit);
 
     pthread_mutex_lock(&drv->lock);
     struct dmd_image *img = image_alloc_locked(drv, &desc, NULL);
@@ -145,9 +157,12 @@ VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
     *image = img->image;
     pthread_mutex_unlock(&drv->lock);
 
-    dmd_log("CreateImage: %dx%d stride=%u slice_h=%u offsets=[0,%u] size=%u "
-            "-> image=%u buf=%u\n",
-            width, height, stride, slice_h, image->offsets[1], image->data_size,
+    dmd_log("CreateImage: %dx%d fourcc=%c%c%c%c stride=%u slice_h=%u "
+            "offsets=[0,%u] size=%u -> image=%u buf=%u\n",
+            width, height,
+            (char)(format->fourcc & 0xFF), (char)((format->fourcc >> 8) & 0xFF),
+            (char)((format->fourcc >> 16) & 0xFF), (char)((format->fourcc >> 24) & 0xFF),
+            stride, slice_h, image->offsets[1], image->data_size,
             (unsigned)image->image_id, (unsigned)image->buf);
 
     return VA_STATUS_SUCCESS;
@@ -183,7 +198,7 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
      * 这两个值已按解码器给的格式块更新过。 */
     VAImage desc;
     dmd_fill_image_geometry(&desc, s->width, s->height, s->stride,
-                            s->slice_height);
+                            s->slice_height, s->format == VA_RT_FORMAT_YUV420_10);
 
     /* surface 缓冲装不下声明的 data_size 时不能 derive：调用方会按
      * data_size 读越界。 */
@@ -234,22 +249,31 @@ VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
     return VA_STATUS_SUCCESS;
 }
 
-/* NV12 逐行搬运：源与目的可能有不同的 stride/slice_height，
- * 整块 memcpy 只在两者完全一致时才对，其余情况必须按行。 */
+/* 半平面 4:2:0 逐行搬运（NV12 与 P010 共用）。
+ *
+ * 两个 stride 都是**字节**，所以行拷贝本身与位深无关；唯一要乘
+ * sample_bytes 的是平面内的 x 偏移 —— 它是样本坐标。
+ * 源与目的可能有不同的 stride/slice_height，整块 memcpy 只在两者
+ * 完全一致时才对，其余情况必须按行。 */
 static void nv12_copy(unsigned char *dst, unsigned int dst_stride,
                       unsigned int dst_slice, const unsigned char *src,
                       unsigned int src_stride, unsigned int src_slice,
                       unsigned int x, unsigned int y, unsigned int w,
-                      unsigned int h)
+                      unsigned int h, unsigned int sample_bytes)
 {
-    unsigned int row_bytes = w < dst_stride ? w : dst_stride;
-    if (row_bytes > src_stride - x)
-        row_bytes = src_stride - x;
+    /* 一切样本坐标，最后统一乘 sample_bytes 换成字节。 */
+    const unsigned int src_w_samples = src_stride / sample_bytes;
+    const unsigned int dst_w_samples = dst_stride / sample_bytes;
+    unsigned int row_samples = w < dst_w_samples ? w : dst_w_samples;
+    if (row_samples > src_w_samples - x)
+        row_samples = src_w_samples - x;
+    const unsigned int row_bytes = row_samples * sample_bytes;
+    const unsigned int xoff = x * sample_bytes;
 
     /* Y 平面 */
     for (unsigned int r = 0; r < h; r++) {
         memcpy(dst + (size_t)r * dst_stride,
-               src + (size_t)(y + r) * src_stride + x, row_bytes);
+               src + (size_t)(y + r) * src_stride + xoff, row_bytes);
     }
 
     /* UV 平面：4:2:0 半平面，高度减半，x 必须按 2 对齐才不会拆开 U/V 对。 */
@@ -259,7 +283,7 @@ static void nv12_copy(unsigned char *dst, unsigned int dst_stride,
     unsigned int uv_y = y / 2;
     for (unsigned int r = 0; r < uv_h; r++) {
         memcpy(duv + (size_t)r * dst_stride,
-               suv + (size_t)(uv_y + r) * src_stride + x, row_bytes);
+               suv + (size_t)(uv_y + r) * src_stride + xoff, row_bytes);
     }
 }
 
@@ -338,16 +362,30 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         }
     }
 
-    if (img->image.format.fourcc != VA_FOURCC_NV12) {
+    /* image 与 surface 的位深必须一致：跨位深搬运要么丢精度（10→8）
+     * 要么读出垃圾（8→10），都不是本驱动该做的事（那是 VPP）。
+     * 消费者拿 P010 image 配 NV12 surface 时明确拒绝，别给半对的像素。 */
+    const int img_ten_bit = img->image.format.fourcc == VA_FOURCC_P010;
+    const int surf_ten_bit = s->format == VA_RT_FORMAT_YUV420_10;
+    if (img->image.format.fourcc != VA_FOURCC_NV12 && !img_ten_bit) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
-    /* 请求区域必须落在 surface 缓冲内。 */
-    if ((unsigned int)x + width > s->stride ||
+    if (img_ten_bit != surf_ten_bit) {
+        pthread_mutex_unlock(&drv->lock);
+        dmd_log("GetImage: 位深不符 image=%.4s(%d) surface=%.4s(%d)\n",
+                (const char *)&img->image.format.fourcc, img_ten_bit,
+                surf_ten_bit ? "P010" : "NV12", surf_ten_bit);
+        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
+    const unsigned int spb = surf_ten_bit ? 2u : 1u;
+
+    /* 请求区域必须落在 surface 缓冲内。stride 是字节，先折回样本坐标。 */
+    if ((unsigned int)x + width > s->stride / spb ||
         (unsigned int)y + height > s->slice_height) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("GetImage: 区域 %d,%d %ux%u 超出 surface 缓冲 %ux%u\n", x, y,
-                width, height, s->stride, s->slice_height);
+        dmd_log("GetImage: 区域 %d,%d %ux%u 超出 surface 缓冲 %u×%u(%u 字节行)\n",
+                x, y, width, height, s->stride / spb, s->slice_height, s->stride);
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     /* 目标 image 必须装得下请求的尺寸。 */
@@ -364,7 +402,8 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
 
     nv12_copy(img->data, img->image.pitches[0],
               img->image.offsets[1] / img->image.pitches[0], s->data, s->stride,
-              s->slice_height, (unsigned int)x, (unsigned int)y, width, height);
+              s->slice_height, (unsigned int)x, (unsigned int)y, width, height,
+              spb);
 
     pthread_mutex_unlock(&drv->lock);
 
