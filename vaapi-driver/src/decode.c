@@ -144,6 +144,101 @@ void dmd_context_reset_locked(struct dmd_context *c)
     c->current_target = VA_INVALID_ID;
 }
 
+/* =========================== IO 所有权与会话销毁 ===========================
+ *
+ * 为什么需要这一对函数（2026-09-21 Chrome 实测）：
+ *
+ * 每个会碰会话的线程都是"持锁检查 → 抓 session 指针 → 放锁做 IO → 重新持锁
+ * → 用完指针（release_frame / store_frame）"。io_busy 原本在重新持锁后**立刻**
+ * 清掉，可指针在那之后还要用；而拆会话的一方（DestroyContext、会话重建）只看
+ * io_busy，看到 0 就 close。于是：一边 close(d->fd) 并 munmap 掉 CAPTURE 缓冲，
+ * 另一边还在对同一个 fd 做 QBUF/DQBUF —— 报 ENOTTY（"对设备不适当的 ioctl
+ * 操作"），fd 号被宿主进程拿去开别的文件后，我们下一次 ioctl 动的就是它的 fd。
+ * Chrome 侧的终局就是
+ *     Crashing due to FD ownership violation
+ *     GPU process exited unexpectedly: exit_code=5
+ *
+ * 所以：io_busy 必须撑到最后一次使用之后（下面 io_release 的调用点都按这个改），
+ * 而"拆会话"改成有人在用就挂起、由最后用完的人拆（session_retire_locked）。
+ */
+
+/* 取得本槽位的 IO 所有权：持锁等前一个使用者交还，然后占住。
+ * 返回 0 = 已取得；-1 = 等待超时，调用方**必须放弃这次 IO**，绝不能硬占。
+ *
+ * 为什么不能"等不到就直接 io_busy=1"：那是把别人正在用的所有权标记覆盖掉，
+ * 后交还的一方会把它清零，于是拆会话的人看到 0 就 close —— 两个线程同时
+ * 对同一个 V4L2 fd 做 QBUF/DQBUF，正是 ENOTTY / FD ownership violation。
+ *
+ * ⚠️ 本函数等待期间会放锁，所以**返回后必须重新确认槽位**
+ * （context_slot_ok），并且**在此之后**才抓 c->session。原来几处是
+ * "先抓 session 指针、再去等 io_busy、然后拿旧指针做 IO"，等待窗口里
+ * 会话可以被别人拆掉，那是 use-after-free。 */
+static int io_acquire(struct dmd_driver *drv, int idx, const char *who)
+{
+    int waited = 0;
+    while (drv->io_busy[idx]) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 20 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts);
+        waited += 20;
+        if (waited >= DMD_FRAME_TIMEOUT_MS) {
+            dmd_log("%s: 等 IO 所有权超时（槽位 %d 已被占 %d ms），本次 IO 放弃\n",
+                    who, idx, waited);
+            return -1;
+        }
+    }
+    drv->io_busy[idx] = 1;
+    return 0;
+}
+
+/* 放锁等待之后确认这个槽位仍是我们要的那个 context。
+ * drv->contexts 是定长数组，指针不会失效，但内容会被下一个
+ * CreateContext 换人 —— 只比指针不够，必须比 ID 与 in_use。 */
+static int context_slot_ok(struct dmd_context *c, VAContextID id)
+{
+    return c && c->in_use && c->id == id;
+}
+
+/* 交出本槽位的 IO 所有权；若挂着的会话等的就是这一次交还，就地销毁它。
+ * 返回 1 = 本槽位的会话已被销毁，调用方**不得**再用旧的 session 指针。
+ * 调用方持锁。 */
+static int io_release(struct dmd_driver *drv, int idx)
+{
+    drv->io_busy[idx] = 0;
+    pthread_cond_broadcast(&drv->io_done);
+
+    struct dmd_session *z = drv->io_defer[idx];
+    if (!z) return 0;
+    drv->io_defer[idx] = NULL;
+    dmd_session_destroy(z);
+    return 1;
+}
+
+/* 请求销毁一个会话。调用方持锁，且必须**已经**把它从 context 上摘掉并置
+ * c->retiring，否则交还 io_busy 之前收帧线程会把这个待拆的会话重新抓去用。 */
+static void session_retire_locked(struct dmd_driver *drv, int idx,
+                                 struct dmd_session *s)
+{
+    if (!s) return;
+    if (!drv->io_busy[idx]) {
+        dmd_session_destroy(s);
+        return;
+    }
+    if (drv->io_defer[idx]) {
+        /* 走到这里意味着同一个槽位上挂了两个没人用的会话 —— 按上面的前提
+         * 不该发生。宁可不拆（泄漏一个会话）也不能拆别人在用的。 */
+        dmd_log("io_defer[%d] 已被占用，旧会话本次不拆（宁可泄漏不可错拆）\n",
+                idx);
+        return;
+    }
+    drv->io_defer[idx] = s;
+}
+
 /* ========================== 后台收帧（Chrome 路径） ==========================
  *
  * 为什么必须有：Chrome 从不调 vaSyncSurface（实测 0 次，Firefox 是 1500 次），
@@ -169,7 +264,7 @@ static void *dmd_reaper_thread(void *arg)
         int worked = 0;
         for (int i = 0; i < DMD_MAX_CONTEXTS; i++) {
             struct dmd_context *c = &drv->contexts[i];
-            if (!c->in_use || !c->session || drv->io_busy[i])
+            if (!c->in_use || !c->session || drv->io_busy[i] || c->retiring)
                 continue;
             if (c->pending_count <= 0)
                 continue;
@@ -198,30 +293,28 @@ static void *dmd_reaper_thread(void *arg)
             int rc = dmd_session_next_frame(sess, &f, 20);
 
             pthread_mutex_lock(&drv->lock);
-            drv->io_busy[i] = 0;
-            pthread_cond_broadcast(&drv->io_done);
 
+            /* io_busy 要撑到**最后一次碰 sess** 之后才交还：下面
+             * dmd_session_release_frame 用的是放锁前抓来的指针，早清一步
+             * 就等于把"还有人在用这个会话"谎报成"没人用了"，
+             * 那边 DestroyContext / 会话重建便会去 close 它的 fd。 */
             c = dmd_find_context_locked(drv, cid);
-            if (!c) {
-                if (rc == DMD_OK)
-                    dmd_session_release_frame(sess, &f);
-                continue;
+            if (c && rc == DMD_OK) {
+                VASurfaceID id = dmd_pending_take_locked(c, f.unit_seq);
+                struct dmd_surface *s = dmd_find_surface_locked(drv, id);
+                if (s) {
+                    surface_store_frame_locked(s, &f);
+                    s->state = DMD_SURFACE_READY;
+                    c->frames_out++;
+                    worked = 1;
+                    if (dmd_trace_order())
+                        dmd_log("ORDER reap   surf=%u unit_seq=%u pend=%d\n",
+                                (unsigned)id, f.unit_seq, c->pending_count);
+                }
             }
-            if (rc != DMD_OK)
-                continue;
-
-            VASurfaceID id = dmd_pending_take_locked(c, f.unit_seq);
-            struct dmd_surface *s = dmd_find_surface_locked(drv, id);
-            if (s) {
-                surface_store_frame_locked(s, &f);
-                s->state = DMD_SURFACE_READY;
-                c->frames_out++;
-                worked = 1;
-                if (dmd_trace_order())
-                    dmd_log("ORDER reap   surf=%u unit_seq=%u pend=%d\n",
-                            (unsigned)id, f.unit_seq, c->pending_count);
-            }
-            dmd_session_release_frame(sess, &f);
+            if (rc == DMD_OK)
+                dmd_session_release_frame(sess, &f);
+            io_release(drv, i);
         }
         pthread_mutex_unlock(&drv->lock);
 
@@ -735,25 +828,38 @@ static int session_rebuild_locked(struct dmd_driver *drv, struct dmd_context *c,
     unsigned int h = c->picture_height;
     int ten_bit = c->av1_bd_reported == 2;
 
-    /* 先摘下旧会话，避免放锁期间别的线程还往里写。 */
+    /* 摘下旧会话 + 置 retiring。只摘指针挡不住收帧线程：它可能在摘之前就把
+     * sess 抓在手里、正放锁做 IO。旧代码在这里直接 io_busy=1（不检查现值）
+     * 然后 destroy(old)，等于一边 close 对方还在 ioctl 的 fd 一边等它不报错。
+     * 现在交给 session_retire_locked：有人在用就挂起，由他交还时拆。 */
+    const VAContextID cid = c->id;
     c->session = NULL;
+    c->retiring = 1;
+    session_retire_locked(drv, idx, old);
 
-    drv->io_busy[idx] = 1;
     pthread_mutex_unlock(&drv->lock);
-    if (old)
-        dmd_session_destroy(old);
     struct dmd_session *ns = session_open(codec, w, h, ten_bit);
     pthread_mutex_lock(&drv->lock);
-    drv->io_busy[idx] = 0;
-    pthread_cond_broadcast(&drv->io_done);
+
+    c = dmd_find_context_locked(drv, cid);
+    if (!c) {
+        /* context 在放锁期间被拆了（DestroyContext 会把 io_defer 里的旧会话
+         * 交还给最后用完的人拆）。新会话没人接手，直接拆掉。 */
+        if (ns)
+            dmd_session_destroy(ns);
+        dmd_log("会话重建完成时 context 已不存在\n");
+        return -1;
+    }
 
     if (!ns) {
         dmd_log("会话重建失败\n");
         c->session_failed = 1;
+        c->retiring = 0;
         return -1;
     }
 
     c->session = ns;
+    c->retiring = 0;
     c->input_finished = 0;
     /* 新会话的 daemon 侧 vcl_in 从 1 重新开始，这里必须同步归零，
      * 否则提交序号与回传的 PTS 错位，配对会持续走"无匹配"回退路径。
@@ -936,8 +1042,10 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
         dmd_log("SEF 统计3: EndPicture送出中show=1 %lu, flush送出中show=1 %lu\n",
                 c->av1_ep_show1, c->av1_flush_show1);
 
-    /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 宁可泄漏一个
-     * 会话也不能挂死宿主进程的 Terminate 路径。 */
+    /* 有 IO 在飞时不能拆：等它结束。带超时避免死等 —— 超时后**不排空、不亲手
+     * 拆**，只把会话挂到 io_defer，由那个还在用的线程交还时拆。
+     * 直接拆就是本次要修的 bug：close 掉别人还在 ioctl 的 fd，fd 号被宿主
+     * 进程回收后我们下一次动的是它的 fd。 */
     int idx = (int)(c - drv->contexts);
     int waited = 0;
     while (drv->io_busy[idx] && waited < DMD_FRAME_TIMEOUT_MS) {
@@ -956,6 +1064,13 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
             return VA_STATUS_SUCCESS;
         }
     }
+    const int io_stuck = drv->io_busy[idx];
+    if (io_stuck)
+        dmd_log("DestroyContext: 等 IO 交还超时（%d ms），会话改为延后销毁\n",
+                DMD_FRAME_TIMEOUT_MS);
+
+    /* 从此刻起收帧线程不再碰本 context 的会话（它见到 retiring 就跳过）。 */
+    c->retiring = 1;
 
     /* 归还所有属于本 context 的 buffer：ffmpeg 正常会自己 Destroy，
      * 但异常路径下可能漏，driver 不能因此泄漏。 */
@@ -978,59 +1093,55 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
      * 这些帧并没有错，只是还攥在 MediaCodec 里：和流末尾一样，需要关掉写端
      * 才会吐出来。所以这里做一次和 SyncSurface 相同的 flush + 取帧循环。
      * 上面已经等过 io_busy，此刻没有别的线程在这个 context 上做 IO。 */
-    if (c->session && c->pending_count > 0) {
+    if (c->session && c->pending_count > 0 && !io_stuck) {
         struct dmd_session *fs = c->session;
+        /* 整段排空期间**一直**占住本槽位。原来每轮交还再抢，交还那一瞬间
+         * 收帧线程完全可以把这个会话抓去用（它只看 io_busy），而本函数接着
+         * 就要拆它 —— 那就是 ENOTTY 与 FD ownership violation 的来路。 */
+        drv->io_busy[idx] = 1;
         if (!c->input_finished) {
             c->input_finished = 1;
-            drv->io_busy[idx] = 1;
             pthread_mutex_unlock(&drv->lock);
             dmd_session_finish_input(fs);
             pthread_mutex_lock(&drv->lock);
-            drv->io_busy[idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
-            c = dmd_find_context_locked(drv, context);
-            if (!c) {
-                pthread_mutex_unlock(&drv->lock);
-                return VA_STATUS_SUCCESS;
-            }
         }
 
         int drained = 0;
         int budget = DMD_FRAME_TIMEOUT_MS;
-        while (c->pending_count > 0 && budget > 0) {
+        while (c && c->pending_count > 0 && budget > 0) {
             struct dmd_frame frame;
             memset(&frame, 0, sizeof(frame));
-            drv->io_busy[idx] = 1;
             pthread_mutex_unlock(&drv->lock);
             int frc = dmd_session_next_frame(fs, &frame, 100);
             pthread_mutex_lock(&drv->lock);
-            drv->io_busy[idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
             budget -= 100;
 
             c = dmd_find_context_locked(drv, context);
-            if (!c) {
-                if (frc == DMD_OK)
-                    dmd_session_release_frame(fs, &frame);
-                pthread_mutex_unlock(&drv->lock);
-                return VA_STATUS_SUCCESS;
+            if (c && frc == DMD_OK) {
+                VASurfaceID id = dmd_pending_take_locked(c, frame.unit_seq);
+                struct dmd_surface *ds = dmd_find_surface_locked(drv, id);
+                if (ds) {
+                    surface_store_frame_locked(ds, &frame);
+                    ds->state = DMD_SURFACE_READY;
+                    drained++;
+                }
             }
+            if (frc == DMD_OK)
+                dmd_session_release_frame(fs, &frame);
+            if (!c)
+                break;
             if (frc == DMD_ERR_TIMEOUT)
-                continue;
+                continue;          /* 还有预算就继续等，与原来一致 */
             if (frc != DMD_OK)
-                break; /* EOS 或真错误：剩下的确实取不到了 */
-
-            VASurfaceID id = dmd_pending_take_locked(c, frame.unit_seq);
-            struct dmd_surface *ds = dmd_find_surface_locked(drv, id);
-            if (ds) {
-                surface_store_frame_locked(ds, &frame);
-                ds->state = DMD_SURFACE_READY;
-                drained++;
-            }
-            dmd_session_release_frame(fs, &frame);
+                break;             /* EOS 或真错误：剩下的确实取不到了 */
         }
+        io_release(drv, idx);
         if (drained)
             dmd_log("DestroyContext: 排空补齐 %d 帧\n", drained);
+        if (!c) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_SUCCESS;
+        }
     }
 
     /* 仍未就绪的 surface 状态要复位，否则它们永远停在 PENDING，
@@ -1046,15 +1157,20 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
         }
     }
 
+    const unsigned long long gone_units =
+        c->session ? (unsigned long long)dmd_session_units_sent(c->session) : 0ULL;
+    const unsigned long long gone_frames =
+        c->session ? (unsigned long long)dmd_session_frames_received(c->session)
+                   : 0ULL;
     dmd_log("DestroyContext: context=%u（送入 %llu 单元，取回 %llu 帧）\n",
-            (unsigned)context,
-            c->session ? (unsigned long long)dmd_session_units_sent(c->session)
-                       : 0ULL,
-            c->session
-                ? (unsigned long long)dmd_session_frames_received(c->session)
-                : 0ULL);
+            (unsigned)context, gone_units, gone_frames);
 
+    /* 会话交给 session_retire_locked 拆，不能让 dmd_context_reset_locked 顺手
+     * destroy —— 还有线程在用它的 fd 时那一次 destroy 就是本次的 bug。 */
+    struct dmd_session *gone = c->session;
+    c->session = NULL;
     dmd_context_reset_locked(c);
+    session_retire_locked(drv, idx, gone);
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;
@@ -1476,6 +1592,66 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                 memcpy(&c->av1_pic_param, b->data,
                        sizeof(VADecPictureParameterBufferAV1));
                 c->have_av1_pic_param = 1;
+                /* 诊断：把消费者给的**每一个**合成输入打出来。
+                 * 合成流的正确性只能靠"与源码流逐字段对拍"，而对拍要先
+                 * 知道 VA 侧到底给了什么 —— 是消费者没填，还是我们读错。
+                 * DMD_AV1_PICDBG=1 时打前 6 帧。 */
+                if (getenv("DMD_AV1_PICDBG")) {
+                    static int pdbg;
+                    const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
+                    const __typeof__(q->seq_info_fields) *sq = &q->seq_info_fields;
+                    if (++pdbg <= 6) {
+                        const __typeof__(q->pic_info_fields) *pf =
+                            &q->pic_info_fields;
+                        fprintf(stderr,
+                            "[picdbg] #%d ft=%u show=%u showable=%u oh=%u "
+                            "cur=%u scm=%u int_mv=%u intrabc=%u hiprec=%u "
+                            "switchable=%u refmvs=%u err_res=%u cdf_upd=%u "
+                            "endupd=%u unif=%u warp=%u lgt=%u tx=%u "
+                            "tiles=%ux%u ctx_upd=%u prof=%u dbi=%u ohb=%u\n",
+                            pdbg, (unsigned)pf->bits.frame_type,
+                            (unsigned)pf->bits.show_frame,
+                            (unsigned)pf->bits.showable_frame,
+                            (unsigned)q->order_hint,
+                            (unsigned)q->current_frame,
+                            (unsigned)pf->bits.allow_screen_content_tools,
+                            (unsigned)pf->bits.force_integer_mv,
+                            (unsigned)pf->bits.allow_intrabc,
+                            (unsigned)pf->bits.allow_high_precision_mv,
+                            (unsigned)pf->bits.is_motion_mode_switchable,
+                            (unsigned)pf->bits.use_ref_frame_mvs,
+                            (unsigned)pf->bits.error_resilient_mode,
+                            (unsigned)pf->bits.disable_cdf_update,
+                            (unsigned)pf->bits.disable_frame_end_update_cdf,
+                            (unsigned)pf->bits.uniform_tile_spacing_flag,
+                            (unsigned)pf->bits.allow_warped_motion,
+                            (unsigned)pf->bits.large_scale_tile,
+                            (unsigned)0,
+                            (unsigned)q->tile_cols, (unsigned)q->tile_rows,
+                            (unsigned)q->context_update_tile_id,
+                            (unsigned)q->profile, (unsigned)q->bit_depth_idx,
+                            (unsigned)q->order_hint_bits_minus_1);
+                        fprintf(stderr,
+                            "[seqdbg] #%d still=%u sbs128=%u f_intra=%u "
+                            "edge=%u iic=%u mc=%u dual=%u oh_en=%u jnt=%u "
+                            "cdef=%u mono=%u range=%u subs=%u/%u fg=%u\n",
+                            pdbg, (unsigned)sq->fields.still_picture,
+                            (unsigned)sq->fields.use_128x128_superblock,
+                            (unsigned)sq->fields.enable_filter_intra,
+                            (unsigned)sq->fields.enable_intra_edge_filter,
+                            (unsigned)sq->fields.enable_interintra_compound,
+                            (unsigned)sq->fields.enable_masked_compound,
+                            (unsigned)sq->fields.enable_dual_filter,
+                            (unsigned)sq->fields.enable_order_hint,
+                            (unsigned)sq->fields.enable_jnt_comp,
+                            (unsigned)sq->fields.enable_cdef,
+                            (unsigned)sq->fields.mono_chrome,
+                            (unsigned)sq->fields.color_range,
+                            (unsigned)sq->fields.subsampling_x,
+                            (unsigned)sq->fields.subsampling_y,
+                            (unsigned)sq->fields.film_grain_params_present);
+                    }
+                }
                 /* AV1 的显示顺序就是 order_hint（规范 6.8.2），
                  * 作用与 H.264/HEVC 的 POC 相同：解码器按显示序吐帧，
                  * 而 ffmpeg 按解码序提交，配对回退路径需要它。
@@ -1486,6 +1662,33 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
                  *
                  * KEY 帧会重置 order_hint 序列，用 frame_type 判新序列：
                  * frame_type 0=KEY，与 H.264 的 frame_num==0 同义。 */
+                /* 全局运动参数对拍：只在有非恒等变换时打，逐参考帧一行。
+                 * 用来确认 VA 侧 wmmat[] 是否就是源码流里的 gm_params[][]
+                 * （规范 5.9.24），据此反推 subexp 符号。 */
+                if (getenv("DMD_AV1_WMDBG")) {
+                    const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
+                    int any = 0;
+                    for (int i = 0; i < 7; i++)
+                        if (q->wm[i].wmtype != VAAV1TransformationIdentity ||
+                            q->wm[i].invalid) any = 1;
+                    if (any) {
+                        fprintf(stderr, "[wm] oh=%u hp=%u prim=%u warp=%u\n",
+                                q->order_hint,
+                                (unsigned)q->pic_info_fields.bits
+                                        .allow_high_precision_mv,
+                                (unsigned)q->primary_ref_frame,
+                                (unsigned)q->pic_info_fields.bits
+                                        .allow_warped_motion);
+                        for (int i = 0; i < 7; i++)
+                            fprintf(stderr, "[wm]  i=%d type=%d inv=%u "
+                                    "m=%d,%d,%d,%d,%d,%d\n",
+                                    i, (int)q->wm[i].wmtype,
+                                    (unsigned)q->wm[i].invalid,
+                                    q->wm[i].wmmat[0], q->wm[i].wmmat[1],
+                                    q->wm[i].wmmat[2], q->wm[i].wmmat[3],
+                                    q->wm[i].wmmat[4], q->wm[i].wmmat[5]);
+                    }
+                }
                 if (getenv("DMD_AV1_SEFPROBE")) {
                     const VADecPictureParameterBufferAV1 *q = &c->av1_pic_param;
                     fprintf(stderr, "[sef] oh=%u ft=%u show=%u showable=%u "
@@ -1837,6 +2040,31 @@ static const unsigned char *build_unit(struct dmd_context *c,
                                    c->av1_repair_buf, c->av1_repair_len,
                                    c->av1_repair_bitpos,
                                    c->av1_repair_frame);
+
+        /* 引用帧不在影子 DPB 里 —— 这帧硬件不可能解出来，见
+         * dmd_av1_refs_resolvable() 的注释（Venus 对引用空槽的帧不出帧也不
+         * 报错，会把整条码流拖死）。
+         *
+         * ⚠️ 判断必须放在 patch_prev_refresh **之后**。放在之前实测会级联误丢：
+         * 影子槽位的登记就发生在 patch 里（上一帧的真实 refresh 由本帧的
+         * map 差分反算出来，然后登记），跳过 patch 等于让上一帧永远不进
+         * DPB，于是它后面每一帧都"引用不可解析"。mid5.ivf 实测：patch 前
+         * 判断 → 43 帧里丢 37 帧，只有 KEY 与其后继 1 帧出画；patch 后
+         * 判断 → 只丢 KEY 之前的 7 帧。
+         *
+         * 被丢的帧不合成、不送硬件，但它的 map 仍作为差分基准被 patch 记录
+         * ——这是对的：下一帧 patch 拿它做差分算的是"这个被丢的帧在源流里
+         * 踢掉了谁"，用于本帧的占槽选择；而它自己的 refresh 值因修复缓冲为
+         * 空（build 提前返回，没写 av1_next_repair_buf）被自然丢弃。 */
+        if (!dmd_av1_refs_resolvable(pp, &c->av1_dpb)) {
+            c->av1_ref_drop++;
+            dmd_log("EndPicture: AV1 surface=%u 的参考帧不在 DPB"
+                    "（拖到 GOP 中间起解？），跳过提交并按空壳交付\n",
+                    (unsigned)c->current_target);
+            c->av1_ref_drop_now = 1;
+            return NULL;
+        }
+
         if (want_tiles == 0 || (uint32_t)c->av1_tile_count != want_tiles) {
             /* tile 数量与帧头声明不符会让解码器从第二个 tile 起全部错位，
              * 与其送出去让 MediaCodec 解出花屏，不如干净回落软解。 */
@@ -2411,32 +2639,27 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     }
 
     /* ================================================================
-     * AV1 当前的阻塞点：ffmpeg 对 show_frame=0 的 surface 也要求像素
+     * show_frame=0 这个坑已经填了：合成帧头里 show_frame 恒置 1（"方向 A"）
      * ================================================================
-     * 实测的 surface → 数据 映射（DMD_VA_LOG 的"送出"日志，按字节数认帧）：
-     *   surface1  19258B  oh= 0  show=1
-     *   surface2   2688B  oh=16  show=0
-     *   surface3    649B  oh= 8  show=0
-     *   surface4    245B  oh= 4  show=0
-     *   surface5    183B  oh= 2  show=0
-     *   surface6     87B  oh= 1  show=1
-     * 登记与送出完全一致，无双重登记（曾怀疑此项，实测否证）。
+     * 当时的症状留档，别再当成待办：msm_vidc 只对 show_frame=1 的帧吐 CAPTURE
+     * 缓冲（正确行为），而 ffmpeg 的 VA-API 后端会对**部分** show_frame=0 的
+     * surface 调 Sync 并读像素，驱动又让这类 surface 永久停在 PENDING，于是
+     * 白等 5s 超时后报 "Failed to read image from surface 0x5: internal
+     * decoding error"，硬解停在 2 帧。
+     * 当时实测的 surface → 数据映射（按字节数认帧）：
+     *   surface1 19258B oh= 0 show=1   surface2  2688B oh=16 show=0
+     *   surface3   649B oh= 8 show=0   surface4   245B oh= 4 show=0
+     *   surface5   183B oh= 2 show=0   surface6    87B oh= 1 show=1
+     * ffmpeg 只 Sync 了 1、6、5 三个：前两个配对成功，surface5（show=0）要不到
+     * 像素。登记与送出本身完全一致，无双重登记（曾怀疑此项，实测否证）。
      *
-     * ffmpeg 实测只 Sync 了 surface 1、6、5 三个：
-     *   surface1（show=1）配对成功 ✓
-     *   surface6（show=1）配对成功 ✓
-     *   surface5（show=0）—— 它仍要像素，而该帧本就不产生输出
-     * 于是报 "Failed to read image from surface 0x5: internal decoding error"，
-     * 硬解停在 2 帧（等于 dav1d 对同段码流的基线，说明解码本身没错）。
-     *
-     * 也就是说：msm_vidc 只对 show_frame=1 的帧吐 CAPTURE 缓冲（正确行为），
-     * 而 ffmpeg 的 VA-API 后端会对部分 show_frame=0 的 surface 调 Sync 并读像素。
-     * 驱动目前让这类 surface 永久停在 PENDING，直到超时。
-     *
-     * 待定的修法（需先确认 ffmpeg VA-API 侧的确切期望，不要凭猜实现）：
-     *   a) 把 show_frame=0 的 surface 标为已完成但无像素
-     *   b) 让它复用所引用帧的内容（AV1 的 show_existing_frame 语义）
-     *   c) 在 EndPicture 阶段就识别 show_frame=0 并不为其登记 pending
+     * 现在每个提交单元都产生一次输出，所以每个被 Sync 的 surface 都配得到帧。
+     * 复核（GOP=300 的 1080p 真流前 300 帧，cut300.obu）：300 帧全部交付、
+     * 149 次 Sync、0 次超时、0 次"引用不可解析"、rc=0。
+     * 那 149 次与源流里 show_frame=1 的帧数同量级 —— ffmpeg 只为要显示的帧
+     * 取像素，这部分是预期行为。
+     * 日志里另有一条 "surface_wait: surface 1 从未提交解码，拒绝读取"，位置在
+     * CreateSurfaces 之后、任何解码之前，是 ffmpeg 的一次探测性读取，不是缺陷。
      * ================================================================ */
 
     /* ---- AV1 第二趟：DPB 趟（重发上一帧）----
@@ -2501,28 +2724,43 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             no_repair = (e && *e && *e != '0') ? 1 : 0;
         }
         if (need && !no_repair && c->pending_count < DMD_MAX_SURFACES) {
-            int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
-            c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
-            c->pending_seq[rq] = c->last_seq;
-            c->pending_poc[rq] = INT32_MAX;
-            c->pending_unit[rq] = ++c->units_submitted;
-            c->pending_count++;
-            av1_dump_tagged("2", rbuf, rlen);
-            dmd_log("EndPicture: AV1 修复重发 %zu 字节（哨兵 unit %llu）",
-                    rlen, (unsigned long long)c->pending_unit[rq]);
             const int ridx = (int)(c - drv->contexts);
-            drv->io_busy[ridx] = 1;
-            pthread_mutex_unlock(&drv->lock);
-            (void)dmd_session_send_unit(c->session, rbuf, rlen);
-            pthread_mutex_lock(&drv->lock);
-            drv->io_busy[ridx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
-            c = dmd_find_context_locked(drv, context);
-            free(rbuf);
-            if (!c) {
+            /* 顺序要求：先取得 IO 所有权，**然后**才登记哨兵、才抓 session
+             * 指针。原来反过来（先登记、盲置 io_busy、放锁发），等待与放锁
+             * 的窗口里别人能把会话拆掉或插进自己的帧。 */
+            int can_send = 0;
+            if (io_acquire(drv, ridx, "EndPicture/AV1 修复重发") == 0) {
+                can_send = context_slot_ok(c, context) && c->session &&
+                           c->pending_count < DMD_MAX_SURFACES;
+                if (!can_send)
+                    io_release(drv, ridx);
+            }
+            if (can_send) {
+                struct dmd_session *rsess = c->session;
+                int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
+                c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
+                c->pending_seq[rq] = c->last_seq;
+                c->pending_poc[rq] = INT32_MAX;
+                c->pending_unit[rq] = ++c->units_submitted;
+                c->pending_count++;
+                av1_dump_tagged("2", rbuf, rlen);
+                dmd_log("EndPicture: AV1 修复重发 %zu 字节（哨兵 unit %llu）",
+                        rlen, (unsigned long long)c->pending_unit[rq]);
                 pthread_mutex_unlock(&drv->lock);
-                free(scratch);
-                return VA_STATUS_ERROR_INVALID_CONTEXT;
+                (void)dmd_session_send_unit(rsess, rbuf, rlen);
+                pthread_mutex_lock(&drv->lock);
+                io_release(drv, ridx);
+                c = dmd_find_context_locked(drv, context);
+                free(rbuf);
+                if (!c) {
+                    pthread_mutex_unlock(&drv->lock);
+                    free(scratch);
+                    return VA_STATUS_ERROR_INVALID_CONTEXT;
+                }
+            } else {
+                free(rbuf);
+                dmd_log("EndPicture: 本帧 DPB 修复趟跳过"
+                        "（拿不到 IO 所有权、槽位换人或队列已满）\n");
             }
         } else {
             if (need && getenv("DMD_AV1_LOG"))
@@ -2549,6 +2787,24 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
     if (!unit) {
         struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (c->av1_ref_drop_now) {
+            /* 参考帧缺失被丢掉的帧：不能像"不支持码流重建"那样回
+             * UNIMPLEMENTED —— vaEndPicture 报错会让调用方判定整条流失败
+             * （ffmpeg 实测 rc=251、0 帧）。这里与 show_frame=0 走同一条
+             * 语义：surface 标成就绪（内容是这张 surface 上一次的残留），
+             * 流程继续往前推，码流里的下一个 KEY 一到就恢复正常。 */
+            c->av1_ref_drop_now = 0;
+            if (s) {
+                s->state = DMD_SURFACE_READY;
+                s->decode_status = VA_STATUS_SUCCESS;
+            }
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            c->av1_tile_count = 0;
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            return VA_STATUS_SUCCESS;
+        }
         if (s) {
             s->state = DMD_SURFACE_IDLE;
             s->decode_status = VA_STATUS_ERROR_UNIMPLEMENTED;
@@ -2610,14 +2866,35 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     unsigned int ph = c->picture_height;
 
     if (!sess) {
-        /* 放锁重试建会话，避免持锁做 connect。 */
-        drv->io_busy[idx] = 1;
+        /* 放锁重试建会话，避免持锁做 connect。
+         * 建会话前同样要先取得 IO 所有权：本槽位若被别人占着，我们盲置
+         * io_busy 再交还，等于把对方的所有权抹掉。
+         * 另外 ten_bit 必须在放锁**之前**读好 —— 原来是在放锁之后读
+         * `c->av1_bd_reported`，那个 c 可能已经换人了。 */
+        const int retry_ten_bit = c->av1_bd_reported == 2;
+        if (io_acquire(drv, idx, "EndPicture/建会话") < 0) {
+            struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+            if (s) {
+                s->state = DMD_SURFACE_IDLE;
+                s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            c->current_target = VA_INVALID_ID;
+            c->slice_len = 0;
+            c->av1_tile_count = 0;
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        if (!context_slot_ok(c, context)) {
+            io_release(drv, idx);
+            pthread_mutex_unlock(&drv->lock);
+            free(scratch);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
         pthread_mutex_unlock(&drv->lock);
-        struct dmd_session *retry =
-            session_open(codec, pw, ph, c->av1_bd_reported == 2);
+        struct dmd_session *retry = session_open(codec, pw, ph, retry_ten_bit);
         pthread_mutex_lock(&drv->lock);
-        drv->io_busy[idx] = 0;
-        pthread_cond_broadcast(&drv->io_done);
+        io_release(drv, idx);
         c = dmd_find_context_locked(drv, context);
         if (!c) {
             pthread_mutex_unlock(&drv->lock);
@@ -2733,8 +3010,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 if (!c) {
                     if (bp_rc == DMD_OK)
                         dmd_session_release_frame(bp_sess, &bp_frame);
-                    drv->io_busy[bp_idx] = 0;
-                    pthread_cond_broadcast(&drv->io_done);
+                    io_release(drv, bp_idx);
                     pthread_mutex_unlock(&drv->lock);
                     free(scratch);
                     return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -2758,13 +3034,16 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 drained++;
             }
 
-            drv->io_busy[bp_idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
+            /* 交还所有权前先把要打印的会话状态读出来：io_release 可能顺手
+             * 把延后销毁的会话拆掉，之后再读 bp_sess 就是读已释放内存。 */
+            const int bp_left = dmd_session_frames_pending(bp_sess);
+
+            io_release(drv, bp_idx);
 
             if (drained > 0)
                 dmd_log("EndPicture: 提前排空 %d 帧（session 待取 %d/%d，"
                         "待配对 %d）\n", drained,
-                        dmd_session_frames_pending(bp_sess), sess_cap,
+                        bp_left, sess_cap,
                         c->pending_count);
         }
 
@@ -2981,6 +3260,10 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             if (!c) {
                 if (rrc == DMD_OK)
                     dmd_session_release_frame(ds, &rf);
+                /* 必须交还所有权再走：原来直接 return，本槽位的 io_busy
+                 * 永久停在 1，下一个占用同槽位的 context 会白等 5 秒、
+                 * 收帧线程则永远跳过它。 */
+                io_release(drv, di);
                 pthread_mutex_unlock(&drv->lock);
                 free(scratch);
                 return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -2996,8 +3279,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             }
             dmd_session_release_frame(ds, &rf);
         }
-        drv->io_busy[di] = 0;
-        pthread_cond_broadcast(&drv->io_done);
+        io_release(drv, di);
         break;
     }
 
@@ -3123,14 +3405,58 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
     c->slice_len = 0;
     c->av1_tile_count = 0;
 
-    /* 串行化同 context 的 IO。 */
-    while (drv->io_busy[idx]) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += DMD_FRAME_TIMEOUT_MS / 1000;
-        if (pthread_cond_timedwait(&drv->io_done, &drv->lock, &ts) == ETIMEDOUT)
-            break;
+    /* 串行化同 context 的 IO。
+     *
+     * ⚠️ 顺序要求：**先取得所有权，再抓 session 指针**。
+     * 原来正好相反 —— `sess` 在函数前半就抓好了，这里才去等 io_busy，
+     * 而等待要放锁。放锁窗口里 DestroyContext / 会话重建可以把这个会话拆掉
+     * （旧代码甚至不等所有权、直接 io_busy=1，两个线程同时动同一个 V4L2 fd），
+     * 于是拿着旧指针放锁做 IO = use-after-free，交还时又把对方的所有权清零
+     * = 下一个拆会话的人以为没人用了。实测签名是 QBUF/DMA_BUF_SYNC 报
+     * ENOTTY，Chrome 侧 "Crashing due to FD ownership violation"。 */
+    if (io_acquire(drv, idx, "EndPicture/送单元") < 0) {
+        /* 拿不到所有权：这一帧不能送。已登记的队列项要摘回去，
+         * 否则留个永远配不上的空洞，其后每帧都落到顺序推断。 */
+        if (c->pending_count > 0)
+            c->pending_count--;
+        struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (s) {
+            s->state = DMD_SURFACE_IDLE;
+            s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        c->current_target = VA_INVALID_ID;
+        pthread_mutex_unlock(&drv->lock);
+        free(tx);
+        free(scratch);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+    if (!context_slot_ok(c, context)) {
+        /* 槽位已换人：这里**不能**再动 c-> 的任何字段（那些队列、计数器
+         * 现在是别人的 context）。原 context 连同它的队列一起没了，
+         * 少这一帧无所谓。 */
+        io_release(drv, idx);
+        pthread_mutex_unlock(&drv->lock);
+        free(tx);
+        free(scratch);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    sess = c->session;
+    if (!sess) {
+        io_release(drv, idx);
+        if (c->pending_count > 0)
+            c->pending_count--;
+        struct dmd_surface *s = dmd_find_surface_locked(drv, target);
+        if (s) {
+            s->state = DMD_SURFACE_IDLE;
+            s->decode_status = VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        c->current_target = VA_INVALID_ID;
+        pthread_mutex_unlock(&drv->lock);
+        free(tx);
+        free(scratch);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
     /* H.264：参数集必须在首个 VCL 之前送。先在持锁时快照所需数据，
      * 放锁后再发（发送是阻塞 IO，不能持锁做）。 */
     int need_param_sets = 0;
@@ -3391,10 +3717,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
         c->av1_sef_count--;
     }
 
-    drv->io_busy[idx] = 1;
+    /* 所有权已在上面 io_acquire 拿到，这里只放锁。 */
     pthread_mutex_unlock(&drv->lock);
 
     int rc = DMD_OK;
+    int sef_sent_now = 0;   /* 放锁期间不能写 c->，见下方用法 */
     if (need_hevc_params) {
         if (hevc_send_param_sets(sess, &hevc_snap, profile_snap) != 0)
             rc = DMD_ERR_PROTOCOL;
@@ -3429,8 +3756,11 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                                                 (unsigned)sef_send_slot);
         if (hn > 0) {
             sn += hn;
+            /* ⚠️ 这里在**放锁**期间，不能写 c->：指针有效不代表对象还是我们的
+             * （槽位可能已被 DestroyContext 复位、被下一个 CreateContext 复用）。
+             * 先累到局部量，重新持锁后再入账。 */
             if (dmd_session_send_unit(sess, sefbuf, sn) == DMD_OK)
-                c->av1_sef_sent++;
+                sef_sent_now++;
         }
     }
 
@@ -3440,14 +3770,25 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 
 
     pthread_mutex_lock(&drv->lock);
-    drv->io_busy[idx] = 0;
-    pthread_cond_broadcast(&drv->io_done);
+
+    /* 交还所有权**之前**把错误串抄出来：dmd_session_last_error 返回的是会话
+     * 内部缓冲区，而 io_release 有可能顺手把延后销毁的会话拆掉。 */
+    char sess_err[160];
+    sess_err[0] = 0;
+    if (rc != DMD_OK) {
+        const char *m = dmd_session_last_error(sess);
+        if (m)
+            snprintf(sess_err, sizeof(sess_err), "%s", m);
+    }
+
+    io_release(drv, idx);
 
     c = dmd_find_context_locked(drv, context);
     if (!c) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
+    c->av1_sef_sent += sef_sent_now;
 
     if (rc != DMD_OK) {
         /* 回滚入队：这一帧永远不会有对应输出。从队尾摘掉。 */
@@ -3458,9 +3799,8 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             s->state = DMD_SURFACE_IDLE;
             s->decode_status = VA_STATUS_ERROR_DECODING_ERROR;
         }
-        const char *msg = dmd_session_last_error(sess);
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("EndPicture: 送单元失败 rc=%d: %s\n", rc, msg);
+        dmd_log("EndPicture: 送单元失败 rc=%d: %s\n", rc, sess_err);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
@@ -3586,8 +3926,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             if (!c) {
                 if (hrc == DMD_OK)
                     dmd_session_release_frame(hsess, &hf);
-                drv->io_busy[idx] = 0;
-                pthread_cond_broadcast(&drv->io_done);
+                io_release(drv, idx);
                 pthread_mutex_unlock(&drv->lock);
                 return VA_STATUS_ERROR_INVALID_CONTEXT;
             }
@@ -3602,11 +3941,13 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             }
             dmd_session_release_frame(hsess, &hf);
         }
-        drv->io_busy[idx] = 0;
-        pthread_cond_broadcast(&drv->io_done);
+        /* 交还所有权前读出来：io_release 可能顺手拆掉延后销毁的会话，
+         * 而 c->session 到那时也可能已换人，日志数字就不是本会话的了。 */
+        const int left = dmd_session_frames_pending(hsess);
+        io_release(drv, idx);
         if (harvested)
             dmd_log("EndPicture: 返回前写入 %d 帧（session 待取 %d）\n",
-                    harvested, dmd_session_frames_pending(c->session));
+                    harvested, left);
     }
 
     pthread_mutex_unlock(&drv->lock);
@@ -3813,6 +4154,60 @@ found:
     return head;
 }
 
+/* 诊断：把**真正交给消费者**的那份像素落盘（DMD_SURF_DUMP2=<前缀>）。
+ *
+ * 文件名带落盘序号、目标 surface、unit 号，因此可以不依赖显示就能判断
+ * "驱动写进 surface 的东西对不对"。用途：同一条码流分别用 ffmpeg 与浏览器
+ * 跑一遍，逐帧比 md5 —— 输入字节相同时，这一步能把缺陷切到
+ * "解码/槽位状态" 还是 "导出与显示路径"。 */
+static void surf_dump_store(struct dmd_surface *s, unsigned unit)
+{
+    const char *pre = getenv("DMD_SURF_DUMP2");
+    if (!pre || !pre[0] || !s->data || s->data_size == 0)
+        return;
+    static unsigned n;
+    char path[512];
+    snprintf(path, sizeof path, "%s.%04u.s%u.u%u.yuv", pre, ++n,
+             (unsigned)s->id, unit);
+    FILE *fp = fopen(path, "wb");
+    if (fp) { fwrite(s->data, 1, s->data_size, fp); fclose(fp); }
+}
+
+/* surface 比帧小的时候：逐行搬能装下的左上角，其余补成合法的黑。
+ * 只在 dumb buffer（尺寸建池时定死）装不下帧时走这里。 */
+static void store_clipped_locked(struct dmd_surface *s, const struct dmd_frame *f,
+                                 unsigned int src_stride, unsigned int src_slice)
+{
+    if (!f->data || !s->data)
+        return;
+
+    const size_t plane = (size_t)src_stride * src_slice;   /* 源 Y 平面字节数 */
+    if (f->size < plane + plane / 2)
+        return;                      /* 源连一整帧都不够，宁可不写 */
+
+    unsigned int cols = src_stride < s->stride ? src_stride : s->stride;
+    unsigned int rows = src_slice < s->slice_height ? src_slice : s->slice_height;
+    cols &= ~1u;                     /* 色度 2x2，奇数会拆开 U/V 对 */
+    rows &= ~1u;
+
+    dumb_sync_begin_write(s);
+
+    for (unsigned int r = 0; r < rows; r++)
+        memcpy(s->data + (size_t)r * s->stride,
+               f->data + (size_t)r * src_stride, cols);
+    for (unsigned int r = rows; r < s->slice_height; r++)
+        memset(s->data + (size_t)r * s->stride, 0, s->stride);
+
+    unsigned char *duv = s->data + (size_t)s->stride * s->slice_height;
+    const unsigned char *suv = f->data + plane;
+    for (unsigned int r = 0; r < rows / 2; r++)
+        memcpy(duv + (size_t)r * s->stride, suv + (size_t)r * src_stride, cols);
+    for (unsigned int r = rows / 2; r < s->slice_height / 2; r++)
+        memset(duv + (size_t)r * s->stride, 128, s->stride); /* UV 中性是 128 不是 0 */
+
+    dumb_sync_end_write(s);
+}
+
 static void surface_store_frame_locked(struct dmd_surface *s,
                                        const struct dmd_frame *f)
 {
@@ -3837,12 +4232,8 @@ static void surface_store_frame_locked(struct dmd_surface *s,
                                  : (unsigned int)f->height;
 
     /* 以解码器给的几何为准更新 surface：VAImage 的 offsets[1] 必须
-     * 用 slice_height（1088）而不是显示高（1080），否则色度平面错位。 */
-    s->stride = src_stride;
-    s->slice_height = src_slice;
-    s->buf_width = (unsigned int)f->width;
-    s->buf_height = (unsigned int)f->height;
-
+     * 用 slice_height（1088）而不是显示高（1080），否则色度平面错位。
+     * ⚠️ 赋值必须等"这帧装得下"确认之后 —— 见下面 need > data_size 分支。 */
     size_t need = (size_t)src_stride * src_slice * 3 / 2;
     if (need > s->data_size) {
         /* 解码器给的缓冲比预分配的大（流内分辨率变大）。
@@ -3855,23 +4246,55 @@ static void surface_store_frame_locked(struct dmd_surface *s,
          *   __GI___libc_realloc (oldmem=0x7fafda3000, bytes=3136320)
          *   → surface_store_frame_locked → sync_surface_locked
          *   → dmd_SyncSurface2 → vaSyncSurface → av_hwframe_transfer_data
-         * dumb buffer 的尺寸在 surface 创建时按对齐几何定好，正常容得下
-         * 解码器输出；真不够就只拷放得下的部分，而不是崩掉整个进程。 */
+         *
+         * dumb buffer 装不下时原先的做法是"记新几何、只拷放得下的部分"，
+         * 那是错的：stride/slice 记成 1920/1088 而映射仍是 1280x736 的大小，
+         * 之后任何按 stride*slice 定位色度平面的读都越界。实测 grow 用例
+         * （720p 建池 → 1080p 码流）SIGSEGV 在 nv12_copy 取
+         * UV = src + 1920*1088 处。
+         *
+         * 真正的根子在客户端：surface 池按建池时的尺寸分配，AV1 换到更大
+         * 分辨率时 ffmpeg 不重建池（实测仍按 1280x720 调 vaGetImage），
+         * 整帧本来就没法交出去。驱动能做的是让这一帧明确失败，而不是拖崩
+         * 整个进程 —— surface 保留旧几何与旧内容，读的人拿到的是上一帧。 */
         if (s->exportable) {
-            dmd_log("surface %u: 帧需 %zu 字节 > dumb buffer %zu 字节，"
-                    "截断（stride=%u slice=%u）\n",
-                    (unsigned)s->id, need, s->data_size, src_stride, src_slice);
-            need = s->data_size;
-        } else {
-            unsigned char *mem = realloc(s->data, need);
-            if (!mem) {
-                s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
-                return;
-            }
-            s->data = mem;
-            s->data_size = need;
+            /* dumb buffer 不能长个（ realloc 会 SIGSEGV，见上），但也不能
+             * "记新几何 + 截断拷" —— 那会让 stride/slice(1920/1088) 与实际
+             * 映射(1280×736 大小)不符，之后任何按 stride*slice 定位色度平面
+             * 的读都越界。实测 grow 用例（720p 建池 → 1080p 码流）
+             * SIGSEGV 在 nv12_copy 取 UV = src + 1920*1088 处。
+             *
+             * 也不能直接判该帧失败：实测 ffmpeg 收到
+             * VA_STATUS_ERROR_OPERATION_FAILED 就整条流放弃（125 帧只出 25
+             * 帧，rc=-5），真实场景里等于播放器一升清晰度就停住。
+             *
+             * 所以按 VA-API 对"surface 小于图像"的通行语义处理：**裁到
+             * surface 能装下的左上角**，几何保持不变。客户端拿到的是能用的
+             * 画面（放大观感）而不是错误。
+             *
+             * 根子在客户端：surface 池按建池时的尺寸分配，AV1 换到更大分辨率
+             * 时 ffmpeg 不重建池（实测仍按 1280x720 调 vaGetImage）。 */
+            dmd_log("surface %u: 帧 %ux%u 大于池 %ux%u，按 surface 裁剪存入"
+                    "（客户端换分辨率后未重建 surface 池）\n",
+                    (unsigned)s->id, src_stride, src_slice,
+                    s->stride, s->slice_height);
+            store_clipped_locked(s, f, src_stride, src_slice);
+            s->decode_status = VA_STATUS_SUCCESS;
+            return;
         }
+        unsigned char *mem = realloc(s->data, need);
+        if (!mem) {
+            s->decode_status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+            return;
+        }
+        s->data = mem;
+        s->data_size = need;
     }
+
+    s->stride = src_stride;
+    s->slice_height = src_slice;
+    s->buf_width = (unsigned int)f->width;
+    s->buf_height = (unsigned int)f->height;
 
     /* ⚠️ CPU 对 dumb buffer 的写入必须被 DMA_BUF_IOCTL_SYNC 的 START/END
      * 包住，否则数据可能停在 D-cache 里，GPU 通过导出的 dmabuf 采样时
@@ -3889,6 +4312,7 @@ static void surface_store_frame_locked(struct dmd_surface *s,
 
     dumb_sync_end_write(s);
 
+    surf_dump_store(s, (unsigned)f->unit_seq);
     s->decode_status = VA_STATUS_SUCCESS;
 }
 
@@ -4275,19 +4699,30 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
                     (unsigned long long)dmd_session_frames_received(c->session),
                     c->daemon_has_unit_seq, c->pending_count,
                     spent, flush_after_ms);
+            /* 排空也要先取得 IO 所有权，**然后**才抓会话指针。
+             * 原来这里是盲置 io_busy=1：收帧线程可能正占着这个会话做 IO，
+             * 我们一边 drain 一边让它 DQBUF，交还时又把它的所有权抹掉。 */
+            if (io_acquire(drv, idx, "SyncSurface/排空") < 0)
+                return VA_STATUS_ERROR_TIMEDOUT;
+            if (!context_slot_ok(c, context)) {
+                io_release(drv, idx);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
             struct dmd_session *fs = c->session;
+            if (!fs) {
+                io_release(drv, idx);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
             /* 优先用可逆排空：daemon 送 EOS 催出帧后 flush 复位并重送 CSD，
              * 会话仍可用 —— 于是不必重建，省掉 connect+握手+configure。
              * 只有排空失败（老 daemon 不认长度 0）才退回不可逆的 finish_input。 */
-            drv->io_busy[idx] = 1;
             pthread_mutex_unlock(&drv->lock);
             int frc = dmd_session_drain(fs);
             int reversible = (frc == DMD_OK);
             if (!reversible)
                 frc = dmd_session_finish_input(fs);
             pthread_mutex_lock(&drv->lock);
-            drv->io_busy[idx] = 0;
-            pthread_cond_broadcast(&drv->io_done);
+            io_release(drv, idx);
             c = dmd_find_context_locked(drv, context);
             if (!c) {
                 pthread_mutex_unlock(&drv->lock);
@@ -4311,9 +4746,12 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             return VA_STATUS_ERROR_TIMEDOUT;
         }
 
-        struct dmd_session *sess = c->session;
-
-        /* 串行化 IO，然后放锁收帧。 */
+        /* 串行化 IO，然后放锁收帧。
+         *
+         * ⚠️ 会话指针必须在**拿到所有权之后**才抓。原来的顺序是
+         * "先 sess = c->session，再去等 io_busy"，而等待要放锁 ——
+         * 放锁窗口里 DestroyContext / 会话重建可以把这个会话拆掉，
+         * 于是 next_frame 用的是已释放的会话。 */
         while (drv->io_busy[idx]) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -4333,7 +4771,17 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
             if (s->state != DMD_SURFACE_PENDING)
                 return s->decode_status;
         }
+        /* 循环退出即"无人占用"，此处置位是原子接管（仍持锁），不是硬抢。 */
         drv->io_busy[idx] = 1;
+        if (!context_slot_ok(c, context)) {
+            io_release(drv, idx);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        struct dmd_session *sess = c->session;
+        if (!sess) {
+            io_release(drv, idx);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
         pthread_mutex_unlock(&drv->lock);
 
         struct dmd_frame frame;
@@ -4341,36 +4789,51 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         int rc = dmd_session_next_frame(sess, &frame, slice_ms);
 
         pthread_mutex_lock(&drv->lock);
-        drv->io_busy[idx] = 0;
-        pthread_cond_broadcast(&drv->io_done);
         spent += slice_ms;
 
+        /* 交还 io_busy 一定排在**最后一次碰 sess** 之后（下面两处 release_frame）。
+         * 原来这里先清标志再 release，清标志到 release 之间 DestroyContext /
+         * 会话重建就能把这个会话拆掉 —— release 用的是已销毁会话的缓冲。 */
         c = dmd_find_context_locked(drv, context);
-        if (!c) {
-            if (rc == DMD_OK)
-                dmd_session_release_frame(sess, &frame);
-            return VA_STATUS_ERROR_INVALID_CONTEXT;
-        }
-
         if (rc == DMD_OK) {
-            VASurfaceID head = dmd_pending_take_locked(c, frame.unit_seq);
-            if (dmd_trace_order())
-                dmd_log("ORDER out    surf=%u unit_seq=%u waiting=%u pend=%d\n",
-                        (unsigned)head, frame.unit_seq, (unsigned)target,
-                        c->pending_count);
-            c->frames_out++;      /* 诊断计数：本会话已交付的帧数 */
-            struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
-            if (hs) {
-                surface_store_frame_locked(hs, &frame);
-                hs->state = DMD_SURFACE_READY;
-            } else {
-                dmd_log("SyncSurface: 待配对 surface %u 已销毁，帧被丢弃\n",
-                        (unsigned)head);
+            if (c) {
+                VASurfaceID head = dmd_pending_take_locked(c, frame.unit_seq);
+                if (dmd_trace_order())
+                    dmd_log("ORDER out    surf=%u unit_seq=%u waiting=%u pend=%d\n",
+                            (unsigned)head, frame.unit_seq, (unsigned)target,
+                            c->pending_count);
+                c->frames_out++;  /* 诊断计数：本会话已交付的帧数 */
+                struct dmd_surface *hs = dmd_find_surface_locked(drv, head);
+                if (hs) {
+                    surface_store_frame_locked(hs, &frame);
+                    hs->state = DMD_SURFACE_READY;
+                } else {
+                    dmd_log("SyncSurface: 待配对 surface %u 已销毁，帧被丢弃\n",
+                            (unsigned)head);
+                }
             }
             /* release 不做阻塞 IO（TCP 模式只是标记缓冲可复用）。 */
             dmd_session_release_frame(sess, &frame);
-            continue;
         }
+        /* 错误串要在交还所有权**之前**抄好。交还之后 sess 就不再受保护：
+         * sess_dead 只表示"本次交还顺手拆掉了延后销毁的那个会话"，
+         * 而即使它返回 0，别的线程（Chrome 正在 DestroyContext）也能在
+         * 下一瞬间把同一个会话拆掉。 */
+        char serr[160];
+        serr[0] = 0;
+        if (rc != DMD_OK && rc != DMD_ERR_TIMEOUT) {
+            const char *m = dmd_session_last_error(sess);
+            if (m)
+                snprintf(serr, sizeof(serr), "%s", m);
+        }
+        const int sess_dead = io_release(drv, idx);
+
+        if (!c)
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        if (sess_dead)
+            break;               /* 会话被别人延后拆掉了，不能再碰它 */
+        if (rc == DMD_OK)
+            continue;
 
         if (rc == DMD_ERR_TIMEOUT) {
             /* 帧还没出来。daemon 未开 low-latency，解码器会攒几帧，
@@ -4431,8 +4894,7 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         }
 
         /* 真错误 */
-        dmd_log("SyncSurface: 取帧失败 rc=%d: %s\n", rc,
-                dmd_session_last_error(sess));
+        dmd_log("SyncSurface: 取帧失败 rc=%d: %s\n", rc, serr);
         struct dmd_surface *s3 = dmd_find_surface_locked(drv, target);
         if (s3 && s3->state == DMD_SURFACE_PENDING) {
             s3->state = DMD_SURFACE_IDLE;
@@ -4440,6 +4902,12 @@ static VAStatus sync_surface_locked(struct dmd_driver *drv, VAContextID context,
         }
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
+
+    /* 只有 sess_dead 会走到这里：会话在本线程放锁收帧期间被延后销毁，
+     * 槽位已交给下一个使用者，不能再碰 sess。等帧的一方本就晚于
+     * Terminate/重建，报无效上下文比继续等一个不存在的会话诚实。 */
+    dmd_log("SyncSurface: 等待期间会话已被销毁（context 被重建或终止）\n");
+    return VA_STATUS_ERROR_INVALID_CONTEXT;
 }
 
 /* 找到 surface 所属 context（用于 Sync）。调用方持锁。 */

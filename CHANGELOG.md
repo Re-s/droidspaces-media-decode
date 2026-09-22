@@ -1,7 +1,296 @@
-# 更新日志（v0.4.7-rc1 预发布 · 分支 feat/msm-vidc-512-upstream）
+# 更新日志（v0.4.7 · 分支 fix/vaapi-io-fd-race）
 
-> 以下内容属 **v0.4.7-rc1（预发布）**，截至 2026-09-20 只推在
-> `feat/msm-vidc-512-upstream` 分支上，未合入 master；`## v0.4.6` 及以后为已发布历史。
+> 以下内容属 **v0.4.7**。它建立在 `v0.4.7-rc1` 之上：rc1 之后又修了两处
+> Chrome 侧的问题（`--enable-features=Vulkan` 的文档错误、以及本文件第一节
+> 的 `close(0)`）。`## v0.4.6` 及以后为已发布历史。
+
+## ✅ FD 崩溃的真凶找到了：每次拆会话无条件 `close(0)` 24 次（不是竞态）
+
+`dmd_v4l2_open()` 开头 `memset(d, 0, sizeof(*d))`，随后把 `out[]`、`cap[]` 的
+`dbuf_fd` 置 -1，**唯独漏了 `extra[]`**。而 `dmd_v4l2_close()` 不看条件就执行
+`bufs_free(d->extra, DMD_V4L2_MAX_CAP)`，`bufs_free` 的判据是 `dbuf_fd >= 0`
+—— 于是 24 个"未分配"槽全被当成有效 fd，**每拆一次会话就对 fd 0 调 24 次
+`close()`**（`v4l2_backend.h:199` 的注释本来就写着"-1 表示未分配"，漏的正是
+这个不变量）。
+
+**判据不是"这次没崩"，是 strace 直接数到**（同一条 1280x720 AV1、ffmpeg 路径）：
+修复前 `close(0)` 24 次 —— 第 1 次返回 0（真的把宿主进程的 stdin 关掉了），
+后 23 次 `EBADF`；修复后 **0 次**。
+
+为什么 ffmpeg 永远看不出问题、Chrome 必崩：Chromium **拦截 `close()` 并按
+`ScopedFD` 记账检查归属** —— `base/files/scoped_file_linux.cc`:
+
+```cpp
+extern "C" int close(int fd) {
+  if (base::IsFDOwned(fd) && g_is_ownership_enforced) CrashOnFdOwnershipViolation();
+```
+
+fd 0 只要被 Chrome 自己复用一次（它把某个文件开到 0 号），我们下一次拆会话的
+`close(0)` 就当次打死 GPU 进程。所以它的表现是"时有时无"，取决于 fd 0 此刻在
+谁手里 —— 这正是我上一轮把它误判成"IO 竞态没修干净"的原因。
+
+**同强度 A/B（400 ms 换一次源，专打边收帧边拆会话）**
+
+| 驱动 | 结果 |
+|---|---|
+| `0.4.7+232600f8`（未做 io_busy 修复） | 启动约 **26 秒**后崩，`exit_code=5` |
+| `0.4.7+5b415fc8`（上一节的修复） | 约 17 分钟内崩 **3 次**（900 ms 强度下干净 —— 竞态确实收窄了） |
+| `0.4.7+d92e4299`（本版） | **548 秒：1352 个上下文 / 1351 场会话正常收尾 / FD 崩溃 0 / 崩溃退出 0 / ENOTTY 0 / 等 IO 所有权超时 0** |
+
+像素回归同步复测（防"修崩溃修坏画质"）：AV1 **480p / 720p / 1080p 与软解逐字节
+一致**，H.264 逐字节一致，另一条 AV1 probe 流前 100 帧逐字节一致。
+
+## ✅ Chrome FD 崩溃的第一步：IO 所有权必须覆盖到最后一次使用
+
+⚠️ **本节当初的标题写的是"修好了"，那是过早的。** 它修掉的是真实存在的第一个
+问题，但 400 ms 强度下仍崩 3 次；真凶见上一节。下面的 A/B 只在 900 ms 强度下
+成立，那个强度恰好碰不到 fd 0 被 Chrome 复用的时机。
+
+`Crashing due to FD ownership violation` / `GPU process exited unexpectedly:
+exit_code=5` 的根因之一是驱动内部把 V4L2 槽位的"有人在用"标记（`io_busy[]`）提前
+交还了：收帧线程还攥着会话指针和帧缓冲，`DestroyContext` 就已经把会话拆掉、
+`close()` 掉 fd，宿主进程随后把同号 fd 复用成别的文件，那次 QBUF 就打到了别人
+的 fd 上（`dmd_DestroyContext` 里 `io_busy` 检查与置位之间还有一段放锁的空窗）。
+
+改法是把不变量写清楚并贯彻到全部 12 处 IO：`io_busy` 表示"有线程在锁外引用这个
+会话，含它尚未 release 的帧缓冲"，必须覆盖**最后一次**使用；会话销毁延后挂进
+`io_defer[]`，由最后一个使用者在 `io_release()` 里真正拆；`c->retiring` 阻止收帧
+线程复活将死的会话；会话指针一律在拿到所有权**之后**再快照。
+
+**A/B 实测（骁龙 8 Elite + Chrome 151，同一台机、同一压测页）**
+
+压测页每 0.9 秒在 480P↔720P 之间换一次源，专打"边收帧边销毁上下文"这条路径：
+
+| 驱动 | 结果 |
+|---|---|
+| `0.4.7+232600f8`（修复前） | 启动约 **26 秒**后 `GPU process exited unexpectedly: exit_code=5` |
+| `0.4.7+5b415fc8`（本版） | **61 个 `CreateContext`、60 场会话正常收尾、0 次崩溃**；60 场全部"送入 N == 收到 M"（无掉帧），`等 IO 所有权超时` 0 次，ENOTTY 0 次 |
+
+本机回归同步全绿：`make tests`、`regress_av1_pixels.sh` 17/17、
+`regress_av1_midgop.sh` 5/5、`regress_av1_reschange.sh` 5/5、
+`verify_driver.sh` 5 种编码逐字节、`cmp2.sh final` 1800/1800 逐字节等于软解。
+
+## 🔧 文档纠错：`--enable-features=Vulkan` 会让 Chrome 完全不建硬解上下文
+
+上一轮补 Vulkan 参数时把两件事混成了一件，实测（8 Elite + Chrome 151，唯一变量是
+参数，判据 = 驱动日志里 `CreateContext` 次数）：
+
+| `--enable-features` | 额外 `--use-angle=vulkan` | `CreateContext` |
+|---|---|---|
+| 三项 Vaapi… | 无 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 无 | **0 ✗** |
+| 三项 Vaapi… | 有 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 有 | **0 ✗** |
+
+即：`--enable-features=Vulkan`（等同 `chrome://flags` 里那个 "Vulkan"）任何机型都
+不能开 —— 开了 GPU 进程仍会探测、仍给每个 profile 建满 config，然后直接
+`vaTerminate`，一个解码上下文都不建，视频静默走软解，看着像"配了没生效"。
+显示需要的是 `--use-angle=vulkan`（只切 ANGLE 后端，实测不影响硬解，8 Elite 不给
+它会文字糊加重影）。已改：`tools/configure-chrome-vaapi.sh`（不再注入该项，且遇到
+老版本注入过的 `.desktop` 会**自动改写**回来）、`README.md`、`README.en.md`、
+`doc/browser-vaapi-guide.md` 第 2 / 2.5 / 3 节、`doc/release-v0.3.4-notes.md`。
+
+## 🧪 浏览器实测：AV1 硬解在 Chrome 里跑通（同时挂出两条新问题）
+
+装到系统路径后（不带 `LIBVA_DRIVERS_PATH`，与浏览器同一条件）在 Chrome 里放
+B站 AV1：驱动 `0.4.7+b6270ec8-dirty`，AV1 合成 2514 次、修复重发 2501 次，
+建了 1280x720 与 1920x1080 两路 `profile=32` 上下文。关键计数**全为 0**：
+空壳丢帧 0、等帧超时(≥1000ms) 0、会话重建 0、`TIMEDOUT`/rc=251 0；
+`next_frame 超时 20 ms` 2670 次全是轮询节拍。此前那个约 130 次零复现的偶发
+rc=251，在浏览器里也没有复现。
+
+⚠️ 不要把这条当成"中间起解已修"的浏览器证据：空壳丢帧 0 次说明拖进度条根本没
+走到新闸门 —— B站走 MSE，seek 会落到关键帧再喂，驱动看不到 GOP 中间起解。
+浏览器这轮只证明"稳定不死锁"，中间起解仍只有 `regress_av1_midgop.sh` 5/5 背书。
+
+## ✅ AV1 流中换分辨率修好：变小逐字节正确，变大不再崩进程
+
+分支 `fix/av1-resolution-change`（叠在 `feat/av1-global-motion` 上，未推）。
+下面「挂账一」记录的卡死已修，且修完这一条又牵出三个缺陷，逐个查证后一并解决。
+
+**定位过程（三条对照实验把范围夹到极小）**
+
+1. 单独播 720p：硬解与软解逐字节一致 ⇒ 解码本身没问题。
+2. 加临时探针把固件写进 CAPTURE 缓冲的字节直接落盘：切换后第一帧（关键帧）
+   逐字节正确，其后帧亮度也对、只有色度错。
+3. 再用仓库里现成的 `DMD_SURF_DUMP2` 把驱动 surface 内容落盘比对：切换后
+   25 帧的亮度**和**色度在 surface 里全部正确。
+
+⇒ 错不在固件、不在重配、不在解码，而在**驱动把 surface 交给客户端的那一步**。
+
+**四处修改**
+
+1. `dmd_v4l2_session.c`：`publish_format()` 被 `if (!s->fmt.valid)` 挡着，
+   **一辈子只发布一次**。重配之后交给驱动的帧仍带着旧的
+   `stride=1920 / slice_height=1088`，而数据实际已是 1280 行距 —— 色度平面按
+   错位的位置读，整段全花。现在 `cap_reconfig()` 置 `d->fmt_dirty`，会话层经
+   新的 `maybe_publish_format()` 重发几何。
+2. 顺带补掉一个悬空读：重配会 `REQBUFS(0)` + `bufs_free()` 掉旧 CAPTURE 缓冲，
+   而待取队列里存的是**指向那些缓冲的裸指针**。现在重发前先清队列
+   （实测该处通常为空，代价最多是切换瞬间一两帧）。
+3. `dmd_GetImage()`：请求超出 surface 时原样整笔拒绝。客户端（ffmpeg 复用 AV1
+   context）仍按建池尺寸来取，报错等于整个会话废掉；不裁剪则色度全错。改为
+   **裁到真实帧 + 余下补中性值**（Y 补 0、UV 补 128，与 `surface_alloc_dumb`
+   那套"UV=0 会变纯绿"的结论一致）。
+4. 分辨率**变大**方向的 SIGSEGV（gdb 抓到栈停在 `nv12_copy` 取
+   `UV = src + 1920*1088`）：旧代码在 dumb buffer 装不下时"记新几何、只拷放得
+   下的部分"，于是 stride/slice 与实际映射大小不符，任何按 `stride*slice`
+   定位色度平面的读都越界。改为按 surface 裁剪入库（`store_clipped_locked`），
+   几何保持不变；`surface_store_frame_locked` 里的几何赋值也挪到"装得下"确认
+   之后。**没有**改成"该帧直接报错"——实测客户端收到
+   `VA_STATUS_ERROR_OPERATION_FAILED` 会放弃整条码流（125 帧只出 25 帧），
+   播放器一升清晰度就会停住。
+
+**实测**
+
+| 用例 | 结果 |
+| --- | --- |
+| 单次 1080p→720p（50 帧） | 50/50 与软解逐字节一致 |
+| 18 段混合分辨率、**17 次**流中重配（450 帧） | 450/450 逐字节一致 |
+| 高码率真尺寸 400 帧、3 次重配（6M/8M maxrate） | 400/400 逐字节一致，4.5 s 跑完无卡顿 |
+| 360p→720p→360p（变大） | 不崩、75/75 帧全出，**小尺寸段仍逐字节一致** |
+| HEVC / H.264 换分辨率对照组 | 各 50/50 逐字节一致（无退化） |
+| `make tests` / `regress_av1_pixels.sh` / `regress_av1_midgop.sh` / `verify_driver.sh` | 全绿：单测全过、17/17、5/5、五 codec 逐字节一致 |
+
+**仍未解决（客户端限制，非驱动可为）**：分辨率变大时拿不到整幅画面。ffmpeg 换
+分辨率不重建 surface 池（实测大帧到达时它仍按建池时的 640x360 调
+`vaGetImage`），信息量本来就装不下；驱动能保证的是不崩、出帧数与软解一致、
+切回小尺寸后逐字节正确。浏览器侧 Chrome 换清晰度会新建 context，不走这条路。
+
+新增 `tests/regress_av1_reschange.sh`（变小 / 多次交替 / 变大三组 + HEVC、
+H.264 对照组，码流自生成，本机实测 5 通过 0 失败）。
+
+### 挂账一：AV1 流中换分辨率必死（AV1 专有，可稳定复现）—— 已修，见本节第一节
+
+单进程 ffmpeg 把 1080p/720p/480p 三段 concat 起来喂硬解即可复现：
+
+    会话就绪 → SOURCE_CHANGE → CAPTURE 就绪 1920x1088
+    → 第二次 SOURCE_CHANGE → Failed to sync surface 0x2: 38 → 整条 abort (rc=-5)
+
+根因形状在 `v4l2_backend.c:1155`：第二次 `SOURCE_CHANGE` 时 `d->cap_ready` 已为
+1，`if (!d->cap_ready && setup_capture(d) < 0)` 直接跳过，CAPTURE 仍停在
+1920x1088，固件不再出帧，sync 超时。该处注释写明这套语义是按"首次分辨率协商"
+设计的（"配好 CAPTURE 后固件自动继续出帧"），真·流中换分辨率未覆盖。
+
+**AV1 专有**：同样 1080p→720p 的 concat，HEVC 与 H.264 都完整出 50/50 帧、
+与软解字节数一致、rc=0；只有 AV1 死。所以不是通用 session 层坏了，而是 AV1
+没走到那条恢复路径（`session_rebuild_locked` 被刻意收紧——重建会摧毁参考链、
+要黑到下个 IDR，见 decode.c:708 的注释）。
+
+### 挂账二：Chrome 换清晰度时 GPU 进程崩溃
+
+`Crashing due to FD ownership violation` → `GPU process exited unexpectedly:
+exit_code=5`，用户侧表现为"切换失败黑屏一下，随后恢复"。两轮各复现一次
+（15:42:41、16:08:11），都在连着 4 次 1920x1080/1280x720 来回切的
+`CreateContext` 之后。**不是** 站点播放器的锅。
+
+FD 假设已逐条排除（全阴性）：所有 `open()` 带 `O_CLOEXEC`；驱动从不 `close()`
+Chrome 传入的 DRM fd；`plane.m.fd` 传的是自己 `dmabuf_alloc()` 出的 fd，不经手
+调用方 fd 故无双重关闭；实测单进程连切 6 轮 × 3 分辨率，fd 50→49、同时只有
+1 个 `video32` + 1 个 `dma_heap`，**无泄漏**。栈全是 `<unknown>`，暂时归不了因；
+先把挂账一修掉再看崩溃是否跟着消失。
+
+## 🔧 `dmd_v4l2_close()` 在判空之前就解引用 `d`
+
+`bufs_free(d->extra, ...)` 写在 `if (!d) return` 之前，`d` 为空时直接崩。
+把判空提到最前（`extra` 是内联数组、不会为空，判空只是把语义写全）。
+该函数同时是错误路径的清理入口，所以这条影响所有建会话失败的场景。
+
+## 🩹 AV1 从 GOP 中间起解：从"整条码流被放弃"变成"黑到下个关键帧后逐字节正确"
+
+拖动进度条落到非关键帧、或拿到半截码流时，头几帧引用的是硬件 DPB 里根本
+不存在帧。Venus 对这种帧**既不出帧也不报错**，于是 `vaSyncSurface` 白等 2s
+（顺带触发不可逆的 `finish_input`）再等到 5s 超时返 `VA_STATUS_ERROR_TIMEDOUT`，
+ffmpeg 收到错误后放弃整条码流 —— 实测 `rc=251`、输出 0 帧。软解 dav1d 对同
+一段码流是丢掉那 7 帧、照常交出其余 36 帧。
+
+**修法**：合成前先判一次引用可否解析（`dmd_av1_refs_resolvable`），判不过的帧
+不提交、按**空壳**交付（`READY` + `VA_STATUS_SUCCESS`）。返回错误是不行的 ——
+`vaEndPicture` 一返错，调用方就整条放弃。
+
+**两个必须记住的坑**（都是实测踩到的）：
+1. 判断只能放在 `dmd_av1_patch_prev_refresh` **之后**。影子槽位的登记就发生
+   在 patch 里（上一帧的真实 refresh 要等本帧的 `ref_frame_map` 差分才算得
+   出来），放它之前返回会让上一帧永远进不了 DPB，于是其后每一帧都被判成
+   "引用不可解析"而级联误丢 —— 级联版 43 帧里只有关键帧与其后继 1 帧出画。
+2. `reference_select` **不能**当放行条件。规范 5.9.2 里它为 0 只表示帧头不
+   显式给 7 个槽号，帧照样引用 LAST（`ref_frame_idx[0]`）。第一版加了这条
+   提前放行，结果该拦的没拦住，日志照常"合成 2957 字节"、照样卡死。
+
+**新增回归** `tests/regress_av1_midgop.sh` + `tests/ivf_cut.py`。用 IVF 而不是
+裸 `.obu` 是因为 ffmpeg 的 obu 解封装器要求文件第一个 temporal unit 就是关键帧，
+从中间切的 `.obu` 报 "Invalid data found when processing input" 压根喂不进去；
+另记一条踩过的坑：ffprobe 对 IVF 报的 `pos` 指向 12 字节**帧记录头**，而 `size`
+是**载荷长度**、不含那 12 字节，算错就是 dav1d 那句
+`Invalid OBU length: 6564, but only 6552 bytes remaining`。
+脚本自带两个变体：纯截取（头几帧连序列头都没有，ffmpeg 自己丢）与补序列头
+截取（那几帧会真喂到驱动，压的就是上面那条闸门）。
+
+**验证**
+- 新回归 5/5：不卡死、帧数合理、**关键帧之后与软解逐字节一致**，ffmpeg 契约与
+  Chrome 契约（`DMD_NO_MAP_WAIT=1`）各一趟。
+- `tests/regress_av1_pixels.sh` 仍 **17/17 逐字节一致** —— 拦错一帧就会掉帧，
+  这条是"正常码流绝不触发"的护栏（另在真流上数过：前 300 帧 / 2100 个引用，
+  判"不可解析"的次数为 0）。
+- 单测新增 8 组断言（该拦/该放两个方向各钉一遍，含 `reference_select=0` 与
+  surface 号被复用的情形）。`make tests` 全过，`make AV1=1` 无警告。
+- 拖动 seek 全套 13/13（`-ss` 六个时间点逐哈希一致、三条坏流不崩、
+  从 GOP 中间起解）。
+- 顺带把 `decode.c` 里"show_frame=0 是当前阻塞点"那段注释更正为已解决留档：
+  自打合成头里 show_frame 恒置 1 之后，GOP=300 真流前 300 帧是 300 帧全交付、
+  149 次 Sync、0 次超时。
+- 一个尚未解释的观测：修复刚落地时有**一次**跑在 surface 1 上超时（rc=251），
+  之后约 130 次连跑零复现（含带日志的 60 次压测、解码中途 `kill -9` 后立刻
+  重跑 8 轮、同进程两路 AV1 会话并发 12 轮）。两条候选线索各做成实验都是
+  阴性：①"上次异常退出留下 Venus 会话残留"；②"同进程内上下文串味"——
+  每个 context 各自建会话，重置清单里没有跨 context 的共享项。**不是已解决**，
+  只是暂时抓不到；浏览器端复跑若再出现，从这台机器上当时还有什么别的进程
+  占着解码器这条线查。
+
+## ✅ AV1 全局运动（global motion）合成：带 gm 的码流从整段坏帧变逐字节正确
+
+之前对所有参考帧恒写 `is_global = 0`（`av1_bitstream.c` 的桩），凡是编码端
+用了全局运动的流，运动补偿整体丢失：自制的平移样本 `gm-pan`（24 帧、其中
+8 帧带 `is_global=1`）第 4 帧起 13% 像素偏差，第 5~23 帧 100% 偏差。
+
+**为什么不是"照抄 VA 的值"就行**：VA-API 的 `wm[i].wmmat[]` 是**重建后**的
+参数（ffmpeg `vaapi_av1.c` 直接抄 `AV1Frame.gm_params`），而码流里是
+recentering + `sub_exp` 的**差分符号**，且差分的基准 prev 取自
+`ref_frame_idx[primary_ref_frame]` 那个槽里"解码器当时那份"参数。所以要
+逆解 `inverse_recenter`、按 `abs_bits/prec_bits` 分档还原符号，还要按槽
+镜像一份 prev（`dmd_av1_dpb.gm_slot`）与影子 DPB 同步 —— 两遍法保证时序
+一致：`EndPicture(k+1)` 先 patch 让第 k 帧进槽，再合成第 k+1 帧，硬件也是
+先收 repair(k) 再收 pixel(k+1)。写位次序也不是下标升序：ROTZOOM 是
+`[2][3][0][1]`，AFFINE 是 `[2][3][4][5][0][1]`。
+
+**踩到的坑（值得留）**：`increment(v, max)` 是"v 个 1，v<max 时再补一个 0"，
+不是"v+1 个 1 再补 0"。写错时每个符号恰好都多一个前导 1 又各自被终止符重新
+对齐 —— 症状是"只有 gm 的数值全错、帧头其余部分照常"，源符号 118 被读成
+237（= 2v+1）。只看像素完全推不出来。
+
+**验证**
+- 单测新增 4 组断言（默认 prev / 非默认 prev 差分 / hp=0 档 / 编不出来时整帧
+  退回 IDENTITY）。期望位串**逐字抄自源码流的 ffmpeg CBS trace**，另用一个
+  独立写的 Python 读侧回解出 CBS 打印的同一批符号（118/31/936/2873、
+  2/5/512/1541）双向核对。
+- `tests/regress_av1_pixels.sh` 新增 `gm-pan`、`tiles2x1`、`screen-10b`
+  三条样本：**17/17 逐字节一致**（ffmpeg 契约与 Chrome 契约各一趟）。
+- `make clean && make AV1=1` 无警告，原有单测全通过。
+
+## 🩹 AV1 环路滤波 `lr_unit_shift` 编码：屏幕内容类码流从"全坏"变逐帧正确
+
+规范 5.9.20：`use_128x128_superblock=1` 时码流位是**有效位移减一**
+（`lr_unit_shift = 1 + 该位`，有效值只可能 1 或 2），而 VA-API 的
+`lr_unit_shift` 给的是**有效值**。旧写法在 sbs128 分支写 `sh ? 1 : 0`，
+把有效位移 1 写成 2 —— restoration 单元从 64 变 128，凡"128 超块 +
+restoration"的码流每一帧都错，Chrome 里表现为整片坏帧。
+
+此前 1800 帧 B 站真流逐字节一致没暴露它：那条流的 restoration 帧恰好全是
+有效位移 2，写 1 属于蒙对。复现流是 libaom 编的 testsrc（屏幕内容类，
+128 超块 + 有效位移 1）。
+
+**验证**：`av1_probe.mp4` 120 帧硬解与软解 rawvideo 逐字节一致
+（md5 `535433d98da5a85842d3db3252391cda`）；真流 1800/1800 不回归。
 
 ## ⚡ AV1 1080p60 真流帧率修好：51fps → 120~190fps（像素逐字节不变）
 

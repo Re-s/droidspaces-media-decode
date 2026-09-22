@@ -82,6 +82,7 @@ google-chrome \
   --ozone-platform=wayland \
   --render-node-override=/dev/dri/renderD128 \
   --ignore-gpu-blocklist \
+  --use-angle=vulkan \
   --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
 ```
 
@@ -90,13 +91,21 @@ google-chrome \
 | `--ozone-platform=wayland` | 见上节，dmabuf 输出的前提 |
 | `--render-node-override=/dev/dri/renderD128` | **核心**。Chromium `vaapi_wrapper.cc` 的 `PreSandboxInitialization()` 只枚举 PCI 总线 DRM 设备，ARM 平台设备的 renderD128 会被 `if (device->bustype != DRM_BUS_PCI) continue;` 跳过。此开关走 `LoadDrmFD()` 分支绕过白名单 |
 | `--ignore-gpu-blocklist` | ARM GPU 在 Chrome 的软件渲染黑名单里 |
+| `--use-angle=vulkan` | ANGLE（WebGL 与部分 GL 呈现路径）走 Vulkan 后端。骁龙 8 Elite 上不给它就**文字糊成一团并且重影**；实测不影响硬解，所以保留 |
 | `--enable-features=...` | Linux VA-API 解码总开关（DMABUF/GL 两路都开） |
+
+最后一条**必须写成一项、多个 feature 用逗号分隔**：`--enable-features` 出现两次时
+不要依赖框架帮你合并，写全在一个列表里最稳。
+
+⚠️ **`--enable-features` 的列表里绝对不能有 `Vulkan`** —— 那是"打开 Vulkan 图形
+后端"的开关，实测会让 Chrome 完全不创建 VA-API 解码上下文（对照表见第 2.5 节）。
+`--use-angle=vulkan` 是另一回事，只管 ANGLE 后端，照留。
 
 注意：容器里通常需要 `MESA_LOADER_DRIVER_OVERRIDE=msm` 让 GL 栈认出 Adreno。
 
-### 2.5 关闭 Vulkan：只能在 chrome://flags 里改
+### 2.5 `Vulkan`：两个参数别混为一谈（0.4.7 实测纠正）
 
-ozone wayland 与 Vulkan 硬性冲突，不关掉的话 GPU 进程会报：
+先说这条 GPU 进程日志，它**不是**故障：
 
 ```
 ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
@@ -104,13 +113,41 @@ ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc:249] ERROR:
 Consider switching to '--ozone-platform=x11' or disabling Vulkan
 ```
 
-**唯一可靠的关法是打开 `chrome://flags`，把 Vulkan 设为 `Disabled`，重启浏览器。**
+它给的两个建议里，`--ozone-platform=x11` 在两台实测机型上都不可用
+（本地只有 wayland，X11 起不来），那条 ERROR 两台都会打，可以无视。
+判据始终是**视频与文字显示是否正常**，外加驱动日志里有没有 `CreateContext`。
 
-⚠️ 命令行开关关不掉它。本文此前写的 `--disable-vulkan` 是错的 ——
-Chrome 151 的二进制里根本没有这个开关（只有 `enable-vulkan` 与 `use-vulkan`），
-而 Chromium 的 switch 不像 feature flag 那样自动生成 `disable-` 反面，
-传进去既不报错也不生效，纯粹被忽略。实测下列写法**全部无效**，
-GPU 进程照样打印上面那条警告：
+真正要分清的是这两项，它们名字像、作用相反：
+
+| 项 | 管什么 | 对硬解的影响 |
+|---|---|---|
+| `--use-angle=vulkan` | 只切 ANGLE 的后端 | **无影响**，实测照常建上下文；8 Elite 不给它还花屏 |
+| `--enable-features=Vulkan`（等于 `chrome://flags` 里的 "Vulkan"） | 打开 Vulkan 图形后端 | **硬解直接没有** |
+
+骁龙 8 Elite + Chrome 151 + 本驱动，2026-09-21 逐项对照实测（同一素材、同一套
+驱动，唯一变量是参数；判据 = 驱动日志里 `CreateContext` 次数）：
+
+| `--enable-features` | 额外的 `--use-angle=vulkan` | `CreateContext` |
+|---|---|---|
+| 三项 Vaapi… | 无 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 无 | **0 ✗** |
+| 三项 Vaapi… | 有 | 1 ✓ |
+| 三项 Vaapi… **+ Vulkan** | 有 | **0 ✗** |
+
+踩了这个坑时的表现很阴：GPU 进程照样加载驱动、照样给每个 profile 建满 config
+（`CreateConfig: profile=32 …` 全都在），紧接着一个 `vaTerminate`，
+**一个 `CreateContext` 都没有**。页面播放流畅、CPU 不降，看起来就是
+"参数配了没生效"。所以别照搬 `chrome://flags` 教程里"把 Vulkan 打开"那一步。
+
+本文早期版本（0.4.6 及之前）写的"显式开 Vulkan 更保险 / 8 Elite 必须开 Vulkan"，
+是把上面两项混成了一项，0.4.7 起按本表纠正。nabu / SD855 那一代还要额外去掉
+`--use-angle=vulkan`（wayland 与 Vulkan 冲突），那是机型差异；而**不进
+`--enable-features=Vulkan` 是所有机型的共同要求**，属 Chrome 侧行为，与本驱动无关。
+
+另有一条与机型无关的实测结论仍然成立：**命令行关不掉 Vulkan**。Chrome 151 的二进制里
+根本没有 `--disable-vulkan` 这个开关（只有 `enable-vulkan` 与 `use-vulkan`），而
+Chromium 的 switch 不像 feature flag 那样自动生成 `disable-` 反面，传进去既不报错
+也不生效，纯粹被忽略。实测下列写法全部无效，GPU 进程照样打印上面那条警告：
 
 ```sh
 --disable-vulkan                            # 开关不存在，被忽略
@@ -119,11 +156,13 @@ GPU 进程照样打印上面那条警告：
 --use-vulkan=disabled --disable-features=Vulkan,VulkanFromANGLE   # 仍然无效
 ```
 
-实测环境 Chrome 151.0.7922.173，判据是 GPU 进程还会不会继续打印
-`not compatible with Vulkan`。
+也就是说，如果 `chrome://flags` 里那个 "Vulkan" 已经被开成 `Enabled`，命令行
+拉不回来（选择存在 profile 的 `Local State` 里，跟着 profile 走），只能手动设回
+`Disabled`。而正确配置本来就不需要开它 —— 显示要正常靠的是 `--use-angle=vulkan`。
 
-后果是这一项**没法写进 `.desktop` 固化**，换机器或重建 profile 后要手动再关一次
-（`chrome://flags` 的选择存在 profile 的 `Local State` 里，备份 profile 会带走）。
+nabu / SD855 上还有一层：那一代连 ANGLE 的 Vulkan 后端都不能用，
+`--use-angle=vulkan` 也要去掉（`tools/configure-chrome-vaapi.sh` 用
+`DMD_VULKAN=off` 区分两种机型）。
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
@@ -133,13 +172,17 @@ GPU 进程照样打印上面那条警告：
 D=/usr/share/applications/google-chrome.desktop
 if ! grep -q "render-node-override" "$D"; then
     [ -f "$D.bak" ] || sudo cp "$D" "$D.bak"
-    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+    # 骁龙 8 Elite 及更新的机型：保留 --use-angle=vulkan（不给就文字糊、重影）
+    # nabu / SD855：删掉 --use-angle=vulkan（那代 wayland 与 Vulkan 冲突）
+    # ⚠️ 两种情况都**不要**在 --enable-features 里加 Vulkan，加了就没有硬解（见 2.5 节）
+    FLAGS="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
     sudo sed -i \
       -e "s|^Exec=/usr/bin/google-chrome-stable $|Exec=/usr/bin/google-chrome-stable $FLAGS %U|" \
       -e "s|^Exec=/usr/bin/google-chrome-stable |Exec=/usr/bin/google-chrome-stable $FLAGS |" \
       "$D"
 fi
 grep -c "render-node-override" "$D"    # 每个 Exec 入口 1 次,不应随执行次数增长
+grep -c "features=[^ ]*Vulkan" "$D"    # 必须是 0；非 0 就踩了 2.5 节那个坑
 
 # 执行后每个 Exec= 行应形如(注意开头就是 --ozone-platform=wayland):
 # Exec=/usr/bin/google-chrome-stable --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,... %U
@@ -441,6 +484,35 @@ SyncSurface: 等帧超时 5000 ms
 会话重建循环 0，9 次 `INSUFFICIENT` 全部重配成功（9/9），2977 帧配对，
 `DestroyContext` 送入/取回完全平衡（1080/1080、850/850、630/630）。
 
+### 7. AV1 拖进度条：黑到下一个关键帧是**预期行为**（0.4.7 起）
+
+**症状**：AV1 视频拖进度条后短暂黑屏/花屏，几秒后恢复；恢复后画面正常。
+
+**这不是缺陷**。msm_vidc 是状态解码器，落到 GOP 中间时头几帧引用的是它
+DPB 里根本不存在的帧。这类帧硬件**既不出帧也不报错**，于是驱动只能干等
+`SyncSurface` 超时，而调用方（浏览器/ffmpeg）一收到同步错误就放弃整条码流
+—— ffmpeg 侧实测 `rc=251`、输出 0 帧；浏览器里的等价表现应是"拖动后不再出画"
+（**这条尚未在浏览器上复测**，不要当实测结论用）。
+
+0.4.7 起驱动在合成码流前先判一次引用可否解析，判不过的帧不提交、直接按
+"就绪但内容为这张 surface 的残留"交付，流程继续往前推，**下一个关键帧一到
+就恢复正常**，之后的像素与软解逐字节一致。
+
+判据（`DMD_VA_LOG=1`）：
+
+```
+EndPicture: AV1 surface=N 的参考帧不在 DPB（拖到 GOP 中间起解？），跳过提交并按空壳交付
+```
+
+出现这行属正常，条数应约等于"起点到下一个关键帧之间的帧数"；**不该**再出现
+`SyncSurface: 等帧超时 5000 ms` 或播放中止。GOP 越长，这段黑屏越久 ——
+观感不好时是片源 GOP 的问题，不是解码器的。
+
+**实测**（GOP=12 的 36 帧样本 + B 站 1080p60 真流 GOP=300，ffmpeg 路径）：
+从第 5 帧起解 43 帧全交付，其中 7 帧走空壳，关键帧之后与软解逐字节一致；
+不卡死、不中止。浏览器端（Chrome / Firefox 拖进度条）尚未复测，装上新驱动后
+请按上面的日志判据核对一遍。
+
 ---
 
 ## 三、实时监视：确认硬解"持续"在用
@@ -498,11 +570,13 @@ curl -fsSL https://raw.githubusercontent.com/Re-s/droidspaces-media-decode/v0.3.
 |---|---|---|
 | 会话建立成功但 0 帧 | Chrome 跑在 X11，dmabuf 输出走不通 | 换 Wayland 模式 |
 | GPU 进程 maps 无 drv_video | PCI 白名单跳过了平台设备 | 确认 `--render-node-override` |
-| 日志报 `not compatible with Vulkan` | wayland 与 Vulkan 硬性冲突 | 在 `chrome://flags` 把 **Vulkan** 设为 Disabled 后重启，命令行开关无效，见下 |
+| 日志报 `not compatible with Vulkan` | Chromium 的固定提示，两台机型的处置**相反** | 按视频与文字是否正常决定：nabu 要关，骁龙 8 Elite 必须留（关了会文字糊、重影），见 §2.5 |
+| 配置全对但文字糊成一团、画面重影 | 在骁龙 8 Elite 上把 Vulkan 关了 | 到 `chrome://flags` 把 Vulkan 恢复 Enabled（默认值）并重启，见 §2.5 |
 | Firefox 有进程不解码 | RDD 沙箱拦设备 | `MOZ_DISABLE_RDD_SANDBOX=1` |
 | user.js 写了没生效 | 写错了 profile | 查 installs.ini 的 Default |
 | Chrome HEVC 在线流掉帧/绿屏 | anland 呈现反馈缺失（平台 bug） | 用 Firefox；或等平台修复 |
 | 视频卡顿 + CPU 飙高，但"硬解已启用" | 实际回落软解了（0.4.0 无端点问题，多为浏览器侧没走硬解路径） | 按第零章的 ffmpeg 判据自查后端；再用验证三步确认浏览器进程加载了驱动 |
 | ffmpeg 日志 `hevc (native)` | 根本没用硬解，静默回落软解了 | 测试命令要带 `-hwaccel_output_format vaapi` |
 | 拖进度条/切清晰度卡数秒并反复 | `INSUFFICIENT` 重配没做（0.4.3 及更早） | 升级到 0.4.4；判据见第二章第 6 节的 7 秒循环 |
+| AV1 拖动后黑几秒再恢复 | 起点落在 GOP 中间，头几帧引用缺失 —— **预期行为** | 不用处理，判据与原理见第二章第 7 节；若拖动后**一直不出画**，那是 0.4.7 之前的整条码流放弃缺陷，升级后按第 7 节的日志判据核对 |
 | 驱动 init 了但一帧不出 | 该设备的 V4L2 解码会话起不来（已知有此类设备） | 跑 `vaapi-driver/tools/probe_device_support.c`，看有没有事件到达（⚠️ 该探针只订阅标准 `SOURCE_CHANGE`，而 msm_vidc 只发私有 `PORT_SETTINGS_*`，所以"没有 `SOURCE_CHANGE`"本身不构成不可用的判据，见第二章第 6 节） |

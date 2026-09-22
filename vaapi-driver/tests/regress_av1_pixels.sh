@@ -82,6 +82,13 @@ check() {
 SRC="testsrc2=size=640x360:rate=25"
 AOM="-c:v libaom-av1 -cpu-used 8 -lag-in-frames 0 -b:v 2M"
 
+# 全局运动专用源：整幅画面平移，aom 会把它编成 ROTZOOM/AFFINE 的 gm_params。
+# 单独一条源是因为 gm 只在"真的存在全局位移"时出现 —— testsrc2 自身不动，
+# 用 crop 按 t 平移才能稳定编出 gm（实测 24 帧里有 8 帧带 is_global=1）。
+PAN="testsrc2=size=1280x720:rate=25,crop=640:360:'mod(t*120,640)':'mod(t*80,360)'"
+AOM_GM="-c:v libaom-av1 -cpu-used 8 -lag-in-frames 0 -usage 0 \
+-enable-global-motion 1 -enable-intrabc 0 -g 240 -keyint_min 240 -sc_threshold 0 -crf 30"
+
 # 长 GOP 跨回绕：`--wrap` 只跑这几条（每条 200 帧，比主流程慢得多）。
 WRAP="${WRAPFRAMES:-200}"
 wrap_only=0
@@ -98,6 +105,14 @@ check r854x480       "testsrc2=size=854x480:rate=25"         "$AOM -g 20"  yuv42
 check r1080          "testsrc2=size=1920x1080:rate=25"       "$AOM -g 20"  yuv420p 1920x1080
 check bit10          "testsrc2=size=640x360:rate=25,format=yuv420p10le" "$AOM -g 20 -pix_fmt yuv420p10le" yuv420p10le 640x360
 check lossless-cq0   "$SRC"                                  "-c:v libaom-av1 -cpu-used 8 -usage 1 -b:v 0 -crf 0 -g 20" yuv420p 640x360
+# 全局运动（is_global/is_rot_zoom/gm_params，规范 5.9.24）。此前恒写
+# is_global=0，带 gm 的流整帧运动补偿丢失：实测 gm-pan 第 4 帧起 13% 像素偏差、
+# 第 5~23 帧 100% 偏差。编码结构与 lossless/g240 都不重叠，必须单独一条。
+check gm-pan         "$PAN"                                  "$AOM_GM" yuv420p 640x360
+# 多 tile：tile_info/tile_group 的长度与排列只在多 tile 时出现。
+check tiles2x1       "testsrc2=size=1280x720:rate=25"       "$AOM -tile-columns 1 -g 20" yuv420p 1280x720
+# 屏幕内容：intrabc + palette（帧内帧也要写 gm 语法，见 5.9.24 的调用位置）。
+check screen-10b     "testsrc=size=640x360:rate=25,format=yuv420p10le" "$AOM -enable-global-motion 1 -enable-intrabc 1 -enable-palette 1 -g 240 -keyint_min 240 -sc_threshold 0 -pix_fmt yuv420p10le -crf 20" yuv420p10le 640x360
 if $FFMPEG -hide_banner -encoders 2>/dev/null | grep -q libsvtav1; then
     check svt-ra       "$SRC"                                "-c:v libsvtav1 -preset 8 -g 20" yuv420p 640x360
     check svt-ld       "$SRC"                                "-c:v libsvtav1 -preset 8 -g 240 -keyint_min 240 -svtav1-params preset=2" yuv420p 640x360

@@ -393,6 +393,113 @@ static void test_patch_prev_refresh(void)
 }
 
 
+/* ------------------------------------------------- 引用帧可解析性判定
+ *
+ * dmd_av1_refs_resolvable() 是"从 GOP 中间起解"那道闸门：引用了硬件 DPB 里
+ * 根本不存在帧的码流，Venus 既不出帧也不报错，会把 vaSyncSurface 拖到超时、
+ * 调用方随后放弃整条码流（实测 rc=251、0 帧）。所以判错的两个方向都有代价：
+ *   该放行却拦 → 正常播放凭空丢帧（画面一直黑到下个关键帧）；
+ *   该拦却放  → 整条码流废掉。
+ * 本用例把这两侧各钉一遍。 */
+static void test_refs_resolvable(void)
+{
+    printf("引用帧可解析性判定（从 GOP 中间起解的闸门）\n");
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+
+    /* 约定：影子表槽 2 存帧号 7，帧 7 属于 surface 100。
+     * surf_hist 是静态接口，测试里直接按它的语义填。 */
+#define SETUP()   do {                                              \
+        memset(&dpb, 0, sizeof(dpb));                               \
+        memset(&pic, 0, sizeof(pic));                               \
+        dpb.dpb_shadow[2] = 7;                                      \
+        dpb.surf_hist[0].surf = 100; dpb.surf_hist[0].frame = 7;    \
+        dpb.surf_hist_n = 1;                                        \
+        dpb.frame_seq = 7;                                          \
+        for (int i = 0; i < 8; i++)                                 \
+            pic.ref_frame_map[i] = (VASurfaceID)100;                \
+        pic.ref_frame_idx[0] = 2;   /* LAST 在槽 2 */               \
+        pic.ref_frame_idx[3] = 2;   /* ALTREF 也在槽 2 */           \
+    } while (0)
+
+    /* 1. 帧间帧、引用都查得到 → 放行 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;   /* INTER_FRAME */
+    check_eq("引用齐全的帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 2. KEY / INTRA_ONLY / SWITCH 不需要参考 → 一律放行，
+     *    哪怕 map 里全是 INVALID（关键帧起解就是这个样子）。 */
+    SETUP();
+    for (int ft = 0; ft <= 3; ft++) {
+        if (ft == 1)
+            continue;
+        memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
+        pic.pic_info_fields.bits.frame_type = (unsigned)ft;
+        check_eq("非帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+    }
+
+    /* 3. allow_intrabc 的帧内帧不引用任何帧 → 放行 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.pic_info_fields.bits.allow_intrabc = 1;
+    memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
+    check_eq("intrabc 帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 4. LAST 指向一个从未解码过的 surface（VA_INVALID_ID）→ 拦。
+     *    这正是"拖到 GOP 中间起解"的头几帧：ffmpeg 的 ref_frame_map 里
+     *    那些槽是 4294967295，硬件 DPB 里对应槽是空的。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.ref_frame_map[2] = 0xffffffffu;
+    check_eq("LAST 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 5. LAST 能解析、ALTREF（槽号 5）解析不出 → 也拦。
+     *    复合参考与 skip_mode 真的会用到的槽，引用不到同样解不出来。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.ref_frame_idx[3] = 5;
+    pic.ref_frame_map[5] = 0xffffffffu;    /* 该槽里没有帧 */
+    check_eq("ALTREF 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 6. ⚠️ reference_select=0 **不能**当成"这帧不引用"放行条件。
+     *    规范 5.9.2：它为 0 只是帧头里不显式给 7 个槽号，帧照样引用 LAST
+     *    （ref_frame_idx[0]）。第一版就是加了这个提前放行，结果该拦的没拦住，
+     *    日志仍显示"合成 2957 字节"、照样 rc=251 卡死。
+     *    两个方向都要钉：引用坏 + reference_select=0 → 拦。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.mode_control_fields.bits.reference_select = 0;
+    pic.ref_frame_map[2] = 0xffffffffu;
+    check_eq("reference_select=0 且引用坏时仍拦截",
+             (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+    /* 引用好 + reference_select=0 → 放行（正常播放里大量帧是这种，
+     * 误拦就会级联：实测 43 帧丢 37 帧）。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    pic.mode_control_fields.bits.reference_select = 0;
+    check_eq("reference_select=0 且引用齐全时放行",
+             (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+
+    /* 7. surface 号复用：ffmpeg 回收 surface 后同一个号属于新帧。
+     *    surf_hist 里 100 号已被帧 9 拥有，而影子表里只有帧 7 → 帧 9 查不到
+     *    → 拦。这条防的是"拿 surface 当身份"那种错法。 */
+    SETUP();
+    pic.pic_info_fields.bits.frame_type = 1;
+    dpb.surf_hist[0].frame = 9;
+    check_eq("surface 已易主时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+
+    /* 8. NULL 保护：没有 pic 时无从判断，放行（交给后面的 tile 检查）；
+     *    没有 dpb 时判"解析不出"→ 拦。真实调用里 dpb 是 context 的常驻
+     *    成员、永不为 NULL，这里只是把语义钉死，别日后改成静默透传。 */
+    SETUP();
+    check_eq("pic 为 NULL 时放行", (long)dmd_av1_refs_resolvable(NULL, &dpb), 1);
+    pic.pic_info_fields.bits.frame_type = 1;
+    check_eq("dpb 为 NULL 时按解析不出处理",
+             (long)dmd_av1_refs_resolvable(&pic, NULL), 0);
+#undef SETUP
+}
+
+
 /* 载荷是按位写的，断言就得按位读。
  * bit_at：第 idx 位（idx=0 是 buf[0] 的最高位），越界返回 -1。 */
 static long bit_at(const unsigned char *buf, size_t n, size_t idx)
@@ -670,6 +777,172 @@ static void test_refresh_bitpos_invariants(void)
     unsetenv("DMD_AV1_NO_SHOWFORCE");
 }
 
+/* -------------------------------------------------------------- 全局运动 */
+
+/* 在按位写的载荷里找一段连续的位，返回起始位下标；找不到返回 -1。 */
+static long find_bits(const unsigned char *buf, size_t n, const char *pat)
+{
+    const size_t plen = strlen(pat);
+    for (size_t i = 0; i + plen <= n * 8; i++) {
+        size_t k = 0;
+        while (k < plen && bit_at(buf, n, i + k) == (long)(pat[k] - '0'))
+            k++;
+        if (k == plen)
+            return (long)i;
+    }
+    return -1;
+}
+
+static void check_bits(const char *what, const unsigned char *buf, size_t n,
+                       const char *pat)
+{
+    if (find_bits(buf, n, pat) >= 0)
+        return;
+    fails++;
+    printf("  ✗ %s：码流里找不到 %zu 位模式\n      %s\n",
+           what, strlen(pat), pat);
+}
+
+static void check_no_bits(const char *what, const unsigned char *buf, size_t n,
+                          const char *pat)
+{
+    long at = find_bits(buf, n, pat);
+    if (at < 0)
+        return;
+    fails++;
+    printf("  ✗ %s：码流第 %ld 位出现了不该有的模式\n      %s\n", what, at, pat);
+}
+
+/* 一个最小可用的帧间帧参数（全局运动只在帧间帧出现）。
+ * ref_frame_map 全 0xff、dpb 全零：my_idx[] 会算出无意义的槽号，但
+ * ① prev=默认值的用例根本不查表；② prev=非默认的用例把**八个槽都填成
+ * 同一份**参数，槽号落在哪儿都一样。所以本用例只考编码算法，不考槽翻译
+ * （槽翻译由 test_patch_prev_refresh / 硬件回归覆盖）。 */
+static void gm_pic(VADecPictureParameterBufferAV1 *pic, int hp)
+{
+    memset(pic, 0, sizeof(*pic));
+    pic->frame_width_minus1  = 63;
+    pic->frame_height_minus1 = 63;
+    pic->order_hint = 2;
+    pic->order_hint_bits_minus_1 = 6;
+    pic->pic_info_fields.bits.frame_type = 1;          /* INTER_FRAME */
+    pic->pic_info_fields.bits.show_frame = 1;
+    pic->pic_info_fields.bits.allow_high_precision_mv = (unsigned)hp;
+    pic->seq_info_fields.fields.enable_order_hint = 1;
+}
+
+static void gm_set(VADecPictureParameterBufferAV1 *pic, int i, int type,
+                   const int32_t m[6])
+{
+    pic->wm[i].wmtype = (VAAV1TransformationType)type;
+    pic->wm[i].invalid = 0;
+    for (int j = 0; j < 6; j++)
+        pic->wm[i].wmmat[j] = m[j];
+}
+
+/* 期望位串的来源（三重复核，任何一处出错都会被另两处抓到）：
+ *   1) "1111110110110…" 这 109 位**逐字抄自源码流的 ffmpeg CBS trace**
+ *      （av1work/cov/orig_tr.txt 第 158~266 行的位列），即 aom 编码器自己写的位。
+ *      语法：ref1 是 ROTZOOM(1,1) + 符号 118/31/936/2873，ref2、ref3 无，
+ *      ref4 是 ROTZOOM + 符号 2/5/512/1541，ref5~7 无。
+ *   2) 另用一个独立写的读侧（av1work/gmbits.py）把这串位解回
+ *      118/31/936/2873、2/5/512/1541，与 CBS 打印的符号一致。
+ *   3) 硬件实测：该片段 24 帧输出与软解逐字节相同。
+ * 其余三串（diff/hp0/fallback）由同一份 Python 生成并做写→读 round-trip。 */
+static const char GM_SRC[] =
+    "11111101101101101111111111101101010001111111110011001110010011001001"
+    "01111111100000000001111111101000000101000";
+static const char GM_DIFF[] =
+    "10100011000010011111111100000000000011111111101000000000011111111100"
+    "1000000000111001000111011110111000110";
+static const char GM_HP0[] = "10101100001";
+static const char GM_FALLBACK[] = "010100100001";
+/* GM_SRC 里 ref1 那一段（58 位）：用例 4 的 wm[0] 就是它加了一个 LSB，
+ * 用来断言"没有被四舍五入到最近格点后照样写出去"。 */
+static const char GM_M0[] =
+    "1111110110110110111111111110110101000111111111001100111001";
+
+static void test_global_motion(void)
+{
+    printf("全局运动 global_motion_params（规范 5.9.24 / 7.11.3.7）\n");
+
+    static const int32_t M0[6] = { 479232, -1471488, 65654, -32, 32, 65654 };
+    static const int32_t M3[6] = { 262144, -789504, 65538, -6, 6, 65538 };
+    /* TRANSLATION(hp=1) 格点 1<<13、(hp=0) 1<<14；ROTZOOM/AFFINE 的 idx0/1
+     * 格点 1<<10、idx2..5 格点 1<<1。不在格点上的值实现会退回 IDENTITY。 */
+    static const int32_t D_TR[6] = { 40960, -16384, 0, 0, 0, 65536 };
+    static const int32_t D_AF[6] = { 1024, -3072, 65536, 2048, -2048, 65536 };
+    static const int32_t H_TR[6] = { 49152, -16384, 0, 0, 0, 65536 };
+    static const int32_t F_TR[6] = { 8192, -8192, 0, 0, 0, 65536 };
+    static const int32_t PREV[6] = { 32768, 16384, 67584, -1024, 512, 65576 };
+
+    unsigned char buf[1024];
+    struct dmd_av1_dpb dpb;
+    VADecPictureParameterBufferAV1 pic;
+    size_t n;
+
+    /* --- 1) prev = 默认值（primary_ref_frame = NONE），与源码流同值 --- */
+    gm_pic(&pic, 1);
+    pic.primary_ref_frame = 7;                    /* PRIMARY_REF_NONE */
+    gm_set(&pic, 0, VAAV1TransformationRotzoom, M0);
+    gm_set(&pic, 3, VAAV1TransformationRotzoom, M3);
+    memset(&dpb, 0, sizeof(dpb));
+    n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
+    if (n == 0) {
+        fails++;
+        printf("  ✗ 帧头合成返回 0，用例未覆盖目标\n");
+        return;
+    }
+    check_bits("prev=默认时应写出与源码流逐位相同的 gm 语法", buf, n, GM_SRC);
+
+    /* --- 2) prev = 非默认值：查表按槽取 prev，符号是差分结果 --- */
+    gm_pic(&pic, 1);
+    pic.primary_ref_frame = 0;
+    gm_set(&pic, 0, VAAV1TransformationTranslation, D_TR);
+    gm_set(&pic, 1, VAAV1TransformationAffine, D_AF);
+    memset(&dpb, 0, sizeof(dpb));
+    for (int k = 0; k < 8; k++)
+        for (int i = 0; i < 7; i++)
+            for (int j = 0; j < 6; j++)
+                dpb.gm_slot[k].p[i][j] = PREV[j];
+    n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
+    if (n == 0) {
+        fails++;
+        printf("  ✗ 差分用例帧头合成返回 0\n");
+        return;
+    }
+    check_bits("prev=非默认时应按差分写符号（ROTZOOM/AFFINE 顺序 [2][3][0][1]/[2][3][4][5][0][1]）",
+               buf, n, GM_DIFF);
+
+    /* --- 3) hp=0 的 TRANSLATION：abs_bits 8 / prec_bits 2，档位算错就全错 --- */
+    gm_pic(&pic, 0);
+    pic.primary_ref_frame = 7;
+    gm_set(&pic, 0, VAAV1TransformationTranslation, H_TR);
+    memset(&dpb, 0, sizeof(dpb));
+    n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
+    check_bits("hp=0 TRANSLATION 应走 9-1/3-1 那一档", buf, n, GM_HP0);
+
+    /* --- 4) 编不出来的值必须整参考帧退回 IDENTITY，且不留半截 ---
+     * wm[0] 的 wmmat[0] 比格点偏 1（479232+1 不能被 1024 整除）；
+     * wm[1] 是合法的 TRANSLATION。退回正确时码流是 "0" + wm[1] 的位串，
+     * 若写了一半参数，wm[1] 的位串就不会紧贴在 is_global=0 之后。 */
+    gm_pic(&pic, 1);
+    pic.primary_ref_frame = 7;
+    {
+        int32_t bad[6];
+        memcpy(bad, M0, sizeof(bad));
+        bad[0] += 1;
+        gm_set(&pic, 0, VAAV1TransformationRotzoom, bad);
+    }
+    gm_set(&pic, 1, VAAV1TransformationTranslation, F_TR);
+    memset(&dpb, 0, sizeof(dpb));
+    n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
+    check_bits("不可编码的 gm 应整帧退回 IDENTITY 且不写半截参数",
+               buf, n, GM_FALLBACK);
+    check_no_bits("退回时不得把越界值四舍五入后照常写出（那会让硬件重建出错误矩阵）",
+                  buf, n, GM_M0);
+}
+
 int main(void)
 {
     printf("=== AV1 比特流原语自测 ===\n");
@@ -683,8 +956,10 @@ int main(void)
     test_sequence_header();
     test_show_existing();
     test_patch_prev_refresh();
+    test_refs_resolvable();
     test_frame_header_show_frame();
     test_refresh_bitpos_invariants();
+    test_global_motion();
 
     if (fails == 0) {
         printf("=== 全部通过 ===\n");

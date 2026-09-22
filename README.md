@@ -36,8 +36,8 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | HEVC Main | ✅ 可用 | 12/12 帧，md5 与软解逐字节一致 |
 | VP9 Profile 0 | ✅ 可用 | 50/50 帧，md5 与软解逐字节一致 |
 | VP8 | ✅ 可用 | 90/90 帧，md5 与软解逐字节一致（0.4.2 新增）|
-| AV1 Profile 0 | ✅ 可用（预发布 rc1） | 真流（B 站 1080p60）1800/1800 帧 md5 与软解逐字节一致，120~190fps；另 14 组合成结构回归全过 |
-| AV1 10bit（P010） | 🚧 合成流通过 | 896 帧逐字节一致；真 10bit 网络流未测 |
+| AV1 Profile 0 | ✅ 可用（0.4.7） | 真流（B 站 1080p60）1800/1800 帧 md5 与软解逐字节一致，120~190fps；另 14 组合成结构回归全过。浏览器侧 480p/720p/1080p/**4K** 均在 Chrome 里逐帧平衡，三路并发与 MSE（seek / 带内换分辨率）已通过 |
+| AV1 10bit（P010） | 🚧 解码可用，**浏览器不可用** | ffmpeg 路径真 10bit 流输出 p010le 与软解逐字节一致；Chrome/Firefox 传的是 `SEPARATE_LAYERS`，驱动尚未实现 10bit 的双层导出，浏览器会静默回落软解（已知限制） |
 | MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
 | HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
 
@@ -130,7 +130,7 @@ FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
 
 ```bash
 D=/usr/share/applications/google-chrome.desktop
-F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
+F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
 grep -q render-node-override "$D" || {
   sudo cp "$D" "$D.bak"
   sudo sed -i "s|^\(Exec=[^ ]*\)|\1 $F|" "$D"
@@ -138,8 +138,20 @@ grep -q render-node-override "$D" || {
 grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数增长
 ```
 
-然后打开 `chrome://flags`，搜 `Vulkan`，设为 `Disabled`，重启浏览器。
-这一步没有命令行等价物，原因见下方提示。
+`--enable-features` 要**写成一条**、多项用逗号分隔，不要重复出现两次（重复时
+只有一份生效）。**里面绝对不能有 `Vulkan`**：骁龙 8 Elite + Chrome 151 实测，
+加上它之后 GPU 进程照常探测、照常给每个 profile 建 config，然后 `vaTerminate`，
+**一个 `CreateContext` 都没有** —— 视频静默回落软解，页面流畅、驱动 0 配对帧，
+看起来就像"配了没生效"。
+
+`--use-angle=vulkan` 是另一回事：它只把 ANGLE（WebGL / GL 呈现）切到 Vulkan 后端，
+骁龙 8 Elite 上少了它文字糊成一团并重影，而实测**不影响**硬解，所以保留。
+nabu（SD855）这一代连它也要去掉（wayland 与 Vulkan 冲突）。
+
+同理，`chrome://flags` 里那个 "Vulkan" 开关（等价于 `--enable-features=Vulkan`）
+也要保持 `Disabled`；`--use-angle=vulkan` 才是显示正常需要的那一项。
+逐条对照实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
+重启浏览器后生效。
 
 本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该
 profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
@@ -278,10 +290,12 @@ Firefox 脚本会自动找 profile，覆盖 `~/.mozilla/firefox`、
 Chrome 脚本在容器内没有 sudo 时，会自动改用
 `~/.local/share/applications` 下的用户级副本。
 
-> ⚠️ **Chrome 有一步脚本代劳不了**：打开 `chrome://flags`，把 **Vulkan** 设为
-> `Disabled`，重启浏览器。ozone wayland 与 Vulkan 硬性冲突，而这一项没有
-> 可用的命令行开关 —— `--disable-vulkan` 这个开关在 Chrome 里根本不存在，
-> `--disable-features=Vulkan`、`--use-vulkan=disabled` 实测同样无效。
+> ⚠️ **Chrome 有一步脚本代劳不了，而且结论按机型相反**：nabu（SD855）上要打开
+> `chrome://flags` 把 **Vulkan** 设为 `Disabled` 并重启；骁龙 8 Elite 上**必须保持
+> 默认（Enabled）**，关掉会文字糊成一团、画面重影。判据是显示是否正常，不是日志里
+> 有没有 `not compatible with Vulkan`。这一项没有可用的命令行开关 ——
+> `--disable-vulkan` 这个开关在 Chrome 里根本不存在，`--disable-features=Vulkan`、
+> `--use-vulkan=disabled` 实测同样无效。
 > 详见[指南第 2.5 节](doc/browser-vaapi-guide.md)。
 
 ### 手动配置

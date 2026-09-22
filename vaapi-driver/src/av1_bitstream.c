@@ -5,6 +5,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <va/va.h>
 #include <va/va_dec_av1.h>
@@ -840,7 +841,18 @@ static void put_lr_params(struct dmd_bitwriter *bw,
          * 6 帧样本里 ry=rcb=rcr=0，整个 if 块被跳过，掩盖了缺陷。 */
         const unsigned sh = p->loop_restoration_fields.bits.lr_unit_shift;
         if (p->seq_info_fields.fields.use_128x128_superblock) {
-            dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
+            /* ⚠️ sbs128=1 时码流位是**有效位移减一**（规范 5.9.20：
+             * "When use_128x128_superblock is equal to 1, lr_unit_shift is
+             * set equal to 1 + lr_unit_shift"），有效值只可能是 1 或 2。
+             * VA-API 给的是有效值，所以这里必须写 sh-1，而不是 sh 的非零判定。
+             *
+             * 实测（testsrc 合成流 av1_probe.mp4，帧 oh=16，lr_type[2]=SGRPROJ，
+             * 源码流该位 0 ⇒ 有效位移 1）：旧写法把 0 写成 1 ⇒ 有效位移 2 ⇒
+             * restoration 单元从 64 变成 128 ⇒ **整条流每一帧都错**
+             * （framemd5 128/128 全不匹配，浏览器里表现为满屏坏帧）。
+             * 之所以此前 B 站 1800 帧真流逐字节一致，是它的 restoration 帧
+             * 恰好全是有效位移 2（写 1 蒙对）—— 这个缺陷被样本掩盖了。 */
+            dmd_bw_put_bits(bw, sh > 1 ? 1 : 0, 1);
         } else {
             dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
             if (sh)
@@ -1017,12 +1029,206 @@ static void dmd_av1_remember_surface(struct dmd_av1_dpb *dpb,
     }
 }
 
+/* ------------------------------------------------- 全局运动（5.9.24） */
+
+/* 规范/参考实现的位宽常量（libavcodec/av1.h）。 */
+#define DMD_GM_ABS_ALPHA_BITS      12   /* alpha（idx 2..5 及各类型的斜切项）*/
+#define DMD_GM_ALPHA_PREC_BITS     15
+#define DMD_GM_ABS_TRANS_ONLY_BITS  9   /* 仅平移（TRANSLATION 的 idx 0/1）*/
+#define DMD_GM_TRANS_ONLY_PREC_BITS 3
+#define DMD_GM_ABS_TRANS_BITS      12   /* ROTZOOM/AFFINE 的 idx 0/1 */
+#define DMD_GM_TRANS_PREC_BITS      6
+#define DMD_WARPEDMODEL_PREC_BITS  16
+
+enum dmd_gm_type { GM_IDENTITY = 0, GM_TRANSLATION = 1,
+                   GM_ROTZOOM = 2, GM_AFFINE = 3 };
+
+/* av_log2()：floor(log2(v))，v=0 时为 0。 */
+static int dmd_gm_ilog2(uint32_t v)
+{
+    int n = 0;
+    while (v > 1) { v >>= 1; n++; }
+    return n;
+}
+
+/* 算术右移（等价 floor(v / 2^n)）。这里必须自己写：解码器侧用的是
+ * `prev >> prec_diff`，对负数是**向下取整**；C 的整数除法是向零取整，
+ * 直接除会差一格，算出的符号与解码器重建的就不一致。 */
+static int32_t dmd_gm_fdiv(int32_t v, int32_t d)
+{
+    int32_t q = v / d;
+    if (v % d && ((v < 0) != (d < 0))) q--;
+    return q;
+}
+
+/* increment()（规范 4.10.5）：写 v，取值范围 [0,max]。
+ * 位串是"v 个 1"，v<max 时再补一个 0 作终止符（共 v+1 位）；
+ * v==max 时不补 0（共 max 位）—— 顶格值没有终止符，读侧靠数到 max 位收敛。
+ * ⚠️ 这里曾写成"v+1 个 1 再补 0"，于是每个 subexp 符号前都多出一个 1：
+ *   实测源符号 118 被读成 237（= 2v+1），且每个符号都各自错位又各自重新
+ *   对齐（终止符仍在），所以只有 gm 的数值全错、帧头其余部分照常。 */
+static void dmd_gm_put_increment(struct dmd_bitwriter *bw, uint32_t v,
+                                 uint32_t max_len)
+{
+    for (uint32_t i = 0; i < v; i++)
+        dmd_bw_put_flag(bw, 1);
+    if (v != max_len)
+        dmd_bw_put_flag(bw, 0);
+}
+
+/* sub_exp()（规范 4.10.8）：逐位对齐 libavcodec/cbs_av1 的 write_subexp。 */
+static void dmd_gm_put_subexp(struct dmd_bitwriter *bw, uint32_t value,
+                              uint32_t range_max)
+{
+    const uint32_t max_len = (uint32_t)dmd_gm_ilog2(range_max - 1) - 3;
+    uint32_t len, range_bits, range_offset;
+
+    if (value < 8) {
+        range_bits = 3; range_offset = 0; len = 0;
+    } else {
+        range_bits = (uint32_t)dmd_gm_ilog2(value);
+        len = range_bits - 2;
+        if (len > max_len) {          /* 顶格与下一档合并，改用 ns() */
+            range_bits--;
+            len = max_len;
+        }
+        range_offset = 1u << range_bits;
+    }
+    dmd_gm_put_increment(bw, len, max_len);
+    if (len < max_len)
+        dmd_bw_put_bits(bw, value - range_offset, (int)range_bits);
+    else
+        dmd_av1_put_ns(bw, value - range_offset, range_max - range_offset);
+}
+
+/* recentering 的逆运算。解码侧（规范 7.11.3.6 / inverse_recenter）是
+ *   if ((r<<1) <= mx) x = inverse_recenter(r, sub)
+ *   else              x = mx-1-inverse_recenter(mx-1-r, sub)
+ * 已知 x 与 r，反解 sub：先把越界的 r 镜像到前半区（连同 x），再按
+ * inverse_recenter 的三段定义逐个求逆。 */
+static uint32_t dmd_gm_recenter_encode(uint32_t x, uint32_t r, uint32_t mx)
+{
+    if ((int64_t)r * 2 > (int64_t)mx) {
+        x = mx - 1 - x;
+        r = mx - 1 - r;
+    }
+    if ((int64_t)x > (int64_t)r * 2) return x;
+    if (x < r) return 2 * (r - x) - 1;
+    return 2 * (x - r);
+}
+
+/* 规范里"重建后"的 gm_params 默认值（7.11.3.6 之前的初始化）：
+ * idx%3==2 → 1<<16（恒等缩放的定点 1.0），其余 0。 */
+static void dmd_gm_default(int32_t p[7][6])
+{
+    for (int i = 0; i < 7; i++)
+        for (int j = 0; j < 6; j++)
+            p[i][j] = (j % 3 == 2) ? (1 << DMD_WARPEDMODEL_PREC_BITS) : 0;
+}
+
+/* 算出一个 gm_params 符号（码流里 sub_exp 的整数值）。返回 0 成功；
+ * -1 表示 VA 给的值无法由本语法表达，调用方须把该参考帧退回 IDENTITY。
+ *
+ * 依据：解码侧 cur = (decoded << prec_diff) + round，故
+ * decoded = (cur - round) >> prec_diff 必须整除；r 由 prev 同法算出，
+ * 必须是**解码器当时那份** prev（见 dmd_av1_dpb.gm_slot）。 */
+static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
+                               int hp, uint32_t *sym, uint32_t *range_max)
+{
+    uint32_t abs_bits, prec_bits;
+
+    if (idx < 2) {
+        if (type == GM_TRANSLATION) {
+            abs_bits  = DMD_GM_ABS_TRANS_ONLY_BITS - !hp;
+            prec_bits = DMD_GM_TRANS_ONLY_PREC_BITS - !hp;
+        } else {
+            abs_bits  = DMD_GM_ABS_TRANS_BITS;
+            prec_bits = DMD_GM_TRANS_PREC_BITS;
+        }
+    } else {
+        abs_bits  = DMD_GM_ABS_ALPHA_BITS;
+        prec_bits = DMD_GM_ALPHA_PREC_BITS;
+    }
+
+    const int32_t round     = (idx % 3 == 2) ? (1 << DMD_WARPEDMODEL_PREC_BITS) : 0;
+    const int     prec_diff = (int)DMD_WARPEDMODEL_PREC_BITS - (int)prec_bits;
+    const int32_t sub       = (idx % 3 == 2) ? (int32_t)(1u << prec_bits) : 0;
+    const int32_t mx        = (int32_t)(1u << abs_bits);
+    const int32_t scale     = 1 << prec_diff;
+    const int32_t delta     = cur - round;
+
+    if (delta % scale) return -1;              /* 不落在重建格点上 */
+    const int32_t d = delta / scale;
+    if (d < -mx || d > mx) return -1;
+
+    int32_t r = dmd_gm_fdiv(prev, scale) - sub;
+    if (r < -mx) r = -mx;
+    if (r >  mx) r =  mx;
+
+    /* 无符号域上的 recentering：x、r 各自平移 mx，mx 变成 2*mx+1 个取值。 */
+    const uint32_t mxu = (uint32_t)mx * 2u + 1u;
+    const uint32_t x  = (uint32_t)(d + mx);
+    uint32_t ru = (uint32_t)(r + mx);
+    if (ru >= mxu) ru = mxu - 1;
+    *sym = dmd_gm_recenter_encode(x, ru, mxu);
+    *range_max = mxu;
+    return 0;
+}
+
 /* 把 uncompressed_header() 写进 bw，不含结尾的 trailing_bits /
  * byte_alignment —— 由调用方按封装形式决定：
  *   OBU_FRAME_HEADER(3) 用 trailing_bits（规范 5.9.1）
  *   OBU_FRAME(6)        用 byte_alignment（规范 5.10.1）
  * 这个区别是实测踩出来的：用错会让 tile_group 起始位置偏移，
  * dav1d 报 "Failed to read unit"。 */
+/* 把 VA 的第 i 个参考翻成本合成流的槽号。返回 0 表示**解析不出来**：
+ * 消费者给的 ref_frame_map 项是 VA_INVALID_ID（该槽没有帧），或它指向的帧
+ * 早已被踢出影子 DPB。slot_out 仍会给一个可用的槽号（透传源槽号），
+ * 便于调用方在"照样要送"的路径上保持原有行为。 */
+static int resolve_ref(struct dmd_av1_dpb *dpb,
+                       const VADecPictureParameterBufferAV1 *p,
+                       int i, unsigned *slot_out)
+{
+    const unsigned va_slot = p->ref_frame_idx[i];
+    *slot_out = va_slot < 8 ? va_slot : 0;
+    if (!dpb || va_slot >= 8)
+        return 0;
+    const int want_frame = dmd_av1_frame_of(dpb, p->ref_frame_map[va_slot]);
+    if (want_frame <= 0)
+        return 0;
+    for (int k = 0; k < 8; k++) {
+        if (dpb->dpb_shadow[k] == want_frame) {
+            *slot_out = (unsigned)k;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int dmd_av1_refs_resolvable(const void *pic_v, struct dmd_av1_dpb *dpb)
+{
+    const VADecPictureParameterBufferAV1 *p = pic_v;
+    if (!p)
+        return 1;
+    const uint32_t ft = p->pic_info_fields.bits.frame_type;
+    /* KEY / INTRA_ONLY / SWITCH 都不读参考帧内容（SWITCH 全刷），
+     * allow_intrabc 的帧整帧 intra（规范里直接跳过帧间预测），也不读。
+     * ⚠️ 不要拿 reference_select 当放行条件：规范 5.9.2 里它为 0 只是
+     * "不显式给出 7 个槽号"，帧照样引用 LAST（ref_frame_idx[0]）。 */
+    if (ft != 1 /* INTER_FRAME */ || p->pic_info_fields.bits.allow_intrabc)
+        return 1;
+    /* 真正会被解码器取用的槽位：LAST 恒用；复合参考/skip_mode 再用 ALTREF
+     * （规范 5.9.2 的 ref_alternate_frame = ref_frame_map[ref_frame_idx[3]]）。
+     * VA-API 的 PPB 里没有 reference_mode（它在 slice 参数里），所以这里
+     * 保守地把 3 也算进"用到的参考"。 */
+    unsigned unused_slot;
+    if (!resolve_ref(dpb, p, 0, &unused_slot))
+        return 0;
+    if (!resolve_ref(dpb, p, 3, &unused_slot))
+        return 0;
+    return 1;
+}
+
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     struct dmd_av1_dpb *dpb,
                                     const VADecPictureParameterBufferAV1 *p, int tile_size_bytes)
@@ -1337,25 +1543,21 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
          * 影子 DPB 里同一 surface 可能占多个槽（KEY/全刷帧刷新 8 槽），
          * 取哪个都等价（内容与 CDF 相同），取扫描到的第一个。 */
         for (int i = 0; i < 7; i++) {
-            unsigned va_slot = p->ref_frame_idx[i];
-            unsigned my;
-            int want_frame = -1;
-            if (va_slot < 8 && dpb)
-                want_frame = dmd_av1_frame_of(dpb, p->ref_frame_map[va_slot]);
-            if (want_frame > 0) {
-                my = va_slot;   /* 查不到时退回透传 */
-                for (int k = 0; k < 8; k++) {
-                    if (dpb->dpb_shadow[k] == want_frame) {
-                        my = (unsigned)k;
-                        break;
-                    }
-                }
-            } else {
-                my = va_slot < 8 ? va_slot : 0;
-            }
+            unsigned my = 0;
+            const int ok = resolve_ref(dpb, p, i, &my);
             if (getenv("DMD_AV1_DBG"))
-                fprintf(stderr, "[dbg] ref[%d]: va_slot=%u want_frame=%d "
-                                "-> my_slot=%u\n", i, va_slot, want_frame, my);
+                fprintf(stderr, "[dbg] ref[%d]: va_slot=%u -> my_slot=%u %s\n",
+                        i, (unsigned)p->ref_frame_idx[i], my,
+                        ok ? "" : "未解析");
+            if (getenv("DMD_AV1_REFDBG"))
+                fprintf(stderr, "[refdbg] f=%d t=%u ref[%d]: surf=%u va_slot=%u"
+                                " -> my=%u%s\n",
+                                dpb ? dpb->frame_seq : -1, frame_type, i,
+                                (unsigned)(p->ref_frame_idx[i] < 8
+                                               ? p->ref_frame_map[p->ref_frame_idx[i]]
+                                               : 0),
+                                (unsigned)p->ref_frame_idx[i], my,
+                                ok ? "" : "  <-- 未解析");
             my_idx[i] = my;
             dmd_bw_put_bits(&bw, my, 3);
         }
@@ -1617,14 +1819,94 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
 
-    /* global_motion_params()（5.9.24）：帧间帧逐参考帧写 is_global。
-     * VA-API 的 wm[] 提供变换参数，但把它反向编码成码流需要完整的
-     * 差分编码与参考帧投影逻辑。此处对所有参考帧写 is_global=0
-     * （IDENTITY），代价是丢失全局运动补偿。
-     * ⚠️ 这是本实现的已知简化，见文件末尾说明。 */
+    /* global_motion_params()（规范 5.9.24）：帧间帧逐参考帧写
+     *   is_global[i] | is_rot_zoom[i] | is_translation[i] | 参数们
+     *
+     * VA-API 的 wm[i] 给的是**重建后**的参数（ffmpeg libavcodec/vaapi_av1.c
+     * 直接抄 AV1Frame.gm_params），要还原码流里的符号必须做 recentering
+     * 的逆运算 + subexp 写位，见上面 dmd_gm_put_param。
+     *
+     * ⚠️ 差分的基准 prev 必须是**解码器当时那份**：规范里它取自
+     *   ref_frame_idx[primary_ref_frame] 那个槽。我们用 my_idx[]（已翻译成
+     *   本合成流的槽号）去查按槽备份 gm_slot[]，与硬件读到同一个值。
+     *   primary_ref_frame 为 NONE（帧内帧/err_res/源码流本就不引用任何帧）
+     *   时用默认值，与规范 7.11.3.6 的 setup_past_independence 一致。
+     *
+     * 顺序：ROTZOOM 在码流里是 [2][3][0][1]，AFFINE 是 [2][3][4][5][0][1]，
+     * TRANSLATION 只有 [0][1] —— 不是下标升序，写错顺序整帧头就错位。
+     *
+     * 任一个参数编不出来（VA 给的值不落在重建格点上、或越出该档的
+     * [-mx,mx]）就**整参考帧退回 IDENTITY**：先算后写，绝不写半截。
+     * 退回后本帧存的就是默认参数，后续帧的 prev 跟着一起退回默认，
+     * 合成流仍然自洽，只是丢掉该参考帧的全局运动补偿（与旧行为相同）。 */
+    struct dmd_av1_gm cur_gm;
+    dmd_gm_default(cur_gm.p);
     if (!intra_only) {
-        for (int i = 0; i < 7; i++)
-            dmd_bw_put_flag(&bw, 0);     /* is_global[LAST+i] = 0 */
+        /* 码流里的下标顺序（不是升序！）：见 5.9.24 的调用次序。 */
+        static const int gm_order[4][6] = {
+            { -1, -1, -1, -1, -1, -1 },   /* IDENTITY：不写参数 */
+            {  0,  1, -1, -1, -1, -1 },   /* TRANSLATION */
+            {  2,  3,  0,  1, -1, -1 },   /* ROTZOOM */
+            {  2,  3,  4,  5,  0,  1 },   /* AFFINE */
+        };
+        static const int gm_n[4] = { 0, 2, 4, 6 };
+        const int hp = (int)p->pic_info_fields.bits.allow_high_precision_mv;
+        int32_t prev[7][6];
+
+        if (primary_ref_none || !dpb)
+            dmd_gm_default(prev);
+        else
+            memcpy(prev, dpb->gm_slot[my_idx[p->primary_ref_frame & 7u] & 7u].p,
+                   sizeof(prev));
+
+        for (int i = 0; i < 7; i++) {
+            int type = (int)p->wm[i].wmtype;
+            if (type < GM_IDENTITY || type > GM_AFFINE) type = GM_IDENTITY;
+            const int32_t *cm = p->wm[i].wmmat;
+            const int n = gm_n[type];
+            uint32_t sym[6] = { 0 }, rmax[6] = { 0 };
+            int ok = type != GM_IDENTITY;
+
+            for (int k = 0; ok && k < n; k++)
+                if (dmd_gm_encode_param(type, gm_order[type][k],
+                                        cm[gm_order[type][k]],
+                                        prev[i][gm_order[type][k]],
+                                        hp, &sym[k], &rmax[k]) < 0)
+                    ok = 0;
+
+            if (!ok) {
+                dmd_bw_put_flag(&bw, 0);      /* is_global=0 → IDENTITY */
+                continue;
+            }
+            dmd_bw_put_flag(&bw, 1);                        /* is_global */
+            if (type == GM_ROTZOOM) {
+                dmd_bw_put_flag(&bw, 1);                    /* is_rot_zoom */
+            } else {
+                dmd_bw_put_flag(&bw, 0);
+                dmd_bw_put_flag(&bw, type == GM_TRANSLATION);  /* is_translation */
+            }
+            for (int k = 0; k < n; k++)
+                dmd_gm_put_subexp(&bw, sym[k], rmax[k]);
+            if (getenv("DMD_AV1_BITS"))
+                fprintf(stderr, "[bits] gm i=%d type=%d sym=%u,%u,%u,%u,%u,%u "
+                                "m=%d,%d,%d,%d,%d,%d\n",
+                        i, type, sym[0], sym[1], sym[2], sym[3], sym[4], sym[5],
+                        cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]);
+
+            /* 本帧存进槽的参数 = 解码器重建的那份。VA 的 wmmat[0..5] 正是
+             * AV1Frame.gm_params[0..5]（ffmpeg 逐项照抄，含未传输下标的
+             * 默认值与 ROTZOOM 的 4/5 推导），所以直接取六个值即可。 */
+            for (int j = 0; j < 6; j++) cur_gm.p[i][j] = cm[j];
+        }
+    }
+    if (dpb) {
+        dpb->gm_pending = cur_gm;
+        dpb->gm_pending_frame = dpb->frame_seq;
+        if (refresh_all) {
+            /* KEY/SWITCH 全刷：8 个槽都是本帧（与上面 dpb_shadow 的登记
+             * 同一处、同一条件）。帧内帧的 gm 恒为默认值。 */
+            for (int k = 0; k < 8; k++) dpb->gm_slot[k] = cur_gm;
+        }
     }
 
     /* film_grain_params()（5.9.30）：序列头里 film_grain_params_present
@@ -1978,6 +2260,13 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                 if (mask >> k & 1u) {
                     dpb->dpb_shadow[k] = prev_frame;
                     dpb->dpb_order_hint[k] = dpb->last_oh;
+                    /* 全局运动的按槽备份必须与影子表同步：下一帧算
+                     * 差分符号时查的就是这里登记的这一帧的参数。
+                     * gm_pending 是"最近合成帧"的参数，只有它确实属于
+                     * prev_frame 时才可用（否则宁可用默认值 —— 与解码器
+                     * 那份不一致时最多丢一次运动补偿，不会写坏码流）。 */
+                    if (dpb->gm_pending_frame == prev_frame)
+                        dpb->gm_slot[k] = dpb->gm_pending;
                 }
         }
     }

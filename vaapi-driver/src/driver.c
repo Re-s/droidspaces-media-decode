@@ -80,6 +80,16 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
             leaked_ctx++;
             dmd_context_reset_locked(&drv->contexts[i]);
         }
+        /* 挂在这里等"最后一个用完的人"交还的会话。收帧线程已 join，
+         * 不会再有人交还 io_busy，不等了 —— 直接拆，否则这些 fd 与
+         * V4L2 会话就永久泄漏（driver 被 dlclose 后没人再来回收）。
+         * 真还有别的线程在用的话这里会 UAF，但那属于"进程带病退出"，
+         * 比泄漏更糟的情况在 DestroyContext 一侧已经处理掉了。 */
+        if (drv->io_defer[i]) {
+            dmd_log("Terminate: 槽位 %d 还挂着延后销毁的会话，直接拆\n", i);
+            dmd_session_destroy(drv->io_defer[i]);
+            drv->io_defer[i] = NULL;
+        }
     }
     for (int i = 0; i < DMD_MAX_IMAGES; i++) {
         struct dmd_image *img = &drv->images[i];

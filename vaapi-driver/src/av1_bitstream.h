@@ -159,6 +159,24 @@ struct dmd_av1_dpb {
     VASurfaceID prev_ref_map[8];
     int         prev_valid;
 
+    /* ---- 全局运动参数的按槽备份（规范 5.9.24 / 7.11.3.6）----
+     *
+     * gm_params 是**差分编码**：本帧的符号相对 primary 参考帧的参数算出，
+     * 解码器用的那份 prev 存在它自己 DPB 的槽里。我们合成码流时若按别的
+     * 值编码，硬件重建出来的参数就和源码流不同，运动补偿（进而像素）就错。
+     * 所以必须按槽镜像一份，与 dpb_shadow 同步更新：槽 k 存的是哪一帧，
+     * gm_slot[k] 就是那一帧的 7×6 参数（**重建后**的值，即 VA 的 wmmat）。
+     *
+     * 两份表都只在"帧真正进槽"时更新：
+     *   - 普通帧：像素趟 refresh=0 不进槽，等 DPB 趟（patch_prev_refresh
+     *     反算出真值后就地改写）才登记，故新增 gm_pending 暂存本帧参数；
+     *   - KEY/全刷帧：规范推断全刷，build_frame 里直接写满 8 槽。
+     * 时序与硬件一致：EndPicture(k+1) 先 patch（本帧进槽）再合成 k+1，
+     * 硬件也是先收 repair(k) 再收 pixel(k+1)。 */
+    struct dmd_av1_gm { int32_t p[7][6]; } gm_slot[8];
+    struct dmd_av1_gm gm_pending;      /* 最近合成帧的参数 */
+    int               gm_pending_frame;/* 它属于哪一帧（frame_seq），0=无 */
+
     /* 源 DPB 在上一帧解码时踢出的帧（E_{k-1} = map_{k-1} \ map_k），
      * 以帧号表示。源编码器保证被踢出的帧不会再被任何后续帧引用
      * （死了），本驱动让当前帧占它的影子槽，就永远不会覆盖活引用。
@@ -209,6 +227,26 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 size_t prev_len,
                                 size_t prev_bitpos,
                                 int prev_frame);
+
+/* 本帧的参考帧在影子 DPB 里是否都找得到（即硬件能否解这一帧）。
+ *
+ * 为什么必须问这个：消费者把"槽里没有帧"表达成 ref_frame_map[i] =
+ * VA_INVALID_ID（把进度条拖到 GOP 中间、或码流被截断时就是这种），此时
+ * 合成流只能透传源槽号，硬件于是被要求去引用一个**从未填充过**的 DPB 槽。
+ * msm_vidc 对这种帧的行为是既不吐 CAPTURE 缓冲也不回错误事件 —— 实测
+ * 首帧即 inter 的流：提交 1 单元、取回 0 帧，SyncSurface 等满 5s 超时，
+ * 调用方（ffmpeg）就此放弃整条码流（rc=251）。软解 dav1d 的行为是丢掉这些
+ * 帧、从码流里下一个 KEY 继续出帧。所以调用方遇到本函数返回 0 时应当
+ * **不提交硬件**，直接把 surface 按空壳交付，流程才不会断。
+ *
+ * 只有 INTER 且真会读取参考的帧需要判断：KEY/INTRA_ONLY/SWITCH 不读参考，
+ * allow_intrabc 与 reference_select=0 也不读，一律返回 1。
+ * 判据只覆盖解码器真正取用的槽位（LAST 与 ALTREF，规范 5.9.2），
+ * 其余槽位是填充值，指向空槽不影响解码。
+ *
+ * 实测安全边界：健康码流（1800 帧样本取前 300 帧，2100 个引用）返回 0
+ * 的次数为 **0**，因此不会误伤正常播放。 */
+int dmd_av1_refs_resolvable(const void *pic, struct dmd_av1_dpb *dpb);
 
 /* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
 struct dmd_av1_tile {
