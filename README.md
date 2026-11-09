@@ -80,6 +80,8 @@ install -m 0644 build/msm_drm_drv_video.so \
 
 不想装进系统目录，可以用 `LIBVA_DRIVERS_PATH` 指向 `.so` 所在目录。
 
+For Chrome receive/submission stalls, see [frame delivery](docs/chrome-frame-delivery.md) and [known limitations](docs/known-limitations.md).
+
 ## 自检
 
 ```sh

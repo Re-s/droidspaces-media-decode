@@ -218,8 +218,9 @@ Full instructions, flags, profile configuration and verification steps are in
   Wayland there). Vulkan cannot be turned off from the command line — this Chrome build
   has no `--disable-vulkan` switch — so if someone enabled it in
   `chrome://flags`, set it back to `Disabled` by hand
-- Firefox is recommended for HEVC playback (Chrome has a platform-level
-  presentation-feedback issue on the anland display bridge)
+- For Chrome HEVC stalls, distinguish driver receive/submission starvation from
+  the separately observed Anland presentation-feedback issue. See
+  [Chrome frame delivery](docs/chrome-frame-delivery.md) and its validation limits.
 - Quick check: `bash tools/check-browser-vaapi.sh`
 - 0.4.3 45-second Firefox soak at 720p: 924 exports, 0 solid-green, 0 truncated,
   0 errors, 3863 frames received for 3863 units fed
