@@ -85,9 +85,12 @@
  * 消费者通常只建 1-2 个；给足余量即可。 */
 #define DMD_MAX_CONFIGS 32
 
-/* surface 上限：ffmpeg 的 hwframe pool 默认 20+ 个（initial_pool_size 加
- * 解码器的 DPB 需求），Firefox 会更多。64 对 8 个并发实例足够。 */
+/* Per-context queue depth is separate from the display-wide object table.
+ * Multiple decoder pools share a VADisplay, not one context's slot budget. */
 #define DMD_MAX_SURFACES 64
+#define DMD_MAX_SURFACE_OBJECTS (DMD_MAX_SURFACES * DMD_MAX_CONTEXTS)
+/* Retain the unit identity for consumption without writing a reused target. */
+#define DMD_DISCARD_SURFACE ((VASurfaceID)0xFFFFFFFEu)
 
 /* MediaCodec 的输出滞后深度（实测值，见 vaapi-driver/tools 里的 probe_lag）：
  * 有 B 帧的 H.264 流要送进第 4 个输入单元才吐出第 1 帧，无 B 帧时是 1。
@@ -567,7 +570,7 @@ struct dmd_driver {
     pthread_cond_t io_done;
 
     struct dmd_config configs[DMD_MAX_CONFIGS];
-    struct dmd_surface surfaces[DMD_MAX_SURFACES];
+    struct dmd_surface surfaces[DMD_MAX_SURFACE_OBJECTS];
     struct dmd_context contexts[DMD_MAX_CONTEXTS];
     struct dmd_buffer buffers[DMD_MAX_BUFFERS];
     struct dmd_image images[DMD_MAX_IMAGES];

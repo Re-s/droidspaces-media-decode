@@ -54,7 +54,8 @@ LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
-           $(SRCDIR)/dmd_v4l2_session.c \
+           $(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/dmd_v4l2_session_state.c \
+           $(SRCDIR)/dmd_v4l2_receive.c \
           $(SRCDIR)/v4l2_backend.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
            $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/export.c \
            $(SRCDIR)/av1_bitstream.c $(SRCDIR)/mpeg2_bitstream.c
@@ -70,6 +71,9 @@ TESTDIR   := tests
 TESTBIN   := $(BUILD)/test_av1_bitstream
 TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
           $(SRCDIR)/bitstream.c
+RECEIVE_TESTBIN := $(BUILD)/test_v4l2_receive
+RECEIVE_TEST_SRCS := $(TESTDIR)/test_v4l2_receive.c \
+                    $(SRCDIR)/dmd_v4l2_receive.c $(SRCDIR)/dmd_v4l2_session_state.c
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -99,9 +103,10 @@ check: $(BUILD)/$(TARGET)
 
 # 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN)
+tests: $(TESTBIN) $(RECEIVE_TESTBIN)
 	@echo "== 运行单元测试 =="
 	@$(TESTBIN)
+	@$(RECEIVE_TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
@@ -110,6 +115,10 @@ TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 # fatal error。既有问题，v0.4.4 及更早同样失败。
 $(TESTBIN): $(TEST_SRCS) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
+
+$(RECEIVE_TESTBIN): $(RECEIVE_TEST_SRCS) $(SRCDIR)/dmd_v4l2_session_private.h \
+                    $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(RECEIVE_TEST_SRCS) -o $@
 
 # 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
 gen:

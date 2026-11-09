@@ -101,7 +101,7 @@ VAStatus dmd_Terminate(VADriverContextP ctx)
             free(img->data);
         memset(img, 0, sizeof(*img));
     }
-    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+    for (int i = 0; i < DMD_MAX_SURFACE_OBJECTS; i++) {
         if (drv->surfaces[i].in_use) {
             leaked_surf++;
             dmd_surface_reset_locked(&drv->surfaces[i]);
