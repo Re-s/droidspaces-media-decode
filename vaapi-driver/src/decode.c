@@ -269,8 +269,14 @@ static void *dmd_reaper_thread(void *arg)
             if (c->pending_count <= 0)
                 continue;
 
-            /* Pending input does not imply that CAPTURE already has output.
-             * Try DQBUF without waiting on the I/O needed for further input. */
+            /* The pending list tracks input, not ready CAPTURE buffers.
+             * A previous queue-only receiver missed output still in V4L2,
+             * so always try the backend as well as the retained-frame queue.
+             *
+             * The old 20 ms receive also paced retries, but io_busy excludes
+             * the input that may be needed to release reordered output.
+             * Keep this receive nonblocking and pace retries outside I/O.
+             * Retain the thread for output arriving after the last send. */
             VAContextID cid = c->id;
             struct dmd_session *sess = c->session;
             drv->io_busy[i] = 1;
@@ -310,7 +316,11 @@ static void *dmd_reaper_thread(void *arg)
         }
         pthread_mutex_unlock(&drv->lock);
 
-        /* Yield outside session I/O ownership when this pass delivered nothing. */
+        /* The old bounded receive supplied pacing while holding session I/O.
+         * This existing no-work sleep now supplies pacing outside ownership.
+         * Empty queues already skipped receive and used this sleep before.
+         * Pending input without ready output can now cause more wakeups;
+         * improved playback here does not establish power neutrality. */
         if (!worked)
             usleep(2000);
     }
@@ -2594,8 +2604,14 @@ static int dmd_pending_has_exported_locked(struct dmd_driver *drv,
     return 0;
 }
 
-/* Keep old input identities after the consumer recycles an exported target.
- * Waiting here can prevent the stateful decoder from receiving needed input. */
+/* Never let late pixels overwrite an exported target already recycled by the
+ * consumer. The old guard waited for those pixels before submitting new input,
+ * which can starve a stateful decoder that needs later input to release them.
+ * Keep the old unit identity so that output is consumed and returned once.
+ *
+ * A blanket busy response is not a replacement: earlier FFmpeg/Firefox tests
+ * failed on reuse because readback did not reset surface state. Only retire
+ * older exported H.264/HEVC targets; preserve non-exported synchronous reads. */
 static void retire_reused_target_locked(struct dmd_driver *drv,
                                         struct dmd_context *context,
                                         VASurfaceID target)

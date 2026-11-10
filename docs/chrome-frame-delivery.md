@@ -35,6 +35,38 @@ including `release_frame`, so deferred destruction cannot close a borrowed
 session. It yields outside ownership when it has delivered nothing. The thread
 is retained to deliver completed output even without another submission.
 
+## Historical pacing rationale
+
+The original comments record measured tradeoffs, not arbitrary delays:
+
+- The post-send harvest keeps its 1 ms wait. Earlier tests found that receiving
+  only under input backpressure stopped at 2/6 units, while prompt harvesting
+  received 6/6 or 10/10. A zero-timeout post-send harvest was insufficient in
+  those tests. A former 5 ms wait cost about 3.9 ms per send; the two-submission
+  path spent about 8 ms per output frame and reached only 51 fps. The 1 ms
+  setting reached 120-190 fps on the tested stream with matching pixels.
+- The explicit receiver keeps its 20 ms slices. The historical Firefox 140,
+  1080p30 experiment using 5 ms slices barely changed mean SyncSurface latency
+  (29.2 to 29.4 ms), while reported drops increased from 15.8 to 34.6 percent.
+  The original comment selected 20 ms as a compromise between handling format
+  events and avoiding excessive wakeups. Those measurements are specific to
+  that test setup; they are not a new benchmark of the current Chrome device.
+- The background receiver's former 20 ms receive supplied retry pacing too.
+  This PR changes that cadence when input is pending but no output is ready.
+  It avoids excluding the producer by trying once and using the existing
+  2 ms no-delivery sleep outside I/O ownership. It does not preserve the old
+  background retry rate or establish that the higher rate is harmless.
+
+Faster background retries could compete for CPU on another workload or device,
+even if they improve input availability here. The single-device playback result
+does not invalidate the old pacing experiments or establish a cross-platform
+performance or power guarantee. That tradeoff remains a review boundary.
+
+I/O ownership also protects session lifetime. Simply clearing `io_busy` while a
+blocking receive still uses the session could reintroduce the previously fixed
+FD-close/use-after-free race. The background try returns before buffer release
+and `io_release`; the ordinary mutex and session I/O ownership are distinct.
+
 ## Recycled targets and capacity
 
 For exported H.264/HEVC targets, a recycled target's older pending entries retain
@@ -42,6 +74,16 @@ their input-unit identity but have a discard target. Late output still removes
 exactly its matching record and returns its CAPTURE buffer. It cannot overwrite
 the recycled target or fall through to an ordering guess. Non-exported reads
 retain their synchronous reuse behavior.
+
+The old reuse guard protected against late pixels overwriting a recycled target.
+Its original HEVC example (two B frames) submitted surface 5 for unit 4, recycled
+that surface for unit 18, and only then received the pixels for unit 4. Removing
+that protection without preserving input identity could make old pixels replace
+new content. Earlier blanket busy responses also broke FFmpeg/Firefox readback
+reuse because reading did not reset surface state. Retaining that reason is
+important: the
+replacement consumes older exported units by identity while preserving the
+non-exported synchronous path, rather than rejecting all reuse.
 
 The display-wide surface object table is separate from a context's 64-entry
 pending queue. Multiple decoder pools can coexist on a display without sharing

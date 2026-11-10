@@ -262,31 +262,21 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
             if (!ps_only)
                 s->units_sent++;
 
-            /* ⚠️ 送完必须顺手推一次收帧，哪怕调用方还没来取。
+            /* Harvest output after every successful send, even before the
+             * caller asks for it. Earlier msm_vidc tests received 6/6 or 10/10
+             * units when drained promptly, but stopped at 2/6 when receive
+             * ran only on input backpressure. Retain frames in FIFO order.
              *
-             * msm_vidc 要求及时 DQBUF 才会继续解码：CAPTURE 缓冲一直挂在
-             * 驱动手里不取回，它就停在那里不再出帧。
+             * Keep this opportunistic wait at 1 ms. A zero-timeout harvest
+             * behaved like no harvest in those tests; 50-100 ms waits caught
+             * output but serialized submission. A former 5 ms wait averaged
+             * 3.9 ms per send. On the two-submission path that cost about 8 ms
+             * per output frame and limited 60 fps content to 51 fps. At 1 ms,
+             * the tested stream decoded at 120-190 fps with matching pixels.
              *
-             * 实测对照（tools 侧的 nodrain 试验）：送料后立刻循环收帧，
-             * 送 6 单元收 6 帧、送 10 收 10，零滞后；而只在背压时才收，
-             * 表现为送 6 单元只收 2 帧后彻底停住 —— 上层随即误判为互等，
-             * 触发排空并终结会话，ffmpeg 报 internal decoding error。
-             *
-             * 收到的帧进待取队列，next_frame 会优先从队列取，帧序不乱。
-             *
-             * ⚠️ 超时不能用 0：poll(timeout=0) 立即返回，几乎永远拿不到帧，
-             * 这个循环就形同虚设 —— 实测表现与"完全不收"一样（送 6 收 2）。
-             * 对照 tools/pattern 试验：用 50~100ms 时两种送料节奏都 6/6。
-             *
-             * ⚠️ 但这个值也**不能大**：它是每次成功送料的固定死等 —— 帧没
-             * 好就整段白等，而且每送一个单元付一次。原先取 5ms，实测
-             * 1080p60 真流每次 send_unit 平均耗 3.9ms（就是这一下），两遍法
-             * 每帧两次提交 ⇒ 每帧纯等约 8ms，整条流只跑到 51fps（低于 60，
-             * 实际播放会卡）。改成 1ms 后同一条流 120~190fps，像素逐字节不变。
-             *
-             * Preserve the 1ms opportunistic harvest used by send_unit.
-             * Explicit waits use next_frame. The background receiver only
-             * collects completed output, allowing further input to proceed. */
+             * Those results justify this post-send harvest, not a background
+             * barrier. Explicit waiters use next_frame. The reaper only tries
+             * ready output and paces itself after releasing session I/O. */
             for (;;) {
                 if (s->pend_count >= DMD_V4L2_MAX_CAP - 1) break;
                 uint8_t *pd = NULL; size_t pl = 0; uint64_t pp = 0; int pi = -1;
