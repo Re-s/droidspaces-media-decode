@@ -234,6 +234,12 @@ int dmd_session_drain(struct dmd_session *s);
 int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
                            int timeout_ms);
 
+/* Receive currently available output without waiting for future frames.
+ * Return DMD_ERR_TIMEOUT if no frame is ready. Ordering, format updates, other
+ * results and release_frame ownership match next_frame. Serialize with all
+ * other I/O on this session. */
+int dmd_session_try_next_frame(struct dmd_session *s, struct dmd_frame *out);
+
 /*
  * 归还帧。SHM 模式归还槽位，TCP 模式解除内部缓冲占用。
  * 两种模式都必须调用，无条件调用是安全的（f 为 NULL 或已归还时无操作）。

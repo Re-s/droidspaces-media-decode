@@ -71,7 +71,7 @@ struct dmd_surface *dmd_find_surface_locked(struct dmd_driver *drv,
 {
     if (id == VA_INVALID_ID)
         return NULL;
-    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+    for (int i = 0; i < DMD_MAX_SURFACE_OBJECTS; i++) {
         if (drv->surfaces[i].in_use && drv->surfaces[i].id == id)
             return &drv->surfaces[i];
     }
@@ -269,17 +269,14 @@ static void *dmd_reaper_thread(void *arg)
             if (c->pending_count <= 0)
                 continue;
 
-            /* ⚠️ 必须**主动向 V4L2 取帧**，不能只清 session 待取队列。
+            /* The pending list tracks input, not ready CAPTURE buffers.
+             * A previous queue-only receiver missed output still in V4L2,
+             * so always try the backend as well as the retained-frame queue.
              *
-             * 第一版只在 dmd_session_frames_pending() > 0 时才收，实测
-             * ORDER reap 恒为 0 —— 因为那个计数只反映"已 DQBUF 到 session
-             * 待取队列"的帧，而队列里的帧在 send_unit 里就被顺手收走了。
-             * 真正卡住的帧还在 V4L2 CAPTURE 队列里，必须 DQBUF 才拿得到，
-             * 而 DQBUF 只发生在 next_frame 内部。
-             *
-             * 所以这里无条件调 next_frame：pending_count > 0 就意味着
-             * 还有提交在等结果，poll 一小片是有意义的。超时无帧会返回
-             * DMD_ERR_TIMEOUT，正常现象。 */
+             * The old 20 ms receive also paced retries, but io_busy excludes
+             * the input that may be needed to release reordered output.
+             * Keep this receive nonblocking and pace retries outside I/O.
+             * Retain the thread for output arriving after the last send. */
             VAContextID cid = c->id;
             struct dmd_session *sess = c->session;
             drv->io_busy[i] = 1;
@@ -287,10 +284,7 @@ static void *dmd_reaper_thread(void *arg)
 
             struct dmd_frame f;
             memset(&f, 0, sizeof(f));
-            /* 20ms 与 session 内部的 poll 分片同粒度：再细也不会更快
-             * 拿到帧（实测记录见 dmd_v4l2_session.c 的 slice 注释），
-             * 而额外唤醒会抢走解码需要的 CPU。 */
-            int rc = dmd_session_next_frame(sess, &f, 20);
+            int rc = dmd_session_try_next_frame(sess, &f);
 
             pthread_mutex_lock(&drv->lock);
 
@@ -312,14 +306,21 @@ static void *dmd_reaper_thread(void *arg)
                                 (unsigned)id, f.unit_seq, c->pending_count);
                 }
             }
-            if (rc == DMD_OK)
-                dmd_session_release_frame(sess, &f);
+            if (rc == DMD_OK && dmd_session_release_frame(sess, &f) != DMD_OK)
+                dmd_log("background release failed: context=%u unit=%u: %s\n",
+                        (unsigned)cid, f.unit_seq, dmd_session_last_error(sess));
+            if (rc != DMD_OK && rc != DMD_ERR_TIMEOUT && rc != DMD_EOS)
+                dmd_log("background receive failed: context=%u: %s\n",
+                        (unsigned)cid, dmd_session_last_error(sess));
             io_release(drv, i);
         }
         pthread_mutex_unlock(&drv->lock);
 
-        /* next_frame 自带 20ms poll，本身就是节流，所以只在完全没活干
-         * （所有 context 都没有在飞的提交）时才额外睡一下。 */
+        /* The old bounded receive supplied pacing while holding session I/O.
+         * This existing no-work sleep now supplies pacing outside ownership.
+         * Empty queues already skipped receive and used this sleep before.
+         * Pending input without ready output can now cause more wakeups;
+         * improved playback here does not establish power neutrality. */
         if (!worked)
             usleep(2000);
     }
@@ -617,7 +618,7 @@ static VAStatus create_surfaces_common(VADriverContextP ctx,
     pthread_mutex_lock(&drv->lock);
     for (unsigned int n = 0; n < num_surfaces; n++) {
         struct dmd_surface *slot = NULL;
-        for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+        for (int i = 0; i < DMD_MAX_SURFACE_OBJECTS; i++) {
             if (!drv->surfaces[i].in_use) {
                 slot = &drv->surfaces[i];
                 break;
@@ -1147,7 +1148,7 @@ VAStatus dmd_DestroyContext(VADriverContextP ctx, VAContextID context)
     /* 仍未就绪的 surface 状态要复位，否则它们永远停在 PENDING，
      * 后续 SyncSurface 会等一个永不到来的帧。
      * 注意保留 context 归属与 READY 状态：上面排空填好的帧 ffmpeg 还要取。 */
-    for (int i = 0; i < DMD_MAX_SURFACES; i++) {
+    for (int i = 0; i < DMD_MAX_SURFACE_OBJECTS; i++) {
         struct dmd_surface *s = &drv->surfaces[i];
         if (s->in_use && s->context == context &&
             s->state == DMD_SURFACE_PENDING) {
@@ -2603,6 +2604,32 @@ static int dmd_pending_has_exported_locked(struct dmd_driver *drv,
     return 0;
 }
 
+/* Never let late pixels overwrite an exported target already recycled by the
+ * consumer. The old guard waited for those pixels before submitting new input,
+ * which can starve a stateful decoder that needs later input to release them.
+ * Keep the old unit identity so that output is consumed and returned once.
+ *
+ * A blanket busy response is not a replacement: earlier FFmpeg/Firefox tests
+ * failed on reuse because readback did not reset surface state. Only retire
+ * older exported H.264/HEVC targets; preserve non-exported synchronous reads. */
+static void retire_reused_target_locked(struct dmd_driver *drv,
+                                        struct dmd_context *context,
+                                        VASurfaceID target)
+{
+    if (context->codec != DMD_CODEC_HEVC && context->codec != DMD_CODEC_H264)
+        return;
+    struct dmd_surface *surface = dmd_find_surface_locked(drv, target);
+    if (!surface || !surface->exported) return;
+    for (int offset = 0; offset < context->pending_count; offset++) {
+        int index = (context->pending_head + offset) % DMD_MAX_SURFACES;
+        if (context->pending[index] != target) continue;
+        dmd_log("recycle surface=%u: retain old unit=%llu for discard\n",
+                (unsigned)target,
+                (unsigned long long)context->pending_unit[index]);
+        context->pending[index] = DMD_DISCARD_SURFACE;
+    }
+}
+
 VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
 {
     struct dmd_driver *drv = dmd_get_driver(ctx);
@@ -2738,7 +2765,7 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
             if (can_send) {
                 struct dmd_session *rsess = c->session;
                 int rq = (c->pending_head + c->pending_count) % DMD_MAX_SURFACES;
-                c->pending[rq] = 0xFFFFFFFEu;      /* 哨兵：配对时必然找不到 */
+                c->pending[rq] = DMD_DISCARD_SURFACE;      /* Consume without writing a target. */
                 c->pending_seq[rq] = c->last_seq;
                 c->pending_poc[rq] = INT32_MAX;
                 c->pending_unit[rq] = ++c->units_submitted;
@@ -3211,23 +3238,9 @@ VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context)
                 (unsigned)c->av1_send_surface);
     }
 
-    /* ⚠️ 复用尚未收帧的 surface 会造成同一块内存先后装两帧。
-     *
-     * 实测（Chrome + jinjie_265.mp4，HEVC has_b_frames=2）：
-     *     提交 surf=5 unit=4       ← 期望装 POC 1
-     *     提交 surf=5 unit=18      ← 仅 14 个单元后 Chrome 又拿它当目标
-     *     收帧 surf=5 unit=4 POC=1 ← POC 1 此刻才写进来
-     * Chrome 采样时拿到哪一帧取决于时序竞争，表现为画面前后帧跳跃。
-     *
-     * 成因：EndPicture 是异步的，返回成功只代表码流已送进解码器，
-     * 帧还在硬件流水线里。Chrome 靠自己的 DPB 引用计数判断可回收，
-     * 不调 vaSyncSurface（实测 0 次；Firefox 是 1500 次），
-     * 也不调 QuerySurfaceStatus —— 驱动没有任何机会告知"还没写完"。
-     *
-     * 修法：复用前先把该 surface 那一帧收回来。不能像 0.4.5 第一次尝试那样
-     * 直接拒绝复用（返回 SURFACE_BUSY）—— 那会破坏 ffmpeg/Firefox：
-     * 它们走 DeriveImage 读像素、读完不改 state，第二轮复用全被拒，
-     * md5 回归四码流全 FAIL。这里只阻塞到帧到手，不改变契约。 */
+    /* Consume late output by its old unit identity without overwriting the
+     * recycled export. Non-exported reads keep their synchronous behavior. */
+    retire_reused_target_locked(drv, c, target);
     for (int k = 0; k < c->pending_count; k++) {
         int kp = (c->pending_head + k) % DMD_MAX_SURFACES;
         if (c->pending[kp] != target)

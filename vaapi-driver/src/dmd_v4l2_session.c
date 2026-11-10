@@ -28,8 +28,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include "dmd_client.h"
-#include "v4l2_backend.h"
+#include "dmd_v4l2_session_private.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -43,114 +42,6 @@ static int v4l2_log_wanted(void)
 {
     const char *e = getenv("DMD_VA_LOG");
     return e && e[0] == '1';
-}
-
-struct dmd_session {
-    struct dmd_v4l2_dec dec;
-    int    log;
-    int    codec;
-    int    io_timeout_ms;
-
-    struct dmd_format fmt;
-    struct dmd_error  err;
-
-    uint64_t units_sent;
-    uint64_t frames_recv;
-    uint64_t frame_seq;
-
-    int  input_finished;
-    int  eos;
-
-    /* 待取帧队列。
-     *
-     * 为什么需要它：daemon 版是 input/output 双线程并发，送料与收帧互不
-     * 阻塞。驱动内直通是**单线程** —— 调用序列由 libva 决定，通常是
-     * 送若干单元后才来取一帧。当输入缓冲满而调用方还没来取帧时，必须把
-     * 已解出的帧先接住，否则只能丢帧（毁掉参考帧链）或报错（实测表现为
-     * 送 6 单元只回 2 帧，4 帧待配对，ffmpeg 报 internal decoding error）。
-     *
-     * 容量取 CAPTURE 缓冲数：解码器最多同时持有这么多帧，不会溢出。 */
-    struct {
-        uint8_t *data;
-        size_t   len;
-        uint64_t pts;
-        int      index;
-    } pend[DMD_V4L2_MAX_CAP];
-    int  pend_head, pend_tail, pend_count;
-
-    /* 已交给调用方、尚未 release 的缓冲索引集合。
-     * 用位图而非单个变量：队列化之后可能同时有多帧在调用方手里。 */
-    unsigned char held[DMD_V4L2_MAX_CAP];
-};
-
-static void publish_format(struct dmd_session *s);
-static void sess_log(struct dmd_session *s, const char *fmt, ...);
-
-/* 需要发布几何就发布；几何发布前先把待取队列丢掉。
- *
- * 为什么必须丢：CAPTURE 重配（流中换分辨率、INSUFFICIENT 扩容）会
- * REQBUFS(0) + bufs_free()，把旧缓冲 munmap 掉。待取队列里存的是**指向
- * 那些缓冲的裸指针**，重配后再 pop 就是读已解除映射的地址。
- * 实测这条路径上队列通常是空的（帧被 reaper/next_frame 及时取走），
- * 所以代价最多是切换瞬间的一两帧，换来的是不会读到野内存。 */
-static void maybe_publish_format(struct dmd_session *s)
-{
-    if (s->dec.fmt_dirty) {
-        s->dec.fmt_dirty = 0;
-        if (s->pend_count > 0)
-            sess_log(s, "重配后丢弃 %d 帧陈旧缓冲（已 munmap）", s->pend_count);
-        s->pend_head = s->pend_tail = s->pend_count = 0;
-        memset(s->held, 0, sizeof(s->held));
-        publish_format(s);
-        return;
-    }
-    if (!s->fmt.valid && s->dec.cap_ready) publish_format(s);
-}
-
-/* 把一帧放进待取队列。返回 0 成功，-1 队列满（不应发生）。 */
-static int pend_push(struct dmd_session *s, uint8_t *data, size_t len,
-                     uint64_t pts, int index)
-{
-    if (s->pend_count >= DMD_V4L2_MAX_CAP) return -1;
-    s->pend[s->pend_tail].data  = data;
-    s->pend[s->pend_tail].len   = len;
-    s->pend[s->pend_tail].pts   = pts;
-    s->pend[s->pend_tail].index = index;
-    s->pend_tail = (s->pend_tail + 1) % DMD_V4L2_MAX_CAP;
-    s->pend_count++;
-    return 0;
-}
-
-/* 从待取队列取一帧。返回 1 有帧，0 队列空。 */
-static int pend_pop(struct dmd_session *s, uint8_t **data, size_t *len,
-                    uint64_t *pts, int *index)
-{
-    if (s->pend_count <= 0) return 0;
-    *data  = s->pend[s->pend_head].data;
-    *len   = s->pend[s->pend_head].len;
-    *pts   = s->pend[s->pend_head].pts;
-    *index = s->pend[s->pend_head].index;
-    s->pend_head = (s->pend_head + 1) % DMD_V4L2_MAX_CAP;
-    s->pend_count--;
-    return 1;
-}
-
-static void sess_log(struct dmd_session *s, const char *fmt, ...)
-{
-    if (!s || !s->log) return;
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "[dmd-v4l2] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-}
-
-static void set_err(struct dmd_session *s, int code, const char *msg)
-{
-    if (!s) return;
-    s->err.code = code;
-    snprintf(s->err.msg, sizeof(s->err.msg), "%s", msg ? msg : "");
 }
 
 /* ---------------------------------------------------------------- 配置 */
@@ -190,7 +81,7 @@ void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit)
     /* 只在 CAPTURE 还没配好时有效：配好之后再改几何就没人重协商了，
      * 那种情况（同一会话内位深变化）本驱动不支持，宁可留个日志。 */
     if (s->dec.cap_size && !!ten_bit != !!s->dec.ten_bit) {
-        sess_log(s, "警告: 会话内位深变化(%d→%d)但 CAPTURE 已配好，忽略",
+        dmd_session_log(s, "ignore bit-depth change (%d to %d) after CAPTURE setup",
                  s->dec.ten_bit, ten_bit);
         return;
     }
@@ -220,15 +111,15 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
      * ⚠️ 硬件支持 VP80（第 80 轮实测枚举确认），此前注释说"没有 VP80 格式"是错的。
      * 这里给出明确错误而不是静默失败，便于上层定位。 */
     if (!dmd_v4l2_probe(cfg->codec)) {
-        set_err(s, DMD_ERR_REJECTED, "V4L2 解码器不支持该 codec");
+        dmd_session_set_error(s, DMD_ERR_REJECTED, "V4L2 decoder does not support this codec");
         if (err) *err = s->err;
-        sess_log(s, "probe 失败: codec=%d 不被 /dev/video32 支持", cfg->codec);
+        dmd_session_log(s, "probe failed: codec=%d is unsupported by /dev/video32", cfg->codec);
         free(s);
         return NULL;
     }
 
     if (dmd_v4l2_open(&s->dec, cfg->codec, cfg->width, cfg->height) < 0) {
-        set_err(s, DMD_ERR_IO, "打开 V4L2 解码器失败");
+        dmd_session_set_error(s, DMD_ERR_IO, "failed to open V4L2 decoder");
         if (err) *err = s->err;
         free(s);
         return NULL;
@@ -236,7 +127,7 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
     /* open 里 memset 过 d，位深必须在它之后落。 */
     s->dec.ten_bit = cfg->ten_bit ? 1 : 0;
 
-    sess_log(s, "会话建立: codec=%d %dx%d（V4L2 直通，无 daemon）",
+    dmd_session_log(s, "session opened: codec=%d %dx%d (direct V4L2)",
              cfg->codec, cfg->width, cfg->height);
     if (err) { err->code = 0; err->msg[0] = 0; }
     return s;
@@ -245,7 +136,7 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
 void dmd_session_destroy(struct dmd_session *s)
 {
     if (!s) return;
-    sess_log(s, "会话结束: 送入 %llu 单元, 收到 %llu 帧",
+    dmd_session_log(s, "session closed: sent=%llu units, received=%llu frames",
              (unsigned long long)s->units_sent,
              (unsigned long long)s->frames_recv);
     dmd_v4l2_close(&s->dec);
@@ -371,38 +262,28 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
             if (!ps_only)
                 s->units_sent++;
 
-            /* ⚠️ 送完必须顺手推一次收帧，哪怕调用方还没来取。
+            /* Harvest output after every successful send, even before the
+             * caller asks for it. Earlier msm_vidc tests received 6/6 or 10/10
+             * units when drained promptly, but stopped at 2/6 when receive
+             * ran only on input backpressure. Retain frames in FIFO order.
              *
-             * msm_vidc 要求及时 DQBUF 才会继续解码：CAPTURE 缓冲一直挂在
-             * 驱动手里不取回，它就停在那里不再出帧。
+             * Keep this opportunistic wait at 1 ms. A zero-timeout harvest
+             * behaved like no harvest in those tests; 50-100 ms waits caught
+             * output but serialized submission. A former 5 ms wait averaged
+             * 3.9 ms per send. On the two-submission path that cost about 8 ms
+             * per output frame and limited 60 fps content to 51 fps. At 1 ms,
+             * the tested stream decoded at 120-190 fps with matching pixels.
              *
-             * 实测对照（tools 侧的 nodrain 试验）：送料后立刻循环收帧，
-             * 送 6 单元收 6 帧、送 10 收 10，零滞后；而只在背压时才收，
-             * 表现为送 6 单元只收 2 帧后彻底停住 —— 上层随即误判为互等，
-             * 触发排空并终结会话，ffmpeg 报 internal decoding error。
-             *
-             * 收到的帧进待取队列，next_frame 会优先从队列取，帧序不乱。
-             *
-             * ⚠️ 超时不能用 0：poll(timeout=0) 立即返回，几乎永远拿不到帧，
-             * 这个循环就形同虚设 —— 实测表现与"完全不收"一样（送 6 收 2）。
-             * 对照 tools/pattern 试验：用 50~100ms 时两种送料节奏都 6/6。
-             *
-             * ⚠️ 但这个值也**不能大**：它是每次成功送料的固定死等 —— 帧没
-             * 好就整段白等，而且每送一个单元付一次。原先取 5ms，实测
-             * 1080p60 真流每次 send_unit 平均耗 3.9ms（就是这一下），两遍法
-             * 每帧两次提交 ⇒ 每帧纯等约 8ms，整条流只跑到 51fps（低于 60，
-             * 实际播放会卡）。改成 1ms 后同一条流 120~190fps，像素逐字节不变。
-             *
-             * 取 1 而不是 0：0 会让这个循环形同虚设（见上）。这里只要求
-             * "顺手摘掉已经好的帧"，真正的等待在 next_frame 和驱动的 reaper
-             * 线程（dmd_reaper_thread，20ms 一轮）里，不在这个路径上。 */
+             * Those results justify this post-send harvest, not a background
+             * barrier. Explicit waiters use next_frame. The reaper only tries
+             * ready output and paces itself after releasing session I/O. */
             for (;;) {
                 if (s->pend_count >= DMD_V4L2_MAX_CAP - 1) break;
                 uint8_t *pd = NULL; size_t pl = 0; uint64_t pp = 0; int pi = -1;
                 int pr = dmd_v4l2_recv(&s->dec, &pd, &pl, &pp, &pi, 1);
                 if (pr == 1) {
-                    maybe_publish_format(s);
-                    if (pend_push(s, pd, pl, pp, pi) < 0) {
+                    dmd_session_publish_format_if_needed(s);
+                    if (dmd_session_pending_push(s, pd, pl, pp, pi) < 0) {
                         dmd_v4l2_release(&s->dec, pi);
                         break;
                     }
@@ -414,7 +295,7 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
             return 0;
         }
         if (r < 0) {
-            set_err(s, DMD_ERR_IO, "V4L2 送料失败");
+            dmd_session_set_error(s, DMD_ERR_IO, "V4L2 input submission failed");
             return DMD_ERR_IO;
         }
 
@@ -426,21 +307,21 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
         if (rr == 1) {
             /* 收到帧但调用方还没来取 —— 存进待取队列，绝不丢弃。
              * 丢任何一帧都会毁掉后续的参考帧链。 */
-            if (pend_push(s, fd, fl, fp, fi) < 0) {
+            if (dmd_session_pending_push(s, fd, fl, fp, fi) < 0) {
                 /* 队列容量等于 CAPTURE 缓冲数，理论上到不了这里。
                  * 真到了说明缓冲计数有问题，归还该帧避免泄漏。 */
                 dmd_v4l2_release(&s->dec, fi);
-                set_err(s, DMD_ERR_STATE, "待取帧队列溢出");
+                dmd_session_set_error(s, DMD_ERR_STATE, "pending-frame queue overflow");
                 return DMD_ERR_STATE;
             }
-            maybe_publish_format(s);
+            dmd_session_publish_format_if_needed(s);
             continue;      /* 队列腾出了缓冲，立刻重试送料 */
         }
         if (rr == 2) {
             s->eos = 1;    /* 排空中；余下的帧仍会从队列/recv 取出 */
         }
         if (rr < 0) {
-            set_err(s, DMD_ERR_IO, "背压等待中收帧出错");
+            dmd_session_set_error(s, DMD_ERR_IO, "receive failed while relieving input backpressure");
             return DMD_ERR_IO;
         }
         if (++spins > 500) {          /* 500 × 20ms = 10s */
@@ -452,11 +333,11 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
                 if (s->dec.out[i].queued) qout++;
             for (int i = 0; i < s->dec.n_cap; i++)
                 if (s->dec.cap[i].queued) qcap++;
-            sess_log(s, "背压超时: pend=%d/%d OUTPUT在驱动=%d/%d "
-                        "CAPTURE在驱动=%d/%d",
+            dmd_session_log(s, "input backpressure timed out: pending=%d/%d OUTPUT queued=%d/%d "
+                        "CAPTURE queued=%d/%d",
                      s->pend_count, DMD_V4L2_MAX_CAP,
                      qout, s->dec.n_out, qcap, s->dec.n_cap);
-            set_err(s, DMD_ERR_TIMEOUT, "输入缓冲持续不可用");
+            dmd_session_set_error(s, DMD_ERR_TIMEOUT, "input buffers remained unavailable");
             return DMD_ERR_TIMEOUT;
         }
     }
@@ -469,10 +350,10 @@ int dmd_session_finish_input(struct dmd_session *s)
     s->input_finished = 1;
     /* 告知驱动没有更多数据，逼出流水线里剩余的帧。 */
     if (dmd_v4l2_drain(&s->dec) < 0) {
-        set_err(s, DMD_ERR_IO, "请求排空失败");
+        dmd_session_set_error(s, DMD_ERR_IO, "failed to request decoder drain");
         return DMD_ERR_IO;
     }
-    sess_log(s, "输入结束，已请求排空");
+    dmd_session_log(s, "input finished, drain requested");
     return 0;
 }
 
@@ -514,213 +395,6 @@ int dmd_session_drain(struct dmd_session *s)
      * 代价是会话此后不可再送料 —— 但上层只在等帧超时（默认 2000ms）
      * 且输入尚未结束时才走到这里，那时流实际上已经到尾了。 */
     (void)s;
-    sess_log(s, "排空请求：V4L2 无可逆排空，交由上层发 EOS 催出尾部帧");
+    dmd_session_log(s, "reversible V4L2 drain unavailable; caller must finish input to receive tail frames");
     return DMD_ERR_STATE;
-}
-
-/* -------------------------------------------------------------------- 收帧 */
-
-/* 把 V4L2 协商出的几何写进 dmd_format。
- * V4L2 的 G_SELECTION 已给出有效显示区域，等价于 MediaCodec 的 display crop。 */
-static void publish_format(struct dmd_session *s)
-{
-    struct dmd_v4l2_dec *d = &s->dec;
-    int cw = d->crop_w > 0 ? d->crop_w : d->w;
-    int ch = d->crop_h > 0 ? d->crop_h : d->h;
-
-    s->fmt.buf_width    = d->w;
-    s->fmt.buf_height   = d->h;
-    s->fmt.stride       = d->stride;
-    s->fmt.slice_height = d->slice_height;
-    s->fmt.crop_left    = 0;
-    s->fmt.crop_top     = 0;
-    s->fmt.crop_right   = cw - 1;
-    s->fmt.crop_bottom  = ch - 1;
-    if (!s->fmt.valid) s->fmt.changes++;
-    s->fmt.valid = 1;
-
-    sess_log(s, "格式: 缓冲 %dx%d 有效 %dx%d stride=%d slice=%d",
-             d->w, d->h, cw, ch, d->stride, d->slice_height);
-}
-
-/* 填充 dmd_frame。几何信息随帧自洽（与 daemon 版一致）。 */
-static void fill_frame(struct dmd_session *s, struct dmd_frame *out,
-                       uint8_t *data, size_t len, uint64_t pts, int index)
-{
-    memset(out, 0, sizeof(*out));
-    out->data   = data;
-    out->size   = len;
-    out->width  = (uint32_t)s->dec.w;
-    out->height = (uint32_t)s->dec.h;
-    /* PTS 规则与 daemon 版一致：送料时写 seq*1000 微秒，这里除回来得到
-     * 输入单元序号，驱动据此精确配对 surface，无需知道出帧顺序。 */
-    out->unit_seq = (uint32_t)(pts / 1000ULL);
-    out->stride       = s->fmt.stride;
-    out->slice_height = s->fmt.slice_height;
-    out->crop_left    = s->fmt.crop_left;
-    out->crop_top     = s->fmt.crop_top;
-    out->crop_right   = s->fmt.crop_right;
-    out->crop_bottom  = s->fmt.crop_bottom;
-    /* shm_slot 复用为 CAPTURE 缓冲索引：语义仍是"归还凭据"。 */
-    out->shm_slot = index;
-    out->seq = s->frame_seq++;
-
-    if (index >= 0 && index < DMD_V4L2_MAX_CAP) s->held[index] = 1;
-    s->frames_recv++;
-}
-
-int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
-                           int timeout_ms)
-{
-    if (!s || !out) return DMD_ERR_INVAL;
-
-    /* 先给队列里积压的帧 —— 它们是 send_unit 背压期间接住的，序号更早。
-     * 不先清队列会让帧序错乱。 */
-    {
-        uint8_t *qd = NULL; size_t ql = 0; uint64_t qp = 0; int qi = -1;
-        if (pend_pop(s, &qd, &ql, &qp, &qi)) {
-            fill_frame(s, out, qd, ql, qp, qi);
-            return DMD_OK;
-        }
-    }
-
-    int budget = timeout_ms > 0 ? timeout_ms : s->io_timeout_ms;
-    /* 分片轮询：单片较小，便于及时处理 SOURCE_CHANGE 并在协商完成后
-     * 立刻发布格式（调用方靠它算 surface 布局）。
-     *
-     * ⚠️ 粒度必须远小于帧间隔，否则交付延迟被轮询周期本身拖住。
-     * 原值 50ms 对 30fps（帧间隔 33ms）过粗：帧可能在 poll 刚开始就绪，
-     * 却要等满一片才被发现。实测（Firefox 140，1080p30，真实 27Mbps 码流）
-     * vaSyncSurface 延迟直方图：
-     *     均值 29.2ms  中位 31.6ms  p90 47.7ms  峰值 93.9ms
-     *     >33ms 帧间隔的占 44.9%   → 浏览器丢帧 15.8%
-     * 而硬件纯解码吞吐是 37.4fps（26.7ms/帧，slowfeed 实测），
-     * ⚠️ 但"大头是轮询周期"这个推断**已被实测否证**：把它降到 5ms 后
-     * 延迟几乎没动（均值 29.2→29.4ms，>33ms 占比 44.9%→43.8%），
-     * 浏览器丢帧反而从 15.8% 涨到 34.6%（峰值 93.9→126.9ms，
-     * 细粒度轮询的额外唤醒在这台 8 核设备上抢了 CPU）。
-     * 真正的大头就是解码本身的耗时（26.7ms/帧 ≈ 均值 29ms）——
-     * Firefox 在帧解出来之前就来要，等待时间必然接近一个解码周期。
-     * 取 20ms：比原来的 50ms 细（能及时处理事件），又不引入过多唤醒。 */
-    const int slice = 20;
-    int waited = 0;
-
-    for (;;) {
-        uint8_t *fdata = NULL;
-        size_t flen = 0;
-        uint64_t fpts = 0;
-        int fidx = -1;
-
-        int r = dmd_v4l2_recv(&s->dec, &fdata, &flen, &fpts, &fidx, slice);
-
-        maybe_publish_format(s);
-
-        if (r < 0) {
-            set_err(s, DMD_ERR_IO, "V4L2 收帧出错");
-            return DMD_ERR_IO;
-        }
-        if (r == 2) {
-            s->eos = 1;
-            sess_log(s, "收到 EOS");
-            return DMD_EOS;
-        }
-        if (r == 1) {
-            fill_frame(s, out, fdata, flen, fpts, fidx);
-            return DMD_OK;
-        }
-
-        /* r == 0：本片超时无帧 */
-        waited += slice;
-        if (waited >= budget) {
-            {
-                int q = 0, h = 0;
-                for (int i = 0; i < s->dec.n_cap; i++)
-                    if (s->dec.cap[i].queued) q++;
-                for (int i = 0; i < DMD_V4L2_MAX_CAP; i++)
-                    if (s->held[i]) h++;
-                sess_log(s, "next_frame 超时 %d ms（队列 %d, 已送 %llu, 已收 %llu, "
-                            "CAPTURE 在驱动 %d/%d, 调用方持有 %d）",
-                         budget, s->pend_count,
-                         (unsigned long long)s->units_sent,
-                         (unsigned long long)s->frames_recv,
-                         q, s->dec.n_cap, h);
-                int oq = 0;
-                for (int i = 0; i < s->dec.n_out; i++)
-                    if (s->dec.out[i].queued) oq++;
-                sess_log(s, "  OUTPUT 在驱动 %d/%d", oq, s->dec.n_out);
-            }
-            return DMD_ERR_TIMEOUT;
-        }
-    }
-}
-
-int dmd_session_release_frame(struct dmd_session *s, struct dmd_frame *f)
-{
-    if (!s || !f) return DMD_ERR_INVAL;
-    int idx = f->shm_slot;
-    if (idx < 0) return 0;
-
-    if (dmd_v4l2_release(&s->dec, idx) < 0) {
-        set_err(s, DMD_ERR_IO, "归还缓冲失败");
-        return DMD_ERR_IO;
-    }
-    if (idx < DMD_V4L2_MAX_CAP) s->held[idx] = 0;
-    /* 帧数据位于刚归还的 dmabuf 里，指针立即失效 —— 明确清掉，
-     * 避免调用方误用（daemon 版是内部缓冲，容错性更高，这里更严格）。 */
-    f->data = NULL;
-    f->size = 0;
-    f->shm_slot = -1;
-    return 0;
-}
-
-/* -------------------------------------------------------------------- 查询 */
-
-const struct dmd_format *dmd_session_format(const struct dmd_session *s)
-{
-    return s ? &s->fmt : NULL;
-}
-
-const char *dmd_session_last_error(const struct dmd_session *s)
-{
-    return (s && s->err.msg[0]) ? s->err.msg : "";
-}
-
-int dmd_session_last_error_code(const struct dmd_session *s)
-{
-    return s ? s->err.code : DMD_ERR_INVAL;
-}
-
-int dmd_session_xfer_mode(const struct dmd_session *s)
-{
-    (void)s;
-    /* V4L2 直通没有传输模式之分：帧就在本进程的 dmabuf 映射里。
-     * 返回 SHM 是因为它在语义上更接近"零拷贝共享缓冲"，
-     * 且上层用它判断是否需要额外拷贝。 */
-    return DMD_XFER_SHM;
-}
-
-int dmd_session_fd(const struct dmd_session *s)
-{
-    return s ? s->dec.fd : -1;
-}
-
-uint64_t dmd_session_units_sent(const struct dmd_session *s)
-{
-    return s ? s->units_sent : 0;
-}
-
-uint64_t dmd_session_frames_received(const struct dmd_session *s)
-{
-    return s ? s->frames_recv : 0;
-}
-
-int dmd_session_frames_pending(const struct dmd_session *s)
-{
-    return s ? s->pend_count : 0;
-}
-
-int dmd_session_pending_capacity(const struct dmd_session *s)
-{
-    (void)s;
-    return DMD_V4L2_MAX_CAP;
 }
