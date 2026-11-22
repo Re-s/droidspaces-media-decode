@@ -1,0 +1,57 @@
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index ebfa781..14bf56c 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -5650,7 +5650,11 @@ namespace MediaBrowser.Controller.MediaEncoding
+             var hasGraphicalSubs = hasSubs && !state.SubtitleStream.IsTextSubtitleStream;
+ 
+             var rotation = state.VideoStream?.Rotation ?? 0;
+-            var swapWAndH = Math.Abs(rotation) == 90 && isSwDecoder;
++            var transposeDir = rotation == 0 ? string.Empty : GetVideoTransposeDirection(state);
++            var doVaapiTranspose = isVaapiDecoder
++                && !string.IsNullOrEmpty(transposeDir)
++                && _mediaEncoder.SupportsFilter("transpose_vaapi");
++            var swapWAndH = Math.Abs(rotation) == 90 && (isSwDecoder || doVaapiTranspose);
+             var swpInW = swapWAndH ? inH : inW;
+             var swpInH = swapWAndH ? inW : inH;
+ 
+@@ -5701,7 +5705,15 @@ namespace MediaBrowser.Controller.MediaEncoding
+                 }
+ 
+                 outFormat = doOclTonemap ? string.Empty : "nv12";
+-                var hwScaleFilter = GetHwScaleFilter("scale", "vaapi", outFormat, false, inW, inH, reqW, reqH, reqMaxW, reqMaxH);
++                // Rotate after scaling so software-backed VAAPI VPP implementations
++                // do not rotate a full-resolution frame. Swap the target bounds so
++                // the final dimensions retain the requested display orientation.
++                var scaleReqW = doVaapiTranspose && Math.Abs(rotation) == 90 ? reqH : reqW;
++                var scaleReqH = doVaapiTranspose && Math.Abs(rotation) == 90 ? reqW : reqH;
++                var scaleMaxW = doVaapiTranspose && Math.Abs(rotation) == 90 ? reqMaxH : reqMaxW;
++                var scaleMaxH = doVaapiTranspose && Math.Abs(rotation) == 90 ? reqMaxW : reqMaxH;
++                var hwScaleFilter = GetHwScaleFilter("scale", "vaapi", outFormat, false,
++                    inW, inH, scaleReqW, scaleReqH, scaleMaxW, scaleMaxH);
+ 
+                 if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
+                 {
+@@ -5712,11 +5724,21 @@ namespace MediaBrowser.Controller.MediaEncoding
+                 // allocate extra pool sizes for vaapi vpp
+                 if (!string.IsNullOrEmpty(hwScaleFilter))
+                 {
+-                    hwScaleFilter += ":extra_hw_frames=24";
++                    hwScaleFilter += doVaapiTranspose
++                        ? ":extra_hw_frames=8"
++                        : ":extra_hw_frames=24";
+                 }
+ 
+                 // hw scale
+                 mainFilters.Add(hwScaleFilter);
++
++                // Apply rotation after scaling. The limited VAAPI path is also
++                // used by drivers such as msm_drm; without this, input rotation
++                // metadata is stripped but the pixels stay sideways.
++                if (doVaapiTranspose)
++                {
++                    mainFilters.Add($"transpose_vaapi=dir={transposeDir}");
++                }
+             }
+ 
+             if (doOclTonemap && isVaapiDecoder)

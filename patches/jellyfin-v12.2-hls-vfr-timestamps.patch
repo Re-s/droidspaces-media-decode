@@ -1,0 +1,45 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 6df76de..3614435 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1895,6 +1895,11 @@ public class DynamicHlsController : BaseJellyfinApiController
+                     args += " -start_at_zero";
+                 }
+             }
++
++            // Preserve variable-frame-rate timestamps. FFmpeg's HLS default can
++            // treat an MP4 timebase (for example, 90 kHz) as the frame rate and
++            // duplicate thousands of frames during transcoding.
++            args += " -fps_mode:v:0 passthrough";
+         }
+ 
+         // TODO why was this not enabled for VOD?
+diff --git a/Jellyfin.Api/Helpers/DynamicHlsHelper.cs b/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
+index 4995d37..f049ea5 100644
+--- a/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
++++ b/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
+@@ -623,9 +623,9 @@ public class DynamicHlsHelper
+         {
+             framerate = Math.Round(state.TargetFramerate.GetValueOrDefault(), 3);
+         }
+-        else if (state.VideoStream?.RealFrameRate is not null)
++        else if (state.VideoStream?.ReferenceFrameRate is not null)
+         {
+-            framerate = Math.Round(state.VideoStream.RealFrameRate.GetValueOrDefault(), 3);
++            framerate = Math.Round(state.VideoStream.ReferenceFrameRate.GetValueOrDefault(), 3);
+         }
+ 
+         if (framerate.HasValue)
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index ebfa781..c706105 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -2043,7 +2043,7 @@ namespace MediaBrowser.Controller.MediaEncoding
+                 " -force_key_frames:0 \"expr:gte(t,n_forced*{0})\"",
+                 segmentLength);
+ 
+-            var framerate = state.VideoStream?.RealFrameRate;
++            var framerate = state.VideoStream?.ReferenceFrameRate;
+             if (framerate.HasValue)
+             {
+                 // This is to make sure keyframe interval is limited to our segment,

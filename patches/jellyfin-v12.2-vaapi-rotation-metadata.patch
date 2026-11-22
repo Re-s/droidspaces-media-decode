@@ -1,0 +1,81 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 6df76de..99fa515 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1908,6 +1908,17 @@ public class DynamicHlsController : BaseJellyfinApiController
+             args += EncodingHelper.GetVideoSyncOption(state.OutputVideoSync, _mediaEncoder.EncoderVersion);
+         }
+ 
++        // VAAPI keeps the source pixels unrotated; store the display transform
++        // in the fMP4 track so compatible HLS players can rotate during playback.
++        if (string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
++            && codec.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
++            && _encodingHelper.IsVaapiDecoderEnabled(state, _encodingOptions)
++            && state.VideoStream?.Rotation is int rotation
++            && rotation != 0)
++        {
++            args += " -metadata:s:v:0 rotate=" + rotation.ToString(CultureInfo.InvariantCulture);
++        }
++
+         args += _encodingHelper.GetOutputFFlags(state);
+ 
+         return args;
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index ebfa781..2e0e2b3 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -6590,6 +6590,17 @@ namespace MediaBrowser.Controller.MediaEncoding
+             return null;
+         }
+ 
++        /// <summary>
++        /// Determines whether the selected hardware decoder is VAAPI.
++        /// </summary>
++        /// <param name="state">The encoding job info.</param>
++        /// <param name="options">The encoding options.</param>
++        /// <returns>True when FFmpeg will use a VAAPI decoder.</returns>
++        public bool IsVaapiDecoderEnabled(EncodingJobInfo state, EncodingOptions options)
++        {
++            return GetHardwareVideoDecoder(state, options)?.Contains(" -hwaccel vaapi", StringComparison.OrdinalIgnoreCase) == true;
++        }
++
+         /// <summary>
+         /// Gets a hw decoder name.
+         /// </summary>
+@@ -6684,9 +6695,17 @@ namespace MediaBrowser.Controller.MediaEncoding
+             // Disable the extra internal copy in nvdec. We already handle it in filter chain.
+             var nvdecNoInternalCopy = ffmpegVersion >= _minFFmpegHwaUnsafeOutput;
+ 
+-            // Strip the display rotation side data from the transposed fmp4 output stream.
++            // Strip display rotation when the filter path will rotate the pixels.
++            // For VAAPI-to-VAAPI transcoding, retain it for the output track metadata.
++            var preserveVaapiRotation = hardwareAccelerationType == HardwareAccelerationType.vaapi
++                && isVaapiSupported
++                && isCodecAvailable
++                && outputHwSurface
++                && options.EnableHardwareEncoding
++                && GetVideoEncoder(state, options).EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase);
+             var stripRotationData = (state.VideoStream?.Rotation ?? 0) != 0
+-                && ffmpegVersion >= _minFFmpegDisplayRotationOption;
++                && ffmpegVersion >= _minFFmpegDisplayRotationOption
++                && !preserveVaapiRotation;
+             var stripRotationDataArgs = stripRotationData ? " -display_rotation 0" : string.Empty;
+ 
+             // VideoToolbox decoders have built-in SW fallback
+@@ -7849,6 +7868,16 @@ namespace MediaBrowser.Controller.MediaEncoding
+                 args += GetVideoSyncOption(state.OutputVideoSync, _mediaEncoder.EncoderVersion);
+             }
+ 
++            // VAAPI encoders keep the source pixel orientation. Tell MP4/fMP4
++            // muxers to retain the source display transform in the output track.
++            if (videoCodec.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase)
++                && IsVaapiDecoderEnabled(state, encodingOptions)
++                && state.VideoStream?.Rotation is int rotation
++                && rotation != 0)
++            {
++                args += " -metadata:s:v:0 rotate=" + rotation.ToString(CultureInfo.InvariantCulture);
++            }
++
+             args += GetOutputFFlags(state);
+ 
+             return args;

@@ -1,0 +1,50 @@
+diff --git a/libavformat/movenc.c b/libavformat/movenc.c
+index debe1ac..9e16141 100644
+--- a/libavformat/movenc.c
++++ b/libavformat/movenc.c
+@@ -26,6 +26,7 @@
+ #include <math.h>
+ #include <stdint.h>
+ #include <inttypes.h>
++#include <stdlib.h>
+ 
+ #include "movenc.h"
+ #include "avformat.h"
+@@ -54,6 +55,7 @@
+ #include "libavutil/avstring.h"
+ #include "libavutil/channel_layout.h"
+ #include "libavutil/csp.h"
++#include "libavutil/display.h"
+ #include "libavutil/intfloat.h"
+ #include "libavutil/mathematics.h"
+ #include "libavutil/mem.h"
+@@ -4110,6 +4112,7 @@ static int mov_write_tkhd_tag(AVIOContext *pb, MOVMuxContext *mov,
+     int group   = 0;
+ 
+     uint32_t *display_matrix = NULL;
++    uint32_t display_matrix_from_metadata[9];
+     int       i;
+ 
+ #if CONFIG_AVIF_MUXER
+@@ -4132,6 +4135,21 @@ static int mov_write_tkhd_tag(AVIOContext *pb, MOVMuxContext *mov,
+                                      AV_PKT_DATA_DISPLAYMATRIX);
+         if (sd && sd->size == 9 * sizeof(*display_matrix))
+             display_matrix = (uint32_t *)sd->data;
++
++        // Encoded streams do not necessarily retain input display-matrix side
++        // data. Honor the conventional rotate stream metadata as a fallback so
++        // transcoding can preserve display orientation without rotating pixels.
++        if (!display_matrix) {
++            const AVDictionaryEntry *rotate = av_dict_get(st->metadata, "rotate", NULL, 0);
++            if (rotate) {
++                char *end;
++                double angle = strtod(rotate->value, &end);
++                if (end != rotate->value && !*end && isfinite(angle)) {
++                    av_display_rotation_set((int32_t *)display_matrix_from_metadata, -angle);
++                    display_matrix = display_matrix_from_metadata;
++                }
++            }
++        }
+     }
+ 
+     if (track->flags & MOV_TRACK_ENABLED)
