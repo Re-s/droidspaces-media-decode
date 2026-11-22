@@ -238,6 +238,10 @@ Full instructions, flags, profile configuration and verification steps are in
   linux-dmabuf; under X11 the decoder is created but sees zero traffic
 - **Chrome needs `--render-node-override=/dev/dri/renderD128`**: Chromium only
   enumerates DRM devices on the PCI bus, skipping ARM platform devices
+- **Chrome on GNOME Wayland with Turnip:** The launcher defaults to ANGLE OpenGL.
+  This configuration played H.264, HEVC Main/Main10 and AV1 in Chrome 156,
+  and encoded H.264 with the optional NV12 GBM compatibility library.
+  [Build and launch instructions](doc/browser-vaapi-guide.md#推荐配置gnome-wayland--turnip--angle-opengl).
 - **Native Firefox 160 / GNU/Linux AArch64 uses the dedicated
   [RDD compatibility entrypoint](doc/firefox-sandbox.md)**, retaining Mozilla
   sandboxes with explicit, limited KGSL rules. Install the matching library,
@@ -251,9 +255,8 @@ Full instructions, flags, profile configuration and verification steps are in
   NV12 tests on 8 Elite required it to avoid text smearing and ghosting; this is
   not a requirement for every video format. Chrome 154 Main10/P010 testing found
   that ANGLE Vulkan decodes successfully but fails image import with a black
-  image, while ANGLE OpenGL displays correctly. Fully exit Chrome, then append
-  `--use-gl=angle --use-angle=gl` to the existing launcher for Main10 playback.
-  The global launcher was not changed; see the
+  image, while ANGLE OpenGL displays correctly. Use the OpenGL default for
+  Main10 playback on this setup. See the
   [Main10/P010 validation record](doc/hevc-main10-p010-validation.md).
   nabu / SD855 additionally drops `--use-angle=vulkan` (Vulkan conflicts with
   Wayland there). Vulkan cannot be turned off from the command line — this Chrome build

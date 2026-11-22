@@ -66,6 +66,44 @@ ffmpeg 拿不到硬解会**静默回落软解且不报错**，日志里出现 `h
 
 ## 一、Chrome / Chromium（必须 Wayland 模式）
 
+### 推荐配置：GNOME Wayland + Turnip + ANGLE OpenGL
+
+在 Ubuntu 26.04 arm64、Chrome 156.0.8078.79 和有 DMA-BUF 导入能力的
+GNOME Wayland 会话中，下列配置通过了 H.264、HEVC Main/Main10、AV1 8/10 位播放，
+以及 H.264 WebCodecs 硬件编码。对本机 320×180 片段，禁用
+`ResolutionBasedDecoderPriority` 后 Chrome 才优先选择 VA-API。ANGLE OpenGL
+避免了早期对照测试中 ANGLE Vulkan 的色偏。
+
+在实际登录 Wayland 的普通用户下，从仓库根目录执行。若系统已装好所需版本的
+VA-API 驱动，可省略驱动的构建、复制和 `LIBVA_DRIVERS_PATH`。
+
+```sh
+make -C vaapi-driver BUILD="$HOME/.cache/dmd-vaapi/driver" AV1=1 HEVC10=1 check
+make -C vaapi-driver/gbm-compat BUILD="$HOME/.cache/dmd-vaapi/gbm"
+install -Dm644 "$HOME/.cache/dmd-vaapi/driver/msm_drm_drv_video.so" \
+  "$HOME/.local/lib/droidspaces-vaapi/msm_drm_drv_video.so"
+install -Dm644 "$HOME/.cache/dmd-vaapi/gbm/libgbm.so.1" \
+  "$HOME/.local/lib/droidspaces-gbm/libgbm.so.1"
+
+CHROME_BIN=/usr/bin/google-chrome-stable \
+MESA_LOADER_DRIVER_OVERRIDE=kgsl TU_DEBUG=noconform \
+LIBVA_DRIVERS_PATH="$HOME/.local/lib/droidspaces-vaapi" \
+  sh tools/configure-chrome-vaapi.sh --wrapper-only \
+    --gbm-compat-dir "$HOME/.local/lib/droidspaces-gbm"
+"$HOME/.local/bin/chrome-msm-vaapi"
+```
+
+完全退出已有 Chrome 进程后再从包装脚本启动。脚本继承调用者的 Wayland 会话，
+无需写死用户名、UID、`WAYLAND_DISPLAY` 或 `XDG_RUNTIME_DIR`。移除安装命令的
+`--wrapper-only` 可同时配置桌面图标。使用其他 Mesa 驱动的设备应保留自己的 Mesa
+环境。GBM 兼容库只在 Chrome 启动时加载，Chrome 156 的编码实测不需要 GMB 读回
+调试开关。旧版如需要该开关，可在运行安装脚本时设 `DMD_DISABLE_GMB_READBACK=1`。
+
+请在 `chrome://media-internals` 中核对 `VaapiVideoDecoder`，并检查实际画面和丢帧。
+本次在 YouTube 实测了 H.264 和 AV1 硬解；同一片源切换至 VP9 时曾出现重复的 5 秒
+接收超时，见[上游 issue #7](https://github.com/Re-s/droidspaces-media-decode/issues/7)。
+YouTube 试播未收到 HEVC Main 或 Main10，HEVC 播放验证使用本地 MP4。
+
 ### 1. 为什么必须 Wayland
 
 `VaapiVideoDecodeLinux` 系 feature 的解码帧经 **linux-dmabuf 协议**零拷贝提交给
@@ -80,7 +118,7 @@ dmd 日志特征 —— 握手成功但零流量:
 驱动栈看似加载（GPU 进程 maps 里 libva/drv_video 都在），实际一帧不解。
 **X11 模式下此路不通，没有变通。**
 
-### 2. ANGLE Vulkan + Skia GL 基准配置
+### 2. Chrome 154 的 ANGLE Vulkan + Skia GL 配置
 
 ```shell
 google-chrome \
@@ -165,7 +203,8 @@ MESA_LOADER_DRIVER_OVERRIDE=msm google-chrome \
   --enable-features=AcceleratedVideoDecoder,AcceleratedVideoEncoder,Vulkan,DefaultANGLEVulkan,VulkanFromANGLE,VaapiIgnoreDriverChecks
 ```
 
-脚本默认仍保留 ANGLE Vulkan + Skia GL 基准，没有自动切换为 C 组。
+脚本现在默认采用 ANGLE OpenGL。可在配置时设 `DMD_ANGLE=vulkan` 选择 ANGLE Vulkan，
+这只切换 ANGLE 后端。Chrome Vulkan 合成仍需按上述 C 组完整配置测试。
 对其他 Chrome 版本、GPU、Mesa 或固件，需要重新验证完整播放与编码。
 判断时同时检查 `chrome://gpu` 的 Skia / ANGLE / Vulkan 实际后端、Media 的
 `kVideoDecoderName` / `kIsPlatformVideoDecoder`、播放帧数、丢帧与驱动实际会话；
@@ -183,7 +222,7 @@ MESA_LOADER_DRIVER_OVERRIDE=msm google-chrome \
 
 ### 3. 固化到桌面图标（幂等：重复执行不会叠加）
 
-在容器中运行配置脚本，默认保留上节 A 组基准参数；无 sudo 时自动创建
+在容器中运行配置脚本，默认采用 ANGLE OpenGL；无 sudo 时自动创建
 同名用户桌面入口，覆盖系统入口，不必从宿主改 rootfs：
 
 ```sh

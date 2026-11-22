@@ -175,6 +175,23 @@ HEVC 硬解存在既有参数集重建限制：本机编码输出的
 本轮已修复拒绝时遗漏 IO 所有权归还及码流缓冲区重复释放；此类输入会
 报告不支持，HEVC 硬解能力没有因此扩展。HEVC 编码输出的独立软解通过。
 
+## Chrome 156 与 FFmpeg 编码实测（2026-11-22）
+
+Ubuntu 26.04 arm64 / GNOME Wayland / Turnip 上，Chrome 156.0.8078.79
+以普通用户运行。WebCodecs 使用 `VaapiVideoEncodeAccelerator` 完成 H.264
+Constrained Baseline（CPU I420、Canvas）、Main（Canvas）、High（Canvas）四组
+640×480 测试。每组输出 60 帧，FFmpeg 软解核对帧数、尺寸和 profile 均正确。
+ANGLE OpenGL 与 ANGLE Vulkan 都通过。四组在不设置
+`--gmb-readback-from-texture-disabled-for-debugging` 时也能完成；省去 NV12 GBM
+兼容库时，两种开关设置均因输入缓冲分配失败而输出 0 帧。
+Chrome 拒绝了本次测试的 HEVC Main WebCodecs 配置。
+
+同一驱动经 FFmpeg 验证 H.264 Constrained Baseline、Main、High 的 CBR，
+以及 H.264 High、HEVC Main 的 VBR 和 CQP（HEVC Main 也验证了 CBR）。
+八组 640×360 输出均为 120 帧，全部通过独立软解。
+设备未声明 VP9、AV1 或 HEVC Main10 编码入口。浏览器的构建和启动步骤见
+[GNOME Wayland 配置](browser-vaapi-guide.md#推荐配置gnome-wayland--turnip--angle-opengl)。
+
 ## Chrome 154 编码实测（2026-11-15）
 
 同一 tmp 容器中的 Google Chrome `154.0.8037.97` 已通过 WebCodecs
@@ -218,10 +235,10 @@ sh tools/configure-chrome-vaapi.sh \
 参数；`--uninstall` 恢复备份或删除本脚本新建的包装脚本。先完全退出已有
 Chrome 进程再启动，使新参数与环境生效。
 
-脚本默认采用已验证的 ANGLE Vulkan + Skia GL 基准，不自动切换 Chrome
-Vulkan 后端。该基准也完成 360p / 1080p H.264 硬解，各 60 帧、零丢帧，
-GPU 进程未崩溃。旧 nabu / SD855 配置可用 `DMD_VULKAN=off`，其他设备按实际
-显示与硬解验证结果配置。
+当时的 ANGLE Vulkan + Skia GL 配置也完成 360p / 1080p H.264 硬解，
+各 60 帧、零丢帧，GPU 进程未崩溃。要复用当时的启动参数，可在配置脚本中指定
+`DMD_ANGLE=vulkan DMD_DISABLE_GMB_READBACK=1`。旧 nabu / SD855 可用
+`DMD_ANGLE=auto`，让 Chrome 选择后端。
 
 本轮另测试了 Chrome 154 的 Vulkan 后端：只加 feature `Vulkan` 时，
 Skia 为 GaneshVulkan，但 H.264 播放回落 `FFmpegVideoDecoder`；同时开启

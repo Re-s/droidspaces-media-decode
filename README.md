@@ -185,9 +185,10 @@ nabu（SD855）这一代连它也要去掉（wayland 与 Vulkan 冲突）。
 
 这不是所有格式通用的要求：2026-11-15 的 Chrome 154 / Main10 P010 实测中，
 ANGLE Vulkan 能完成硬解，但图像导入黑屏；ANGLE OpenGL 的画面正常。
-播放 Main10 时，正常退出全部 Chrome 后，通过现入口追加
-`--use-gl=angle --use-angle=gl`。本次未修改全局启动后端，详见
-[`Main10/P010 验证记录`](doc/hevc-main10-p010-validation.md)。
+现在启动脚本默认使用 ANGLE OpenGL。Chrome 156 / GNOME Wayland / Turnip
+已复测 H.264、HEVC Main/Main10、AV1 播放和 H.264 编码，见
+[构建与启动说明](doc/browser-vaapi-guide.md#推荐配置gnome-wayland--turnip--angle-opengl)
+及 [Main10/P010 验证记录](doc/hevc-main10-p010-validation.md)。
 
 同理，`chrome://flags` 里那个 "Vulkan" 开关（等价于 `--enable-features=Vulkan`）
 也要保持 `Disabled`；ANGLE 后端需按上述设备、浏览器版本和视频格式选择。

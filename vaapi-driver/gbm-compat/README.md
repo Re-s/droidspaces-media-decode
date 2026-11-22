@@ -81,15 +81,15 @@ the library in `/usr/local/lib/droidspaces-gbm`:
 
 ```sh
 LD_LIBRARY_PATH=/usr/local/lib/droidspaces-gbm${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-  chromium --ozone-platform=wayland --use-gl=angle --use-angle=vulkan \
-  --gmb-readback-from-texture-disabled-for-debugging
+  chromium --ozone-platform=wayland --use-gl=angle --use-angle=gl
 ```
 
-Keep the machine's existing VA-API and hardware-encoding feature options. The
-readback switch avoids an upstream SHMEM mappable SharedImage being passed
-directly to a Linux VEA that expects dma-buf input; CPU input then uses VEA's
-native NV12 staging allocation. This adapter does not add a software fallback
-when a valid dma-buf or hardware encoder is unavailable.
+Keep the machine's existing VA-API options and enable `AcceleratedVideoEncoder`.
+Chrome 156 on GNOME Wayland encoded H.264 with this adapter and the default
+readback behavior. The tested Chrome 154 setup also needed
+`--gmb-readback-from-texture-disabled-for-debugging` to steer CPU input through
+the VA-API encoder's native NV12 staging buffers. See the
+[Chrome encoding results](../../doc/hardware-encoding.md#chrome-156-与-ffmpeg-编码实测2026-11-22).
 
 ## Chromium's linear allocation path
 
