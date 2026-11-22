@@ -1,21 +1,21 @@
-/* HEVC 参数集合成的可行性验证。
+/* Verify the feasibility of the HEVC parameters being assembled.
  *
- * 关键风险：VA-API 的 VAPictureParameterBufferHEVC 只给出
- * num_short_term_ref_pic_sets（**个数**），不给每个 st_ref_pic_set 的**内容**。
- * 而 slice header 里的 short_term_ref_pic_set_idx 会引用它们，
- * 且当 short_term_ref_pic_set_sps_flag=0 时 slice header 里**内联**了一个
- * st_ref_pic_set —— 那部分是按 SPS 声明的 num_short_term_ref_pic_sets
- * 来解析的（st_ref_pic_set 的语法依赖 stRpsIdx 与 num_delta_pocs）。
+ * Critical risk: VAPictureParameter BufferHEVC from VA-API only gives
+ * Num_shot_term_ref_pic_sets (** number**), not to each st_ref_pic_set**.
+ * The slice header references them through short_term_ref_pic_set_idx,
+ * And when the short_term_ref_pic_set_sps_flag=0 slick header** inner connection**
+ * st_ref_pic_set -- that part is based on the SPS declaration num_shot_term_ref_pic_sets
+ * The syntax of st_ref_pic_set is dependent on stRpsIdx and num_delta_pocs.
  *
- * 所以：如果我们在合成的 SPS 里把 num_short_term_ref_pic_sets 写成 0，
- * 而原始 slice header 是按"SPS 里有 N 个"编码的，解析就会错位。
+ * Setting num_short_term_ref_pic_sets to 0 in the synthesized SPS would
+ * And the original slick header is "N" coded in the SPS, and the parsing is mispositioned.
  *
- * 这个探针用 ffmpeg 解析真实 HEVC 码流，打印：
- *   1) SPS 里实际的 num_short_term_ref_pic_sets
- *   2) 各 slice 的 short_term_ref_pic_set_sps_flag
- * 据此判断能否安全地合成 SPS。
+ * This probe uses ffmpeg to interpret the real HEVC stream, print:
+ *   1) actual num_short_term_ref_pic_sets
+ *   2) Short_term_ref_pic_set_sps_flag for each slick
+ * This makes it possible to synthesize SPS safely.
  *
- * 编译（容器内）：
+ * Compile (in packaging):
  *   gcc -O2 -o probe_hevc_sps probe_hevc_sps.c
  */
 #include <stdio.h>
@@ -26,7 +26,7 @@
 static unsigned char *buf;
 static long blen;
 
-/* 极简 RBSP 读取器（去 EPB） */
+/* Extremely Simple RBSP Reader (Go EPB) */
 struct br {
     const unsigned char *d;
     long len;
@@ -59,8 +59,8 @@ static uint32_t br_ue(struct br *b)
     return ((1u << lz) - 1) + br_u(b, lz);
 }
 
-/* HEVC SPS 里暂时没解析到需要 se(v) 的字段，但位读取器成套保留 ——
- * 后续要解析 pps_beta_offset_div2 一类字段时直接可用。 */
+/* The field requiring se (v) has not been resolved in HEVC SPS, but the bit reader set is kept...
+ * The following field is directly available when you want to interpret the pps_beta_offset_div2. */
 __attribute__((unused))
 static int32_t br_se(struct br *b)
 {
@@ -68,7 +68,7 @@ static int32_t br_se(struct br *b)
     return (c & 1) ? (int32_t)((c + 1) / 2) : -(int32_t)(c / 2);
 }
 
-/* 去掉 emulation prevention bytes */
+/* Remove the declaration reservation bytes */
 static long unescape(const unsigned char *in, long n, unsigned char *out)
 {
     long o = 0; int zeros = 0;
@@ -114,10 +114,10 @@ int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/root/decode-test/test1080.h265";
     FILE *f = fopen(path, "rb");
-    if (!f) { printf("读不了 %s\n", path); return 1; }
+    if (!f) { printf("I can’t read it. %s\n", path); return 1; }
     fseek(f, 0, SEEK_END); blen = ftell(f); fseek(f, 0, SEEK_SET);
     buf = malloc(blen);
-    if (fread(buf, 1, blen, f) != (size_t)blen) { printf("读取失败\n"); return 1; }
+    if (fread(buf, 1, blen, f) != (size_t)blen) { printf("Reading Failed\n"); return 1; }
     fclose(f);
 
     unsigned char *rb = malloc(blen);
@@ -157,7 +157,7 @@ int main(int argc, char **argv)
             }
             br_ue(&b); br_ue(&b); br_ue(&b); br_ue(&b); br_ue(&b); br_ue(&b);
             if (br_u(&b, 1)) {                       /* scaling_list_enabled */
-                if (br_u(&b, 1)) { printf("  (含 scaling list data)\n"); }
+                if (br_u(&b, 1)) { printf("  (Ham scaling list data)\n"); }
             }
             br_u(&b, 1);                             /* amp_enabled */
             br_u(&b, 1);                             /* sao_enabled */
@@ -176,7 +176,7 @@ int main(int argc, char **argv)
             if (irap) br_u(&b, 1);                   /* no_output_of_prior_pics */
             br_ue(&b);                               /* slice_pic_parameter_set_id */
             if (first_slice && !irap) {
-                /* 非 IRAP 才有 POC 与 st_rps 引用 */
+                /* POC and st_rps references are not for IRAP */
                 n_slice++;
             }
             i = s; continue;
@@ -184,15 +184,15 @@ int main(int argc, char **argv)
         i = s;
     }
 
-    printf("\n=== 结论 ===\n");
+    printf("\n=== Conclusions ===\n");
     if (num_st_rps == 0)
-        printf("num_short_term_ref_pic_sets = 0：SPS 里无 st_ref_pic_set，\n"
-               "slice header 内联自己的 —— 合成 SPS 时写 0 即可，**安全**。\n");
+        printf("num_short_term_ref_pic_sets = 0:SPS None st_ref_pic_set,\n"
+               "slice header Inner Unions for-- Synthesis SPS Clock 0 - I’ll be fine.,**Security**.\n");
     else
-        printf("num_short_term_ref_pic_sets = %d：SPS 里有 st_ref_pic_set，\n"
-               "而 VA-API 不提供其内容。若合成时写 0，slice header 中\n"
-               "short_term_ref_pic_set_sps_flag=1 的引用就会失效 —— **有风险**，\n"
-               "需要进一步确认 ffmpeg 送来的码流里该 flag 的取值。\n", num_st_rps);
+        printf("num_short_term_ref_pic_sets = %d:SPS In there. st_ref_pic_set,\n"
+               "And... VA-API Do not provide content. If synthesized, write 0,slice header Medium\n"
+               "short_term_ref_pic_set_sps_flag=1 The quote will fail. —— **Risk.**,\n"
+               "Need further confirmation ffmpeg It’s in the stream. flag Values.\n", num_st_rps);
     (void)sps_flag_1; (void)sps_flag_0; (void)n_slice;
     return 0;
 }

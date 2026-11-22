@@ -1,32 +1,32 @@
-/* 从 VA-API 参数缓冲反向合成 H.264 SPS/PPS 比特流
+/* Bump-back synthesis from VA-API parameters H.264 SPS/PPS bit current
  *
- * ── 为什么需要这个 ────────────────────────────────────────
- * daemon 侧是 MediaCodec，它要的是标准 Annex B 码流，靠起始码定位
- * nal_unit_header 把 SPS/PPS 识别为 codec config（decode-daemon.c:461-489）。
- * 但 ffmpeg 的 hwaccel 不把 SPS/PPS 交给 driver —— 它自己解析掉了
- * （h264dec.c:699 / :717 的 case H264_NAL_SPS / PPS），只把 VCL NALU
- * 经 decode_slice 传下来。所以参数集必须由我们从
- * VAPictureParameterBufferH264 反向合成。
+ * ─ Why this -- — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — — —
+ * The daemon side is MediaCodec, which is a standard Annex B stream, location by starting code.
+ * nal_unit_header identifies the SPS/PPS as codec config (decode-daemon.c: 461-489).
+ * But Hwaccel of ffmpeg does not hand over the SPS/ PPS to Driver -- it deciphers itself.
+ * (h264dec.c: 699 / 717 case H264_NAL_SPS/PPS) only VCL NALU
+ * Passed down by decode_slick. So the argument set must be from us.
+ * VAPicture Parameter BufferH264 inverted synthesis.
  *
- * ── 好消息：slice 不用重建 ────────────────────────────────
- * 主会话核实（research/M-1-forwarding-spec.md）并经本单元复核：
+ * ─ Good news: slick does not need to rebuild -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+ * Main Session Verification (research/M-1-forwarding-spec.md) and reviewed in this module:
  *   h264dec.c:674        FF_HW_CALL(avctx, decode_slice, nal->raw_data, nal->raw_size)
- *   h2645_parse.c:92/145 nal->raw_data = src，src 指向起始码之后
- *   h2645_parse.h:102-107 raw_data 保留 emulation prevention 字节（未去转义）
- *   vaapi_h264.c:386-388 这对 buffer/size 原样进 slice data buffer
+ *   h2645_parse.c: 92/145 nal->raw_data = src, src point to start code
+ *   h2645_parse.h: 102-107 raw_data reserve emulation reservation byte (not transferred)
+ *   vaapi_h264.c: 386-388
  *   vaapi_h264.c:349-350 slice_data_offset=0、slice_data_flag=VA_SLICE_DATA_FLAG_ALL
- * 即 slice data 里是**完整原始 NALU（含 NALU header 与 slice header）**，
- * 只缺起始码。决定性的旁证是 vaapi_h264.c:351 的
- * slice_data_bit_offset = get_bits_count(&sl->gb) —— 它是 slice header
- * **结束**的 bit 位置，这个字段能存在就说明 slice header 在 buffer 里。
+ * The original NALU is the original, the original NALU and the slice header**.
+ * The only missing starting code is the vaapi_h264.c:351 conclusive circumstantial evidence.
+ * - It's a slick header.
+ * **The position of the finished bit, the presence of this field indicates the presence of the slick header in the buffer.
  *
- * 所以我们不需要重建 slice header，也就绕开了参考列表重排序与 MMCO 命令的
- * 反推（那是欠定问题：VAPictureH264 数组给的是最终列表而非重排序命令）。
- * 转发 slice 只需前置 4 字节 00 00 00 01。
+ * So we don't need to rebuild the slick header, and we're going to skip the reference list and reorder it with the MMCO command.
+ * Inverse (that is the problem of default: VAPictureH264 arrays give the final list rather than the order to reorder).
+ * Forwards slick only by four bytes before 0000 00:00 01.
  *
- * ── 仍然要猜的字段 ────────────────────────────────────────
- * profile_idc / level_idc / VUI 在 VA-API 里不存在。处理见下面各处注释：
- * profile_idc 由 VAProfile 映射，level_idc 按分辨率与 DPB 查表推一个刚好够用的。
+ * ─ The fields still to be guessed -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+ * The profile_idc / level_idc / VUI does not exist in VA-API. See the following notes for this treatment:
+ * Profile_idc is mapd by VAProfile, and the number_idc is just enough to push one by resolution with the DPB checklist.
  */
 
 #include <string.h>
@@ -34,18 +34,18 @@
 #include "driver.h"
 #include "bitstream.h"
 
-/* 比特写入原语与 EPB 转义已提取到 bitstream.c，与 HEVC 共用。 */
+/* Bit writing in the original language and EPB conversions have been extracted to bitstream.c, shared with HEVC. */
 
-/* ------------------------------------------------------------ 字段推导 */
+/* ------------------------------------------------------ */
 
-/* profile_idc：VA-API 没有这个字段，只能从 VAProfile 映射。
+/* Profile_idc: VA-API does not have this field, only from the VAProfile map.
  *
- * ⚠️ 关键约束：profile_idc >= 100 时 SPS 比特流里才出现 chroma_format_idc /
- * bit_depth_* / seq_scaling_matrix_present_flag 这一组字段。所以 profile_idc
- * 与我们是否写这组字段必须自洽，否则解析器整体错位、码流报废。
+ * Key constraints: pfile_idc > = 100 = only the SPS bit flow appears when chroma_format_idc /
+ * bit_depth_* / seq_scaling_matrix_present_flag. So the field is profile_idc
+ * Whether or not we write this field must be done on our own, otherwise the separators are mispositioned and the bitstream is out of order.
  *
- * 策略：只要 pic param 里的 chroma/bit_depth 是非默认值，就必须用 High(100)
- * 才能表达它们；否则按 VAProfile 映射。ffmpeg 的 H264High 是最常见情况。
+ * Policy: If the troma/bit_depth in the pic param is not the default value, the High(100) is required
+ * To express them; otherwise, they are mapd using VAProfile. H264Hig of ffmpeg is the most common case.
  */
 static unsigned int derive_profile_idc(VAProfile profile,
                                        const VAPictureParameterBufferH264 *pp)
@@ -54,10 +54,10 @@ static unsigned int derive_profile_idc(VAProfile profile,
     unsigned int bd_luma = pp->bit_depth_luma_minus8;
     unsigned int bd_chroma = pp->bit_depth_chroma_minus8;
 
-    /* 非 4:2:0 或非 8-bit 只能用 High 系列表达。 */
+    /* Non-4:2 / non-8-bit can only be expressed in the High series. */
     if (chroma != 1 || bd_luma != 0 || bd_chroma != 0)
         return 100;
-    /* transform_8x8 是 High profile 独有的工具。 */
+    /* Transform_8x8 is a unique tool for High profile. */
     if (pp->pic_fields.bits.transform_8x8_mode_flag)
         return 100;
 
@@ -72,18 +72,18 @@ static unsigned int derive_profile_idc(VAProfile profile,
     }
 }
 
-/* level_idc：VA-API 完全没有。填过高的风险是 MediaCodec 按 level 预留过大
- * 缓冲甚至拒绝配置；填过低的风险是解码器认为码流超规格。
+/* Quevel_idc: VA-API not at all. The risk of overfilling is that MediaCodec is set at level too high
+ * Bush even refuses configuration; the risk of being too low is that the decoder considers the code flow to be too high.
  *
- * 按 Annex A 的 MaxMBPS/MaxFS 表推一个**刚好够用**的 level，比填固定值稳。
- * 只用帧尺寸推（帧率未知），所以取每个 level 的 MaxFS（帧大小上限，单位宏块）。
+ * Press the Max MBPS/MaxFS Table of Annex A to push a level ** just enough to be used **, which is more stable than the fixed values.
+ * Only frame sizes (the frame rate is unknown) are used, so take MaxFS for each level (frame size cap, in macros).
  */
 static unsigned int derive_level_idc(unsigned int mbs_wide,
                                      unsigned int mbs_high)
 {
-    unsigned int fs = mbs_wide * mbs_high; /* 帧大小，宏块数 */
+    unsigned int fs = mbs_wide * mbs_high; /* Frame size, macros */
 
-    /* Annex A 表 A-1 的 MaxFS 列。level 值是 idc（level×10）。 */
+    /* MaxFS column for Annex A-1. The value is idc (levelx10). */
     static const struct {
         unsigned int max_fs;
         unsigned int idc;
@@ -110,13 +110,13 @@ static unsigned int derive_level_idc(unsigned int mbs_wide,
         if (fs <= tbl[i].max_fs)
             return tbl[i].idc;
     }
-    return 62; /* 超出表范围，给最高 */
+    return 62; /* Out of the table, tops. */
 }
 
-/* ------------------------------------------------------------ SPS 序列化 */
+/* Sequencing of SPSs */
 
-/* 按 ISO/IEC 14496-10 §7.3.2.1.1 的语法顺序写 seq_parameter_set_rbsp。
- * 每个字段标注来源：A = VA-API 有、B = 可推导、C = 只能填默认值。 */
+/* Write seq_parameter_set_rbsp in the syntax order of ISO/IEC 14496-10 § 7.3.2.1.1.
+ * Each field indicates the source: A = VA-API has, B = deduceable, C = only the default values. */
 static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
                              VAProfile profile, unsigned int disp_width,
                              unsigned int disp_height, unsigned char *out,
@@ -130,47 +130,47 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
     unsigned int profile_idc = derive_profile_idc(profile, pp);
     unsigned int frame_mbs_only = pp->seq_fields.bits.frame_mbs_only_flag;
 
-    /* C：profile_idc 由 VAProfile 推 */
+    /* C: profile_idc by VAProfile */
     dmd_bw_put_bits(&bw, profile_idc, 8);
-    /* C：constraint_set0..5 + 2 位 reserved。
+    /* C:constraint_set0.5 + 2 bit reserved.
      *
-     * ⚠️ 这 8 位不能随便填：h264_ps.c:677-689 的 more_rbsp_data_in_pps()
-     * 在 `profile_idc ∈ {66,77,88} 且 (constraint_set_flags & 7) != 0` 时
-     * 返回 0，**PPS 解析会跳过尾部**的 transform_8x8_mode_flag /
+     * ⁇  The 8 places cannot be filled out: h264_ps.c: 677-689 more_rbsp_data_in_pps()
+     * `Profile_idc ⁇ 66,77,88} and (constraint_set_flags & 7)! = 0 '
+     * returns 0, **PPS parsing over tail** transform_8x8_mode_flag/
      * pic_scaling_matrix_present_flag / second_chroma_qp_index_offset
-     * （调用点 h264_ps.c:795）。
+     * (Presspoints h264_ps.c:795).
      *
-     * 所以只在 ConstrainedBaseline 上置 set0|set1（那是它的定义），
-     * 其余一律 0 —— 我们需要 PPS 尾部能被读到。 */
+     * So only set0  ⁇ set1 (which is its definition) is placed on Constrained Basicline.
+     * The rest of the same 0 -- we need PPS tails that can be read. */
     unsigned int constraints = 0;
     if (profile_idc == 66 && profile == VAProfileH264ConstrainedBaseline) {
-        /* set0 (bit7) + set1 (bit6)：baseline 且 constrained */
+        /* Set0 (bit7) + set1 (bit6): baseline and constraining */
         constraints = 0xC0;
     }
     dmd_bw_put_bits(&bw, constraints, 8);
-    /* C：level_idc 按帧尺寸推 */
+    /* C: level_idc by frame size */
     dmd_bw_put_bits(&bw, derive_level_idc(mbs_wide, mbs_high), 8);
-    /* C：seq_parameter_set_id 固定 0（slice header 经 PPS 间接引用，
-     * 而 PPS 里我们也写 0，两边自洽即可） */
+    /* C: seq_parameter_set_id is always 0 (the slice header references it indirectly through the PPS,
+     * And we wrote in the PPS that we can just go on our own. */
     dmd_bw_put_ue(&bw, 0);
 
     if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
         profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
         profile_idc == 86 || profile_idc == 118 || profile_idc == 128) {
-        /* A：这一组只在 High 系列出现，取值必须与 profile_idc 的选择自洽 */
+        /* A: This group only appears in the High Series and the value must be self-serving with the profile_idc selection */
         dmd_bw_put_ue(&bw, pp->seq_fields.bits.chroma_format_idc);
         if (pp->seq_fields.bits.chroma_format_idc == 3) {
-            /* A：VA-API 的 residual_colour_transform_flag 即新标准的
+            /* A: resocial_colour_transform_flag of VA-API
              * separate_colour_plane_flag */
             dmd_bw_put_flag(&bw, pp->seq_fields.bits.residual_colour_transform_flag);
         }
         dmd_bw_put_ue(&bw, pp->bit_depth_luma_minus8);   /* A */
         dmd_bw_put_ue(&bw, pp->bit_depth_chroma_minus8); /* A */
-        /* C：qpprime_y_zero_transform_bypass_flag，填 0（仅无损编码用） */
+        /* C:qpprime_y_zero_transform_bypass_flag, fill 0 (no loss encoding only) */
         dmd_bw_put_flag(&bw, 0);
-        /* B：不写 SPS 级缩放矩阵。VAIQMatrixBufferH264 给的是**最终**矩阵，
-         * 反推 delta_scale 序列需要区分它来自 SPS 还是 PPS 的 fallback 规则，
-         * 无法判定。改为把矩阵放进 PPS（见 build_pps_rbsp），那里语义明确。 */
+        /* B: No SPS scale matrix. VAIQMatrix BufferH264 gives **final ** matrix, ** matrix.
+         * The reverse push of delta_scale sequences requires a distinction between the fallback rules from the SPS or PPS, and the "F" rules from the PPS.
+         * Unable to determine. Put the matrix in the PPP (see build_pps_rbsp), where semantic clarity is expressed. */
         dmd_bw_put_flag(&bw, 0);
     }
 
@@ -184,10 +184,10 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
         /* A */
         dmd_bw_put_flag(&bw, pp->seq_fields.bits.delta_pic_order_always_zero_flag);
         /* C：offset_for_non_ref_pic / offset_for_top_to_bottom_field /
-         * num_ref_frames_in_pic_order_cnt_cycle 与 offset_for_ref_frame[]
-         * 在 VA-API 里完全没有。pic_order_cnt_type==1 极少见（ffmpeg 生成的
-         * 码流几乎都是 type 0 或 2），这里填最简形式：cycle 长度 0。
-         * 若真遇到 type 1 码流，POC 会算错 → 帧序错乱。 */
+         * Nom_ref_frames_in_pic_order_cnt_cyclé and exfset_for_ref_frame[]
+         * Not at all in VA-API. Pic_order_cnt_type=1 rarely generated (ffmpeg)
+         * The stream is almost all type 0 or 2), the simplest form is filled out here: cycle length 0.
+         * If you actually encounter a type 1 stream, POC will miscalculate the frame sequence. */
         dmd_bw_put_se(&bw, 0);
         dmd_bw_put_se(&bw, 0);
         dmd_bw_put_ue(&bw, 0);
@@ -197,11 +197,11 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
     /* A */
     dmd_bw_put_flag(&bw, pp->seq_fields.bits.gaps_in_frame_num_value_allowed_flag);
     dmd_bw_put_ue(&bw, pp->picture_width_in_mbs_minus1); /* A */
-    /* B：⚠️ VA-API 给的是**帧高**宏块数（vaapi_h264.c:251 填的是
-     * h->mb_width/mb_height-1，而 h264_ps.c:457 解析时做过
-     * mb_height *= 2 - frame_mbs_only_flag）。比特流里这个字段是
-     * map units 数，交错流时是帧高的一半，必须换算回去。
-     * 直接原值写入会让交错码流的高度算成两倍。 */
+    /* B:  ⁇  VA-API for ** frame height** macros (vaapi_h264.c:251 filled out)
+     * h->mb_width/mb_night-1, while h264_ps.c:457 was analyzed
+     * The field in the Bits stream is
+     * Map units, half the height of the frame at the staggered flow, must be converted back.
+     * Direct original writing doubles the height of the staggered stream. */
     dmd_bw_put_ue(&bw, mbs_high / (frame_mbs_only ? 1u : 2u) - 1);
     dmd_bw_put_flag(&bw, frame_mbs_only); /* A */
     if (!frame_mbs_only) {
@@ -210,11 +210,11 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
     }
     dmd_bw_put_flag(&bw, pp->seq_fields.bits.direct_8x8_inference_flag); /* A */
 
-    /* B：frame_cropping 由"宏块对齐后的尺寸"与"实际显示尺寸"之差推出。
-     * 这是 1088-vs-1080 在码流侧的对应物：1080 不是 16 的倍数，
-     * 所以 SPS 里编码高度是 1088，靠 crop 砍掉 8 行。
-     * 单位：crop offset 的单位是"色度采样"，4:2:0 下垂直方向要再除 2，
-     * 且 frame_mbs_only=0 时垂直单位再乘 2。 */
+    /* B: frame_croping is rolled out by the difference between the size of the macro and the actual size of the display.
+     * This is the 1088-vs-1080 counterpart on the side of the bitstream: 1080 is not a multiple of 16, but the number of the people who are in the system is not the same as the number of people who are in the system.
+     * So the code height in the SPS is 1088, cutting off 8 lines by Crop.
+     * Unit: Crop offset is "Current Sample", which is divided by two vertically at 4:2:0,
+     * And the vertical unit multiplied by two when the frame_mbs_only=0. */
     unsigned int coded_w = mbs_wide * 16;
     unsigned int coded_h = mbs_high * 16 * (frame_mbs_only ? 1 : 2);
     unsigned int crop_right = 0, crop_bottom = 0;
@@ -240,24 +240,24 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
         dmd_bw_put_flag(&bw, 0);
     }
 
-    /* C：VUI 只写 bitstream_restriction 一段，其余（色彩空间、SAR、帧率）
-     * 仍然缺失 —— VA-API 不提供它们，解码器用默认值：SAR 1:1、
-     * 色彩空间 unspecified。对 NV12 输出，几何与像素值都不受影响
-     * （显示区域由我们按 crop 处理）。
+    /* C: VUI only writes bitstream_restriction paragraph, the rest (colour space, SAR, frame rate)
+     * Still missing -- VA-API does not provide them, the decoder uses default values: SAR 1:1,
+     * Colour space unspecied. No geometry or pixel values are affected for NV12 output
+     * (Show area is handled by us by clicking on the corp.)
      *
-     * 为什么必须写 bitstream_restriction：
-     * 没有它时 max_num_reorder_frames 的缺省值等于 DPB 上限（§E.2.1），
-     * MediaCodec 只能按最坏情况攥帧 —— 实测滞后 4 个输入单元才吐首帧
-     * （无 B 帧的流滞后 1，证明攥帧确实来自重排假设）。
-     * 而浏览器里的 ffmpeg 稳态只保持 3 帧在飞（H.264 重排深度决定），
-     * 送完第 3 帧就阻塞在 vaSyncSurface 等第 1 帧 → 双方差一帧 → 死锁 →
-     * 驱动兜底 flush（不可逆）→ 会话作废 → 浏览器永久回落软解。
-     * 实测 Firefox 140 因此只硬解出 1 帧。
+     * Why must you write bitstream_restriction:
+     * When this is not available, the default value for max_num_reorder_frames is equal to the DPB cap (§E.2.1),
+     * MediaCodec can only throw up the frame by worst-case scenario -- actual time lag of 4 input units
+     * (No B-frame flow lags 1, proving that the lynchium is indeed derived from the re-allocation assumption.
+     * The ffmpeg steady state in the browser is only kept in 3 frames (H.264 rehearsing depth)
+     * When you deliver the third frame, you block the first frame, the vaSyncSurface, etc.
+     * Drives the bottom flush — invalid session — permanent collapse of the browser softened.
+     * The fieldbox 140 is measured so only 1 frame is harded out.
      *
-     * ⚠️ 不要把 max_num_reorder_frames 写 0（曾经试过，已否决）：
-     * 那是谎报流的重排需求，会破坏语义 —— 软解侧实测 150 帧掉到 115 帧。
-     * 这里用 num_ref_frames 作上界：它是 SPS 自带的参考帧数上限，
-     * 重排深度不可能超过它，所以这是**真实且不放大**的约束。 */
+     * ⁇  Do not write max_num_reorder_frames 0 (ve tried, rejected):
+     * That's the reordering requirement for the false stream, which undermines semantic -- soft side measurements 150 frames fall into the 115 frame.
+     * The top line is the num_ref_frames: it's the frame limit of the SPS' own frame.
+     * Rehearsal depth cannot exceed it, so it is a constraint** real and non-magnification**. */
     dmd_bw_put_flag(&bw, 1); /* vui_parameters_present_flag */
 
     dmd_bw_put_flag(&bw, 0); /* aspect_ratio_info_present_flag */
@@ -271,11 +271,11 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
 
     dmd_bw_put_flag(&bw, 1); /* bitstream_restriction_flag */
     dmd_bw_put_flag(&bw, 1); /* motion_vectors_over_pic_boundaries_flag：
-                          * 缺省即 1，写 1 不改变语义 */
-    dmd_bw_put_ue(&bw, 0);   /* max_bytes_per_pic_denom：0 = 无限制 */
-    dmd_bw_put_ue(&bw, 0);   /* max_bits_per_mb_denom：0 = 无限制 */
-    /* log2_max_mv_length_horizontal/vertical：写规范允许的最大值 15，
-     * 等价于不施加额外限制。 */
+                          * Default is 1, Write 1 does not change semantic */
+    dmd_bw_put_ue(&bw, 0);   /* Max_bytes_per_pic_denom: 0 = Unlimited */
+    dmd_bw_put_ue(&bw, 0);   /* max_bits_per_mb_denom: 0 = unlimited */
+    /* The blog  ⁇ mx_mv_length_horizontal/vertical: The writing code allows maximum value 15, which is not allowed in the first place.
+     * The equivalent is not subject to additional restrictions. */
     dmd_bw_put_ue(&bw, 15);
     dmd_bw_put_ue(&bw, 15);
     dmd_bw_put_ue(&bw, pp->num_ref_frames); /* max_num_reorder_frames */
@@ -286,9 +286,9 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferH264 *pp,
     return bw.overflow ? 0 : dmd_bw_bytes(&bw);
 }
 
-/* ------------------------------------------------------------ PPS 序列化 */
+/* - - - - - - - - - - - - - - - - - - - - - - PPS Serialisation */
 
-/* 按 §7.3.2.2 写 pic_parameter_set_rbsp。 */
+/* Press § 7.3.2.2 to write pic_parameter_set_rbsp. */
 static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
                              const VAIQMatrixBufferH264 *iq, int have_iq,
                              int have_sp, unsigned int sp_l0_minus1,
@@ -298,55 +298,55 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, out, out_cap);
 
-    dmd_bw_put_ue(&bw, 0); /* C：pic_parameter_set_id，与 slice header 引用的一致 */
-    dmd_bw_put_ue(&bw, 0); /* C：seq_parameter_set_id，与 SPS 里写的一致 */
+    dmd_bw_put_ue(&bw, 0); /* C:pic_parameter_set_id, consistent with the slick header quote */
+    dmd_bw_put_ue(&bw, 0); /* C: seq_parameter_set_id, consistent with what is written in SPS */
 
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.entropy_coding_mode_flag); /* A */
-    /* A：VA-API 的 pic_order_present_flag 即
+    /* A: pic_order_present_flag of VA-API
      * bottom_field_pic_order_in_frame_present_flag */
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.pic_order_present_flag);
-    /* B：FMO 不支持（VA-API 头文件明确 "FMO is not supported"），
-     * 所以 slice group 数恒为 1。 */
+    /* B: FMO does not support (VA-API header "FMO is not supported" ),
+     * So the number of slick groupes is always 1. */
     dmd_bw_put_ue(&bw, 0);
 
     /* B：num_ref_idx_l0/l1_default_active_minus1。
      *
-     * 照抄**当前帧** slice param 的 num_ref_idx_l0/l1_active_minus1，
-     * 并且每当这两个值变化就重发 PPS（见 decode.c 的 h264_send_param_sets）。
+     * **The current frame  ⁇ um_ref_idx_l0/l1_active_minus1 **
+     * And whenever these two values change, the PPS is reissued (see h264_send_param_sets for decode.c).
      *
-     * 为什么照抄是对的：VA-API 给的是"该 slice 的生效值"。
-     * - 对未带 num_ref_idx_active_override_flag 的 slice，生效值**就等于**
-     *   PPS 默认值 → 照抄即得真值
-     * - 对带 override 的 slice，PPS 默认值对它不起作用 → 填什么都无妨
-     * 两种情况都正确，且不需要区分 override_flag（VA-API 并未暴露它）。
+     * Why is this correct: VA-API gives "the effective value of this slice."
+     * - For slicks without num_ref_idx_active_override_flag, the effective value** equals**
+     *   PPS Default Value * Copying is real
+     * - The default PPS does not work for the slick with override.
+     * Both cases are correct and there is no need to distinguish between override_flag (VA-API does not reveal it).
      *
-     * ⚠️ 两条不能走的歧路，都已实测证伪：
-     * 1) 取**首个 IDR** 的 slice param —— I slice 没有这个语法元素，恒为 0，
-     *    于是非 override 的 B slice 只用 1 个参考帧。这是旧实现的 bug。
-     * 2) 用 num_ref_frames-1 当"安全上界" —— **l1 一位都不能偏大**。
-     *    单变量实测（另一值保持真值 l0=2/l1=0）：
-     *      l0_m1 = 0,1 → 错；2,3,4,15 → 对（l0 可偏大）
-     *      l1_m1 = 0 → 对；1,2,3 → 全错（l1 不可偏大）
-     *    因为 l1_default_active 决定非 override B slice 里 ref_idx_l1 的
-     *    **熵解码码长**，改了它就是语法解析层错位，不是预测质量问题。
+     * Two ways of indefensible error have been tested for perjury:
+     * 1) The first slick paraam ** IDR** -- I slice does not have this syntax element, constant 0,
+     *    So B slice, which is not override, uses only one frame. This is the old bug.
+     * 2) Use num_ref_frames-1 when "safe above" -- **l1 Not one person is larger**.
+     *    Single variable actual (the other value remains true at l0=2/l1=0):
+     *      0_m1 = 0,1  ⁇  error; 2,3,4,15  ⁇  (algesic)
+     *      1_m1 = 0  ⁇  Yes; 1,2,3  ⁇  All wrong (l1 is not big)
+     *    Because I've decided not to be a self-default_active one of the most important things in the "override B slick"
+     *    ** Entropy decoding long**, changed to a syntax decoupling layer, not a quality prediction problem.
      *
-     * ── 实测修正（浏览器黑屏的真正原因）─────────────────────
-     * 上面"照抄当前帧生效值"的推理漏了一种情况：**带 override 的 slice**。
-     * 对它们 VA-API 给的是 override 后的值，与 PPS 默认值无关，
-     * 于是我们会写出一个错的默认值，而**其他**非 override slice 会用它。
+     * - -----------------------------------------------------------------------------------
+     * The reasoning "Clump the current frame" leaves out a situation: ** slick** with override.
+     * For them VA-API gives value after override, regardless of PPS default,
+     * So we'll write a wrong default, and the **other **not override slick will use it.
      *
-     * 实测证据：test1080.h264 的真实 PPS 恒为 l0=2 l1=0（原码流只有一份
-     * PPS），而驱动送出了 5 种变体：l0 取 0/1/2/3、l1 取 0/1。
-     * 其中只有 l0=2 l1=0 那份是对的。会话开头送的恰好是 l0=0 那份，
-     * 于是从第 4 帧起（前 3 帧是流水线里已解好的）画面全黑到下一个 IDR ——
-     * 每轮循环黑 25 帧左右，就是用户看到的"每隔一段黑屏一次"。
+     * Actual evidence: test1080.h264 real PPS constant at 1 = 2 l1 = 0 (only one original stream).
+     * PPS, which is driven by 5 variants: zero 0/1/2/3, 11 0/1.
+     * Only 1 0 = 2 1 = 0 is right. The opening session is exactly the same as the 0 = 0.
+     * So the screens are blacked out from the fourth frame to the next IDR--
+     * Every round black 25 frames around, is what users see as "every other black screen."
      *
-     * 修正办法：**取见过的最大 l0、最小 l1**。
-     * - l0 可以偏大（已实测：l0_m1=2,3,4,15 都对），所以取最大值安全，
-     *   且能覆盖真实默认值（真实值必 <= 某个 slice 的生效值）。
-     * - l1 一位都不能偏大，所以取最小值 —— 非 override slice 报的就是
-     *   真实默认值，而 override slice 只会报得更大。
-     * 这样多轮之后收敛到唯一一份 PPS，也顺带消除了无意义的反复重送。 */
+     * Method of amendment: ** Maximum number of times taken, minimum number of times.
+     * -Twenty can be larger (actually: 1-m1=2, 3, 4, 15), so the maximum is safe.
+     *   and overwrites the true default value (the true value must be < = the effective value of a slice).
+     * -1 No one is bigger, so minimum is required - not the override slick
+     *   Real default, while override slice only returns more.
+     * The only PPS that has been collected after these multiple rounds has been removed by the random repeat. */
     unsigned int def_l0 = have_sp ? sp_l0_minus1 : 0;
     unsigned int def_l1 = have_sp ? sp_l1_minus1 : 0;
     (void)pp;
@@ -367,13 +367,13 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.constrained_intra_pred_flag); /* A */
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.redundant_pic_cnt_present_flag); /* A */
 
-    /* PPS 的可选尾部：只在需要表达 transform_8x8 或缩放矩阵时才写。
-     * 注意这三个字段是"要么全写要么全不写"（more_rbsp_data 判定）。
+    /* Optional end of PPS: only if you want to express transform_8x8 or zoom in the matrix.
+     * Note that these three fields are either "all or nothing" (more_rbsp_data).
      *
-     * 前提：SPS 侧的 profile_idc / constraint_set 组合必须允许解码器读到
-     * 这段尾部（见 build_sps_rbsp 里 constraint_set 的说明）。我们只在
-     * ConstrainedBaseline 上置 constraint 位，而 ConstrainedBaseline 不允许
-     * transform_8x8，所以 need_tail 与"尾部可读"这两件事不会冲突。 */
+     * Precondition: The profile_idc / constraining_set combination on the SPS side must allow the decoder to read to
+     * This tail (see instructions for the background_set in build_sps_rbsp). We're just...
+     * Constrained Basin has been raised to the constraint position, and Constrained Basin is not allowed
+     * Transform_8x8, so there's no conflict between need_tail and "end readable." */
     int need_tail = pp->pic_fields.bits.transform_8x8_mode_flag || have_iq ||
                     pp->second_chroma_qp_index_offset !=
                         pp->chroma_qp_index_offset;
@@ -381,18 +381,18 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
     if (need_tail) {
         dmd_bw_put_flag(&bw, pp->pic_fields.bits.transform_8x8_mode_flag); /* A */
 
-        /* B：缩放矩阵。VAIQMatrixBufferH264 给的是最终绝对值矩阵，
-         * 而码流里是相对 fallback 的差分（delta_scale）。
+        /* B: Scale matrix. VAIQMatrix BufferH264 gives the final absolute matrix,
+         * The bitstream is a difference in the value relative to the fallback (delta_scale).
          *
-         * 这里选择**不写**（pic_scaling_matrix_present_flag = 0）：
-         * 反推 delta_scale 需要知道 fallback 基准（规则 A 用默认矩阵、
-         * 规则 B 用前一个矩阵），而"这个矩阵到底来自 SPS 还是 PPS"
-         * 在 VA-API 层面无法判定 —— 猜错会让整张矩阵偏移。
+         * Here choose not to write** (pic_scaling_matrix_present_flag=0):
+         * Inverted delta_scale needs to know the fallback benchmark (rule A uses default matrix, default matrix, default matrix, default matrix, default matrix, default matrix, default matrix, default matrix, default checker
+         * Rule B, with the previous matrix, and "Is this matrix from the SPS or PPS?"
+         * Unable to determine at VA-API level -- guessing will deflect the entire matrix.
          *
-         * 后果：若码流用了非默认缩放矩阵，反量化系数会与编码端不一致，
-         * 表现为**轻微失真而非花屏**（矩阵只影响系数缩放，不影响熵解码
-         * 与预测结构）。实测 ffmpeg 默认编码不启用自定义矩阵，
-         * 这条路径在常见码流上不触发。 */
+         * Consequences: If the bitstream uses a non-default scaling matrix, the counter-quantification factor is not consistent with the coding end.
+         * ** Minor distortion rather than flower screen** (moderate only influences the scaling coefficient and does not affect entropy decoding)
+         * . The ffmpeg default encoding does not enable custom matrices,
+         * This path is not triggered by the common stream. */
         dmd_bw_put_flag(&bw, 0);
 
         dmd_bw_put_se(&bw, pp->second_chroma_qp_index_offset); /* A */
@@ -404,10 +404,10 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferH264 *pp,
     return bw.overflow ? 0 : dmd_bw_bytes(&bw);
 }
 
-/* ------------------------------------------------------------ 对外接口 */
+/* - - - - - - - - - - - - - - - - - - - - - - External interface */
 
-/* 组装一个带起始码的 NALU：00 00 00 01 + nal_header + 转义后的 RBSP。
- * nal_ref_idc 对参数集固定 3（最高优先级，标准推荐）。 */
+/* To assemble a NAMU:0000 01 + nal_header + RBP with a starting code.
+ * nal_ref_idc fixes the parameter set (highest priority, standard recommendation). */
 static size_t emit_nalu(unsigned int nal_ref_idc, unsigned int nal_unit_type,
                         const unsigned char *rbsp, size_t rbsp_len,
                         unsigned char *out, size_t out_cap)
@@ -450,9 +450,9 @@ size_t dmd_h264_build_pps_nalu(const VAPictureParameterBufferH264 *pp,
                                unsigned char *out, size_t out_cap)
 {
     unsigned char rbsp[256];
-    /* l0/l1 由调用方推导后传入，**不能**直接取 sp 里的生效值 ——
-     * 带 override_flag 的 slice 其生效值与 PPS 默认值无关。
-     * 见 decode.c 里的推导说明。 */
+    /* ⁇ / l1 is passed on by the caller, ** cannot ** directly take the entry value from the sp--
+     * The entry value of the slick with override_flag is not related to the PPS default.
+     * See the decode.c for the deference note. */
     size_t n = build_pps_rbsp(pp, iq, have_iq, sp != NULL,
                               def_l0_minus1, def_l1_minus1, rbsp,
                               sizeof(rbsp));

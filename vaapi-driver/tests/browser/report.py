@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""收集浏览器回传的帧序观测。只服务本机，收满即退。"""
+"""Collect frame-order reports over localhost and exit after the requested count."""
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 OUT=os.environ.get("OUT","/tmp/cr/auto/result.json")
@@ -25,7 +25,7 @@ class H(BaseHTTPRequestHandler):
         ex.append(data)
         json.dump(ex,open(OUT,"w"),ensure_ascii=False,indent=1)
         DONE["n"]+=1
-        print(f"报告 {DONE['n']}/{WANT}: {data.get('label')}",flush=True)
+        print(f"Report {DONE['n']}/{WANT}: {data.get('label')}",flush=True)
         self._s(200,b"ok")
     def do_GET(self):
         p=self.path.split("?")[0]

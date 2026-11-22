@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""把 Annex B 码流里的 SPS 改写成"去掉 VUI、其余比特完全不变"的版本。
+"""Take it. Annex B In the stream. SPS Rewrite to"Get rid of it. VUI、The rest of the bits are completely unchanged."Version of the。
 
-目的：隔离验证 MediaCodec 是否真的需要 SPS 里的 VUI。
-若替换后仍能逐字节正确解码，说明合成 SPS 不写 VUI 是安全的，
-那么 H.264 路径 PSNR 11.5dB 的根因就在别的字段上，而不是缺 VUI。
+Purpose: Separating authentication MediaCodec Do you really need it? SPS Yes. VUI。
+If replaced, you can still decode correctly by bytes, which describes the synthesis SPS No writing. VUI It’s safe.，
+Well... H.264 Path PSNR 11.5dB The root causes are on other fields, not missing. VUI。
 """
 import re
 import sys
@@ -87,9 +87,9 @@ class BW:
 
 
 def rewrite_sps_without_vui(sps_nalu):
-    """输入含 NAL header 的 SPS NALU（无起始码），返回去 VUI 后的 NALU。"""
+    """Enter content NAL header of SPS NALU（No start code. Go back. VUI Behind NALU。"""
     rbsp = unescape(sps_nalu)
-    g = BR(rbsp, 8)  # 跳过 NAL header 字节
+    g = BR(rbsp, 8)  # skip NAL header bytes
     w = BW()
 
     profile_idc = g.u(8)
@@ -109,7 +109,7 @@ def rewrite_sps_without_vui(sps_nalu):
         smp = g.u(1)
         w.u(smp, 1)             # seq_scaling_matrix_present_flag
         if smp:
-            raise SystemExit("该流带 scaling matrix，本脚本未实现（不影响结论，换个流即可）")
+            raise SystemExit("The strap. scaling matrix，This script is not realized (without prejudice to conclusions, a new stream is sufficient)）")
 
     w.ue(g.ue())                # log2_max_frame_num_minus4
     poc = g.ue()
@@ -117,7 +117,7 @@ def rewrite_sps_without_vui(sps_nalu):
     if poc == 0:
         w.ue(g.ue())            # log2_max_pic_order_cnt_lsb_minus4
     elif poc == 1:
-        raise SystemExit("poc_type==1 未实现")
+        raise SystemExit("poc_type==1 Not achieved")
 
     w.ue(g.ue())                # max_num_ref_frames
     w.u(g.u(1), 1)              # gaps_in_frame_num_value_allowed_flag
@@ -135,7 +135,7 @@ def rewrite_sps_without_vui(sps_nalu):
             w.ue(g.ue())        # crop offsets
 
     vui = g.u(1)
-    w.u(0, 1)                   # vui_parameters_present_flag := 0（这就是本次改动）
+    w.u(0, 1)                   # vui_parameters_present_flag := 0（This is the change.）
     w.trailing()
 
     body = w.bytes()
@@ -147,34 +147,34 @@ def main():
     d = open(src, "rb").read()
     starts = [m.start() for m in re.finditer(b"\x00\x00\x01", d)]
     if not starts:
-        raise SystemExit("找不到起始码")
+        raise SystemExit("No start code found")
 
     out = bytearray()
     replaced = 0
     for i, p in enumerate(starts):
         s = p + 3
         e = (starts[i + 1] if i + 1 < len(starts) else len(d))
-        # 去掉下一个起始码前的拖尾零
+        # Remove the tailing zero from the next code.
         end = e
         while end > s and d[end - 1] == 0:
             end -= 1
         nalu = d[s:end]
-        prefix = d[p:s]  # 保留原始起始码形态
-        # 保留原 NALU 前的前导零（4 字节起始码的情形）
+        prefix = d[p:s]  # Keep original starting-code form
+        # Keep the original NALU pre-guiding zero (4 byte start code)
         if i == 0 and p > 0:
             out += d[:p]
         if nalu and (nalu[0] & 0x1f) == 7:
             new, had = rewrite_sps_without_vui(nalu)
-            print(f"SPS: {len(nalu)} -> {len(new)} 字节, 原 vui_present={had}")
+            print(f"SPS: {len(nalu)} -> {len(new)} bytes, Original vui_present={had}")
             out += prefix + new
             replaced += 1
         else:
             out += prefix + nalu
-        # 补回拖尾零
+        # Recover the trail zero.
         out += d[end:e]
 
     open(dst, "wb").write(bytes(out))
-    print(f"替换 {replaced} 个 SPS -> {dst} ({len(out)} 字节, 原 {len(d)} 字节)")
+    print(f"Replace {replaced}  SPS -> {dst} ({len(out)} bytes, Original {len(d)} bytes)")
 
 
 if __name__ == "__main__":

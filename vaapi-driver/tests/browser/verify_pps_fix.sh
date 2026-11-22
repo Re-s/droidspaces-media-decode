@@ -1,47 +1,37 @@
 #!/bin/bash
-# Chrome 画面错乱修复的 A-B 反证（H.264 与 HEVC）。
+# A/B regression test for H.264 and HEVC frame delivery in Chrome.
 #
-# 支持两种素材，用 SRC/SIG 环境变量切换：
-#   SRC=h264_slow.mp4  SIG=h264_sig.json   （默认）
-#   SRC=order_slow.mp4 SIG=hevc_sig.json   （HEVC）
+# Select a clip and software-decoded reference signatures with SRC and SIG.
+#   SRC=h264_slow.mp4  SIG=h264_sig.json   (default)
+#   SRC=order_slow.mp4 SIG=hevc_sig.json   (HEVC)
 #
-# ── 这个脚本存在的理由 ────────────────────────────────────────
-# 被修的 bug 是：I/IDR slice 没有 num_ref_idx_l0/l1_active_minus1 语法元素，
-# VA-API 对它恒报 0，而会话第一帧必然是 IDR，于是驱动把 0 当成 PPS 默认值
-# 的真值写出去（真实值为 l0=2）。
+# An I/IDR slice has no num_ref_idx_l0/l1_active_minus1 fields. VA-API
+# reported zero, which the old driver used as the initial PPS default even
+# though the stream required l0=2. FFmpeg queued enough frames for a correct
+# PPS to arrive before the decoder needed it. Chrome submitted one frame at
+# a time and exposed the first incorrect PPS. Compare canvas signatures to
+# software-decoded pixels to identify the frame that was actually displayed.
 #
-# **这个 bug 在 ffmpeg 路径上完全测不出来。** 实测：旧版驱动跑
-# h264_slow.mp4，前 8 帧与软解逐字节一致，md5 PASS，加 DMD_NO_MAP_WAIT
-# 也一样 PASS。
+# H.264, three rounds of 20 samples:
+#   Old (first PPS 9 bytes, l0=0): 5/4/5 matched, 13/13/13 unrecognized.
+#   New (first PPS 10 bytes, l0=2): 20/20/20 matched, zero mismatches.
+# HEVC, two rounds of 20 samples:
+#   Old: 3/4 matched, 13/11 unrecognized.
+#   New: 20/20 matched, zero mismatches.
 #
-# 原因是提交节奏。ffmpeg 一次灌 6 帧以上（日志里 pend 涨到 6），驱动在
-# unit 1 送出错的 PPS、unit 3 就送出了对的，硬件真正开始解码时正确的
-# PPS 已经到了，bug 被掩盖。Chrome 是逐帧提交，第一帧解码时只有那份错的。
+# HEVC submits its parameter sets once per session. The improvement came
+# from receiving frames before EndPicture returned. With SPS reorder set
+# back to zero, that change alone still gave 20 matches out of 20, with no
+# frames received by the background thread. See the comments in decode.c.
 #
-# 所以验证这个修复**必须用浏览器**，判据是像素而不是帧号单调性：
-# 抓 canvas 像素算签名，与软解基线比对，得出"画面里实际是第几帧"。
-#
-# ── 实测结果（三轮，完全可重复）────────────────────────────
-# H.264（h264_slow.mp4，三轮）：
-#   旧版（首份 PPS 9 字节 l0=0）：一致 5/4/5，无法识别 13/13/13（共 20）
-#   新版（首份 PPS 10 字节 l0=2）：一致 20/20/20，不符 0
-# HEVC（order_slow.mp4，两轮）：
-#   旧版：一致 3/4，无法识别 13/11（共 20）
-#   新版：一致 20/20，不符 0
-#
-# ⚠️ HEVC 侧的改善**不是** PPS 修复带来的（HEVC 参数集每会话只送 1 次）。
-# 单变量实验确认真正起作用的是 decode.c 里 EndPicture 返回前的收帧块：
-# 把合成 SPS 的 reorder 回退成写 0、仅保留该收帧块的变体，仍然 20/20 全对，
-# 且后台收帧线程 reap=0。详见 decode.c 该处注释。
-#
-# 用法：verify_pps_fix.sh <旧版build目录> <新版build目录> [轮数]
-# 旧版可用 git worktree 构建：
+# Usage: verify_pps_fix.sh <old build directory> <new build directory> [rounds]
+# To build the old driver in a separate worktree:
 #   git worktree add --detach /tmp/oldwt 9f00b1a6
 #   cd /tmp/oldwt/vaapi-driver && make VA_CFLAGS=... DRM_CFLAGS=...
 
 set -u
-OLD="${1:?旧版 build 目录}"
-NEW="${2:?新版 build 目录}"
+OLD="${1:?old build directory}"
+NEW="${2:?new build directory}"
 ROUNDS="${3:-1}"
 CR=/tmp/cr
 PORT_BASE=8971
@@ -49,23 +39,23 @@ SRC="${SRC:-h264_slow.mp4}"
 SIG="${SIG:-h264_sig.json}"
 
 for d in "$OLD" "$NEW"; do
-    [ -f "$d/msm_drm_drv_video.so" ] || { echo "找不到驱动: $d"; exit 2; }
+    [ -f "$d/msm_drm_drv_video.so" ] || { echo "No driver found: $d"; exit 2; }
 done
-[ -f "$CR/order_pixel.html" ] || { echo "缺 $CR/order_pixel.html"; exit 2; }
-[ -f "$CR/$SIG" ] || { echo "缺基准签名表 $CR/$SIG"; exit 2; }
-[ -f "$CR/$SRC" ] || { echo "缺素材 $CR/$SRC"; exit 2; }
-echo "素材: $SRC  基准表: $SIG"
+[ -f "$CR/order_pixel.html" ] || { echo "Not available $CR/order_pixel.html"; exit 2; }
+[ -f "$CR/$SIG" ] || { echo "Missing base signature table $CR/$SIG"; exit 2; }
+[ -f "$CR/$SRC" ] || { echo "Shortage of material $CR/$SRC"; exit 2; }
+echo "Clip: $SRC  Reference signatures: $SIG"
 
-echo "旧版: $(strings "$OLD/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
-echo "新版: $(strings "$NEW/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
+echo "old version: $(strings "$OLD/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
+echo "new version: $(strings "$NEW/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
 echo
 
 mkdir -p "$CR/rev"
 
 run_one() {
-    # 注意不要加 --disable-vulkan：Chrome 151 没这个开关（纯被忽略），且
-    # 骁龙 8 Elite 上关 Vulkan 会让显示错乱，只有 nabu 需要关、且只能在
-    # chrome://flags 里关。见 doc/browser-vaapi-guide.md 第 2.5 节。
+    # Chrome 151 ignores --disable-vulkan. On the original Snapdragon 8
+    # Elite test system, disabling Vulkan in chrome://flags caused display
+    # corruption. See doc/browser-vaapi-guide.md section 2.5 for the nabu case.
     local mode="$1" port="$2" drv="$3"
     rm -f "$CR/rev/$mode.json"
     OUT="$CR/rev/$mode.json" ROOT="$CR" WANT_REPORTS=1 \
@@ -96,7 +86,7 @@ pkill -9 -x google-chrome 2>/dev/null
 sleep 1
 
 for r in $(seq 1 "$ROUNDS"); do
-    echo "--- 第 $r 轮 ---"
+    echo "--- Round $r ---"
     run_one "old$r" $((PORT_BASE + r * 4))     "$OLD"
     run_one "new$r" $((PORT_BASE + r * 4 + 2)) "$NEW"
 done
@@ -125,29 +115,30 @@ def evaluate(path):
 
 rounds = int(sys.argv[1])
 print()
-print('轮次  旧版 一致/不符/无法识别        新版 一致/不符/无法识别')
+print('Round  Old (match/mismatch/unknown)  New (match/mismatch/unknown)')
 bad_new = 0
 for r in range(1, rounds + 1):
     o = evaluate(f'{CR}/rev/old{r}.json')
     n = evaluate(f'{CR}/rev/new{r}.json')
-    fo = f'{o[1]}/{o[2]}/{o[3]} (采{o[0]})' if o else '无结果'
-    fn = f'{n[1]}/{n[2]}/{n[3]} (采{n[0]})' if n else '无结果'
+    fo = f'{o[1]}/{o[2]}/{o[3]} ({o[0]} samples)' if o else 'No result'
+    fn = f'{n[1]}/{n[2]}/{n[3]} ({n[0]} samples)' if n else 'No result'
     print(f'  {r}   {fo:28s}  {fn}')
     if n and (n[2] or n[3]):
         bad_new += 1
 
 print()
 if bad_new:
-    print(f'✗ 新版有 {bad_new} 轮出现不符或无法识别 —— 修复未达预期')
+    print(f'✗ {bad_new} round(s) with the new driver had mismatches or unrecognized frames')
 else:
-    print('✓ 新版全部一致；旧版应显著更差（预期一致约 4~5/20、无法识别约 13/20）')
+    print('✓ All frames matched with the new driver. The old driver is expected to match about 4–5 of 20, with about 13 unrecognized.')
 PY
 
 for r in $(seq 1 "$ROUNDS"); do
     for t in old new; do
+        # Match fields shared by both the current and historical driver logs.
         f="$CR/rev/c_$t$r.log"
-        [ -f "$f" ] && printf '%-8s 首份PPS=%s 配对=%s\n' "$t$r" \
-            "$(grep -m1 -o '已送 PPS [0-9]* 字节' "$f")" \
-            "$(grep -c '配对: 帧' "$f")"
+        [ -f "$f" ] && printf '%-8s First PPS=%s match=%s\n' "$t$r" \
+            "$(grep -m1 -o 'PPS [0-9][0-9]*' "$f")" \
+            "$(grep -c ' -> surface .* (unit .* seq .* POC ' "$f")"
     done
 done

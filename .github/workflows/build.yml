@@ -1,15 +1,10 @@
 name: build
 
-# 0.4.0 起只有一个产物：msm_drm_drv_video.so
-#
-# 0.3.x 曾有三个（decode-daemon / 驱动 / dmd_watchdog 模块 zip），因为解码是
-# 在 Android 侧用 MediaCodec 做的，需要一个常驻 daemon 和一个看护它的 KSU 模块。
-# 改成驱动内 V4L2 直通后，解码全程在容器进程内完成（libva 驱动直连
-# /dev/video32），Android 侧不再有本项目的任何可执行文件 —— daemon job 与
-# watchdog job 一并删除。
-#
-# 驱动必须在 aarch64 上编（vaapi-driver/Makefile 顶部有说明：x86_64 交叉
-# 工具链缺 aarch64 glibc），所以走 QEMU 容器。
+# Since 0.4.0, the only release artifact is msm_drm_drv_video.so.
+# The driver opens /dev/video32 directly from the container. In 0.3.x,
+# an Android MediaCodec daemon and its KSU watchdog were also distributed.
+# Build in an aarch64 QEMU container because the x86_64 cross toolchain lacks
+# the aarch64 glibc needed by the driver. See vaapi-driver/Makefile.
 on:
   push:
     branches: [ master ]
@@ -110,45 +105,40 @@ jobs:
           prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
           {
             echo
-            echo '### 本次改动范围'
+            echo '### Scope of changes'
             echo
             if [ -n "$prev" ]; then
-              echo "与 \`${prev}\` 相比："
+              echo "Compared with \`${prev}\`:"
               echo
               driver_changed=$(git diff --name-only "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | wc -l)
               if [ "$driver_changed" -gt 0 ]; then
-                echo "- **\`msm_drm_drv_video.so\`**：源码有改动（\`vaapi-driver/src/\` 下 ${driver_changed} 个文件）"
+                echo "- **\`msm_drm_drv_video.so\`** changed (${driver_changed} files under \`vaapi-driver/src/\`)."
                 git diff --stat "${prev}..${GITHUB_REF_NAME}" -- vaapi-driver/src/ | sed 's/^/      /'
               else
-                echo "- **\`msm_drm_drv_video.so\`**：**源码无改动**（\`vaapi-driver/src/\` 零变更）。"
-                echo "  二进制的 checksum 仍可能与上一版不同，因为它是在 CI 上重新编译的。"
-                echo "  行为未变。"
+                echo "- **\`msm_drm_drv_video.so\`** source is unchanged."
+                echo "  The checksum may differ because CI rebuilt the driver."
               fi
             else
-              echo "首个带此说明的版本，无法与上一 tag 比较。"
+              echo "No previous tag is available for comparison."
             fi
             echo
-            echo '### 构建环境'
-            echo
-            echo '| 产物 | 工具链 |'
+            echo '### Build environment'
+            echo '| Artifact | Toolchain |'
             echo '|---|---|'
-            echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64，系统 gcc |"
+            echo "| \`msm_drm_drv_video.so\` | Debian trixie aarch64, system GCC |"
             echo
-            echo '> 换工具链会改变二进制的 checksum，即使源码一字未动。要判断是否真有'
-            echo '> 代码改动，看上面的「改动范围」而不是 checksum。'
+            echo '> A toolchain change can alter the binary checksum. See the source diff above for code changes.'
             echo
-            echo '### 安装'
+            echo '### Install'
             echo
-            echo '⚠️ 0.4.0 起**不需要任何 Android 侧部署** —— 没有 daemon、没有'
-            echo '看护模块、没有 socket。只需把驱动放进容器：'
+            echo 'Since 0.4.0, install only the driver in the container.'
             echo
             echo '```sh'
             echo 'install -m 0644 msm_drm_drv_video.so \'
             echo '  /usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so'
             echo '```'
             echo
-            echo '前提：容器内有 `libva2`、`libva-drm2`，且容器用户在'
-            echo '`droidspaces-gpu` 组内（平台侧通常已代为加组）。'
+            echo 'Install `libva2` and `libva-drm2` in the container and verify that the user belongs to the `droidspaces-gpu` group.'
           } >> notes.md
           cat notes.md
 

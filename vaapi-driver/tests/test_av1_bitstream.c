@@ -1,18 +1,18 @@
-/* AV1 比特流原语自测。
+/* AV1 Bits in the original language.
  *
- * 为什么值得单独测：这些编码规则错一位，整条码流就从该位起全部错位，
- * 而症状是解码器给一句含糊的 "failed to read obu"——从现象反推不出是
- * leb128 少写了一字节还是 ns(n) 位宽算错。所以在接入真实合成之前，
- * 先用规范里的已知值把每个原语钉死。
+ * Why is it worth taking alone: these code rules are wrong, and the entire bar stream is completely misplaced from there.
+ * And the symptoms are a vague "failed to read obu" -- not from the phenomenon.
+ * Leb128 writes a byte less or n(n) bitwidth error. So before the access is really synthesized,
+ * The known values in the norms are used to nail each original word first.
  *
- * 期望值来源：AV1 规范 4.10（leb128/uvlc/le/su/ns）与 5.3（obu_header）。
- * leb128 的边界值另与 protobuf 的 varint 定义交叉核对（同一编码）。
+ * Source of expected values: AV1 Regulation 4.10 (leb128/uvlc/le/su/ns) and 5.3 (obu_header).
+ * The boundary value of the leb128 is also cross-checked with the protobuf definition of varint (the same code).
  *
- * 独立编译，不链 libva：
+ * Independent compile, unchained libva:
  *   gcc -o test_av1 tests/test_av1_bitstream.c src/av1_bitstream.c src/bitstream.c
  */
 #include <stdio.h>
-#include <stdlib.h>      /* setenv/unsetenv：切 DMD_AV1_NO_SHOWFORCE */
+#include <stdlib.h>      /* Setenv/unsetenv: Tox DMD_AV1_NO_SHOWORCE */
 #include <string.h>
 
 #include <va/va.h>
@@ -28,9 +28,9 @@ static void check_bytes(const char *what, const unsigned char *got, size_t got_n
     if (got_n == want_n && memcmp(got, want, want_n) == 0)
         return;
     fails++;
-    printf("  ✗ %s\n    实得 (%zu 字节):", what, got_n);
+    printf("  ✗ %s\n    - Yeah. (%zu bytes):", what, got_n);
     for (size_t i = 0; i < got_n; i++) printf(" %02x", got[i]);
-    printf("\n    期望 (%zu 字节):", want_n);
+    printf("\n    Expectations (%zu bytes):", want_n);
     for (size_t i = 0; i < want_n; i++) printf(" %02x", want[i]);
     printf("\n");
 }
@@ -40,22 +40,22 @@ static void check_eq(const char *what, long got, long want)
     if (got == want)
         return;
     fails++;
-    printf("  ✗ %s: 实得 %ld，期望 %ld\n", what, got, want);
+    printf("  ✗ %s: - Yeah. %ld,Expectations %ld\n", what, got, want);
 }
 
 /* ---------------------------------------------------------------- leb128 */
 
 static void test_leb128(void)
 {
-    printf("leb128（规范 4.10.5）\n");
+    printf("leb128(Norms 4.10.5)\n");
     struct { uint64_t v; size_t n; unsigned char want[4]; } tv[] = {
         { 0,     1, { 0x00 } },
         { 1,     1, { 0x01 } },
-        { 127,   1, { 0x7f } },          /* 单字节上界 */
-        { 128,   2, { 0x80, 0x01 } },    /* 进位边界 */
+        { 127,   1, { 0x7f } },          /* Word Top */
+        { 128,   2, { 0x80, 0x01 } },    /* Borders in point */
         { 255,   2, { 0xff, 0x01 } },
         { 256,   2, { 0x80, 0x02 } },
-        { 16383, 2, { 0xff, 0x7f } },    /* 双字节上界 */
+        { 16383, 2, { 0xff, 0x7f } },    /* Double Byte Top */
         { 16384, 3, { 0x80, 0x80, 0x01 } },
     };
     for (size_t i = 0; i < sizeof(tv) / sizeof(tv[0]); i++) {
@@ -65,21 +65,21 @@ static void test_leb128(void)
         snprintf(msg, sizeof(msg), "leb128(%llu)", (unsigned long long)tv[i].v);
         check_bytes(msg, out, n, tv[i].want, tv[i].n);
 
-        /* 长度预估必须与实际写入一致——obu_size 要先算长度再写 payload。 */
+        /* The length estimate must be consistent with actual writing -- obu_size must be calculated for length before payload. */
         snprintf(msg, sizeof(msg), "leb128_len(%llu)", (unsigned long long)tv[i].v);
         check_eq(msg, (long)dmd_av1_leb128_len(tv[i].v), (long)tv[i].n);
     }
 
-    /* 容量不足必须返回 0，不能越界写。 */
+    /* The capacity deficit must be returned to 0 and cannot be written across borders. */
     unsigned char tiny[1];
-    check_eq("leb128 容量不足返回 0", (long)dmd_av1_leb128(128, tiny, 1), 0);
+    check_eq("leb128 Unlimited capacity returns 0", (long)dmd_av1_leb128(128, tiny, 1), 0);
 }
 
 /* ------------------------------------------------------------- obu_header */
 
 static void test_obu_header(void)
 {
-    printf("obu_header（规范 5.3.1/5.3.2）\n");
+    printf("obu_header(Norms 5.3.1/5.3.2)\n");
 
     /* forbidden(1)=0 type(4) ext(1)=0 has_size(1)=1 reserved(1)=0 */
     struct { int type; unsigned char first; const char *name; } tv[] = {
@@ -93,84 +93,84 @@ static void test_obu_header(void)
         unsigned char out[8];
         size_t n = dmd_av1_obu_header(tv[i].type, 10, out, sizeof(out));
         char msg[80];
-        snprintf(msg, sizeof(msg), "%s 首字节", tv[i].name);
-        check_eq(msg, n, 2);                 /* 1 头 + 1 leb128(10) */
+        snprintf(msg, sizeof(msg), "%s First bytes", tv[i].name);
+        check_eq(msg, n, 2);                 /* 1 Head + 1 leb 128 (10) */
         check_eq(msg, out[0], tv[i].first);
         snprintf(msg, sizeof(msg), "%s obu_size", tv[i].name);
         check_eq(msg, out[1], 10);
     }
 
-    /* 大 payload：obu_size 变成 2 字节。 */
+    /* Big payload: obu_size becomes 2 bytes. */
     unsigned char out[8];
     size_t n = dmd_av1_obu_header(DMD_OBU_TILE_GROUP, 200, out, sizeof(out));
-    check_eq("TILE_GROUP payload=200 总长", (long)n, 3);
-    check_eq("  首字节", out[0], 0x22);
+    check_eq("TILE_GROUP payload=200 Chief", (long)n, 3);
+    check_eq("  First bytes", out[0], 0x22);
     check_eq("  size[0]", out[1], 0xc8);
     check_eq("  size[1]", out[2], 0x01);
 
-    /* 反向确认实测到的非法值：0xd0 的 forbidden 位是 1，type 是 10。
-     * 这条断言的作用是把"为什么裸载荷不是 OBU"固化成可执行的证据。 */
+    /* Inverse confirmation of illegal value: 0xd0 forbidden is 1, type is 10.
+     * The effect of this assertion is to solidise the "Why Naked Loads Not OBU" into enforceable evidence. */
     unsigned char bad = 0xd0;
-    check_eq("0xd0 的 forbidden_bit（非法）", (bad >> 7) & 1, 1);
-    check_eq("0xd0 的 obu_type（保留值）",    (bad >> 3) & 0x0f, 10);
+    check_eq("0xd0 of forbidden_bit(Illegal)", (bad >> 7) & 1, 1);
+    check_eq("0xd0 of obu_type(Reserve value)",    (bad >> 3) & 0x0f, 10);
 }
 
-/* ------------------------------------------------------------------ 对齐 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - Alignment */
 
 static void test_align(void)
 {
-    printf("byte_alignment / trailing_bits（规范 5.3.4/5.3.5）\n");
+    printf("byte_alignment / trailing_bits(Norms 5.3.4/5.3.5)\n");
 
-    /* byte_align：纯补零，不写 stop bit。写 3 位 101 后对齐 → 1010_0000 */
+    /* byte_align writes zero padding with no stop bit. Writing 101 and aligning produces 1010_0000. */
     unsigned char buf[4];
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_bw_put_bits(&bw, 0x5, 3);            /* 101 */
     dmd_av1_byte_align(&bw);
-    check_eq("byte_align 后字节数", (long)dmd_bw_bytes(&bw), 1);
-    check_eq("byte_align 结果",     buf[0], 0xa0);
+    check_eq("byte_align Number of the after-bytes", (long)dmd_bw_bytes(&bw), 1);
+    check_eq("byte_align result",     buf[0], 0xa0);
 
-    /* trailing_bits：写 1 再补零。同样 101 → 1011_0000 */
+    /* Trailing_bits: Write 1 then zero. Same as 101 § 1011_000 */
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_bw_put_bits(&bw, 0x5, 3);
     dmd_av1_trailing_bits(&bw);
-    check_eq("trailing_bits 后字节数", (long)dmd_bw_bytes(&bw), 1);
-    check_eq("trailing_bits 结果",     buf[0], 0xb0);
+    check_eq("trailing_bits Number of the after-bytes", (long)dmd_bw_bytes(&bw), 1);
+    check_eq("trailing_bits result",     buf[0], 0xb0);
 
-    /* 已对齐时 trailing_bits 仍要写那个 1（它是结束标记，不是填充）。 */
+    /* The one that is still written when the time is set (it is the end mark, not the fill). */
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_bw_put_bits(&bw, 0xff, 8);
     dmd_av1_trailing_bits(&bw);
-    check_eq("已对齐仍写标记位", (long)dmd_bw_bytes(&bw), 2);
-    check_eq("  标记字节",       buf[1], 0x80);
+    check_eq("Marker is still aligned", (long)dmd_bw_bytes(&bw), 2);
+    check_eq("  Tag Bytes",       buf[1], 0x80);
 }
 
 /* -------------------------------------------------------------------- le */
 
 static void test_le(void)
 {
-    printf("le(n)（规范 4.10.4，小端）\n");
+    printf("le(n)(Norms 4.10.4,Hey, Taki.)\n");
     unsigned char buf[8];
     struct dmd_bitwriter bw;
 
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_av1_put_le(&bw, 0x1234, 2);
-    check_eq("le(2) 字节数", (long)dmd_bw_bytes(&bw), 2);
-    check_eq("le(2)[0] 低位在前", buf[0], 0x34);
+    check_eq("le(2) Bytes", (long)dmd_bw_bytes(&bw), 2);
+    check_eq("le(2)[0] Down ahead.", buf[0], 0x34);
     check_eq("le(2)[1]",          buf[1], 0x12);
 
-    /* 未字节对齐时调用是用法错误，必须置 overflow 而不是写出错位数据。 */
+    /* The call when the bytes are not aligned is an error in usage and must be overflowed instead of writing the wrong bit. */
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_bw_put_flag(&bw, 1);
     dmd_av1_put_le(&bw, 0xff, 1);
-    check_eq("le 未对齐时置 overflow", bw.overflow, 1);
+    check_eq("le Unsettled Time overflow", bw.overflow, 1);
 }
 
 /* ------------------------------------------------------------------ uvlc */
 
 static void test_uvlc(void)
 {
-    printf("uvlc（规范 4.10.3）\n");
+    printf("uvlc(Norms 4.10.3)\n");
     /* v=0 → "1"；v=1 → "010"；v=2 → "011"；v=3 → "00100" */
     struct { uint32_t v; const char *bits; } tv[] = {
         { 0, "1" }, { 1, "010" }, { 2, "011" }, { 3, "00100" }, { 6, "00111" },
@@ -181,7 +181,7 @@ static void test_uvlc(void)
         dmd_bw_init(&bw, buf, sizeof(buf));
         dmd_av1_put_uvlc(&bw, tv[i].v);
 
-        /* 把写入的位读回成字符串比对，避免手算字节值。 */
+        /* Read the written bit back to the string matching, avoids the bytes. */
         size_t nbits = strlen(tv[i].bits);
         char got[40] = {0};
         for (size_t b = 0; b < nbits; b++)
@@ -189,7 +189,7 @@ static void test_uvlc(void)
 
         if (strcmp(got, tv[i].bits) != 0) {
             fails++;
-            printf("  ✗ uvlc(%u): 实得 %s，期望 %s\n", tv[i].v, got, tv[i].bits);
+            printf("  ✗ uvlc(%u): - Yeah. %s,Expectations %s\n", tv[i].v, got, tv[i].bits);
         }
     }
 }
@@ -198,31 +198,31 @@ static void test_uvlc(void)
 
 static void test_ns(void)
 {
-    printf("ns(n)（规范 4.10.7）\n");
-    /* n=1 不占位（唯一取值）。 */
+    printf("ns(n)(Norms 4.10.7)\n");
+    /* n = 1 is not available (only value). */
     unsigned char buf[8];
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_av1_put_ns(&bw, 0, 1);
-    check_eq("ns(v=0,n=1) 不占位", (long)bw.bit_pos, 0);
+    check_eq("ns(v=0,n=1) Do Not Place", (long)bw.bit_pos, 0);
 
-    /* n=3：w=2, m=1。v=0 → 1 位 "0"；v=1 → 2 位 "10"；v=2 → 2 位 "11" */
+    /* n=3:w=2, m=1. v=0 = 1 "0"; v= 1 = 2 "10"; v= 2 = 2 "11" */
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_av1_put_ns(&bw, 0, 3);
-    check_eq("ns(0,3) 位数", (long)bw.bit_pos, 1);
-    check_eq("ns(0,3) 值",   (buf[0] >> 7) & 1, 0);
+    check_eq("ns(0,3) Digit", (long)bw.bit_pos, 1);
+    check_eq("ns(0,3) Value",   (buf[0] >> 7) & 1, 0);
 
     dmd_bw_init(&bw, buf, sizeof(buf));
     dmd_av1_put_ns(&bw, 2, 3);
-    check_eq("ns(2,3) 位数", (long)bw.bit_pos, 2);
-    check_eq("ns(2,3) 值",   (buf[0] >> 6) & 3, 3);
+    check_eq("ns(2,3) Digit", (long)bw.bit_pos, 2);
+    check_eq("ns(2,3) Value",   (buf[0] >> 6) & 3, 3);
 }
 
 /* -------------------------------------------------------------------- su */
 
 static void test_su(void)
 {
-    printf("su(n)（规范 4.10.6，补码）\n");
+    printf("su(n)(Norms 4.10.6,Compend)\n");
     unsigned char buf[8];
     struct dmd_bitwriter bw;
 
@@ -239,13 +239,13 @@ static void test_su(void)
     check_eq("su(-8,4) = 0b1000", (buf[0] >> 4) & 0xf, 0x8);
 }
 
-/* -------------------------------------------------------------- 序列头合成 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - Sequence head synthesis */
 
 static void test_sequence_header(void)
 {
-    printf("OBU_SEQUENCE_HEADER 合成（规范 5.5.1）\n");
+    printf("OBU_SEQUENCE_HEADER Synthetic (normative) 5.5.1)\n");
 
-    /* 1080p / 8bit / 4:2:0 / profile 0，对应实测码流 av1_1080p.obu 的属性。 */
+    /* 1080p / 8bit / 4:2 / profile 0, corresponding to properties of the actual bitstream av1_1080p.obu. */
     VADecPictureParameterBufferAV1 p;
     memset(&p, 0, sizeof(p));
     p.profile                 = 0;
@@ -263,48 +263,48 @@ static void test_sequence_header(void)
     unsigned char buf[256];
     size_t n = dmd_av1_build_sequence_header(&p, buf, sizeof(buf));
 
-    check_eq("合成成功（返回非 0）", n > 0, 1);
-    check_eq("首字节 = 0x0a（SEQ_HDR, has_size=1）", buf[0], 0x0a);
-    check_eq("obu_size 与实际 payload 一致", buf[1], (long)(n - 2));
+    check_eq("Synthetic success (returning to non-false) 0)", n > 0, 1);
+    check_eq("First bytes = 0x0a(SEQ_HDR, has_size=1)", buf[0], 0x0a);
+    check_eq("obu_size As compared to actual payload Unanimously.", buf[1], (long)(n - 2));
 
-    /* profile 在首个 payload 字节的高 3 位（f(3) 是最先写的字段）。 */
-    check_eq("payload 起始 3 位 = seq_profile", (buf[2] >> 5) & 0x7, 0);
+    /* The profile is 3 bit higher in the first payload byte (f(3) is the first written field). */
+    check_eq("payload Start 3 bits = seq_profile", (buf[2] >> 5) & 0x7, 0);
 
-    /* 容量不足必须返回 0 而不是越界写。 */
+    /* The capacity deficit must return to 0 instead of cross-border writing. */
     unsigned char tiny[4];
-    check_eq("容量不足返回 0",
+    check_eq("Unlimited capacity returns 0",
              (long)dmd_av1_build_sequence_header(&p, tiny, sizeof(tiny)), 0);
-    check_eq("NULL 参数返回 0",
+    check_eq("NULL Parameter Back 0",
              (long)dmd_av1_build_sequence_header(NULL, buf, sizeof(buf)), 0);
 
-    /* 外部交叉验证记录（本测试不联外部工具，仅留证据）：
-     * 上述参数合成出 16 字节 `0a 0e 00 00 00 05 57 7f 86 ef ff c8 81 01 00 82`，
-     * 交 ffmpeg CBS 层解析得到
+    /* External cross-checking of records (this test does not link external tools, leaving evidence only):
+     * The above parameters synthesize 16 bytes `0a 0e 00 00 00 05 57 7f 86 ff c8 81 01 00 82 `,
+     * ffmpeg CBS layer resolved
      *   "obu_type: 1, payload size: 14"
      *   "Video: av1 (Main), none(tv, bt709/unknown/unknown)"
-     * 即 profile/color_range/matrix_coefficients 三者均被如实解析。 */
+     * The three are actually being interpreted. */
 }
 
 
-/* ---------------------------------------------------------------- SEF 合成
+/* - - - - - - - - - - - - - - - - - - - - - SEF Synthesis
  *
- * 为什么值得测：show_existing_frame 单元只有 4 位有效载荷，但它的
- * 字节布局在第 65~68 轮反复出问题（当时靠改代码试反应，没有基准）。
- * 这里按规范 5.9.2 + 5.3.4 把它钉死。
+ * Why is it worth checking: the show_existing_frame unit has only 4 bit payloads, but it's
+ * The byte layouts are repeated on the 65~68 round (when the code change was tested and no benchmarks were available).
+ * Here, as per the norm, it is nailed to the ground by 5.9.2 + 5.3.4.
  *
- * 期望值推导（规范 5.3.2 obu_header + 5.9.2 frame_header + 5.3.4 trailing）：
- *   OBU 头 = forbidden(1)=0 | type(4)=OBU_FRAME_HEADER=3 | ext(1)=0
+ * The expectation is derived (regulation 5.3.2 obu_header + 5.9.2 frame_header + 5.3.4 trading):
+ *   OBU Head = forbidden (1) = 0  ⁇  type(4) = OBU_FRAME_HEADER=3  ⁇ ext(1) = 0
  *            | has_size(1)=1 | reserved(1)=0
  *          = 0<<7 | 3<<3 | 0<<2 | 1<<1 | 0 = 0x1a
- *   obu_size = 1（载荷一字节）
- *   载荷 = show_existing_frame(1)=1, frame_to_show_map_idx(3)=idx,
- *          trailing: 停止位 1 + 零填充到字节边界
+ *   obu_size = 1 (load one byte)
+ *   Load = show_existing_frame(1)=1, frame_to_show_map_idx(3)=idx,
+ *          Trailing: Stop bit 1 + Zero Filling to Byte Boundary
  *        = 1 idx idx idx 1 0 0 0
  * idx=0 → 0b1000_1000 = 0x88；idx=5 → 0b1101_1000 = 0xd8
  * idx=7 → 0b1111_1000 = 0xf8 */
 static void test_show_existing(void)
 {
-    printf("show_existing_frame 合成（规范 5.9.2）\n");
+    printf("show_existing_frame Synthetic (normative) 5.9.2)\n");
     unsigned char buf[8];
 
     static const unsigned char want0[] = { 0x1a, 0x01, 0x88 };
@@ -319,67 +319,67 @@ static void test_show_existing(void)
     n = dmd_av1_build_show_existing(buf, sizeof(buf), 7);
     check_bytes("SEF map_idx=7", buf, n, want7, sizeof(want7));
 
-    /* map_idx 只有 3 位，高位必须被截掉而不是溢出到 OBU 头。 */
+    /* Map_idx only has 3 bits, the height must be cut and not spilled over to the head of OBU. */
     n = dmd_av1_build_show_existing(buf, sizeof(buf), 13);   /* 13 & 7 == 5 */
-    check_bytes("SEF map_idx=13 应等价于 5", buf, n, want5, sizeof(want5));
+    check_bytes("SEF map_idx=13 Equivalent 5", buf, n, want5, sizeof(want5));
 
-    /* 容量不足必须返回 0 而不是写坏内存。 */
-    check_eq("SEF cap=3 拒绝", (long)dmd_av1_build_show_existing(buf, 3, 0), 0);
-    check_eq("SEF cap=0 拒绝", (long)dmd_av1_build_show_existing(buf, 0, 0), 0);
-    check_eq("SEF buf=NULL 拒绝",
+    /* The capacity deficit must return to 0 instead of writing bad memory. */
+    check_eq("SEF cap=3 Reject", (long)dmd_av1_build_show_existing(buf, 3, 0), 0);
+    check_eq("SEF cap=0 Reject", (long)dmd_av1_build_show_existing(buf, 0, 0), 0);
+    check_eq("SEF buf=NULL Reject",
              (long)dmd_av1_build_show_existing(NULL, 8, 0), 0);
 }
 
-/* ------------------------------------------------- refresh_frame_flags 改写
+/* --------------- refresh_frame_flags rewrite
  *
- * 为什么值得测：这是 AV1 路径里唯一的**原地位改写**，改错会静默污染
- * 已经写好的帧头。第 79 轮查出的"5 帧 refresh 值不对"就出在这条链上，
- * 而当时没有任何单测能定位是差分算错还是写入位置算错。
+ * Why is it worth checking: this is the only **status rewording in the AV1 path, which is a silent contamination?
+ * The frame is already written. The 79th round found "Fifresh 5 is not worth" out of this chain.
+ * And there was no single measurement of the ability to locate whether the difference was wrong or whether the position was wrong.
  *
- * 这里只测最基础的不变量（不依赖真实码流）：
- *   1. dpb 为 NULL 或 cur_pic 为 NULL 时不得崩、不得改写
- *   2. 首次调用（prev_valid=0）不改写，但必须保存 map 并置 prev_valid
- *      —— 这正是第 76 轮那个"序列 —,8,32,64 首值丢失"的根因
- *   3. 第二次调用时按 ref_frame_map 的差分位写入指定 bitpos
+ * Here only the most basic non-variable (not dependent on real stream):
+ *   1. dpb is NULL or cur_pic is NULL indestructible and non-rewable
+ *   2. First call (prev_valid=0) is not rewritten, but must save Map and prev_valid
+ *      - That's the root of the 76th wheel of the sequence -- 8, 32,64th down.
+ *   Write the specified bitpos at ref_frame_map when second call
  *
- * 末位实参是 prev_frame（被改写那一帧的帧号），只用于影子 DPB 登记，
- * 本用例断言的是码流字节与 map 基准，传 0 表示"不登记影子"。 */
+ * The last true reference is prev_frame (the frame number that was rewritten) for the shadow DPI registry only.
+ * This example asserts a cipher bytes with a Map benchmark, and fax 0 means "no shadow registered". */
 static void test_patch_prev_refresh(void)
 {
-    printf("refresh_frame_flags 原地改写\n");
+    printf("refresh_frame_flags Rewrite As-Signature\n");
     struct dmd_av1_dpb dpb;
     VADecPictureParameterBufferAV1 pic;
     unsigned char frame[4];
 
-    /* 1. NULL 保护 */
+    /* 1. NULL Protection */
     memset(&dpb, 0, sizeof(dpb));
     memset(&pic, 0, sizeof(pic));
     dmd_av1_patch_prev_refresh(NULL, &pic, frame, sizeof(frame), 0, 0);
     dmd_av1_patch_prev_refresh(&dpb, NULL, frame, sizeof(frame), 0, 0);
-    check_eq("NULL 参数不置 prev_valid", (long)dpb.prev_valid, 0);
+    check_eq("NULL Parameter is not set prev_valid", (long)dpb.prev_valid, 0);
 
-    /* 2. 首次调用：不改写，但保存 map 并置 prev_valid */
+    /* First call: no rewrite, but save Map and prev_valid */
     memset(&dpb, 0, sizeof(dpb));
     memset(&pic, 0, sizeof(pic));
     for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
     memset(frame, 0, sizeof(frame));
     dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0, 0);
-    check_eq("首次调用置 prev_valid", (long)dpb.prev_valid, 1);
-    check_eq("首次调用不改写码流", (long)frame[0], 0);
-    check_eq("首次调用保存 map", (long)dpb.prev_ref_map[0], 0xff);
+    check_eq("First Call prev_valid", (long)dpb.prev_valid, 1);
+    check_eq("First call without rewrite stream", (long)frame[0], 0);
+    check_eq("First Call Save map", (long)dpb.prev_ref_map[0], 0xff);
 
-    /* 3. 第二次调用：槽 0 与槽 3 变化 → mask = 0b00001001 = 0x09。
-     *    bitpos=0 表示从 frame[0] 的最高位开始写 8 位。 */
-    pic.ref_frame_map[0] = 0x11;   /* 变了 */
-    pic.ref_frame_map[3] = 0x22;   /* 变了 */
+    /* 3. On the second call, slots 0 and 3 change. The mask is 0b00001001 = 0x09.
+     *    Bitpos=0 means eight bits from the top of the frame [0]. */
+    pic.ref_frame_map[0] = 0x11;   /* It's changed. */
+    pic.ref_frame_map[3] = 0x22;   /* It's changed. */
     memset(frame, 0, sizeof(frame));
     dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 0, 0);
-    check_eq("差分改写 mask 槽0|槽3", (long)frame[0], 0x09);
+    check_eq("Offset Rewrite mask Slot 0|Slot 3", (long)frame[0], 0x09);
 
-    /* 4. bitpos 非字节对齐时也要写对：bitpos=4 → 跨 frame[0]/frame[1]。
-     *    mask 0x09 = 0000_1001，从第 4 位起写 8 位：
-     *      frame[0] 低 4 位 = 高 4 位的 mask = 0000
-     *      frame[1] 高 4 位 = 低 4 位的 mask = 1001 → 0x90 */
+    /* 4. Bitpos is also to be correctly aligned in non-byte: bitpos=4  ⁇  cross frame[0]/frame[1].
+     *    mask 0x09 = 00000_1001, starting with 4th place:
+     *      frame[0] low 4 bit = high 4 bit mask = 00000
+     *      frame[1] 4 bit high = mask = 1001  ⁇  0x90 low */
     memset(&dpb, 0, sizeof(dpb));
     memset(&pic, 0, sizeof(pic));
     for (int i = 0; i < 8; i++) pic.ref_frame_map[i] = 0xff;
@@ -388,27 +388,27 @@ static void test_patch_prev_refresh(void)
     pic.ref_frame_map[3] = 0x22;
     memset(frame, 0, sizeof(frame));
     dmd_av1_patch_prev_refresh(&dpb, &pic, frame, sizeof(frame), 4, 0);
-    check_eq("bitpos=4 低半字节", (long)(frame[0] & 0x0f), 0x00);
-    check_eq("bitpos=4 高半字节", (long)(frame[1] & 0xf0), 0x90);
+    check_eq("bitpos=4 Low Halfbyte", (long)(frame[0] & 0x0f), 0x00);
+    check_eq("bitpos=4 Half bytes taller", (long)(frame[1] & 0xf0), 0x90);
 }
 
 
-/* ------------------------------------------------- 引用帧可解析性判定
+/* - -----------------------------------------------------
  *
- * dmd_av1_refs_resolvable() 是"从 GOP 中间起解"那道闸门：引用了硬件 DPB 里
- * 根本不存在帧的码流，Venus 既不出帧也不报错，会把 vaSyncSurface 拖到超时、
- * 调用方随后放弃整条码流（实测 rc=251、0 帧）。所以判错的两个方向都有代价：
- *   该放行却拦 → 正常播放凭空丢帧（画面一直黑到下个关键帧）；
- *   该拦却放  → 整条码流废掉。
- * 本用例把这两侧各钉一遍。 */
+ * dmd_av1_refs_resolve() is the gate "decomposition from the GOP": the hardware is quoted in the DPB
+ * There's no frame stream, and Venus is neither out of frame nor wrong, and will drag the vasyncSurface to time.
+ * The caller then abandons the entire bar stream (rec=251, 0 frame). So the wrong direction is at the cost:
+ *   The video is a good one, but it should be released and stopped.
+ *   The stop is put down and the whole bar code is gone.
+ * This is the case of nailing each side. */
 static void test_refs_resolvable(void)
 {
-    printf("引用帧可解析性判定（从 GOP 中间起解的闸门）\n");
+    printf("Reference frame synthesizing decision (from GOP The middle exit.)\n");
     struct dmd_av1_dpb dpb;
     VADecPictureParameterBufferAV1 pic;
 
-    /* 约定：影子表槽 2 存帧号 7，帧 7 属于 surface 100。
-     * surf_hist 是静态接口，测试里直接按它的语义填。 */
+    /* Commitment: Shadow Slot 2 Frame number 7, Frame 7 belongs to the surface 100.
+     * The surf_hist is a static interface, which is filled out directly in its semantic form in the test. */
 #define SETUP()   do {                                              \
         memset(&dpb, 0, sizeof(dpb));                               \
         memset(&pic, 0, sizeof(pic));                               \
@@ -418,90 +418,90 @@ static void test_refs_resolvable(void)
         dpb.frame_seq = 7;                                          \
         for (int i = 0; i < 8; i++)                                 \
             pic.ref_frame_map[i] = (VASurfaceID)100;                \
-        pic.ref_frame_idx[0] = 2;   /* LAST 在槽 2 */               \
-        pic.ref_frame_idx[3] = 2;   /* ALTREF 也在槽 2 */           \
+        pic.ref_frame_idx[0] = 2;   /* LAST in slot 2 */               \
+        pic.ref_frame_idx[3] = 2;   /* ALTREF is in the slot two. */           \
     } while (0)
 
-    /* 1. 帧间帧、引用都查得到 → 放行 */
+    /* 1. Frames, references found */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;   /* INTER_FRAME */
-    check_eq("引用齐全的帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+    check_eq("Quote fully-referenced frames to release", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
 
-    /* 2. KEY / INTRA_ONLY / SWITCH 不需要参考 → 一律放行，
-     *    哪怕 map 里全是 INVALID（关键帧起解就是这个样子）。 */
+    /* KEY/INTRA_ONLY/SWITCH does not need to be  ⁇  released,
+     *    Even if the map is full of INVALID. */
     SETUP();
     for (int ft = 0; ft <= 3; ft++) {
         if (ft == 1)
             continue;
         memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
         pic.pic_info_fields.bits.frame_type = (unsigned)ft;
-        check_eq("非帧间帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+        check_eq("Non-frame frame release", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
     }
 
-    /* 3. allow_intrabc 的帧内帧不引用任何帧 → 放行 */
+    /* Allow_intrabc frames do not quote any frames  ⁇  Release */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     pic.pic_info_fields.bits.allow_intrabc = 1;
     memset(pic.ref_frame_map, 0xff, sizeof(pic.ref_frame_map));
-    check_eq("intrabc 帧放行", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
+    check_eq("intrabc Frame Release", (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
 
-    /* 4. LAST 指向一个从未解码过的 surface（VA_INVALID_ID）→ 拦。
-     *    这正是"拖到 GOP 中间起解"的头几帧：ffmpeg 的 ref_frame_map 里
-     *    那些槽是 4294967295，硬件 DPB 里对应槽是空的。 */
+    /* LAST points to a never decoded surface (VA_INVALID_ID) stop.
+     *    This is the first frame of the "draw to the middle of the GOP": ref_frame_map
+     *    Those slots are 4294967295, the hardware DPB counters are empty. */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     pic.ref_frame_map[2] = 0xffffffffu;
-    check_eq("LAST 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+    check_eq("reject missing LAST reference", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
 
-    /* 5. LAST 能解析、ALTREF（槽号 5）解析不出 → 也拦。
-     *    复合参考与 skip_mode 真的会用到的槽，引用不到同样解不出来。 */
+    /* 5. LAST is capable of dissecting, Altraf (shelter 5) is unable to decipher, and is not stopped.
+     *    The composite reference and the skip_mode really use the slots that can't be cited as unsettling. */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     pic.ref_frame_idx[3] = 5;
-    pic.ref_frame_map[5] = 0xffffffffu;    /* 该槽里没有帧 */
-    check_eq("ALTREF 引用不到时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+    pic.ref_frame_map[5] = 0xffffffffu;    /* There's no frame in that slot. */
+    check_eq("reject missing ALTREF reference", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
 
-    /* 6. ⚠️ reference_select=0 **不能**当成"这帧不引用"放行条件。
-     *    规范 5.9.2：它为 0 只是帧头里不显式给 7 个槽号，帧照样引用 LAST
-     *    （ref_frame_idx[0]）。第一版就是加了这个提前放行，结果该拦的没拦住，
-     *    日志仍显示"合成 2957 字节"、照样 rc=251 卡死。
-     *    两个方向都要钉：引用坏 + reference_select=0 → 拦。 */
+    /* 6.  ⁇ Reference_select=0** ** Can't ** be used as a "no quote from this frame" release condition.
+     *    Standard 5.9.2: It's 0, but it's not visible in the frame to seven slots, and the frame refers to LAST.
+     *    The first edition of the "ref_frame_idx[0]" was added to the pre-release, and the stop was stopped.
+     *    The log still shows "Synthetic 2957 bytes", which is the same rc=251 card dead.
+     *    Both directions are nailed: + reference_select=0. */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     pic.mode_control_fields.bits.reference_select = 0;
     pic.ref_frame_map[2] = 0xffffffffu;
-    check_eq("reference_select=0 且引用坏时仍拦截",
+    check_eq("reference_select=0 And when the quote is bad, stop it.",
              (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
-    /* 引用好 + reference_select=0 → 放行（正常播放里大量帧是这种，
-     * 误拦就会级联：实测 43 帧丢 37 帧）。 */
+    /* +Reference_select=0  ⁇  (a lot of frames are on normal play.)
+     * The PIMEC: 43 frames dropped. */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     pic.mode_control_fields.bits.reference_select = 0;
-    check_eq("reference_select=0 且引用齐全时放行",
+    check_eq("reference_select=0 and quote full-time release",
              (long)dmd_av1_refs_resolvable(&pic, &dpb), 1);
 
-    /* 7. surface 号复用：ffmpeg 回收 surface 后同一个号属于新帧。
-     *    surf_hist 里 100 号已被帧 9 拥有，而影子表里只有帧 7 → 帧 9 查不到
-     *    → 拦。这条防的是"拿 surface 当身份"那种错法。 */
+    /* 7. The searchface repeater: ffmpeg recovers the searchface after the same number belongs to the new frame.
+     *    The suf_hist 100 is already owned by frame 9, and the shadow watch only contains seven  ⁇  frame nine.
+     *    # Stop. This is the wrong way to "get the surface when you're an identity." */
     SETUP();
     pic.pic_info_fields.bits.frame_type = 1;
     dpb.surf_hist[0].frame = 9;
-    check_eq("surface 已易主时拦截", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
+    check_eq("surface Intercept when available", (long)dmd_av1_refs_resolvable(&pic, &dpb), 0);
 
-    /* 8. NULL 保护：没有 pic 时无从判断，放行（交给后面的 tile 检查）；
-     *    没有 dpb 时判"解析不出"→ 拦。真实调用里 dpb 是 context 的常驻
-     *    成员、永不为 NULL，这里只是把语义钉死，别日后改成静默透传。 */
+    /* NULL protection: Disable from judgement without pic (to back tile);
+     *    The "no explanation" is given without dpb. The real call is from the permanent location of the context
+     *    Members, never NULL, are simply semantic, and not later. */
     SETUP();
-    check_eq("pic 为 NULL 时放行", (long)dmd_av1_refs_resolvable(NULL, &dpb), 1);
+    check_eq("pic Yes. NULL Time free", (long)dmd_av1_refs_resolvable(NULL, &dpb), 1);
     pic.pic_info_fields.bits.frame_type = 1;
-    check_eq("dpb 为 NULL 时按解析不出处理",
+    check_eq("dpb Yes. NULL Unsettled by Resolution",
              (long)dmd_av1_refs_resolvable(&pic, NULL), 0);
 #undef SETUP
 }
 
 
-/* 载荷是按位写的，断言就得按位读。
- * bit_at：第 idx 位（idx=0 是 buf[0] 的最高位），越界返回 -1。 */
+/* The load is written by bit, and the assertion is read by bit.
+ * bit_at: idx (idx=0 is the highest of buff [0]), cross-border return -1. */
 static long bit_at(const unsigned char *buf, size_t n, size_t idx)
 {
     if (idx >= n * 8)
@@ -509,10 +509,10 @@ static long bit_at(const unsigned char *buf, size_t n, size_t idx)
     return (long)((buf[idx / 8] >> (7 - (idx % 8))) & 1u);
 }
 
-/* 最后一个置 1 的位的下标；trailing_bits()（规范 5.3.4）在 payload 末尾
- * 写一个 1 再补零到字节边界，所以这个下标 + 1 就是 payload 的**位数**。
- * 用它比较长度不受字节取整影响 —— 这是本用例的关键观察。
- * 全零时返回 -1。 */
+/* Last subscript for 1; trading_bits() (regulation 5.3.4) at the end of Payload
+ * Write a one and then add zero to byte boundary, so this subscript +1 is the **digit of payload**.
+ * Use it to compare length to size to size -- this is the key observation of this case.
+ * returns -1 at zero. */
 static long last_set_bit(const unsigned char *buf, size_t n)
 {
     for (size_t i = n * 8; i-- > 0; )
@@ -522,43 +522,43 @@ static long last_set_bit(const unsigned char *buf, size_t n)
 }
 
 
-/* ------------------------------------------------- frame_header 的 show_frame 位
+/* - - - - - - - - - - - - - Show_frame bits of frame_header
  *
- * 为什么单独测这两位：驱动把合成头里的 show_frame **恒置 1**（"方向 A"，
- * 已落地）—— 硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，而 ffmpeg 的后端
- * 会为每个提交帧的 surface 要像素。
- * 而规范 5.9.2 规定 showable_frame **只在 show_frame==0 时才出现**：
+ * Why do you take these two alone: the driver turns the show_frame ** constant 1** in the synthetic head?
+ * Landed) - Hardware only throws up CAPTURE buffers for show_frame=1, while ffmpeg backends
+ * It'll be pixels for every frame-up surface.
+ * And regulation 5.9.2 provides that the show_frame** only appears when show_frame=0:
  *     frame_type          f(2)
  *     show_frame          f(1)
  *     if (!show_frame) showable_frame  f(1)
- * 也就是说改写 show_frame 会**改变后续所有字段的位偏移** ——
- * 只翻转那一位而不删掉 showable_frame，整个帧头从此错位一位，
- * 且 refresh_frame_flags 的改写位置（patch_prev_refresh 用的 bitpos）
- * 也会跟着失效。
+ * That is, rewrite show_frame** changes the position of all subsequent fields** —
+ * Turn only the one who did not delete the showable_frame, and the whole frame is now a different one.
+ * and refresh_frame_flags (bitpos for patch_prev_refresh)
+ * That path will also stop working.
  *
- * 所以本用例分两段：先在 A/B 开关（DMD_AV1_NO_SHOWFORCE）下把规范的
- * 条件分支钉死（多一位、右移一位、那两位的取值），
- * 再验证默认路径确实把两种 PPB 合成了逐字节相同的头（强制生效）。
+ * So this example is divided into two paragraphs: first, to regulate it under the A/B Switch (DMD_AV1_NO_SHOWORCE)
+ * The conditions were crucified (one more, one more right, two more values).
+ * Verify that the default path does synthesize two PPBs by bytes (compulsory effect).
  *
- * ⚠️ 本测试只验证结构性不变量（位数、逐位偏移、特定位的取值），
- * 不构造完整的参考帧头 —— 那需要一整套 VA 参数与 DPB 状态，
- * 端到端比对由 verify_driver.sh 与 14 样本回归覆盖。 */
+ * ⁇  This test only verifies structural nonvariancies (digital, location-specific, location-specific)
+ * Do not construct a complete frame of reference - that takes a set of VA parameters and DPB status,
+ * End-to-end matching returns overlayed by the sample of verefy_driver.sh and 14. */
 static void test_frame_header_show_frame(void)
 {
-    printf("frame_header 的 show_frame / showable_frame 联动（规范 5.9.2）\n");
+    printf("frame_header of show_frame / showable_frame Networking (normality) 5.9.2)\n");
 
-    /* 驱动默认把 show_frame **恒置 1**（两遍法的地基：硬件只对 show=1 的帧
-     * 吐 CAPTURE 缓冲），那样本用例要测的 showable_frame 分支根本不会出现。
-     * 先打开 A/B 开关 DMD_AV1_NO_SHOWFORCE 还原规范分支再断言语法，
-     * 末尾再单独钉住"默认强制置 1"这个行为本身。 */
+    /* Driver Defaults Show_frame ** Always 1** (two-fold foundation: hardware only frames for show=1
+     * The showable_frame branch that this example is about to measure is not available.
+     * The Syntax is a key to the process of re-establishing the standard branch of the A/B switch and then to assert the grammar.
+     * And then the "default forced 1" act itself is stuck at the end. */
     setenv("DMD_AV1_NO_SHOWFORCE", "1", 1);
 
     unsigned char buf_show[512], buf_noshow[512];
     struct dmd_av1_dpb dpb;
     VADecPictureParameterBufferAV1 pic;
 
-    /* 构造一个最小可用的帧间帧参数。只关心前几位的布局，
-     * 后续字段用 0 即可 —— 两次调用只差 show_frame，其余完全相同。 */
+    /* Constructes a minimum available frame parameter. Only the previous layouts are concerned.
+     * The following field is available at 0 -- two calls are only short of show_frame, the rest being identical. */
     memset(&pic, 0, sizeof(pic));
     pic.frame_width_minus1  = 1919;
     pic.frame_height_minus1 = 1079;
@@ -578,55 +578,55 @@ static void test_frame_header_show_frame(void)
                                                  sizeof(buf_noshow), &dpb);
 
     if (n_show == 0 || n_noshow == 0) {
-        /* 合成需要的参数不全时函数会拒绝 —— 那样这个测试没意义，
-         * 明确报出来而不是静默通过（静默通过是最坏的结果）。 */
+        /* The argument for synthesis is not full-time -- that's why this test is meaningless.
+         * It is clearly reported, not silently adopted (passing is the worst result). */
         fails++;
-        printf("  ✗ 帧头合成返回 0（show=%zu noshow=%zu），"
-               "测试未能覆盖目标\n", n_show, n_noshow);
+        printf("  ✗ Frame Synthesis Return 0(show=%zu noshow=%zu),"
+               "The test failed to cover the target\n", n_show, n_noshow);
         return;
     }
 
-    /* ⚠️ 断言必须是可否证的，而且不能把"字节数"当"位数"用。
+    /* ⁇  The assertion must be verifiable and cannot be used as a byte number.
      *
-     * 第一版写的是 `n_noshow == n_show + 1`（差一字节）与
-     * "首差在第 1 字节"。两条都建立在"这次恰好跨了字节边界"之上：
-     * 帧头末尾是 trailing_bits()（规范 5.3.4：一个 1 再补零到边界），
-     * 多写一位到底需不需要多一个字节，取决于该位前面已有几位。
-     * 实测随实现微调在 11/12 与 12/12 之间变过 —— 断言本身是错的，
-     * 一旦不成立就把一个正确的实现判成失败。
+     * The first edition reads `n_noshow=n_show+1 ' with
+     * "First difference in 1 byte." Both are based on "this time, it just crossed the byte boundary":
+     * The frame ends with a trailing_bits((regulation 5.3.4:a) one to the border)
+     * The need for one more byte depends on how many are already ahead of that one.
+     * The results of the survey changed between 11/12 and 12/12 - claiming that it was wrong.
+     * Once it is not established, a correct realization is judged to fail.
      *
-     * 规范 5.9.2 真正的不变量是：show_frame==0 时多写一位 showable_frame，
-     * 所以 show=0 的 payload **恰好比 show=1 多一位**，且第 5 位起整体右移一位。
-     * 位数可以观察：payload 结束标记（trailing_bits 的那个 1）是缓冲区里
-     * 最后一个置 1 的位，它之后全是补零。于是"最后一个 1 的下标"就是
-     * payload 的位数，与字节取整无关。 */
-    const size_t PAYLOAD = 2;           /* OBU 头 1 字节 + obu_size 1 字节 */
+     * Standard 5.9.2 The real nonvariable is: show_frame=0 more than one showable_frame,
+     * So show=0 payload ** more than show=1 ** and 5th from the whole to the right.
+     * Digits to see: Payload, end mark (the tracking_bits 1) is in the buffer zone
+     * The last bit of 1 is left with nothing to fill. So the "Last One under" is
+     * The number of places in the payload is not related to bytes. */
+    const size_t PAYLOAD = 2;           /* OBU header 1 byte + obu_size 1 byte */
     const long stop_s = (long)last_set_bit(buf_show, n_show);
     const long stop_t = (long)last_set_bit(buf_noshow, n_noshow);
-    check_eq("show=0 的 payload 恰好比 show=1 多一位",
+    check_eq("show=0 of payload It’s like... show=1 One more.",
              stop_t, stop_s + 1);
 
-    /* show_frame 那一位在 frame_type 之后，载荷内第 3 位（从最高位数）。
+    /* Show_frame that person after the frame_type, the load is 3rd place (from the highest number).
      *
-     * 载荷第 0 字节（= buf[2]）的位布局（帧间帧、非 KEY）：
+     * Bit layout (frame frame, non-KEY) of load 0 bytes (= buff [2]):
      *     show_existing_frame f(1)=0
      *     frame_type          f(2)=1  (INTER)
      *     show_frame          f(1)
-     *     [!show_frame 时] showable_frame f(1)
+     *     [! Show_frame]
      *     ...
-     * 所以 show_frame 是字节内 bit 4（掩码 0x10），showable_frame 是 bit 3。
-     * 实测吻合：show=1 → 0x30 = 0011_0000；show=0 → 0x28 = 0010_1000。 */
+     * So show_frame is bit 4 (mask 0x10) in byte, showable_frame is bit 3.
+     * Observed: show=1 gives 0x30 = 0011_0000. show=0 gives 0x28 = 0010_1000. */
     if (n_show > PAYLOAD && n_noshow > PAYLOAD) {
-        check_eq("show_frame 位（载荷 bit4）在 show=1 时为 1",
+        check_eq("show_frame bit (load) bit4)Yes. show=1 Time 1",
                  (long)((buf_show[PAYLOAD] >> 4) & 1u), 1);
-        check_eq("show_frame 位（载荷 bit4）在 show=0 时为 0",
+        check_eq("show_frame bit (load) bit4)Yes. show=0 Time 0",
                  (long)((buf_noshow[PAYLOAD] >> 4) & 1u), 0);
-        check_eq("showable_frame 位（载荷 bit3）在 show=0 时为 1",
+        check_eq("showable_frame bit (load) bit3)Yes. show=0 Time 1",
                  (long)((buf_noshow[PAYLOAD] >> 3) & 1u), 1);
     }
 
-    /* 右移一位：showable_frame 之后的所有位，show=0 与 show=1 必须逐位错开一格。
-     * 这条抓的是"只多写了位但后续字段没跟着挪"那类错（挪错就是整段错位花屏）。 */
+    /* Shift right one: all places after the showable_frame, show=0 and show=1 must be staggered.
+     * The one that caught the "only wrote more than one bit but the following field did not move" kind of mistake. */
     {
         size_t mism = 0, checked = 0;
         for (long i = (long)PAYLOAD * 8 + 5; i <= stop_s + 1; i++) {
@@ -640,20 +640,20 @@ static void test_frame_header_show_frame(void)
         }
         if (checked < 16) {
             fails++;
-            printf("  ✗ 右移校验只覆盖了 %zu 位，太少，测试未能覆盖目标\n",
+            printf("  ✗ Right-hand check is only over. %zu Bits, too few. The test failed to cover the target.\n",
                    checked);
         } else if (mism != 0) {
             fails++;
-            printf("  ✗ show=0 的后续位未整体右移一位：%zu/%zu 位不符\n",
+            printf("  ✗ show=0 No one to follow.:%zu/%zu Bits Unlike\n",
                    mism, checked);
         }
     }
 
-    /* ---- 再钉住**默认行为**本身：恒置 show_frame=1 ----
-     * 上面整段是在 A/B 开关下验证规范分支；真实跑的是另一种：
-     * 驱动把 show_frame 写成 1（硬件只对 show=1 吐 CAPTURE 缓冲，
-     * 两遍法的地基）。所以两种 PPB 必须产出**逐字节相同**的帧头。
-     * 谁哪天把这个强制去掉，896 帧回归立刻在这里先炸。 */
+    /* - - **Pick the default **in itself: constant show_frame=1 -
+     * The whole section above is validated by the branch of the norm at the A/B switch; the real run is another:
+     * Driver writes show_frame as 1 (hardware only for show=1 vomiting CAPTURE buffer, and then you can use the current system to create a new one.
+     * Two-fold foundation. So two PPBs must produce a frame with the same bytes.
+     * Whoever forced this off one day, 896 frames returned here immediately to blow up first. */
     unsetenv("DMD_AV1_NO_SHOWFORCE");
 
     pic.pic_info_fields.bits.show_frame = 1;
@@ -664,50 +664,50 @@ static void test_frame_header_show_frame(void)
     memset(&dpb, 0, sizeof(dpb));
     size_t f_noshow = dmd_av1_build_frame_header(&pic, buf_noshow,
                                                  sizeof(buf_noshow), &dpb);
-    check_eq("默认：show=0 与 show=1 帧头等长（被强制置 1）",
+    check_eq("Default:show=0 and show=1 Frame Head (compulsoryly) 1)",
              (long)f_noshow, (long)f_show);
     if (f_show > 0 && f_show == f_noshow) {
-        check_eq("默认：两种 PPB 帧头逐字节相同",
+        check_eq("Default: Two PPB Frame by bytes same",
                  (long)memcmp(buf_show, buf_noshow, f_show), 0);
-        check_eq("默认：载荷 bit4 恒为 1",
+        check_eq("Default: Load bit4 Always 1",
                  (long)((buf_noshow[PAYLOAD] >> 4) & 1u), 1);
     }
 }
 
 
 
-/* ------------------------------------------- refresh_frame_flags 的位偏移不变量
+/* - - - - - - - - - - - - - - - - - - - offset_frame_flags
  *
- * 背景：AV1 剩余缺陷里有 5 帧（150 帧样本的第 30/60/90/120/150）
- * refresh_frame_flags 改写不正确。测绘数据是：
- *     70 帧 last_refresh_bitpos=50，这 5 帧 =58，差 **8 位**
- * 而改写用的正是这个 bitpos，偏了就写到别的字段上。
+ * Background: AV1 Residual defect with 5 frames (page 30/60/90/120/150 of the 150 frame sample)
+ * The mapping data are:
+ *     70 frames last_refresh_bitpos=50, 5 frames = 58, 8-bit**
+ * And that's what this bitpos is, just to write it on another field.
  *
- * 本测试把影响该偏移的各因素钉住，并记录已排除的可能：
- *   frame_type / show_frame / error_resilient_mode 三者的组合，
- *   最大差值只有 3 位（primary_ref_frame 的宽度），**凑不出 8**。
- * 所以那 8 位差不来自这三项 —— 缩小了后续排查范围。
+ * This test has nailed the factors that affected the deviation and recorded the exclusions:
+ *   The group of three, the first of which is the "Foster of the "F" and the second of the "Foster of the Red Cross" (Foster of the Red Cross) and the second of the "Foster of the Red Cross" (Foster of the Red Cross) (Foster of the Red Cross
+ *   The maximum margin is only 3 bits (width of prism_ref_frame),** 8** not available.
+ * So the eight-bit difference is not from the three -- it narrows the range of follow-up screening.
  *
- * ⚠️ 这里的绝对值（15~19）比真实码流的 50/58 小很多，因为最小构造
- * 缺少真实序列头带来的前置字段。测的是**差值关系**而非绝对偏移，
- * 绝对值随实现调整会变，差值关系由规范 5.9.2 固定。 */
+ * ⁇  The absolute value here (15-19) is much smaller than the true stream of 50/58 because the smallest construction
+ * Missing prefix fields from the true sequence header. The difference ** is measured instead of absolute deviation.
+ * Absolute values vary as adjustments are achieved, and the margin relationship is fixed by the norm 5.9.2. */
 static void test_refresh_bitpos_invariants(void)
 {
-    printf("refresh_frame_flags 位偏移的不变量（规范 5.9.2）\n");
+    printf("refresh_frame_flags No variable for offset (norm) 5.9.2)\n");
 
-    /* 本用例遍历 show_frame 的 0/1 两种取值，断言的是**规范分支**下的
-     * 位偏移关系。驱动默认把 show_frame 恒置 1（见 build_frame_header），
-     * 那会让 KEY(show=0) 走进 KEY+show 的 refresh_all 分支、
-     * 整个 show=0 维度全部塌缩成 show=1 —— 断言就失去意义。
-     * 所以先开 A/B 开关还原规范行为。默认行为由
-     * test_frame_header_show_frame 末尾单独钉住。 */
+    /* This example takes two values from the show_frame, which is asserted under the normative branch**
+     * Bit-diverse. The driver will keep show_frame constant at 1 (see build_frame_header),
+     * It will allow KEY (show=0) to enter the refresh_all branch of KEY+show,
+     * The whole show=0 dimension collapses to show=1 -- the assertion loses meaning.
+     * So turn on the A/B switch to restore the norm behavior. Default behavior is by
+     * The end of the test_frame_header_show_frame is nailed separately. */
     setenv("DMD_AV1_NO_SHOWFORCE", "1", 1);
 
     struct dmd_av1_dpb dpb;
     VADecPictureParameterBufferAV1 pic;
     unsigned char buf[512];
 
-    /* 返回 last_refresh_bitpos；(size_t)-1 表示该帧不写该字段。 */
+    /* returns last_refresh_bitpos;size_t)-1 to the frame does not write the field. */
     size_t bp[4][2][2];
     for (int ft = 0; ft < 4; ft++)
         for (int show = 0; show < 2; show++)
@@ -729,36 +729,36 @@ static void test_refresh_bitpos_invariants(void)
                 bp[ft][show][er] = dpb.last_refresh_bitpos;
             }
 
-    /* KEY+show 与 SWITCH 走 refresh_all 路径，不写该字段 —— 必须是 -1。
-     * 这条很重要：若它们误写了，改写就会落到一个不存在的字段上。 */
-    check_eq("KEY+show 不写 refresh 字段",
+    /* KEY+show with SWITCH walk refresh_all path, not write the field -- must be -1.
+     * This is important: if they are miswritten, the rewriting will be on a non-existent field. */
+    check_eq("KEY+show No writing. refresh Fields",
              (long)(bp[0][1][0] == (size_t)-1), 1);
-    check_eq("SWITCH 不写 refresh 字段",
+    check_eq("SWITCH No writing. refresh Fields",
              (long)(bp[3][1][0] == (size_t)-1), 1);
-    check_eq("SWITCH(show=0) 也不写",
+    check_eq("SWITCH(show=0) Not even a letter.",
              (long)(bp[3][0][0] == (size_t)-1), 1);
 
-    /* 会写该字段的帧类型必须给出有效偏移。 */
-    check_eq("INTER 写 refresh 字段",
+    /* The frame type that will write the field must be validly offset. */
+    check_eq("INTER Write refresh Fields",
              (long)(bp[1][1][0] != (size_t)-1), 1);
-    check_eq("INTRA_ONLY 写 refresh 字段",
+    check_eq("INTRA_ONLY Write refresh Fields",
              (long)(bp[2][1][0] != (size_t)-1), 1);
-    check_eq("KEY(show=0) 写 refresh 字段",
+    check_eq("KEY(show=0) Write refresh Fields",
              (long)(bp[0][0][0] != (size_t)-1), 1);
 
-    /* error_resilient_mode 省掉 primary_ref_frame(3 位)，所以 er=1 少 3 位。
-     * 这是规范 5.9.2 的条件 !intra_only && !error_resilient_mode。 */
-    check_eq("INTER: er=1 比 er=0 少 3 位",
+    /* error_resilient_mode saves prismary_ref_frame (3 places), so er=1 less than 3 places.
+     * This is the norm 5.9.2 condition! Intra_only &!error_resilient_mode. */
+    check_eq("INTER: er=1 Bing er=0 Less 3 bits",
              (long)(bp[1][1][0] - bp[1][1][1]), 3);
 
-    /* intra_only 同样跳过 primary_ref_frame，与 INTER(er=0) 差 3 位。 */
-    check_eq("INTRA_ONLY 比 INTER(er=0) 少 3 位",
+    /* Intra_only also skips the prism_ref_frame, 3 bits from INTER(er=0). */
+    check_eq("INTRA_ONLY Bing INTER(er=0) Less 3 bits",
              (long)(bp[1][1][0] - bp[2][1][0]), 3);
 
-    /* ⚠️ 关键结论：上面所有组合的最大差值是 3，**凑不出实测的 8 位**。
-     * 所以第 30/60/90/120/150 帧那 8 位偏移不来自 frame_type /
-     * show_frame / error_resilient_mode 中的任何一个。
-     * 这条断言把它固定下来，防止后续误以为是这三项之一。 */
+    /* Key conclusion: The maximum margin for all the above combinations is 3,** 8 bits** which cannot be captured.
+     * So the 8-bit offset of the 30/60/90/120/150 frame does not come from frame_type/
+     * Show_frame / error_resilient_mode any of them.
+     * This assertion has stabilized it to prevent the subsequent misperception that it is one of the three. */
     size_t mx = 0, mn = (size_t)-1;
     for (int ft = 0; ft < 4; ft++)
         for (int show = 0; show < 2; show++)
@@ -770,16 +770,16 @@ static void test_refresh_bitpos_invariants(void)
             }
     if (mx - mn >= 8) {
         fails++;
-        printf("  ✗ 三因素已能造成 %zu 位差（>=8），"
-               "则实测的 8 位差可能就是它们，需重新排查\n", mx - mn);
+        printf("  ✗ Three factors have been created. %zu Bit(>=8),"
+               "And we’re on the spot. 8 The difference may be them. We need to recheck them.\n", mx - mn);
     }
 
     unsetenv("DMD_AV1_NO_SHOWFORCE");
 }
 
-/* -------------------------------------------------------------- 全局运动 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - Global campaigns */
 
-/* 在按位写的载荷里找一段连续的位，返回起始位下标；找不到返回 -1。 */
+/* Find a continuous position in the bit-by-post load, return to the starting subscript; no return -1 can be found. */
 static long find_bits(const unsigned char *buf, size_t n, const char *pat)
 {
     const size_t plen = strlen(pat);
@@ -799,7 +799,7 @@ static void check_bits(const char *what, const unsigned char *buf, size_t n,
     if (find_bits(buf, n, pat) >= 0)
         return;
     fails++;
-    printf("  ✗ %s：码流里找不到 %zu 位模式\n      %s\n",
+    printf("  ✗ %s:I can’t find it in the stream. %zu Bit Mode\n      %s\n",
            what, strlen(pat), pat);
 }
 
@@ -810,14 +810,14 @@ static void check_no_bits(const char *what, const unsigned char *buf, size_t n,
     if (at < 0)
         return;
     fails++;
-    printf("  ✗ %s：码流第 %ld 位出现了不该有的模式\n      %s\n", what, at, pat);
+    printf("  ✗ %s:SMS. %ld You’ve got a pattern that you shouldn’t have.\n      %s\n", what, at, pat);
 }
 
-/* 一个最小可用的帧间帧参数（全局运动只在帧间帧出现）。
- * ref_frame_map 全 0xff、dpb 全零：my_idx[] 会算出无意义的槽号，但
- * ① prev=默认值的用例根本不查表；② prev=非默认的用例把**八个槽都填成
- * 同一份**参数，槽号落在哪儿都一样。所以本用例只考编码算法，不考槽翻译
- * （槽翻译由 test_patch_prev_refresh / 硬件回归覆盖）。 */
+/* A minimum available frame parameter (global motion only occurs in frame frame).
+ * All 0xff, dpb, zero:my_idx[] will count meaningless slots, but
+ * 1 prev = default is not even checked at all; 2 prev = non-default is filled in **8 slots
+ * The same ** parameter, the slot number is the same everywhere. So this is a rule that only applies to algorithms and not to translator.
+ * (Staff translation is covered by test_patch_prev_refresh/ hardware regression). */
 static void gm_pic(VADecPictureParameterBufferAV1 *pic, int hp)
 {
     memset(pic, 0, sizeof(*pic));
@@ -840,15 +840,15 @@ static void gm_set(VADecPictureParameterBufferAV1 *pic, int i, int type,
         pic->wm[i].wmmat[j] = m[j];
 }
 
-/* 期望位串的来源（三重复核，任何一处出错都会被另两处抓到）：
- *   1) "1111110110110…" 这 109 位**逐字抄自源码流的 ffmpeg CBS trace**
- *      （av1work/cov/orig_tr.txt 第 158~266 行的位列），即 aom 编码器自己写的位。
- *      语法：ref1 是 ROTZOOM(1,1) + 符号 118/31/936/2873，ref2、ref3 无，
- *      ref4 是 ROTZOOM + 符号 2/5/512/1541，ref5~7 无。
- *   2) 另用一个独立写的读侧（av1work/gmbits.py）把这串位解回
- *      118/31/936/2873、2/5/512/1541，与 CBS 打印的符号一致。
- *   3) 硬件实测：该片段 24 帧输出与软解逐字节相同。
- * 其余三串（diff/hp0/fallback）由同一份 Python 生成并做写→读 round-trip。 */
+/* The source of the string is expected (three duplicates, any error will be caught in two other places):
+ *   1) "111110110110..." This 109 bit** ffmpeg CBS traffic**, verbatim from source stream
+ *      (v1work/cov/orig_tr.txt 158~266 rows by bit) i.e., the position of the aom encoder itself.
+ *      Syntax: ref1 is ROTZOOM (1,1) + symbol 118/31/936/2873, ref2, ref3 none,
+ *      Ref4 is ROTZOOM + symbol 2/512/1541, ref5~7 none.
+ *   2) to remove the string with a separate reading (av1work/gbits.py)
+ *      118/31/936/2873, 2/512/1541, consistent with CBS printing.
+ *   3) Hardware physical: The 24-snippet output is the same as the soft resolution bytes.
+ * The other three (diff/hp0/fall) are generated and written by the same Python round-trip. */
 static const char GM_SRC[] =
     "11111101101101101111111111101101010001111111110011001110010011001001"
     "01111111100000000001111111101000000101000";
@@ -857,19 +857,19 @@ static const char GM_DIFF[] =
     "1000000000111001000111011110111000110";
 static const char GM_HP0[] = "10101100001";
 static const char GM_FALLBACK[] = "010100100001";
-/* GM_SRC 里 ref1 那一段（58 位）：用例 4 的 wm[0] 就是它加了一个 LSB，
- * 用来断言"没有被四舍五入到最近格点后照样写出去"。 */
+/* The ref1 paragraph in GM_SRC (58 bits): the wm [0] of Example 4 is that it adds an LSB, which is the first LSB to the LSB.
+ * It's used to assert that "not rounded to the nearest cell, but written as it is". */
 static const char GM_M0[] =
     "1111110110110110111111111110110101000111111111001100111001";
 
 static void test_global_motion(void)
 {
-    printf("全局运动 global_motion_params（规范 5.9.24 / 7.11.3.7）\n");
+    printf("Global global_motion_params(Norms 5.9.24 / 7.11.3.7)\n");
 
     static const int32_t M0[6] = { 479232, -1471488, 65654, -32, 32, 65654 };
     static const int32_t M3[6] = { 262144, -789504, 65538, -6, 6, 65538 };
-    /* TRANSLATION(hp=1) 格点 1<<13、(hp=0) 1<<14；ROTZOOM/AFFINE 的 idx0/1
-     * 格点 1<<10、idx2..5 格点 1<<1。不在格点上的值实现会退回 IDENTITY。 */
+    /* TRANSLATION(hp=1) < 13, (hp=0) 1<14; idx0/1 of ROTSOOM/ AFFFINE
+     * Box 1 < 10, idx2.5 > < 1. */
     static const int32_t D_TR[6] = { 40960, -16384, 0, 0, 0, 65536 };
     static const int32_t D_AF[6] = { 1024, -3072, 65536, 2048, -2048, 65536 };
     static const int32_t H_TR[6] = { 49152, -16384, 0, 0, 0, 65536 };
@@ -881,7 +881,7 @@ static void test_global_motion(void)
     VADecPictureParameterBufferAV1 pic;
     size_t n;
 
-    /* --- 1) prev = 默认值（primary_ref_frame = NONE），与源码流同值 --- */
+    /* --1) prev = default value (primariy_ref_frame=NONE), equal to source flow --- */
     gm_pic(&pic, 1);
     pic.primary_ref_frame = 7;                    /* PRIMARY_REF_NONE */
     gm_set(&pic, 0, VAAV1TransformationRotzoom, M0);
@@ -890,12 +890,12 @@ static void test_global_motion(void)
     n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
     if (n == 0) {
         fails++;
-        printf("  ✗ 帧头合成返回 0，用例未覆盖目标\n");
+        printf("  ✗ Frame Synthesis Return 0,Use of examples that do not cover targets\n");
         return;
     }
-    check_bits("prev=默认时应写出与源码流逐位相同的 gm 语法", buf, n, GM_SRC);
+    check_bits("prev=The default should be written with the same source stream as the one in place gm Syntax:", buf, n, GM_SRC);
 
-    /* --- 2) prev = 非默认值：查表按槽取 prev，符号是差分结果 --- */
+    /* --2) prev = non-default value: check table prev by slot, symbol is differential result --- */
     gm_pic(&pic, 1);
     pic.primary_ref_frame = 0;
     gm_set(&pic, 0, VAAV1TransformationTranslation, D_TR);
@@ -908,24 +908,24 @@ static void test_global_motion(void)
     n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
     if (n == 0) {
         fails++;
-        printf("  ✗ 差分用例帧头合成返回 0\n");
+        printf("  ✗ The case is synthesized using the case header. 0\n");
         return;
     }
-    check_bits("prev=非默认时应按差分写符号（ROTZOOM/AFFINE 顺序 [2][3][0][1]/[2][3][4][5][0][1]）",
+    check_bits("prev=The difference in the number of characters should be used for non-default(ROTZOOM/AFFINE Order [2][3][0][1]/[2][3][4][5][0][1])",
                buf, n, GM_DIFF);
 
-    /* --- 3) hp=0 的 TRANSLATION：abs_bits 8 / prec_bits 2，档位算错就全错 --- */
+    /* --3) thp=0 TRANSLATION: abs_bits8/ prec_bits2, all slot errors --- */
     gm_pic(&pic, 0);
     pic.primary_ref_frame = 7;
     gm_set(&pic, 0, VAAV1TransformationTranslation, H_TR);
     memset(&dpb, 0, sizeof(dpb));
     n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
-    check_bits("hp=0 TRANSLATION 应走 9-1/3-1 那一档", buf, n, GM_HP0);
+    check_bits("hp=0 TRANSLATION We should go. 9-1/3-1 That one.", buf, n, GM_HP0);
 
-    /* --- 4) 编不出来的值必须整参考帧退回 IDENTITY，且不留半截 ---
-     * wm[0] 的 wmmat[0] 比格点偏 1（479232+1 不能被 1024 整除）；
-     * wm[1] 是合法的 TRANSLATION。退回正确时码流是 "0" + wm[1] 的位串，
-     * 若写了一半参数，wm[1] 的位串就不会紧贴在 is_global=0 之后。 */
+    /* --4) Unable to compile values must be returned to IDENTITY without half-hands--
+     * wm[0] wmmat[0] for a margin 1 (479232+1 cannot be divided by 1024);
+     * wm[1] is legal TRAINSLATION. Returning the correct time stream is a string of "0" + wm[1],
+     * If you write half the parameter, the wm [1] string will not be close to 0 after is_global=0. */
     gm_pic(&pic, 1);
     pic.primary_ref_frame = 7;
     {
@@ -937,15 +937,15 @@ static void test_global_motion(void)
     gm_set(&pic, 1, VAAV1TransformationTranslation, F_TR);
     memset(&dpb, 0, sizeof(dpb));
     n = dmd_av1_build_frame_header(&pic, buf, sizeof(buf), &dpb);
-    check_bits("不可编码的 gm 应整帧退回 IDENTITY 且不写半截参数",
+    check_bits("Unencoded gm The whole frame should be returned. IDENTITY And don’t write half a cross-section of parameters.",
                buf, n, GM_FALLBACK);
-    check_no_bits("退回时不得把越界值四舍五入后照常写出（那会让硬件重建出错误矩阵）",
+    check_no_bits("Do not round the value of the crossing back and write it as usual.)",
                   buf, n, GM_M0);
 }
 
 int main(void)
 {
-    printf("=== AV1 比特流原语自测 ===\n");
+    printf("=== AV1 Bits in the plain language. ===\n");
     test_leb128();
     test_obu_header();
     test_align();
@@ -962,9 +962,9 @@ int main(void)
     test_global_motion();
 
     if (fails == 0) {
-        printf("=== 全部通过 ===\n");
+        printf("=== All through ===\n");
         return 0;
     }
-    printf("=== %d 项失败 ===\n", fails);
+    printf("=== %d Item Failed ===\n", fails);
     return 1;
 }

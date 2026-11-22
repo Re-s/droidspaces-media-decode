@@ -1,8 +1,8 @@
-/* H.264/HEVC 共用的比特流写入原语。
+/* H.264/HEVC common bit flow to the original language.
  *
- * 两种编码的语法元素编码方式完全一致（u(n)/ue(v)/se(v)/rbsp_trailing_bits
- * 与 emulation prevention），所以从 h264_bitstream.c 里提出来共享，
- * 避免 HEVC 再抄一份。
+ * The syntax elements of the two codes are fully identical (u(n)/ue(v)/se(v)/rbsp_trailing_bits)
+ * The blog is a blog of the blog "The World of Human Rights" (Advanced by the blog "The World of Human Rights" (Advanced by the blog "The World of Human Rights"), which is used to share the information from the H264_bitstream.c.
+ * Avoid the HVC copying again.
  */
 #ifndef DMD_BITSTREAM_H
 #define DMD_BITSTREAM_H
@@ -14,8 +14,8 @@ struct dmd_bitwriter {
     unsigned char *buf;
     size_t cap;
     size_t byte_pos;
-    int bit_pos;       /* 0..7，当前字节内已写的位数 */
-    int overflow;      /* 置位后所有写入都是空操作，调用方检查这个字段 */
+    int bit_pos;       /* 0.7, the number of places written in the current byte */
+    int overflow;      /* All writing is empty after position. Caller check this field. */
 };
 
 void   dmd_bw_init(struct dmd_bitwriter *bw, unsigned char *buf, size_t cap);
@@ -26,8 +26,8 @@ void   dmd_bw_put_se(struct dmd_bitwriter *bw, int32_t v);
 void   dmd_bw_rbsp_trailing(struct dmd_bitwriter *bw);
 size_t dmd_bw_bytes(const struct dmd_bitwriter *bw);
 
-/* RBSP → EBSP：每遇 00 00 0x（x<=3）插入一个 03。
- * MediaCodec 收到的必须是转义后的形式。返回写入 out 的字节数，0 = 容量不足。 */
+/* RBSP  ⁇  EBSP: Insert a 03 at 0000 0x (x< = 3) per encounter.
+ * MediaCodec must receive it in a transliterated form. Returns the bytes written out, 0 = insufficient capacity. */
 size_t dmd_rbsp_escape(const unsigned char *rbsp, size_t len,
                        unsigned char *out, size_t out_cap);
 

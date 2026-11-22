@@ -1,19 +1,19 @@
 /*
- * v4l2_enum_fmt —— 直接枚举 V4L2 视频节点支持的编解码格式。
+ * v4l2_enum_fmt - direct listing of codec formats supported by V4L2 video nodes.
  *
- * 用途：绕开 MediaCodec / Codec2 / vendor HAL 的全部抽象层，问内核驱动
- * "这颗芯片到底支持哪些格式"。这是判定某个 codec 是否有硬件支持的终极判据 ——
- * MediaCodec 的 codec 列表来自 XML 配置，可能声明了硬件实际不支持的格式。
+ * Use: Disclosing all abstract layers of MediaCodec/ Codec2/ vendor HAL, asking for inner core drivers
+ * "What format does this chip support?" This is the final decision to determine whether a codec is supported by hardware --
+ * MediaCodec 's list of codec is derived from the XML configuration and may state the format that hardware is not actually supported.
  *
- * 背景：SM8750 上 c2.qti.av1.decoder 在组件创建阶段即失败
- * （QueryrequiredInfos from downstream failed），且 dshmon 报 vidcHw=false。
- * 需要确认 vidc 硬件是否真的具备 AV1 解码能力。
+ * Background: SM8750 on c2.qti.av1.decoder failed during component creation.
+ * (Queryrequired Infos from downstream failed) and dshmon idw=false.
+ * Requires confirmation that the vidc hardware has the AV1 decoding capability.
  *
- * 用法（需 root，视频节点属 system:camera）:
- *     v4l2_enum_fmt /dev/video32        # 解码节点
- *     v4l2_enum_fmt /dev/video33        # 编码节点
+ * Usage (root needed, video node system:camera):
+ *     v42_enum_fmt /dev/video32# Decoding node
+ *     v42_enum_fmt /dev/video33# Encoded Node
  *
- * 交叉编译（NDK）:
+ * Cross-compiling (NDK):
  *     aarch64-linux-android21-clang -O2 -static -o v4l2_enum_fmt \
  *         tools/v4l2_enum_fmt.c
  */
@@ -51,7 +51,7 @@ static void enum_one(int fd, enum v4l2_buf_type type, const char *label)
                (fd_desc.flags & V4L2_FMT_FLAG_COMPRESSED) ? "  (compressed)" : "");
         found++;
     }
-    if (!found) printf("  (无)\n");
+    if (!found) printf("  (None)\n");
 }
 
 int main(int argc, char **argv)
@@ -59,24 +59,24 @@ int main(int argc, char **argv)
     const char *dev = (argc > 1) ? argv[1] : "/dev/video32";
     int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "打开 %s 失败: %s\n", dev, strerror(errno));
+        fprintf(stderr, "open %s failed: %s\n", dev, strerror(errno));
         return 1;
     }
 
     struct v4l2_capability cap;
     memset(&cap, 0, sizeof(cap));
     if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-        printf("设备: %s\n", dev);
+        printf("Equipment: %s\n", dev);
         printf("  driver=%s card=%s bus=%s\n", cap.driver, cap.card, cap.bus_info);
         printf("  capabilities=0x%08x\n", cap.capabilities);
     }
 
-    /* 输出队列（OUTPUT）= 喂进去的编码码流；捕获队列（CAPTURE）= 取出的原始帧。
-     * 解码器的压缩格式在 OUTPUT 侧，所以判断"支持解什么"要看 OUTPUT。 */
-    enum_one(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, "OUTPUT_MPLANE（喂入的码流格式）");
-    enum_one(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, "CAPTURE_MPLANE（取出的像素格式）");
-    enum_one(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT, "OUTPUT（单平面）");
-    enum_one(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE, "CAPTURE（单平面）");
+    /* Output queue (OUTPUT) = incoming bitstream; capture queue (CAPTURE) = original frame taken.
+     * The decoder is in a compressed format on the OUTPUT side, so the "support to what" is to be judged by the OUTPUT. */
+    enum_one(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, "OUTPUT_MPLANE(The flow format for feeding)");
+    enum_one(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, "CAPTURE_MPLANE(Extracted pixel format)");
+    enum_one(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT, "OUTPUT(Mono-Plate)");
+    enum_one(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE, "CAPTURE(Mono-Plate)");
 
     close(fd);
     return 0;

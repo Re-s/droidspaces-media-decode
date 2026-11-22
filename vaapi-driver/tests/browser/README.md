@@ -1,81 +1,80 @@
-# 浏览器侧帧序验证
+# Browser frame-order verification
 
-用于验证 Chrome 实际上屏的帧顺序与画面内容，覆盖 ffmpeg 测不到的路径。
+These tests exercise Chrome's actual presentation path. The
+[FFmpeg contract regression](../regress_chrome_contract.sh) can simulate
+early surface sampling with `DMD_NO_MAP_WAIT=1`. The browser pages also cover
+Media Source Extensions (MSE) chunk delivery, changes to `src`, and the
+browser's choice of which decoded surface to present.
 
-## 为什么需要浏览器测试
+## What to measure
 
-`tests/regress_chrome_contract.sh` 用 `DMD_NO_MAP_WAIT=1` 模拟 Chrome 的
-"EndPicture 返回即采样"契约，但它仍然是 ffmpeg 在驱动。有两件事只有真实
-浏览器能覆盖：
+`requestVideoFrameCallback` reports `mediaTime`, which the test converts
+to an expected frame index. The MSE page also makes a canvas pixel signature.
+Compare it with a software-decoded reference to identify which frame the
+browser actually presented. A correct timestamp can accompany stale pixels.
 
-- **MSE 分段喂流**：在线视频走 `appendBuffer`，时间轴基准与直读 `src` 不同
-- **实际上屏内容**：Chrome 的软件 DPB 决定哪个 surface 何时上屏
+Callbacks can miss presented frames. In one comparison, build `9f00b1a6`
+and a fixed build produced identical, increasing frame-index sequences
+despite different pixels. Use the canvas signature for pixel validation.
 
-## 判据
+Check the timestamp origin of the fixture before comparing frame indices.
+In the tested fragmented MP4 generated with
+`-movflags frag_keyframe+empty_moov`, `start_time` was 1.0 seconds versus
+0.0 in the source. At 2 fps, that introduced a constant two-frame offset.
 
-`requestVideoFrameCallback` 给出每次上屏的 `mediaTime`，据此算出帧号；
-同时用 canvas 抓像素算签名，与软解基线比对，得到"画面里实际是第几帧"。
-两者不符 = 时间戳对但画面错，那才是"前后帧跳跃"。
+## Run the MSE test
 
-⚠️ **`rvfc` 会漏采**，单看帧号单调性判据不足。实测：旧版驱动
-（`9f00b1a6`，无收帧线程）与修复版跑出的帧号序列逐值相同，都单调递增 ——
-说明只看单调性测不出问题，必须做像素比对。
+From this directory, stage the test pages and a compatible H.264 fragmented
+MP4 in a working directory. Start the report server with a fresh output path.
 
-⚠️ **fMP4 有时间轴偏移**。`-movflags frag_keyframe+empty_moov` 生成的分段流
-`start_time=1.0`，而原始流是 `0.0`。@2fps 就是 2 帧偏移，逐帧恒定。
-比对前必须扣掉，否则 20/20 全部"不符"（实测踩过）。
+```sh
+test_dir=$(mktemp -d)
+cp mse_test.html net_test.html abr_test.html "$test_dir/"
+cp /path/to/h264_frag.mp4 "$test_dir/"
+OUT="$test_dir/report.json" ROOT="$test_dir" WANT_REPORTS=1 python3 report.py 8871
+```
 
-## 用法
+In the desktop user's Wayland session, open the page with the
+[configured VA-API Chrome launcher](../../../README.md#chrome-on-gnome-wayland).
+Set the MIME codec and frame rate to match the fixture. This example uses
+H.264 High at 2 fps and seeks once halfway through the test.
 
-```bash
-# 起回传服务器（收满指定份数即退）
-OUT=/tmp/r.json ROOT=/tmp/cr WANT_REPORTS=1 python3 report.py 8871 &
-
-# 硬解跑 MSE
-LIBVA_DRIVER_NAME=msm_drm LIBVA_DRIVERS_PATH=<build目录> \
-google-chrome --ozone-platform=wayland \
-  --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiIgnoreDriverChecks \
-  --autoplay-policy=no-user-gesture-required \
+```sh
+"$HOME/.local/bin/chrome-msm-vaapi" --autoplay-policy=no-user-gesture-required \
   'http://127.0.0.1:8871/mse_test.html?src=h264_frag.mp4&mime=video/mp4;%20codecs%3D%22avc1.64001f%22&fps=2&n=20&seek=1'
 ```
 
-参数：`src` 分段流、`mime` MSE codec 串、`fps` 帧率、`n` 采样数、
-`chunk` 分块字节、`seek=1` 中途插一次 seek。
+Confirm the decoder in `chrome://media-internals` and inspect
+`report.json` in the working directory. Stop the report server after it
+writes the result if it is still running.
 
-## 三个测试页
+| Page | Playback path | Parameters |
+|---|---|---|
+| `mse_test.html` | MSE chunk delivery with canvas pixel signatures | `src`, `mime`, `fps`, `n` samples, `chunk` bytes, `seek=1` |
+| `net_test.html` | Direct HTTP video and frame-index sampling | `url`, `fps`, `n`, `seek=1`. Cross-origin fixtures must allow CORS |
+| `abr_test.html` | Resolution changes by switching `src` | Set the in-page `srcs` list and the `PER` frames-per-source constant |
 
-| 页面 | 覆盖路径 | 关键参数 |
-|------|----------|----------|
-| `mse_test.html` | MSE `appendBuffer` 分段喂流 | `src` `mime` `fps` `n` `chunk` `seek=1` |
-| `net_test.html` | 真实 HTTP 在线源直读 | `url` `fps` `n` `seek=1` |
-| `abr_test.html` | ABR 分辨率切换（换 src） | 页内 `srcs` 数组、`PER` 每档帧数 |
+## Recorded results and limitations
 
-### 实测结果（修复版驱动）
+- Direct HEVC playback of the 1280×720 `jinjie_265.mp4` fixture produced
+  24 monotonic samples and 231 driver frame matches. The seek run sampled
+  frames 0–11 and 86–97 without backward samples or reported drops.
+- The 640×360 → 1280×720 → 640×360 source switch produced ten samples per
+  source. All three runs followed the expected resolution with no backward
+  samples. The driver opened three sessions and logged 86 frame matches.
+- The tested Chrome build rejected the HEVC MSE fixture with `sb error`
+  and `InvalidStateError`, while direct `<video src>` playback yielded
+  131 hardware frame matches. Use direct playback for that fixture and
+  an offline software decoder for reference pixels. Use H.264 when the
+  browser needs to provide both the hardware and software paths.
 
-真实在线源 `jinjie_265.mp4`（HEVC 1280x720，用户最初报问题的 URL）：
-- 直读播放 24 帧：单调递增、零回退，231 次配对
-- 加 seek 干扰 24 帧：帧号 0-11 连续，seek 后 86-97 连续，零回退零丢帧
+## Test page timing
 
-ABR 分辨率切换（640x360 → 1280x720 → 640x360）：
-- 三档各采 10 帧，分辨率正确跟随，全部单调、零回退
-- 驱动建 3 个会话（`CAPTURE 就绪` 640x368 两次、1280x720 一次），86 次配对
+Changing `src` cancels pending frame callbacks. Register a fresh callback
+after `loadeddata` so it uses the new media state. The original test without
+that wait stalled after opening one decode session.
 
-## 编写这类页面的两个坑
-
-**换 src 会取消 pending 的 `requestVideoFrameCallback`。** 紧跟 `v.src=`
-立刻重新注册也无效 —— 那时新流还没就绪。必须等 `loadeddata` 事件。
-实测症状是整个测试卡住不回传（只建了 1 个会话）。
-
-**MSE 播放推进依赖 `updateend` 驱动 `play()`。** 整段很快 `endOfStream`
-之后 `updateend` 不再触发，若那时 `readyState` 还没到 `HAVE_CURRENT_DATA`
-就没人调 `play()` 了。实测只采到 1 帧就 timeout。补 `loadeddata`/`canplay`
-监听与定时兜底。
-
-## 已知环境限制
-
-- **Chrome MSE 拒收 HEVC**：同一个 `hevc_frag.mp4` 走 `<video src>` 直读
-  能正常硬解（实测 131 次配对、帧号单调），走 MSE 报 `sb error` +
-  `InvalidStateError`。这是 Chrome MSE 层的策略，与驱动无关。
-  HEVC 的浏览器验证请用直读方式。
-- **Chrome 软解不支持 HEVC**（专利），所以 HEVC 做不了软/硬解 A-B 对照。
-  需要 A-B 对照时用 H.264 素材。
+MSE `updateend` can finish before the video reaches `HAVE_CURRENT_DATA`.
+The MSE test also starts playback on `loadeddata` and `canplay` and retries
+on a timer. Without those fallbacks, a fast append could produce just one
+sample before the timeout.

@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>逐秒追踪</title>
+<title>Playback tracker</title>
 <style>
   body { background:#111; color:#ddd; font-family:monospace; margin:0; padding:8px; }
   video { width:700px; max-width:100%; background:#000; display:block; }
@@ -13,23 +13,20 @@
 </head>
 <body>
 <video id="v" muted playsinline></video>
-<div id="hud">追踪中…</div>
+<div id="hud">Tracking…</div>
 <div id="tl"></div>
 
 <script>
-/* 逐秒追踪播放质量，用 setInterval 采样而**不用** requestVideoFrameCallback。
+/* Sample playback quality once a second. In testing, requestVideoFrameCallback
+ * fired only 241 times for 610 presented frames. Counting the callbacks yielded
+ * a false 12 fps reading, and timing them suggested 58% stutter.
  *
- * 为什么不用 rVFC：实测它每 2.5 帧才回调一次（meta.presentedFrames 增量 610
- * 而回调只有 241 次）。把回调次数当呈现帧数会算出 12fps 的假结果，
- * 把回调间隔当帧间隔会算出 58% 的假顿卡。这是前三版探针共同的错误。
+ * Use differences in the cumulative getVideoPlaybackQuality() counters for the
+ * number of decoded and dropped frames. Check video.currentTime separately to
+ * see whether playback is advancing at the expected rate.
  *
- * 本版只信两个来源：
- *   · getVideoPlaybackQuality().totalVideoFrames / droppedVideoFrames
- *     —— 浏览器自己的累计计数，逐秒取差得到每秒真实解码量与丢帧量
- *   · video.currentTime —— 播放进度，用来检测播放是否真的在推进
- *
- * 目标是抓住"同配置下丢帧数从 5 跳到 140"这个间歇性退化发生的时刻，
- * 看它是持续性的还是突发性的。
+ * This helps establish whether a jump from 5 to 140 dropped frames under the
+ * same configuration is sustained or confined to a brief interval.
  */
 const q = new URLSearchParams(location.search);
 const secs = parseInt(q.get('secs') || '30', 10);
@@ -66,20 +63,20 @@ function sample() {
     at: +el.toFixed(1),
     decoded: dTotal, dropped: dDrop,
     fps: +(dTotal / dt).toFixed(1),
-    /* 媒体时间推进速率：1.0 = 正常播放，<1 = 播放跟不上（卡） */
+    /* Media time rate. At 1.0, playback keeps up with wall-clock time. */
     rate: +(dCt / dt).toFixed(3)
   });
 
   prev = { t: now, total: qq.totalVideoFrames, drop: qq.droppedVideoFrames, ct: ct };
 
-  /* 时间线：每秒一行，丢帧高亮 */
+  /* Show one timeline row per second and highlight drops. */
   tl.innerHTML = rows.slice(-24).map(function (r) {
     const bad = r.dropped > nominal * 0.05 || r.rate < 0.9;
     const mark = bad ? '<span class="bad">' : '<span class="ok">';
-    return mark + ('  ' + r.at).slice(-5) + 's  解码 ' + ('  ' + r.decoded).slice(-3) +
-           '  丢 ' + ('  ' + r.dropped).slice(-3) +
+    return mark + ('  ' + r.at).slice(-5) + 's  decoded ' + ('  ' + r.decoded).slice(-3) +
+           '  dropped ' + ('  ' + r.dropped).slice(-3) +
            '  ' + ('    ' + r.fps.toFixed(1)).slice(-5) + 'fps' +
-           '  进度x' + r.rate.toFixed(2) + '</span>';
+           '  rate ×' + r.rate.toFixed(2) + '</span>';
   }).join('\n');
 
   const sumD = rows.reduce(function (a, r) { return a + r.decoded; }, 0);
@@ -89,11 +86,11 @@ function sample() {
   }).length;
 
   hud.innerHTML =
-    '已测 <b>' + el.toFixed(0) + '</b>/' + secs + 's　' +
-    '累计解码 <b>' + sumD + '</b>　丢 <b class="' + (sumX > sumD * 0.05 ? 'bad' : 'ok') +
+    'Measured <b>' + el.toFixed(0) + '</b>/' + secs + 's　' +
+    'Decoded <b>' + sumD + '</b>　Dropped <b class="' + (sumX > sumD * 0.05 ? 'bad' : 'ok') +
       '">' + sumX + '</b> (' + (sumD ? (100 * sumX / sumD).toFixed(2) : 0) + '%)<br>' +
-    '平均 <b>' + (sumD / el).toFixed(2) + '</b> fps（标称 ' + nominal + '）　' +
-    '异常秒数 <b class="' + (badSecs ? 'bad' : 'ok') + '">' + badSecs + '</b>/' + rows.length;
+    'Average <b>' + (sumD / el).toFixed(2) + '</b> fps (nominal ' + nominal + ')　' +
+    'Seconds with stutter or drops <b class="' + (badSecs ? 'bad' : 'ok') + '">' + badSecs + '</b>/' + rows.length;
 
   if (el >= secs && !reported) {
     reported = true;
@@ -114,9 +111,9 @@ function sample() {
 
 v.addEventListener('loadedmetadata', function () {
   v.play().then(function () { timer = setInterval(sample, 1000); sample(); })
-          .catch(function (e) { hud.textContent = '播放失败: ' + e; });
+          .catch(function (e) { hud.textContent = 'Playback failed: ' + e; });
 });
-v.addEventListener('error', function () { hud.textContent = '载入失败: ' + file; });
+v.addEventListener('error', function () { hud.textContent = 'Cannot load: ' + file; });
 </script>
 </body>
 </html>

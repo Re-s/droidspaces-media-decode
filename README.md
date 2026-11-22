@@ -1,77 +1,93 @@
 # DroidSpaces Media Decode
 
-> 🌐 **English version: [README.en.md](README.en.md)**
+Hardware video decoding and encoding for Linux containers. The VA-API driver
+runs inside the application process and talks directly to Qualcomm's msm_vidc
+V4L2 interfaces. The default decoder is `/dev/video32` and the default encoder
+is `/dev/video33`.
 
-给 Linux 容器提供视频硬件解码与编码：一个 VA-API 驱动，直连高通 msm_vidc 的 V4L2 接口。
+## Supported codecs
 
-## 项目简介
-
-容器内的应用（ffmpeg、Firefox、Chrome）通过标准 VA-API 调用驱动；浏览器还需
-对应的启动环境与沙箱设备兼容配置。
-驱动被 libva `dlopen` 进消费者进程，直接操作 `/dev/video32`。
-
-```
-容器 ffmpeg / Firefox
-   ↓  标准 VA-API 调用
-libva → dlopen → msm_drm_drv_video.so     ← 本项目
-   ↓  V4L2 stateful decoder ioctl
-/dev/video32  (高通 msm_vidc / Venus)
-```
-
-**Android 侧没有本项目的任何进程或文件。**
-
-> ⚠️ **0.4.0 是架构性重写。** 0.3.x 走的是
-> `容器 → unix socket → Android 侧 decode-daemon → MediaCodec`，
-> 需要刷 KSU 模块并让 daemon 常驻。那条链路已整条删除：
-> 不再有 daemon、看护、socket、SHM 与 MediaCodec 调用。
-> 升级只需换掉容器里的 `.so`，并可以卸载 `dmd_watchdog` 模块。
->
-> 历史架构的记录见 [`CHANGELOG.md`](CHANGELOG.md) 与
-> [`doc/release-archive.md`](doc/release-archive.md)。
-
-## 支持的编解码器
-
-| 编解码器 | 状态 | 实机验证 |
+| Decode profile | Build and device requirements | Validation |
 |---|---|---|
-| H.264 | ✅ 可用 | 300/300 帧，md5 与软解逐字节一致 |
-| HEVC Main | ✅ 可用 | 12/12 帧，md5 与软解逐字节一致 |
-| VP9 Profile 0 | ✅ 可用 | 50/50 帧，md5 与软解逐字节一致 |
-| VP8 | ✅ 可用 | 90/90 帧，md5 与软解逐字节一致（0.4.2 新增）|
-| AV1 Profile 0 | ✅ 可用（0.4.7） | 真流（B 站 1080p60）1800/1800 帧 md5 与软解逐字节一致，120~190fps；另 14 组合成结构回归全过。浏览器侧 480p/720p/1080p/**4K** 均在 Chrome 里逐帧平衡，三路并发与 MSE（seek / 带内换分辨率）已通过 |
-| AV1 10bit（P010） | 🚧 `AV1=1` 独立构建已验证 | ffmpeg 路径真 10bit 流与软解逐字节一致；P010 独立 EGL 数值采样已通过，浏览器实际消费链路另需验证 |
-| MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
-| HEVC Main10（NV12/P010） | ✅ 本机 tmp 已启用；源码仍需 `HEVC10=1` | 2026-11-15，SM8750P 上 Main10 profile 的 P010/NV12 五组共 300 帧像素一致、错误 0；mpv 直接 VAAPI、Firefox 160 与 Chrome 154 的 ANGLE OpenGL 对照均有正常画面；Chrome 默认 ANGLE Vulkan 虽硬解成功，P010 图像导入仍黑屏，详见真实约 10 秒片段验证记录 |
-| VP9 Profile2 | 🚧 未开放 | 不受 `HEVC10=1` 开关影响；早期探测失败不能证明硬件必然不支持 |
+| H.264 Constrained Baseline, Main, High | Default build | Bit-exact FFmpeg output and Chrome 156 playback |
+| HEVC Main | Default build | Bit-exact FFmpeg output and Chrome 156 playback |
+| HEVC Main10 | `HEVC10=1` | NV12 for 8-bit streams and P010 for 10-bit streams. Bit-exact FFmpeg output and local Chrome 156 playback with ANGLE OpenGL |
+| VP9 Profile 0 | Default build | Bit-exact native decoding in earlier tests. A Chrome YouTube run encountered repeated receive timeouts. See [upstream issue #7](https://github.com/Re-s/droidspaces-media-decode/issues/7) |
+| VP8 | Default build, conditional on device support | Bit-exact on tested older hardware. The tested Snapdragon 8 Elite setup fell back to software in Chrome |
+| AV1 Profile 0, 8-bit and 10-bit | `AV1=1` and compatible firmware | Bit-exact FFmpeg output and local Chrome 156 playback with ANGLE OpenGL |
+| VP9 Profile 2 and MPEG-2 | Outside the supported configuration | MPEG-2 remains experimental and is not advertised by default |
 
-判据一律是与软解 **md5 逐字节一致**，而不是"能解出来"。除 1080p 外，
-HEVC 的 720p、854x480（宽非 128 倍数）、640x360、720x1280（竖屏）与一条
-1080p→720p→480p 切换流均已逐字节验证。
+The seven-case FFmpeg matrix on the integrated build compared 192 frames per
+case with software decoding. It covered three H.264 profiles, HEVC Main and
+Main10, and 8-bit and 10-bit AV1. Earlier AV1 tests also covered a 1,800-frame
+1080p60 stream, 480p to 4K Chrome playback, three concurrent streams, and MSE
+seeking and resolution switches. See the [AV1 status](doc/av1-v4l2-status.md)
+and [Main10/P010 validation record](doc/hevc-main10-p010-validation.md) for
+hardware and application details.
 
-AV1 使用 `AV1=1`，HEVC Main10 使用独立的 `HEVC10=1` 构建开关；编码仍限 8 位 NV12。
-HEVC 的 SPS 短期参考集通过受限的切片重写支持，缺失的长期参考表、自定义缩放表等仍拒绝。
-能力边界见 [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md)，Main10 的构建、
-P010 校验和实测范围见 [`doc/hevc-main10-p010-validation.md`](doc/hevc-main10-p010-validation.md)。
+The 0.5.0-dev encoder probes its selected V4L2 node for H.264 Constrained
+Baseline/Main/High, HEVC Main, and VP9 Profile 0. It accepts progressive 8-bit
+NV12, I/P frames, one reference, and one slice per picture. Use `-bf 0` with
+FFmpeg. H.264 and HEVC Main support CBR/VBR and a VBR-backed constant-QP
+request. HRD/VBV and peak bitrate requests are firmware hints. Recreate the
+encoding context to change stream settings.
 
-## 编译与安装
+FFmpeg encoding was verified for H.264 and HEVC Main on Snapdragon 8 Elite.
+Chrome 156 WebCodecs encoded H.264 Baseline, Main, and High using the optional
+NV12 GBM adapter. Chrome rejected the tested HEVC encode configuration.
+See the [hardware encoding guide](doc/hardware-encoding.md) for supported
+controls, verification, and the limits of the tested combinations.
 
-Firefox 160 在 GNU/Linux AArch64 上可使用可选兼容库，保留 Mozilla 沙箱并为
-RDD 增加限定 KGSL ioctl 规则。它只在 RDD 预开所需设备，保护缓存 fd，明确拒绝
-exec 与 io_uring；不会启动 daemon。编译 `make -C vaapi-driver firefox-compat`，
-安装与 Gold 用户桌面入口见 [`doc/firefox-sandbox.md`](doc/firefox-sandbox.md)。
-仅 `about:support` 显示支持不能证明硬解，须同时核对实际硬件输出帧数。
+## Build and install
 
-### 新增：V4L2 硬编码（0.5.0-dev）
+Build in an AArch64 environment with `build-essential`, `pkg-config`,
+`libva-dev`, and `libdrm-dev`. Run these commands from the repository root.
 
-编码也在容器进程内直接调用 V4L2，默认节点 `/dev/video33`，**无需 daemon、
-Termux、MediaCodec 或定制 Mesa**。H.264 Constrained Baseline / Main / High、
-HEVC Main、VP9 Profile 0 的 `VAEntrypointEncSlice` 按设备实际格式和 profile
-探测结果声明；没有枚举到的编码器不会出现。编码节点可用
-`DMD_VA_ENCODE_DEVICE` 覆盖。
+```sh
+make -C vaapi-driver check tests
+make -C vaapi-driver BUILD=build-all-decode AV1=1 HEVC10=1 check tests
+```
 
-当前支持 8bit NV12、CBR/VBR、I/P 帧、单参考与单 slice；使用 FFmpeg 时指定
-`-bf 0`。码率控制由硬件执行，HRD/VBV 是建议，不保证精确峰值或自定义 QP。
-参数变更需要重建编码 context。完整用法、设备权限与验证范围见
-[`doc/hardware-encoding.md`](doc/hardware-encoding.md)。
+The first command builds the default driver. The second enables both opt-in
+decoders in a separate build directory. To build Main10 alone, use
+`BUILD=build-hevc10 HEVC10=1 AV1=0`.
+
+The container needs `libva2`, `libva-drm2`, and access to the render node, the
+decoder, and a DMA-BUF allocator. The platform normally grants access through
+the `droidspaces-gpu` group. Encoding also needs read/write access to the
+encoder node. See the [platform contract](doc/platform-integration-contract.en.md)
+or its [Chinese version](doc/platform-integration-contract.md).
+
+Try the build as your normal user before installing it system-wide.
+
+```sh
+export LIBVA_DRIVER_NAME=msm_drm
+export LIBVA_DRIVERS_PATH="$PWD/vaapi-driver/build-all-decode"
+
+vainfo --display drm --device /dev/dri/renderD128
+ffmpeg -vaapi_device /dev/dri/renderD128 -hwaccel vaapi \
+  -hwaccel_output_format vaapi -i input.mp4 -an -f null -
+```
+
+`vainfo` reports the loaded build and the available profiles. A real decode
+confirms that the device produces frames. The vendor string includes the
+driver version and Git build ID, with a `-dirty` suffix for builds with
+uncommitted changes.
+
+Install the tested build into the system libva directory when ready.
+
+```sh
+sudo make -C vaapi-driver BUILD=build-all-decode AV1=1 HEVC10=1 install
+```
+
+libva expects the filename `msm_drm_drv_video.so` for the msm render node. Use
+`LIBVA_DRIVERS_PATH` to select a separate build without replacing the system
+copy.
+
+## FFmpeg encoding and processing
+
+Encode an H.264 clip after converting the source to NV12 and uploading it to
+a VA-API surface.
 
 ```sh
 LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
@@ -79,354 +95,109 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
   -c:v h264_vaapi -bf 0 -g 30 -rc_mode CBR -b:v 6M output.mp4
 ```
 
-安装方法与解码相同，仍只有一个 `.so`。
-
-### 构建
-
-必须在 **aarch64** 上编译（x86_64 交叉工具链缺 aarch64 glibc）：
+A VA-API hardware decode can also feed the encoder through the driver's NV12
+video-processing path.
 
 ```sh
-# 依赖：build-essential pkg-config libva-dev libdrm-dev
-cd vaapi-driver
-make AV1=1      # 产物 build/msm_drm_drv_video.so（含 AV1；不带 AV1=1 则不声明）
-# Main10 独立构建（不额外开启 AV1）：make HEVC10=1 AV1=0 BUILD=build-hevc10
-make check      # 确认导出了 __vaDriverInit_* 入口
-make tests      # 单元测试
+LIBVA_DRIVER_NAME=msm_drm ffmpeg \
+  -init_hw_device vaapi=va:/dev/dri/renderD128 \
+  -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi \
+  -i input.mp4 -vf 'scale_vaapi=format=nv12' \
+  -c:v h264_vaapi -bf 0 -b:v 2M -an output.mp4
 ```
 
-安装到容器（**这是全部步骤**）：
+Scaling and rotation operate on CPU-backed NV12 surfaces. See the
+[driver README](vaapi-driver/README.md) for the rotation example and the
+[encoding guide](doc/hardware-encoding.md) for crop and alignment details.
+
+## Browser setup
+
+### Chrome on GNOME Wayland
+
+From the logged-in desktop user's Wayland session, build the driver as shown
+above and install the per-user launcher. This example uses the tested Chrome
+156 and Turnip setup. If libva already finds the intended system driver,
+omit `LIBVA_DRIVERS_PATH`.
 
 ```sh
-install -m 0644 build/msm_drm_drv_video.so \
-  /usr/lib/aarch64-linux-gnu/dri/msm_drm_drv_video.so
+CHROME_BIN=/usr/bin/google-chrome-stable \
+MESA_LOADER_DRIVER_OVERRIDE=kgsl TU_DEBUG=noconform \
+LIBVA_DRIVERS_PATH="$PWD/vaapi-driver/build-all-decode" \
+  sh tools/configure-chrome-vaapi.sh --wrapper-only
+
+"$HOME/.local/bin/chrome-msm-vaapi"
 ```
 
-> 产物名不可更改：libva 从 msm render node 推导出的驱动名就是 `msm_drm`，
-> 只会尝试打开 `<dridir>/msm_drm_drv_video.so` 这一个文件，无 fallback。
+Fully exit existing Chrome processes before launching the wrapper. Omit
+`--wrapper-only` to configure the user-level desktop entries as well. The script
+supports `--verify` and `--uninstall`. For WebCodecs encoding, build the
+[optional NV12 GBM adapter](vaapi-driver/gbm-compat/README.md) and pass its
+absolute directory using `--gbm-compat-dir`. Chrome 156 worked with the
+default GMB readback behavior.
 
-前提条件：
+The wrapper selects Wayland, the msm render node, ANGLE OpenGL, and the VA-API
+features. It disables `ResolutionBasedDecoderPriority` so Chrome can select
+VA-API for small clips such as 320×180. Keep the Chromium feature named
+`Vulkan` out of `--enable-features`. ANGLE backend selection is controlled
+separately through `DMD_ANGLE`.
 
-- 容器内有 `libva2` 与 `libva-drm2`
-- 容器用户在 `droidspaces-gpu` 组内（平台侧通常已代为加组）——
-  `/dev/video32` 属 `root:droidspaces-gpu`、模式 `crw-rw----`
-- 平台已透传 `/dev/dri/renderD128`
+Check `chrome://media-internals` for `kVideoDecoderName = VaapiVideoDecoder`
+during playback, then check the image and dropped frames. YouTube H.264 and
+AV1 were verified. The HEVC Main and Main10 Chrome tests used local MP4 files.
+See the [browser guide](doc/browser-vaapi-guide.md) for the exact flags, Vulkan
+comparisons, and compositor requirements.
 
-不想装进系统目录，可以用 `LIBVA_DRIVERS_PATH` 指向 `.so` 所在目录。
+### Firefox
 
-For Chrome receive/submission stalls, see [frame delivery](docs/chrome-frame-delivery.md) and [known limitations](docs/known-limitations.md).
+The tested native Firefox 160 AArch64/glibc setup uses the
+[RDD compatibility launcher](doc/firefox-sandbox.md). Build it with
+`make -C vaapi-driver firefox-compat`. The setup pairs a system policy with a
+per-user launcher and retains the Mozilla sandboxes while granting limited KGSL
+ioctl access. Run the browser from the desktop session and verify actual
+decoded frames alongside `about:support`. The Firefox guide covers installation,
+verification, and rollback.
 
-## 自检
+For Chrome receive stalls, see [frame delivery](docs/chrome-frame-delivery.md)
+and [known limitations](docs/known-limitations.md). Run
+`bash tools/check-browser-vaapi.sh` for a quick check and enable
+`DMD_VA_LOG=1` to inspect frame delivery when troubleshooting.
 
-```sh
-LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
-  -hwaccel_output_format vaapi -i in.mp4 -f null -
-```
+## Kernel compatibility and test devices
 
-`vainfo` 只证明驱动能加载、profile 列表是**静态声明**的，不证明能出帧；
-验真实解码用上面这条命令。想确认硬件真的在跑，可以看 Venus 的内核实况
-（用户态改不了这些值，解码期间 `mvs0_gdsc` 应为 `enabled`）：
+The driver tries `REQBUFS(DMABUF)` and defers CAPTURE setup until
+`SOURCE_CHANGE` on the newer path. If DMABUF is rejected, it falls back to
+USERPTR with the legacy private `PORT_SETTINGS` events and `SESSION_CONTINUE`.
 
-```sh
-for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
-  [ "$(cat $r/name)" = mvs0_gdsc ] && echo "mvs0_gdsc=$(cat $r/state)"; done
-```
+- The legacy path was tested on a Xiaomi Pad 5 (`nabu`), Snapdragon 855
+  / Adreno 640, with Android 13, kernel 4.14.336, and a Debian 13 AArch64
+  DroidSpaces container.
+- The modern path was tested on Snapdragon 8 Elite (SM8750P / Adreno 830)
+  with Ubuntu 26.04 AArch64. The current Chrome validation used GNOME Wayland
+  and Turnip. AV1 requires compatible firmware.
 
-版本串形如 `0.4.6+<git短hash>`，工作区有未提交改动时带 `-dirty`。
-浏览器把解码放在单独的 RDD/GPU 进程里，系统目录和 `LIBVA_DRIVERS_PATH`
-可能各有一份 `.so`，靠这个后缀能确认实际 `dlopen` 的是哪一版。
-
-多分辨率回归（**需要真机**，判据是硬解与软解 md5 逐字节一致）：
-
-```sh
-cd vaapi-driver/tests
-FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh test.hevc
-```
-
-### 环境变量
-
-| 变量 | 默认 | 作用 |
+| Affected release | Symptom | Fix |
 |---|---|---|
-| `DMD_VA_LOG=1` | 关 | 输出驱动日志到 stderr。排查任何问题的第一步。 |
-| `DMD_TRACE_ORDER=1` | 关 | 打印 surface 提交/收帧的配对时序。 |
-| `DMD_HARVEST_EXPORTED_ONLY=0` | **开** | 关闭"仅对导出过 dmabuf 的 surface 收帧"。默认开启可省下每帧一次 memcpy（33.0 → 56.1 fps）。 |
-| `DMD_NO_MAP_WAIT=1` | 关 | 取消 map 时的兜底等帧，让 ffmpeg 跑在 Chrome 的处境下。**测试用**。 |
-| `DMD_CSD_DUMP=1` | 关 | 打印合成 SPS 的原始字节。改参数集合成逻辑时用。 |
-| `DMD_VA_TOLERATE_MISSING=1` | 关 | 取不到帧也报成功。**纯诊断**，画面必然是错的。 |
+| 0.4.1 and earlier | FFmpeg `-f null -` decode could hang | 0.4.2 |
+| 0.4.2 and earlier | Non-1080p video could appear green | 0.4.3 |
+| 0.4.3 and earlier | Browser seeks or quality switches could stall for seconds | 0.4.4 |
+| 0.4.5 and earlier | Chrome could present early frames out of order | 0.4.6 |
 
-## 浏览器
+See [upgrade and pitfalls](doc/upgrade-and-pitfalls.md) for the causes and
+current codec limitations. For detailed device behavior, see the
+[platform verification notes](doc/verified-platform-facts.md) and the
+[driver README](vaapi-driver/README.md).
 
-先确认后端能出帧（上面的 ffmpeg 自检），**这一步不通就别碰浏览器**。
+## Documentation
 
-### 快速配置
-
-下面两段都是幂等的，重复执行不会叠加。不需要下载任何东西，直接粘进终端。
-
-**Chrome** —— 给 `.desktop` 的每个 `Exec=` 注入必需参数：
-
-```bash
-D=/usr/share/applications/google-chrome.desktop
-F="--ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --ignore-gpu-blocklist --use-angle=vulkan --enable-features=VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
-grep -q render-node-override "$D" || {
-  sudo cp "$D" "$D.bak"
-  sudo sed -i "s|^\(Exec=[^ ]*\)|\1 $F|" "$D"
-}
-grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数增长
-```
-
-`--enable-features` 要**写成一条**、多项用逗号分隔，不要重复出现两次（重复时
-只有一份生效）。**里面绝对不能有 `Vulkan`**：骁龙 8 Elite + Chrome 151 实测，
-加上它之后 GPU 进程照常探测、照常给每个 profile 建 config，然后 `vaTerminate`，
-**一个 `CreateContext` 都没有** —— 视频静默回落软解，页面流畅、驱动 0 配对帧，
-看起来就像"配了没生效"。
-
-`--use-angle=vulkan` 是另一回事：它只把 ANGLE（WebGL / GL 呈现）切到 Vulkan 后端，
-早期骁龙 8 Elite / Chrome 151 的 NV12 测试中少了它文字糊成一团并重影，因此当时保留。
-nabu（SD855）这一代连它也要去掉（wayland 与 Vulkan 冲突）。
-
-这不是所有格式通用的要求：2026-11-15 的 Chrome 154 / Main10 P010 实测中，
-ANGLE Vulkan 能完成硬解，但图像导入黑屏；ANGLE OpenGL 的画面正常。
-现在启动脚本默认使用 ANGLE OpenGL。Chrome 156 / GNOME Wayland / Turnip
-已复测 H.264、HEVC Main/Main10、AV1 播放和 H.264 编码，见
-[构建与启动说明](doc/browser-vaapi-guide.md#推荐配置gnome-wayland--turnip--angle-opengl)
-及 [Main10/P010 验证记录](doc/hevc-main10-p010-validation.md)。
-
-同理，`chrome://flags` 里那个 "Vulkan" 开关（等价于 `--enable-features=Vulkan`）
-也要保持 `Disabled`；ANGLE 后端需按上述设备、浏览器版本和视频格式选择。
-逐条对照实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
-重启浏览器后生效。
-
-本机（nabu / SM8150）固件不支持 AV1，发布版驱动也默认不声明该
-profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流畅、
-驱动 0 配对帧），看起来像"配了没生效"。播放器里选 AVC / HEVC。
-别的机型以编码表和 `vainfo` 为准，不要把这条当成驱动通用限制。
-
-**Firefox** —— 当前原生 Firefox 160 / GNU/Linux AArch64 使用
-[`RDD 兼容入口`](doc/firefox-sandbox.md)，保留 Mozilla 沙箱并增加限定 KGSL
-访问规则。按该文档安装配套兼容库、系统策略和用户启动器，不设置
-`MOZ_DISABLE_RDD_SANDBOX`。下面两步保留为旧版手工配置的历史记录，
-不适用于当前兼容入口。
-
-第一步，给 `.desktop` 注入环境变量：
-
-```bash
-D=/usr/share/applications/firefox.desktop
-grep -q MOZ_DISABLE_RDD_SANDBOX "$D" || {
-  sudo cp "$D" "$D.bak"
-  sudo sed -i 's|^Exec=|Exec=env MOZ_DISABLE_RDD_SANDBOX=1 LIBVA_DRIVER_NAME=msm_drm |' "$D"
-}
-grep -c MOZ_DISABLE_RDD_SANDBOX "$D"   # 每个 Exec 行 1 次
-```
-
-旧版手工配置曾使用 `MOZ_DISABLE_RDD_SANDBOX=1`：Firefox 把解码放在 RDD 进程里，
-它的沙箱会挡掉 `/dev/video32`，日志里表现为
-`Sandbox: Couldn't open video device`。这一项和 `user.js` 里的
-pref 是两回事 —— pref 只开 Firefox 自己的硬解开关，不解决设备访问。
-
-第二步，写进每个 profile 的 `user.js`（先完全退出 Firefox）：
-
-```bash
-pkill -x firefox 2>/dev/null; sleep 1
-for R in ~/.mozilla/firefox ~/.config/mozilla/firefox \
-         ~/snap/firefox/common/.mozilla/firefox \
-         ~/.var/app/org.mozilla.firefox/.mozilla/firefox; do
-  [ -f "$R/profiles.ini" ] || continue
-  sed -n 's/^Path=//p' "$R/profiles.ini" | while read -r p; do
-    case "$p" in /*) U="$p/user.js" ;; *) U="$R/$p/user.js" ;; esac
-    [ -d "$(dirname "$U")" ] || continue
-    touch "$U"
-    for k in \
-      'user_pref("media.hardware-video-decoding.enabled", true);' \
-      'user_pref("media.hardware-video-decoding.force-enabled", true);' \
-      'user_pref("media.ffmpeg.vaapi.enabled", true);' \
-      'user_pref("media.hevc.enabled", true);' \
-      'user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);' \
-      'user_pref("media.ffmpeg.disable-software-fallback", true);' \
-      'user_pref("media.video-queue.hw-accel-size", 10);' \
-      'user_pref("media.video-queue.default-size", 10);' \
-      'user_pref("media.video-queue.send-to-compositor-size", 6);'
-    do grep -qxF "$k" "$U" || printf '%s\n' "$k" >> "$U"; done
-    echo "已配置 $U"
-  done
-done
-```
-
-profile 根目录要遍历这四处：不同安装方式（apt、XDG 新位置、snap、flatpak）
-放在不同地方，同一台机器上也可能并存多份。只写 `~/.mozilla` 的话，
-Firefox 实际用另一处时就会"配了但没生效"——页面能播、统计正常，实际走软解。
-
-三处不能省：
-
-`media.ffmpeg.disable-software-fallback` 是**唯一**能关掉硬解性能看门狗的
-开关。FFmpegVideoDecoder 累计 16 帧 `decodeTime > frameDuration` 就打印
-`HW decoding is slow, switching back to SW decode`，然后禁用硬解并重建
-解码器。此前误把 `force-enabled` 当成这个开关 —— 154 源码里看门狗条件
-只有 `IsDecodingSlow() && !media.ffmpeg.disable-software-fallback`，
-`force-enabled` 只绕过 gfxInfo 黑名单，完全不参与判定。B 站 1080p 每个
-解码器建立后立刻 `PORT_SETTINGS(INSUFFICIENT)` 重配，叠固件首帧滞后 4
-个输入单元，看门狗在解码器初期最敏感，于是进入杀解码器 → Seek 回同一
-PTS → 重建 → 再重配 → 再误判的死循环，页面表现为"播几秒卡在加载"。
-实测同一视频：加上后 100s / 3min 的 HW slow、FATAL、Seek 全 0；3min
-配对 4645 帧、送入 3099 收到 3099。代价是真正硬解损坏时不再自动退回软解。
-
-`media.hardware-video-decoding.force-enabled` 仍建议开，作用是绕过
-gfxInfo 黑名单，与看门狗无关。
-
-三项 `media.video-queue.*`：1080p30 27Mbps 实测不加丢帧 14.25%，加上
-降到 0.89%。
-
-**验证**：最可靠的判据是驱动日志。带 `DMD_VA_LOG=1` 启动浏览器，
-播一段视频，看有没有 `[v4l2] 会话就绪` 和 `配对: 帧`：
-
-```bash
-DMD_VA_LOG=1 firefox 2>&1 | grep -E '会话就绪|配对: 帧'
-```
-
-播放中另开一个终端看硬件门控（解码期间应为 `enabled`，空闲时 `disabled`，
-所以要在播放时查）：
-
-```bash
-for r in /sys/devices/platform/soc/*gdsc/regulator/regulator.*/; do
-  [ "$(cat $r/name)" = mvs0_gdsc ] && echo "mvs0_gdsc=$(cat $r/state)"; done
-```
-
-不要只看播放是否流畅，也不要用 `vainfo` —— 前者软解一样流畅，
-后者只证明驱动能加载。
-
-**还原**：
-
-```bash
-# Chrome
-sudo mv /usr/share/applications/google-chrome.desktop.bak \
-        /usr/share/applications/google-chrome.desktop
-# Firefox 的 .desktop
-sudo mv /usr/share/applications/firefox.desktop.bak \
-        /usr/share/applications/firefox.desktop
-# Firefox：删掉上面那些 user_pref 行（四处都扫，和安装对称）
-pkill -x firefox 2>/dev/null; sleep 1
-for R in ~/.mozilla/firefox ~/.config/mozilla/firefox \
-         ~/snap/firefox/common/.mozilla/firefox \
-         ~/.var/app/org.mozilla.firefox/.mozilla/firefox; do
-  for U in "$R"/*/user.js; do
-    [ -f "$U" ] && sed -i '/media\.\(hardware-video-decoding\|ffmpeg\|hevc\|video-queue\)/d' "$U"
-  done
-done
-```
-
-> ⚠️ 这条还原按 pref 名匹配删除，会连带删掉你自己写的同类 pref
-> （例如 `media.hardware-video-decoding.force-enabled`）。在意的话先
-> `cp user.js user.js.bak`，或改用 `tools/configure-firefox-vaapi.sh --uninstall`
-> ——那个脚本用标记块界定范围，只删自己写的部分。
-
-仓库里也有等价脚本，多了 `--verify` / `--uninstall` 和冲突检测：
-`tools/configure-chrome-vaapi.sh`、`tools/configure-firefox-vaapi.sh`、
-`tools/check-browser-vaapi.sh`（也附在 [Release](../../releases/latest) 里）。
-
-Firefox 脚本会自动找 profile，覆盖 `~/.mozilla/firefox`、
-`~/.config/mozilla/firefox`（较新版本遵循 XDG 后的位置）、snap 与 flatpak
-四处，每个找到的 profile 都写一遍；用 `FIREFOX_HOME` 可指定只处理某一个。
-已有其它工具管理的 profile（`user.js` 里带 `>>> DroidSpaces ... >>>` 块）
-不会整段覆盖，但仍会补上对方不管的
-`media.ffmpeg.disable-software-fallback` —— 缺了它 B 站 1080p 会播几秒
-卡在加载。
-
-驱动目录优先取系统 dri 目录，用 `DMD_DRIVER_DIR` 可指定别处 ——
-`--verify` 第一行会显示实际选中的是哪一个，升级后建议瞄一眼，
-确认不是遗留的旧版本。
-
-Chrome 脚本在容器内没有 sudo 时，会自动改用
-`~/.local/share/applications` 下的用户级副本。
-
-> ⚠️ **Chrome 有一步脚本代劳不了，而且结论按机型相反**：nabu（SD855）上要打开
-> `chrome://flags` 把 **Vulkan** 设为 `Disabled` 并重启；骁龙 8 Elite 上**必须保持
-> 默认（Enabled）**，关掉会文字糊成一团、画面重影。判据是显示是否正常，不是日志里
-> 有没有 `not compatible with Vulkan`。这一项没有可用的命令行开关 ——
-> `--disable-vulkan` 这个开关在 Chrome 里根本不存在，`--disable-features=Vulkan`、
-> `--use-vulkan=disabled` 实测同样无效。
-> 详见[指南第 2.5 节](doc/browser-vaapi-guide.md)。
-
-### 手动配置
-
-Chrome 必须用 Wayland 模式，X11 下解码器能创建但一帧不走：
-
-```sh
-google-chrome \
-  --ozone-platform=wayland \
-  --render-node-override=/dev/dri/renderD128 \
-  --ignore-gpu-blocklist \
-  --enable-features="VaapiVideoDecodeLinux,VaapiVideoDecoder,VaapiVideoDecodeLinuxGL"
-```
-
-Firefox 把 pref 写进 profile 的 `user.js`。三项 `media.video-queue.*`
-不是可选项（1080p30 27Mbps 不加丢帧 14.25%，加上 0.89%）；
-`media.ffmpeg.disable-software-fallback` 也不是可选项（关掉硬解看门狗，
-否则 B 站 1080p 播几秒卡在加载）。完整清单用上面的粘贴块，不要手抄漏项。
-
-每个参数为什么不能省、Firefox 完整 pref 与其特有的坑、验证三步、实时监视、
-排障速查表，都在 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md)。
-
-## 旧版本的坑
-
-如果你不是在用最新版，先看 [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md)：
-
-| 你在用 | 症状 | 修复版本 |
-|---|---|---|
-| 0.4.1 及更早 | `-f null -` 自检挂死 | 0.4.2 |
-| 0.4.2 及更早 | 播非 1080p 绿屏（1080p 正常） | 0.4.3 |
-| 0.4.3 及更早 | 浏览器拖进度条 / 切清晰度卡数秒 | 0.4.4 |
-| 0.4.5 及更早 | Chrome 硬解开头几帧顺序错乱 | 0.4.6 |
-
-那份文档也记录了不随版本变化的能力边界（HEVC `st_ref_pic_set`、10bit、
-AV1 与 MPEG-2 的现状）。
-
-
-## 性能与能效
-
-**"硬解"只指用专用硬件解码，不代表省电或省 CPU。** 实测单路 1080p 硬解的
-整机功耗比软解略高（6.12 W vs 5.74 W），墙钟也不占优；真实价值在并发，
-以及把 CPU 让给其它工作。
-
-> ⚠️ 这组数字测的是 0.3.x 的 daemon 架构，V4L2 直通的能效与吞吐**尚未重新测量**。
-> 定性结论预计仍成立，具体数字应视为待复测。0.3.x 的性能数字（1080p 峰值
-> 194 fps 等）与当前架构无关，已全部作废。
-
-完整数据、口径说明与两个不可引用的错数字见
-[`doc/performance-and-roadmap.md`](doc/performance-and-roadmap.md)。
-
-## 文档
-
-| 文档 | 内容 |
+| Document | Contents |
 |---|---|
-| [`vaapi-driver/README.md`](vaapi-driver/README.md) | 驱动内部实现、V4L2 协商细节 |
-| [`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) | AV1 遗留缺陷的完整测绘与方法教训 |
-| [`doc/platform-integration-contract.md`](doc/platform-integration-contract.md) | 平台侧需要提供什么（0.4.0 只剩设备节点权限一项） |
-| [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) | 浏览器接入：完整参数、固化脚本、验证与排障 |
-| [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md) | 各版本已知缺陷与升级理由、编解码器能力边界 |
-| [`doc/performance-and-roadmap.md`](doc/performance-and-roadmap.md) | 性能与能效实测数据 |
-| [`doc/verified-platform-facts.md`](doc/verified-platform-facts.md) | 平台取证事实 |
-| [`doc/why-not-v4l2.md`](doc/why-not-v4l2.md) | ⚠️ 结论已被推翻的历史文档，保留其取证过程与方法教训 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 版本历史 |
+| [Driver README](vaapi-driver/README.md) | Driver internals, V4L2 negotiation, and verification |
+| [Hardware encoding](doc/hardware-encoding.md) | Rate control, device permissions, and validated workflows |
+| [Codec telemetry](doc/video-stats-v1.md) | Per-context counters and the shared record layout |
+| [Browser frame-order tests](vaapi-driver/tests/browser/README.md) | Pixel verification across browser playback paths |
+| [Jellyfin patches](patches/README.md) | Rotation and transcoding integration |
+| [Changelog](CHANGELOG.md) | Release history |
 
-## 测试设备
+## License
 
-小米平板 5（`nabu`），骁龙 855（SM8150 / Adreno 640），Android 13，内核 `4.14.336`；
-容器为 DroidSpaces 内 Debian 13 aarch64。
-
-AV1 需要更新的硬件，在另一台设备上验证。
-
-## 内核兼容
-
-驱动按 `REQBUFS` 结果自动分叉，两类内核都支持，无需配置：
-
-- **老内核**（nabu / kernel 4.14）：`USERPTR` 名义内存 + 私有 `PORT_SETTINGS`
-  事件 + `SESSION_CONTINUE`
-- **新内核**（Android 12+ / kernel 5.x+，实测 Android 15 / kernel 6.6）：
-  标准 V4L2 stateful 语义，只接受 `DMABUF`、发标准 `SOURCE_CHANGE`、
-  在事件后协商 CAPTURE
-
-新内核适配自 0.4.5 起（上游 PR #4）。两条路径的差异细节见
-[`vaapi-driver/README.md`](vaapi-driver/README.md) 与
-[`CHANGELOG.md`](CHANGELOG.md) 的 v0.4.5。
-
-## 许可
-
-见 [LICENSE](LICENSE)。
+See [LICENSE](LICENSE).

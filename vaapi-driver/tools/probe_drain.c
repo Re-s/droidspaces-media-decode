@@ -1,28 +1,28 @@
-/* MediaCodec 在 EOS + flush 之后还能继续解码吗？
+/* MediaCodec can still decode after EOS + Flush?
  *
- * 这决定 daemon 能不能提供"可逆的排空"：
- * 现在驱动为了拿到帧只能 finish_input（不可逆 shutdown(SHUT_WR)），
- * 之后必须重建会话 —— 实测每帧 155 ms、播放慢 4.7 倍。
+ * This decision determines whether Damon can provide "reversible emptiness":
+ * The driver can retrieve the frame only by calling finish_input, which irreversibly calls shutdown(SHUT_WR),
+ * Then you have to rebuild the session - to measure 155 ms per frame, and to play 4.7 times slower.
  *
- * 若 EOS 后 AMediaCodec_flush + 重送 CSD 能让同一个 codec 实例继续工作，
- * daemon 就能把"催出帧"做成不销毁会话的操作，省掉重建。
+ * If the AmediaCodec_flush+ re-transmission CSD after EOS allows the same codec example to continue working, the CSD will be able to do so.
+ * Daemon can make "circle" into a non-destructive session operation, save reconstruction.
  *
- * 注意这是在**容器外**（Android 侧）跑的，直接用 NDK MediaCodec，
- * 不经过 daemon 协议 —— 目的是先验证解码器语义，再决定要不要改 daemon。
+ * Note that this is running outside of ** container** (android side) using NDK MediaCodec,
+ * Without the daemon protocol -- the purpose is to verify the semantic syntax of the decoder before deciding whether to change the daemon.
  *
- * ⚠️ 局限：本探针**只统计帧数与 codec 实例是否存活，不检查画面内容**。
+ * Limitations: This probe** only counts the number of frames and the codec example, without checking the contents of the image**.
  *
- * 它当年的结论"排空 3 帧后 flush 重送 CSD 能继续解出 6 帧"被读成了
- * "排空可逆、无副作用"—— 那是**过度解读**。它证明的只是 codec 实例没死、
- * 还能吐帧，没有证明吐出来的帧是对的。
+ * It was "Funneled" when it came to the conclusion that "Flush is reloaded after three frames" and the CSD can continue to decipher the six frames."
+ * "Deficit reversible, non-subsequent" -- that's ** overread**. It proves only that the codec case is not dead.
+ * And the frame, and it didn't prove the frame was right.
  *
- * 后来的黑帧调查确证：**flush 会摧毁参考帧链**，续解出的 P/B 帧要一直
- * 黑到下一个 IDR（实测浏览器 135/708 帧纯黑，修复后归零）。
- * 所以"可逆"只在"会话对象可继续使用"这个意义上成立，画面是有代价的。
+ * Later black frame investigations confirmed that **flush would destroy the reference frame** and that the P/B frame would be rediscovered forever.
+ * Black to next IDR (actual browser 135/708 frames are black and fixed to zero).
+ * So "reverseable" is only established in the sense that "the object of the conversation can continue to be used", and the image is costly.
  *
- * 引用本探针结论时必须带上这条限定。要验证画面正确性，用逐字节比对
- * 软解基线，或按亮度均值判黑帧（见 probe_replay.c / probe_black.c）。
- * 本项目已因"只数帧数不看像素"栽过三次，这是其中一次的源头。
+ * This qualification must be used when quoting this probe. To verify the image's correctness, the byte-to-by-the-the-tem.
+ * Softly delineate the baseline, or a black frame is judged by the mean brightness (see probe_replay.c/ probe_black.c).
+ * This project has been planted three times because of the "no pixels at all" which is the source of one of the cases.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,11 +66,11 @@ static long next_nalu(long from, long *len)
     return -1;
 }
 
-/* 排空：送 EOS，收完所有帧，返回收到的帧数 */
+/* Queued: send EOS, take all frames, return the number of frames received */
 static int drain(AMediaCodec *c)
 {
     ssize_t bi = AMediaCodec_dequeueInputBuffer(c, 1000000);
-    if (bi < 0) { printf("  排空: 取不到输入缓冲 %zd\n", bi); return -1; }
+    if (bi < 0) { printf("  Empty: Unable to take input buffer %zd\n", bi); return -1; }
     AMediaCodec_queueInputBuffer(c, bi, 0, 0, 0, FLAG_EOS);
 
     int got = 0;
@@ -80,16 +80,16 @@ static int drain(AMediaCodec *c)
         if (oi >= 0) {
             if (info.size > 0) {
                 got++;
-                /* 只数帧不够 —— 上一版就是因此误判 flush 可用。
-                 * 检查亮度：flush 丢掉参考帧后解出来的是纯黑（Y=16）。 */
+                /* Only the frames are not enough -- the previous version was used for miscalculation.
+                 * Check brightness: The flash excavated the frame after it was dropped is pure black (Y=16). */
                 size_t osz; uint8_t *ob = AMediaCodec_getOutputBuffer(c, oi, &osz);
                 if (ob && osz > 200000) {
                     double sum = 0; int nsamp = 0;
                     for (size_t k = 0; k < 100000; k += 97) { sum += ob[k]; nsamp++; }
                     double mean = sum / nsamp;
                     if (got <= 8)
-                        printf("    帧%d 亮度均值 %.1f%s\n", got, mean,
-                               mean < 20.0 ? "  ← 黑帧!" : "");
+                        printf("    frame%d Brightness Mean %.1f%s\n", got, mean,
+                               mean < 20.0 ? "  ← Black Frame!" : "");
                 }
             }
             int eos = (info.flags & FLAG_EOS) != 0;
@@ -103,7 +103,7 @@ static int drain(AMediaCodec *c)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/data/local/tmp/test1080.h264";
-    if (load(path) < 0) { printf("读不了 %s\n", path); return 1; }
+    if (load(path) < 0) { printf("I can’t read it. %s\n", path); return 1; }
 
     unsigned char *sps = NULL, *pps = NULL;
     long sps_len = 0, pps_len = 0, off = 0, len;
@@ -116,16 +116,16 @@ int main(int argc, char **argv)
         else if (nut == 1 || nut == 5) { vo[nv] = off - 3; vl[nv] = len + 3; nv++; }
         off += len;
     }
-    if (!sps || !pps || nv < 12) { printf("码流不足\n"); return 1; }
+    if (!sps || !pps || nv < 12) { printf("We’re running out of yards.\n"); return 1; }
 
     AMediaCodec *c = AMediaCodec_createDecoderByType("video/avc");
-    if (!c) { printf("建解码器失败\n"); return 1; }
+    if (!c) { printf("Failed to build codec\n"); return 1; }
     AMediaFormat *fmt = AMediaFormat_new();
     AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, 1920);
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, 1080);
     if (AMediaCodec_configure(c, fmt, NULL, NULL, 0) != AMEDIA_OK) {
-        printf("configure 失败\n"); return 1;
+        printf("configure failed\n"); return 1;
     }
     AMediaCodec_start(c);
 
@@ -139,8 +139,8 @@ int main(int argc, char **argv)
     memcpy(ib, csd, sps_len + pps_len);
     AMediaCodec_queueInputBuffer(c, bi, 0, sps_len + pps_len, 0, FLAG_CODEC_CONFIG);
 
-    /* 第一段：送 3 帧（模拟浏览器稳态），排空 */
-    printf("--- 第一段：送 3 个 VCL 后排空 ---\n");
+    /* First paragraph: Send 3 frames (simulator steady state), empty */
+    printf("--- Paragraph 1: Send 3  VCL Back row empty ---\n");
     for (int i = 0; i < 3; i++) {
         bi = AMediaCodec_dequeueInputBuffer(c, 1000000);
         ib = AMediaCodec_getInputBuffer(c, bi, &cap);
@@ -148,33 +148,33 @@ int main(int argc, char **argv)
         AMediaCodec_queueInputBuffer(c, bi, 0, vl[i], i * 33333, 0);
     }
     int g1 = drain(c);
-    printf("  排空取到 %d 帧\n", g1);
+    printf("  Free to %d frame\n", g1);
 
-    /* 关键一步：flush 能否让它复活 */
-    printf("--- 对照A：EOS 后**不** flush，直接继续送料 ---\n");
+    /* Key step: whether Flush can bring it back to life. */
+    printf("--- control A:EOS After**No, no, no.** flush,Keep the feed going. ---\n");
     {
         ssize_t t = AMediaCodec_dequeueInputBuffer(c, 200000);
         printf("  dequeueInputBuffer -> %zd %s\n", t,
-               t >= 0 ? "(还能收输入)" : "(拒绝输入，EOS 后必须 flush)");
+               t >= 0 ? "(And you can take the input.)" : "(Deny input,EOS - I’ll have to. flush)");
         if (t >= 0) {
-            /* 真送一个 VCL 看出不出帧 */
+            /* I'm sending a VCL. I can't see the frame. */
             size_t cp; uint8_t *p2 = AMediaCodec_getInputBuffer(c, t, &cp);
             memcpy(p2, data + vo[3], vl[3]);
             AMediaCodec_queueInputBuffer(c, t, 0, vl[3], 3 * 33333, 0);
             AMediaCodecBufferInfo bi2;
             ssize_t o2 = AMediaCodec_dequeueOutputBuffer(c, &bi2, 500000);
-            printf("  送一个 VCL 后 dequeueOutput -> %zd\n", o2);
+            printf("  One for you. VCL After dequeueOutput -> %zd\n", o2);
             if (o2 >= 0) AMediaCodec_releaseOutputBuffer(c, o2, false);
         }
     }
 
-    printf("--- flush 后重送 CSD，继续送第 4..9 个 VCL ---\n");
+    printf("--- flush Reload CSD,Keep sending the first one. 4..9  VCL ---\n");
     media_status_t fs = AMediaCodec_flush(c);
     printf("  AMediaCodec_flush -> %d (0=OK)\n", fs);
 
     bi = AMediaCodec_dequeueInputBuffer(c, 1000000);
     if (bi < 0) {
-        printf("  ✗ flush 后取不到输入缓冲（%zd）→ EOS 不可逆，必须重建\n", bi);
+        printf("  ✗ flush Unable to get input buffer(%zd)→ EOS Irreversible. Rebuilding.\n", bi);
         return 2;
     }
     ib = AMediaCodec_getInputBuffer(c, bi, &cap);
@@ -183,21 +183,21 @@ int main(int argc, char **argv)
 
     for (int i = 3; i < 9; i++) {
         bi = AMediaCodec_dequeueInputBuffer(c, 1000000);
-        if (bi < 0) { printf("  第%d个VCL取不到输入缓冲\n", i); break; }
+        if (bi < 0) { printf("  number%d  VCL Unable to take input buffer\n", i); break; }
         ib = AMediaCodec_getInputBuffer(c, bi, &cap);
         memcpy(ib, data + vo[i], vl[i]);
         AMediaCodec_queueInputBuffer(c, bi, 0, vl[i], i * 33333, 0);
     }
     int g2 = drain(c);
-    printf("  第二段排空取到 %d 帧\n", g2);
+    printf("  Second line empty to %d frame\n", g2);
 
-    printf("\n=== 结论 ===\n");
+    printf("\n=== Conclusions ===\n");
     if (fs == AMEDIA_OK && g2 > 0)
-        printf("✓ EOS + flush 可逆：同一 codec 实例能继续解码\n"
-               "  → daemon 可以提供\"不销毁会话的排空\"，省掉每帧重建\n");
+        printf("✓ EOS + flush Reversible: same codec The example can be decoded.\n"
+               "  → daemon - Yes, I can.\"Do not destroy the empty session\",Save every frame of reconstruction.\n");
     else
-        printf("✗ EOS 后即使 flush 也拿不到新帧（g2=%d）\n"
-               "  → 排空必然作废实例，当前的重建方案已是必需\n", g2);
+        printf("✗ EOS And then, flush I can’t get a new frame.(g2=%d)\n"
+               "  → Draining invalidates the instance, so the current rebuild path is required.\n", g2);
 
     AMediaCodec_stop(c);
     AMediaCodec_delete(c);

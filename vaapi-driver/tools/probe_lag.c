@@ -1,8 +1,8 @@
-/* 测量 MediaCodec 在低延迟模式下的真实输出滞后。
+/* Measuring the real output of MediaCodec in low-delay mode.
  *
- * 方法：逐个送 VCL 单元，每送一个就以 800ms 超时试取一帧，
- * 记录"第几个单元送进去之后第一帧才出来"。这个数字就是滞后深度。
- * 浏览器里 ffmpeg 稳态只保持 3 帧在飞，所以滞后 >=4 就会死锁。
+ * Method: One VCL unit per unit, each delivered with a frame to be tested at 800 ms per hour.
+ * The record says "The first frame comes out after the first units are in." That's the number of the lag depths.
+ * The ffmpeg steady state in the browser is only 3 frames in flight, so the delay > = 4 is locked dead.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -24,7 +24,7 @@ static int load(const char *p)
     return 0;
 }
 
-/* 找下一个起始码，返回 NALU 起点（含起始码）*/
+/* Find a new start, return to NALU starting (including startup)*/
 static long next_sc(long from)
 {
     for (long i = from; i + 3 < buflen; i++) {
@@ -37,7 +37,7 @@ static long next_sc(long from)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/root/decode-test/test1080.h264";
-    if (load(path) < 0) { fprintf(stderr, "读不了 %s\n", path); return 1; }
+    if (load(path) < 0) { fprintf(stderr, "I can’t read it. %s\n", path); return 1; }
 
     struct dmd_session_config cfg;
     dmd_session_config_init(&cfg);
@@ -46,7 +46,7 @@ int main(int argc, char **argv)
     struct dmd_error err;
     memset(&err, 0, sizeof(err));
     struct dmd_session *s = dmd_session_create(&cfg, &err);
-    if (!s) { fprintf(stderr, "会话建立失败 code=%d\n", err.code); return 1; }
+    if (!s) { fprintf(stderr, "Session Create Failed code=%d\n", err.code); return 1; }
     int rc;
 
     int sent = 0, first_frame_after = -1, frames = 0;
@@ -54,13 +54,13 @@ int main(int argc, char **argv)
     while (off >= 0 && sent < 12) {
         long end = next_sc(off + 3);
         long len = (end < 0 ? buflen : end) - off;
-        /* 跳过起始码取 NAL 头判类型 */
+        /* Skip Start-Up NAL Header Type */
         long sc = (buf[off+2] == 1) ? 3 : 4;
         int nut = buf[off + sc] & 0x1f;
 
-        if (nut == 1 || nut == 5) {   /* 只送 VCL，模拟驱动行为 */
+        if (nut == 1 || nut == 5) {   /* Send VCL only, simulate drive behavior */
             rc = dmd_session_send_unit(s, buf + off, len);
-            if (rc != DMD_OK) { fprintf(stderr, "送单元失败 rc=%d\n", rc); break; }
+            if (rc != DMD_OK) { fprintf(stderr, "Sending module failed rc=%d\n", rc); break; }
             sent++;
 
             struct dmd_frame f;
@@ -69,24 +69,24 @@ int main(int argc, char **argv)
             if (rc == DMD_OK) {
                 frames++;
                 if (first_frame_after < 0) first_frame_after = sent;
-                printf("送第 %d 个 VCL 后取到帧（累计 %d 帧）\n", sent, frames);
+                printf("Send the first one to the first. %d  VCL Then take frame (cumulative) %d frame)\n", sent, frames);
                 dmd_session_release_frame(s, &f);
             } else {
-                printf("送第 %d 个 VCL 后 800ms 内无帧 (rc=%d)\n", sent, rc);
+                printf("Send the first one to the first. %d  VCL After 800ms No frame inside. (rc=%d)\n", sent, rc);
             }
         } else {
-            /* 参数集：驱动会合成后单独送，这里也送以贴近真实 */
+            /* Parameter set: The driver is synthesized and sent separately, and here is also sent to the real */
             dmd_session_send_unit(s, buf + off, len);
         }
         off = end;
     }
 
-    printf("\n=== 结论 ===\n");
-    printf("首帧出现在送入第 %d 个 VCL 之后\n", first_frame_after);
-    printf("滞后深度 = %d\n", first_frame_after);
-    printf("浏览器 ffmpeg 稳态在飞 3 帧：滞后 <=3 则不死锁，>=4 死锁\n");
-    printf("判定：%s\n", (first_frame_after > 0 && first_frame_after <= 3)
-                            ? "✓ 不会死锁" : "✗ 仍会死锁");
+    printf("\n=== Conclusions ===\n");
+    printf("The frame is in the first place. %d  VCL After\n", first_frame_after);
+    printf("Latitude = %d\n", first_frame_after);
+    printf("Browser ffmpeg Steady. 3 Frame: Backward <=3 And don’t die of locking.,>=4 Damn lock.\n");
+    printf("Decision:%s\n", (first_frame_after > 0 && first_frame_after <= 3)
+                            ? "✓ It’s not locked." : "✗ Still locks.");
 
     dmd_session_destroy(s);
     free(buf);

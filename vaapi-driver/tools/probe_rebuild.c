@@ -1,27 +1,27 @@
-/* ⚠️ 本探针的结论**不可信**，保留仅作教训记录。
+/* * The conclusions of this probe** are not credible, and a record of lessons learned is retained.
  *
- * 它报告"重建会话后能从非 IDR 帧续传出帧"，据此得出"重建代价可接受"。
- * 但它**只数了帧数，没有检查画面内容** —— 那些帧全是纯黑（Y=16）。
+ * It reports that "rebuilding sessions can be transmitted from non-IDR frames", which leads to "rebuilding costs are acceptable."
+ * But it** counted only frames, without checking the contents of the screen** -- those frames were all pure black (Y=16).
  *
- * 真相：任何丢弃解码器状态的操作（AMediaCodec_flush 或重建会话）都会摧毁
- * 参考帧链，而 H.264 的 P/B 帧必须依赖它。从非 IDR 位置重新开始解码，
- * 要一直黑到下一个 IDR（本测试流每 30 帧一个，故最多连黑 29 帧），
- * 表现为播放时"画面一闪一闪"。
+ * Truth: Any action to discard the codec state (AmediaCodec_flush or re-establish session) will be destroyed
+ * The reference frame, which must be relied on by the P/B frame of H.264. Decoding from non-IDR positions is restarted.
+ * To blacken until the next IDR (one in every 30 frames of this test stream, so black at most 29 frames),
+ * Showed as "A Vision Flash".
  *
- * 正确做法见 probe_replay.c：重建后必须从最近的 IDR 重放，
- * 重放出的帧丢弃。检测手段见 probe_black.c（按亮度均值判黑帧）。
+ * The right approach is to be found in probe_replay.c: Replaying after reconstruction from the nearest IDR, and then replaying the project from the IDR.
+ * Drops the redistributed frame. See probe_black.c for detection.
  *
- * 教训：验证解码正确性**永远不能只数帧数**。这个错误在本项目里犯了三次
- * （probe_rebuild、probe_drain、以及"浏览器全程硬解 143 帧"那次报告）。
+ * Lessons: Verify decoding validity** can never be counted only in frame**. This error was made three times in this project.
+ * (probe_rebuild, probe_drain, and the report "Browser full frame hardened")
  */
-/* 验证：flush 之后重建会话，能否从流中途继续正确解码？
+/* Verify: Can you correct the password from the stream by reconstructing the session after Flush?
  *
- * 这是"驱动侧透明重建"方案的前提。关键问题是重建后的新 MediaCodec
- * 没有参考帧，必须等到下一个 IDR 才能出正确画面 —— 如果中途重建只能
- * 靠 IDR，那这个方案在浏览器场景（长 GOP）就会有可见花屏。
+ * This is the premise of the "Driving Transparency Rebuilding". The key issue is the new MediaCodec after the reconstruction.
+ * No frame of reference, wait until the next IDR is right -- if you can only recreate it in the middle of the road.
+ * IDR, that's a plan with a visible screen on the browser scene.
  *
- * 做法：送 8 个 VCL（跨 IDR 之后进入 P/B），flush 收尾，
- * 然后重建会话、重送参数集 + 后续 VCL，看能否出帧。
+ * Practice: Send 8 VCLs (B/ P/ P after IDR), Flush closing,
+ * Then recreate the session, re-transmit the argument set + follow-up VCL, see if you can get out of the frame.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,15 +50,15 @@ static struct dmd_session *mk(void){
     cfg.codec=DMD_CODEC_H264; cfg.width=1920; cfg.height=1080;
     struct dmd_error e; memset(&e,0,sizeof(e));
     struct dmd_session *s=dmd_session_create(&cfg,&e);
-    if(!s) fprintf(stderr,"建会话失败 code=%d %s\n",e.code,e.msg);
+    if(!s) fprintf(stderr,"Create session failed code=%d %s\n",e.code,e.msg);
     return s;
 }
 
 int main(int argc,char**argv){
     const char *path=argc>1?argv[1]:"/root/decode-test/test1080.h264";
-    if(load(path)<0){fprintf(stderr,"读不了\n");return 1;}
+    if(load(path)<0){fprintf(stderr,"I can’t read it.\n");return 1;}
 
-    /* 记住参数集，重建时要重送 */
+    /* Remember the set of parameters. Reload when reconstructing. */
     long sps_off=-1,sps_len=0,pps_off=-1,pps_len=0;
 
     struct dmd_session *s=mk(); if(!s) return 1;
@@ -83,9 +83,9 @@ int main(int argc,char**argv){
         if(sent>=8){ resume_from=(end<0?buflen:end); break; }
         off=end;
     }
-    printf("阶段1: 送 %d VCL, 取 %d 帧\n",sent,got);
+    printf("phase 1: Send %d VCL, Take %d frame\n",sent,got);
 
-    /* flush 收尾 */
+    /* Flush, close it. */
     dmd_session_finish_input(s);
     for(;;){
         struct dmd_frame f; memset(&f,0,sizeof(f));
@@ -93,15 +93,15 @@ int main(int argc,char**argv){
         if(rc!=DMD_OK) break;
         got++; dmd_session_release_frame(s,&f);
     }
-    printf("阶段1 flush 后累计 %d 帧\n",got);
+    printf("phase 1 flush Cumulative after %d frame\n",got);
     dmd_session_destroy(s);
 
-    /* ==== 重建：从流中途继续 ==== */
-    printf("\n--- 重建会话，从中途继续送 ---\n");
+    /* Rebuild the session and resume partway through the stream */
+    printf("\n--- Rebuild session, continue from midway ---\n");
     s=mk(); if(!s) return 1;
     if(sps_off>=0) dmd_session_send_unit(s,buf+sps_off,sps_len);
     if(pps_off>=0) dmd_session_send_unit(s,buf+pps_off,pps_len);
-    printf("已重送 SPS(%ld) PPS(%ld)\n",sps_len,pps_len);
+    printf("Reloaded SPS(%ld) PPS(%ld)\n",sps_len,pps_len);
 
     int sent2=0,got2=0,first_nut=-1;
     off=resume_from;
@@ -117,11 +117,11 @@ int main(int argc,char**argv){
         if(dmd_session_next_frame(s,&f,400)==DMD_OK){got2++;dmd_session_release_frame(s,&f);}
         off=end;
     }
-    printf("续传首个 VCL 类型 = %d (1=非IDR, 5=IDR)\n",first_nut);
-    printf("阶段2: 送 %d VCL, 取 %d 帧\n",sent2,got2);
-    printf("\n=== 结论 ===\n%s\n",
-        got2>0 ? "✓ 重建后能从中途继续出帧（不必等 IDR）"
-               : "✗ 重建后中途无法出帧：必须等下一个 IDR，会有可见花屏");
+    printf("Continue First VCL Type = %d (1=Not IDR, 5=IDR)\n",first_nut);
+    printf("phase 2: Send %d VCL, Take %d frame\n",sent2,got2);
+    printf("\n=== Conclusions ===\n%s\n",
+        got2>0 ? "✓ The reconstruction will continue from the middle. IDR)"
+               : "✗ No frame can be drawn after reconstruction: we have to wait for the next one. IDR,There’s a visual screen.");
     dmd_session_destroy(s);
     free(buf);
     return 0;

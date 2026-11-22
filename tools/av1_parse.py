@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-AV1 位级解析/比对器 —— 辅助排查 OBU 反向合成的字段错位。
+AV1 Bits Parsing/Matching -- Assistant Check OBU Inverted Fields to Align。
 
-用法:
-    python3 av1_parse.py <file.obu>          逐字段打印
-    python3 av1_parse.py <a.obu> <b.obu>     两份码流逐字段比对
+Usage:
+    python3 av1_parse.py <file.obu>          Field-by-field printing
+    python3 av1_parse.py <a.obu> <b.obu>     Two stream-by-field matching.
 
-⚠️ 重要局限（吃过教训，务必先读）：
-本脚本**不是权威判据**。它是手写实现，自身可能与规范有偏差，
-且历史上出现过"解析器的错误与驱动的错误互相抵消、显得已对齐"
-的情况，导致三四轮排查走错方向。
+Important limitations:
+This is the script.**It’s not an authoritative verdict.**。It’s handwritten and it may be out of line with the norm.，
+And it’s been there in history."The error of the parser is offset by the error of the driver and appears to be aligned"
+The situation led to the wrong direction in three or four rows.。
 
-定位单个错误比特时，权威工具是 ffmpeg 自带的 trace_headers：
+When locating individual errors, the authoritative tool is ffmpeg It’s self-contained. trace_headers：
 
     ffmpeg -loglevel trace -f obu -i <file> -c copy \
            -bsf:v trace_headers -f null - 2>&1 | grep -a "trace_headers"
 
-它输出「位偏移 + 字段名 + 二进制串 + 值」，可直接与真实码流 diff。
-本脚本的价值在于快速概览与批量比对，用它形成假设、用 trace_headers 定论。
+It produces ”Big offset.” + Field Name + Binary String + Value, direct to the real stream diff。
+The value of this script is to compare the quick overview with the volume, using it to make assumptions, use trace_headers Findings。
 """
 import sys
 
@@ -25,28 +25,28 @@ import sys
 class BitReader:
     def __init__(self, data):
         self.d = data
-        self.pos = 0                      # 位偏移
+        self.pos = 0                      # Offset
 
     def f(self, n):
-        """f(n)：MSB 优先读 n 位（规范 4.10.2）。"""
+        """f(n)：MSB Priority reading n bit (norm) 4.10.2）。"""
         v = 0
         for _ in range(n):
             byte = self.pos >> 3
             if byte >= len(self.d):
-                raise EOFError(f"读越界于位 {self.pos}")
+                raise EOFError(f"Read beyond bit {self.pos}")
             bit = (self.d[byte] >> (7 - (self.pos & 7))) & 1
             v = (v << 1) | bit
             self.pos += 1
         return v
 
     def su(self, n):
-        """su(n)：n 位补码（规范 4.10.6）。"""
+        """su(n)：n Bit Compend (Physics) 4.10.6）。"""
         v = self.f(n)
         sign = 1 << (n - 1)
         return v - (1 << n) if v & sign else v
 
     def ns(self, n):
-        """ns(n)：非对称编码（规范 4.10.7）。"""
+        """ns(n)：Asymmetric encoding (norm) 4.10.7）。"""
         if n <= 1:
             return 0
         w = n.bit_length()
@@ -74,7 +74,7 @@ class BitReader:
 
 
 class Fields:
-    """收集字段名与值，供比对使用。"""
+    """Collect field names and values for matching。"""
     def __init__(self, quiet=False):
         self.items = []
         self.quiet = quiet
@@ -93,7 +93,7 @@ class Fields:
 
 
 def parse_sequence_header(br, F):
-    """sequence_header_obu()，规范 5.5.1。"""
+    """sequence_header_obu()，Norms 5.5.1。"""
     prof = F.add("seq_profile", br.f(3))
     F.add("still_picture", br.f(1))
     reduced = F.add("reduced_still_picture_header", br.f(1))
@@ -102,7 +102,7 @@ def parse_sequence_header(br, F):
     else:
         timing = F.add("timing_info_present_flag", br.f(1))
         if timing:
-            raise NotImplementedError("timing_info 未实现解析")
+            raise NotImplementedError("timing_info No resolution achieved")
         F.add("initial_display_delay_present_flag", br.f(1))
         cnt = F.add("operating_points_cnt_minus_1", br.f(5))
         for i in range(cnt + 1):
@@ -143,7 +143,7 @@ def parse_sequence_header(br, F):
     F.add("enable_superres", br.f(1))
     F.add("enable_cdef", br.f(1))
     F.add("enable_restoration", br.f(1))
-    # color_config()，规范 5.5.2
+    # color_config()，Norms 5.5.2
     hbd = F.add("high_bitdepth", br.f(1))
     if prof == 2 and hbd:
         F.add("twelve_bit", br.f(1))
@@ -175,7 +175,7 @@ def parse_sequence_header(br, F):
 
 
 def parse_uncompressed_header(br, F, S):
-    """uncompressed_header()，规范 5.9.2。S 是序列头的 Fields（提供能力位）。"""
+    """uncompressed_header()，Norms 5.9.2。S It’s the head of the sequence. Fields（Provide capacity slots）。"""
     def sq(name, default=0):
         v = S.get(name, default)
         return v if v is not None else default
@@ -203,7 +203,7 @@ def parse_uncompressed_header(br, F, S):
     if not show:
         F.add("showable_frame", br.f(1))
     if ft == 3 or (ft == 0 and show):
-        err_res = 1                   # 恒 1，不写入
+        err_res = 1                   # Hen-hyun. 1，Do Not Write
     else:
         err_res = F.add("error_resilient_mode", br.f(1))
     F.add("disable_cdf_update", br.f(1))
@@ -215,12 +215,12 @@ def parse_uncompressed_header(br, F, S):
         if sq("seq_choose_integer_mv"):
             F.add("force_integer_mv", br.f(1))
     if fid_present:
-        F.add("current_frame_id", br.f(1))   # 简化
+        F.add("current_frame_id", br.f(1))   # Simplified
     frame_size_override = 1 if ft == 3 else F.add("frame_size_override_flag",
                                                   br.f(1))
     if eoh:
         F.add("order_hint", br.f(ohb))
-    # refresh_frame_flags：KEY+show 时恒 allFrames、不写
+    # refresh_frame_flags：KEY+show Cycling allFrames、No writing.
     refresh_all = (ft == 0 and show)
     if not intra or not refresh_all:
         if not (ft == 0 and show):
@@ -232,7 +232,7 @@ def parse_uncompressed_header(br, F, S):
         F.add("primary_ref_frame", br.f(3))
     if not (ft == 0 and show):
         F.add("refresh_frame_flags", br.f(8))
-    # 参考帧
+    # Reference Frame
     if not intra:
         if eoh:
             short = F.add("frame_refs_short_signaling", br.f(1))
@@ -256,14 +256,14 @@ def parse_uncompressed_header(br, F, S):
     if F.get("render_and_frame_size_different"):
         F.add("render_width_minus_1", br.f(16))
         F.add("render_height_minus_1", br.f(16))
-    # allow_intrabc（CBS uncompressed_header 原文）：
+    # allow_intrabc（CBS uncompressed_header Original）：
     #   if (allow_screen_content_tools && upscaled_width == frame_width)
     #       flag(allow_intrabc);
     #   else infer(allow_intrabc, 0)
-    # upscaled == frame 等价于本帧未走 superres 上采样。
-    # allow_intrabc：经 ffmpeg trace_headers 校准 —— 真实码流在
-    # allow_screen_content_tools=0 时该位**不出现**（位 46 是 render_and_...，
-    # 位 47 直接是 disable_frame_end_update_cdf）。
+    # upscaled == frame The same price as the frame. superres Up sampling。
+    # Verified allow_intrabc against FFmpeg trace_headers in the source bitstream:
+    # allow_screen_content_tools=0 Time**Not present.**（bits 46 Yes. render_and_...，
+    # The video is available at www.un.org/photo_s/sc/sc/sc/sc/sc/sc/sc/sc/sc/sc/sc/sc/sc/sc/
     if intra:
         if asct and not F.get("use_superres", 0):
             F.add("allow_intrabc", br.f(1))
@@ -279,7 +279,7 @@ def parse_uncompressed_header(br, F, S):
             F.add("use_ref_frame_mvs", br.f(1))
     if not F.get("disable_cdf_update"):
         F.add("disable_frame_end_update_cdf", br.f(1))
-    # tile_info()，规范 5.9.15
+    # tile_info()，Norms 5.9.15
     w = sq("max_frame_width_minus_1") + 1
     h = sq("max_frame_height_minus_1") + 1
     mi_cols = 2 * ((w + 7) >> 3)
@@ -337,7 +337,7 @@ def parse_uncompressed_header(br, F, S):
     if cl + rl > 0:
         F.add("context_update_tile_id", br.f(cl + rl))
         F.add("tile_size_bytes_minus_1", br.f(2))
-    # quantization_params()，规范 5.9.12
+    # quantization_params()，Norms 5.9.12
     F.add("base_q_idx", br.f(8))
 
     def delta_q():
@@ -361,7 +361,7 @@ def parse_uncompressed_header(br, F, S):
         if S.get("separate_uv_delta_q"):
             F.add("qm_v", br.f(4))
 
-    # segmentation_params()，规范 5.9.14
+    # segmentation_params()，Norms 5.9.14
     seg = F.add("segmentation_enabled", br.f(1))
     if seg:
         primary_none = intra or err_res
@@ -383,21 +383,21 @@ def parse_uncompressed_header(br, F, S):
                             br.su(bits[j] + 1)
                         else:
                             br.f(bits[j])
-            F.add("→ segmentation data 已读", 1)
+            F.add("→ segmentation data Read", 1)
 
-    # CodedLossless 推导（规范 7.12.1）
+    # CodedLossless Inference (norm) 7.12.1）
     q = F.get("base_q_idx")
     lossless = (q == 0 and F.get("DeltaQYDc") == 0 and
                 F.get("DeltaQUDc", 0) == 0 and F.get("DeltaQUAc", 0) == 0)
 
-    # delta_q_params()，规范 5.9.17
+    # delta_q_params()，Norms 5.9.17
     if q > 0:
         dq = F.add("delta_q_present", br.f(1))
         if dq:
             F.add("delta_q_res", br.f(2))
     else:
         dq = 0
-    # delta_lf_params()，规范 5.9.18
+    # delta_lf_params()，Norms 5.9.18
     if dq:
         if not F.get("allow_intrabc", 0):
             dlf = F.add("delta_lf_present", br.f(1))
@@ -405,7 +405,7 @@ def parse_uncompressed_header(br, F, S):
                 F.add("delta_lf_res", br.f(2))
                 F.add("delta_lf_multi", br.f(1))
 
-    # loop_filter_params()，规范 5.9.11
+    # loop_filter_params()，Norms 5.9.11
     if not lossless and not F.get("allow_intrabc", 0):
         lf0 = F.add("loop_filter_level[0]", br.f(6))
         lf1 = F.add("loop_filter_level[1]", br.f(6))
@@ -423,9 +423,9 @@ def parse_uncompressed_header(br, F, S):
                 for i in range(2):
                     if br.f(1):
                         br.su(7)
-                F.add("→ lf deltas 已读", 1)
+                F.add("→ lf deltas Read", 1)
 
-    # cdef_params()，规范 5.9.19
+    # cdef_params()，Norms 5.9.19
     if not lossless and not F.get("allow_intrabc", 0) and en_cdef:
         F.add("cdef_damping_minus_3", br.f(2))
         cb = F.add("cdef_bits", br.f(2))
@@ -436,7 +436,7 @@ def parse_uncompressed_header(br, F, S):
                 F.add(f"cdef_uv_pri[{i}]", br.f(4))
                 F.add(f"cdef_uv_sec[{i}]", br.f(2))
 
-    # lr_params()，规范 5.9.20
+    # lr_params()，Norms 5.9.20
     all_lossless = lossless and not F.get("use_superres", 0)
     if not all_lossless and not F.get("allow_intrabc", 0) and en_restoration:
         rt = [F.add(f"lr_type[{i}]", br.f(2)) for i in range(1 if mono else 3)]
@@ -447,15 +447,15 @@ def parse_uncompressed_header(br, F, S):
             if sub_x and sub_y and len(rt) > 1 and (rt[1] or rt[2]):
                 F.add("lr_uv_shift", br.f(1))
 
-    # read_tx_mode()，规范 5.9.21
+    # read_tx_mode()，Norms 5.9.21
     if not lossless:
         F.add("tx_mode_select", br.f(1))
 
-    # frame_reference_mode()，规范 5.9.23
+    # frame_reference_mode()，Norms 5.9.23
     if not intra:
         F.add("reference_select", br.f(1))
 
-    # skip_mode_params()，规范 5.9.22
+    # skip_mode_params()，Norms 5.9.22
     if not intra and F.get("reference_select", 0):
         F.add("skip_mode_present", br.f(1))
 
@@ -463,23 +463,23 @@ def parse_uncompressed_header(br, F, S):
         F.add("allow_warped_motion", br.f(1))
     F.add("reduced_tx_set", br.f(1))
 
-    # global_motion_params()，规范 5.9.24
+    # global_motion_params()，Norms 5.9.24
     if not intra:
         for i in range(7):
             F.add(f"is_global[{i}]", br.f(1))
 
-    # film_grain_params()，规范 5.9.30
+    # film_grain_params()，Norms 5.9.30
     if S.get("film_grain_params_present") and (show or F.get("showable_frame", 0)):
         F.add("apply_grain", br.f(1))
 
-    F.add("→ trailing 前位置", br.pos)
+    F.add("→ trailing Front Position", br.pos)
     one = br.f(1)
     F.add("→ trailing_one_bit", one)
     return F
 
 
 def parse_obus(data, label, quiet=False):
-    """遍历 OBU，解析序列头；返回 {obu_type: Fields}。"""
+    """Walking through OBU，parsing sequence headers, returning {obu_type: Fields}。"""
     out = {}
     i = 0
     names = {1: "SEQ_HDR", 2: "TD", 3: "FRAME_HDR", 4: "TILE_GRP",
@@ -487,7 +487,7 @@ def parse_obus(data, label, quiet=False):
     while i < len(data):
         h = data[i]
         if (h >> 7) & 1:
-            print(f"  ✗ {label}: 位 {i*8} 的 forbidden_bit=1，不是合法 OBU 头")
+            print(f"  ✗ {label}: bits {i*8} of forbidden_bit=1，It’s not legal. OBU Head")
             return out
         t = (h >> 3) & 0xF
         ext = (h >> 2) & 1
@@ -512,28 +512,28 @@ def parse_obus(data, label, quiet=False):
                 parse_sequence_header(BitReader(payload), F)
                 out[1] = F
             except Exception as e:
-                print(f"    ✗ 序列头解析失败: {e}")
+                print(f"    ✗ Sequence header parsing failed: {e}")
         elif t in (3, 6) and 1 in out:
             F = Fields(quiet)
             try:
                 parse_uncompressed_header(BitReader(payload), F, out[1])
                 out[3] = F
             except Exception as e:
-                print(f"    ✗ 帧头解析失败于字段后: {e}")
+                print(f"    ✗ Frame parsing failed after field: {e}")
                 out[3] = F
         i = j + size
     return out
 
 
 def compare(fa, fb, la, lb):
-    """并排比对两组字段，指出首个不一致。"""
+    """Match two fields in parallel, indicating first inconsistency。"""
     na = {n: v for n, v in fa.items}
     nb = {n: v for n, v in fb.items}
     diffs = 0
-    print(f"  {'字段':36s} {la:>12s} {lb:>12s}")
+    print(f"  {'Fields':36s} {la:>12s} {lb:>12s}")
     for n, v in fa.items:
         w = nb.get(n, "—")
-        mark = "" if w == v else "  ← 不一致"
+        mark = "" if w == v else "  ← Inconsistent"
         if mark:
             diffs += 1
         print(f"  {n:36s} {str(v):>12s} {str(w):>12s}{mark}"
@@ -541,27 +541,27 @@ def compare(fa, fb, la, lb):
               f"  {n:36s} {v:>12} {str(w):>12}{mark}")
     only_b = [n for n, _ in fb.items if n not in na]
     if only_b:
-        print(f"  仅 {lb} 有的字段: {', '.join(only_b)}")
+        print(f"  Only {lb} Some Fields: {', '.join(only_b)}")
     return diffs
 
 
 def main():
     if len(sys.argv) == 2:
         data = open(sys.argv[1], "rb").read()
-        print(f"=== 解析 {sys.argv[1]} ({len(data)} 字节) ===")
+        print(f"=== Parsing {sys.argv[1]} ({len(data)} bytes) ===")
         parse_obus(data, "in")
         return 0
     if len(sys.argv) == 3:
         a = open(sys.argv[1], "rb").read()
         b = open(sys.argv[2], "rb").read()
-        print(f"=== 比对 ===")
+        print(f"=== Right. ===")
         fa = parse_obus(a, "A", quiet=True)
         fb = parse_obus(b, "B", quiet=True)
         for t in sorted(set(fa) | set(fb)):
             if t in fa and t in fb:
                 print(f"\n--- OBU type {t} ---")
                 d = compare(fa[t], fb[t], "A", "B")
-                print(f"  差异 {d} 处")
+                print(f"  Variance {d} Branch")
         return 0
     print(__doc__)
     return 1

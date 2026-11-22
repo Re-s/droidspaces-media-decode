@@ -2,19 +2,19 @@
  * Storage may be a DRM allocation or a CPU-only fallback. Derived images
  * borrow that storage; only actual DRM allocations can supply PRIME handles.
  *
- * ── ffmpeg 的实际回读路径（已读 hwcontext_vaapi.c 确证）──────
- * vaapi_frames_init 先建一个测试 surface 调 vaDeriveImage 探测（:696），
- * 成功且 fourcc 匹配则 derive_works=1（:700）；失败只是 debug 日志，不致命。
- * 但 vaapi_map_frame 的条件是
+ * - - ffmpeg 's actual readback path (readed hwcontext_vaapi.c authenticated) - ─ ─ ~ ~ ffmpeg
+ * vaapi_frames_init first build a test search search for the vaDeriveImage (:696), which is a very interesting piece of information about the situation in the country.
+ * Successful and sourcecc matches derive_works=1 (700); failure is only debug log, not fatal.
+ * But the condition of vaapi_map_frame
  *   derive_works && dst->format == sw_format && ((flags & MAP_DIRECT) || !(flags & MAP_READ))
- * hwdownload 是**读**访问，所以即使 derive_works=1 也仍走 else 分支：
- * vaCreateImage（:900）+ vaGetImage（:910）。两条路都必须实现。
+ * hwdownload is **read** access, so even the derive_works=1 leaves the other branch:
+ * Both roads must be achieved.
  *
- * ── 1088 vs 1080：本文件最关键的一处 ────────────────────────
- * 解码器输出缓冲 1920x1088、显示 1920x1080、stride=1920、slice_height=1088。
- * VAImage.width/height 报**显示尺寸**（1920x1080，否则 ffmpeg 的尺寸校验失败），
- * 但 offsets[1] 必须用**缓冲高**：offsets[1] = stride * slice_height = 1920*1088。
- * 用 1080 算会让 UV 平面整体偏移 1920*8 字节 —— 症状是绿边、花屏、色度错位。
+ * ─ - 1088 vs 1080: One of the most critical parts of this document – the one that is -- the one that is – the one that is – the other that is – the other that is – the other that is – the other that is – the other that is – the other that is – the other that is – the other that is – the other that is – the other that is
+ * Decoder output buffer 1920x1088, displaying 1920x1080, stride=192, slice_height=1088.
+ * VAImage. width/ height** display dimensions** (1920x1080; otherwise ffmpeg's size verification failed),
+ * But offsets [1] must be buffered high**: offsets[1] = stride* slice_height = 1920*1088.
+ * Using 1080 to offset the UV plane byte of 1920*8 - the symptoms are green edges, flower screens, colouring.
  */
 
 #include <stdio.h>
@@ -404,11 +404,11 @@ VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image
     return status;
 }
 
-/* NV12 与 P010 共用同一套几何算式，因为**这里的 stride 一律是字节**：
- * P010 的一行是 样本宽×2 字节，于是 data_size = stride*slice*3/2、
- * offsets[1] = stride*slice 对两种位深都成立，不用分支。
- * 只有 fourcc 与 bits_per_pixel 要分开报 —— 消费者靠 fourcc 判断
- * 每样本几个字节，报错了它就会按错宽度重采样（症状是画面横向压扁）。 */
+/* NV12 shares a geometric algorithm with P010, because **Stride here is always bytes**:
+ * P010 line is a sample width x 2 bytes, so data_size = stride*slick*3/2,
+ * Offsets [1] = branch*slick for both depths.
+ * Only sourcecc and bits_per_pixel will be reported separately - consumers will be judged by sourcecc
+ * Each sample has several bytes, which are misreported and re-sampled at the wrong width (symptoms are horizontal flattening). */
 void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
                              unsigned int disp_height, unsigned int stride,
                              unsigned int slice_height, int ten_bit)
@@ -417,33 +417,33 @@ void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
 
     img->format.fourcc = ten_bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
     img->format.byte_order = VA_LSB_FIRST;
-    /* VA 的 bits_per_pixel 记的是**布局名义值**，不是有效位数：
-     * P010 每像素 1.5×16 = 24 bit？不 —— 各家驱动（含 Mesa）对 P010
-     * 沿用 12，与 NV12 相同，有效位数由 fourcc 本身表达。跟着惯例走，
-     * 免得消费者拿它做量程校验时把我们拒掉。 */
+    /* VA's bits_per_pixel keeps ** the notional value of the layout**, not the valid number:
+     * P010 per pixel 1.5 x 16 = 24 bit? No - each driver (including Mesa) vs P010
+     * Follow 12, same as NV12, the valid digits are expressed by sourcecc itself. Follow the custom.
+     * The price of the food is not enough to keep the consumer from taking it for a quantum check. */
     img->format.bits_per_pixel = 12;
 
-    /* 报显示尺寸：ffmpeg 按 sw_format 的尺寸校验，报缓冲尺寸会不匹配。 */
+    /* Displays size: ffmpeg does not match buffer size by sw_format. */
     img->width = (uint16_t)disp_width;
     img->height = (uint16_t)disp_height;
 
-    img->num_planes = 2; /* NV12：Y 平面 + 交织 UV 平面 */
+    img->num_planes = 2; /* NV12:Y plane + knit UV plane */
     img->pitches[0] = stride;
-    img->pitches[1] = stride; /* UV 交织，每行 2 字节一组，行宽与 Y 相同 */
+    img->pitches[1] = stride; /* UV interwoven, 2 bytes grouping each line with the same line width as Y */
     img->offsets[0] = 0;
-    /* ⚠️ 用 slice_height（缓冲高 1088），不是 disp_height（1080）。 */
+    /* Use slick_height (buffer 1088), not disp_height (1080). */
     img->offsets[1] = stride * slice_height;
 
-    /* data_size 覆盖到 UV 平面结束：Y 是 stride*slice_height，
-     * UV 是它的一半（4:2:0 半平面）。 */
+    /* Data_size overwrite UV: Y is stride*slick_height,
+     * UV is half of it (4:2:0 half plane). */
     img->data_size = stride * slice_height * 3 / 2;
 
     img->num_palette_entries = 0;
     img->entry_bytes = 0;
 }
 
-/* 取一个空闲 image 槽位并分配后备存储。调用方持锁。
- * backing 为 NULL 时自行 calloc；非 NULL 时借用（derive 场景，不拥有）。 */
+/* Take an empty Image slot and assign backup storage. The caller holds the lock.
+ * Call oc when backing is NULL; borrow (derive scene, not owned) when not NULL. */
 static struct dmd_image *image_alloc_locked(struct dmd_driver *drv,
                                             const VAImage *desc,
                                             unsigned char *backing)
@@ -468,9 +468,9 @@ static struct dmd_image *image_alloc_locked(struct dmd_driver *drv,
     memset(slot, 0, sizeof(*slot));
     slot->in_use = 1;
     slot->id = (VAImageID)(drv->next_image_id++);
-    /* image.buf 必须是能被 vaMapBuffer 认出的 ID。用独立的 buffer ID 空间会
-     * 与真 buffer 撞号，所以共用 next_buffer_id —— MapBuffer 先查 buffer 表
-     * 再查 image 表，两边 ID 不重叠即可。 */
+    /* Image. buff must be an ID that can be recognized by vamapBuffer. Use a separate Buffer ID space conference
+     * Collapse with real buffer, so share next_buffer_id — Map Buffer first check the buffer table
+     * Check the table for the image, and the ID on both sides is not overlapping. */
     slot->buf_id = (VABufferID)(drv->next_buffer_id++);
     slot->image = *desc;
     slot->image.image_id = slot->id;
@@ -478,7 +478,7 @@ static struct dmd_image *image_alloc_locked(struct dmd_driver *drv,
     slot->data = data;
     slot->data_size = desc->data_size;
     slot->acquired_fd = -1;
-    /* backing 非空表示数据属于 surface，DestroyImage 不能 free。 */
+    /* The data is not empty, but data belong to the search Image that cannot be free. */
     slot->derived_from = VA_INVALID_ID;
 
     return slot;
@@ -506,17 +506,17 @@ VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (width > DMD_MAX_WIDTH || height > DMD_MAX_HEIGHT)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
-    /* NV12(8bit) 与 P010(10bit) 两种线性半平面。其余格式要在驱动里做
-     * 色彩/位深转换，那属于 VPP，本驱动不声明。 */
+    /* NV12(8bit) and P010(10bit) are two linear semi-plane. The rest of the format is to be done in the drive
+     * Colour/bit deep, that belongs to VPP, this driver is not stated. */
     if (format->fourcc != VA_FOURCC_NV12 && format->fourcc != VA_FOURCC_P010)
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     const int ten_bit = format->fourcc == VA_FOURCC_P010;
 
-    /* 这里拿不到 surface，只能按解码器的对齐规则推导几何 ——
-     * 与 surface 的预分配用同一套规则（宽 128、高 32）。真实几何在
-     * GetImage 时按 surface 的实际 stride/slice_height 逐行搬运，
-     * 所以即使解码器给了不同对齐也不会错位。
-     * stride 一律是**字节**，所以 10bit 只要把它翻倍。 */
+    /* No surface is found here, but only geometry is derived by the rules of alignment of the decoder...
+     * The preallocation with the surface is based on the same set of rules (128 wide, 32 high).
+     * GetImage moves by line using the actual stride/ slice_height of the surface,
+     * So even if the decoder is different, it's not different.
+     * The stride is always ** bytes**, so 10bit just double it. */
     unsigned int stride =
         dmd_align_up((unsigned int)width, DMD_WIDTH_ALIGN) * (ten_bit ? 2u : 1u);
     unsigned int slice_h = dmd_align_up((unsigned int)height, DMD_HEIGHT_ALIGN);
@@ -529,7 +529,7 @@ VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format, int width,
     struct dmd_image *img = image_alloc_locked(drv, &desc, NULL);
     if (!img) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("CreateImage: 槽位耗尽或分配失败（上限 %d）\n", DMD_MAX_IMAGES);
+        dmd_log("CreateImage: no free slots or allocation failed (limit %d)\n", DMD_MAX_IMAGES);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
     *image = img->image;
@@ -609,19 +609,19 @@ VAStatus dmd_DeriveImage(VADriverContextP ctx, VASurfaceID surface,
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    /* derive 是"直接访问 surface 内存"，所以借用 surface->data，
-     * 不另分配也不拷贝。DestroyImage 不得 free 它。
-     * 几何用 surface 的**实际** stride/slice_height —— 帧回来后
-     * 这两个值已按解码器给的格式块更新过。 */
+    /* The deive is "direct access to the memory of the surface," so borrow the surface->data,
+     * No more distributions, no copies. Destroy Image can't free it.
+     * Geometric surface**actual**stride/ slick_height --when the frame returns
+     * These two values have been updated to the format block given by the decoder. */
     VAImage desc;
     dmd_fill_image_geometry(&desc, s->width, s->height, s->stride,
                             s->slice_height, s->format == VA_RT_FORMAT_YUV420_10);
 
-    /* surface 缓冲装不下声明的 data_size 时不能 derive：调用方会按
-     * data_size 读越界。 */
+    /* Not when the data_size is buffered.
+     * Data_size read across the border. */
     if (desc.data_size > s->data_size) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("DeriveImage: surface %u 缓冲 %zu < 需要 %u，拒绝\n",
+        dmd_log("DeriveImage: surface %u buffer is %zu bytes, requires %u\n",
                 (unsigned)surface, s->data_size, desc.data_size);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -792,7 +792,7 @@ VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_SURFACE_BUSY;
     }
-    /* derive 出来的 image 借用 surface 缓冲，绝不能 free。 */
+    /* The deive image borrows a surface buffer, never free. */
     unsigned char *owned =
         (img->derived_from == VA_INVALID_ID) ? img->data : NULL;
     memset(img, 0, sizeof(*img));
@@ -802,19 +802,19 @@ VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image)
     return VA_STATUS_SUCCESS;
 }
 
-/* 半平面 4:2:0 逐行搬运（NV12 与 P010 共用）。
+/* Half-floor 4:2 :00 line-by-line (NV12 shared with P010).
  *
- * 两个 stride 都是**字节**，所以行拷贝本身与位深无关；唯一要乘
- * sample_bytes 的是平面内的 x 偏移 —— 它是样本坐标。
- * 源与目的可能有不同的 stride/slice_height，整块 memcpy 只在两者
- * 完全一致时才对，其余情况必须按行。 */
+ * Both strides are ** bytes** so the copy itself is not about bits; only to multiply
+ * The sample_bytes is a x offset inside the plane -- it's the sample coordinates.
+ * Source and purpose may differ
+ * The rest would have to follow the lines when there was complete consistency. */
 static void nv12_copy(unsigned char *dst, unsigned int dst_stride,
                       unsigned int dst_slice, const unsigned char *src,
                       unsigned int src_stride, unsigned int src_slice,
                       unsigned int x, unsigned int y, unsigned int w,
                       unsigned int h, unsigned int sample_bytes)
 {
-    /* 一切样本坐标，最后统一乘 sample_bytes 换成字节。 */
+    /* All sample coordinates, final uniform by sample_bytes to bytes. */
     const unsigned int src_w_samples = src_stride / sample_bytes;
     const unsigned int dst_w_samples = dst_stride / sample_bytes;
     unsigned int row_samples = w < dst_w_samples ? w : dst_w_samples;
@@ -823,13 +823,13 @@ static void nv12_copy(unsigned char *dst, unsigned int dst_stride,
     const unsigned int row_bytes = row_samples * sample_bytes;
     const unsigned int xoff = x * sample_bytes;
 
-    /* Y 平面 */
+    /* Y plane */
     for (unsigned int r = 0; r < h; r++) {
         memcpy(dst + (size_t)r * dst_stride,
                src + (size_t)(y + r) * src_stride + xoff, row_bytes);
     }
 
-    /* UV 平面：4:2:0 半平面，高度减半，x 必须按 2 对齐才不会拆开 U/V 对。 */
+    /* UV plane: 4:2:0 half-plane, height halved, x must be 2 paired to not open U/V right. */
     unsigned char *duv = dst + (size_t)dst_stride * dst_slice;
     const unsigned char *suv = src + (size_t)src_stride * src_slice;
     unsigned int uv_h = h / 2;
@@ -867,18 +867,18 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (width == 0 || height == 0)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    /* 色度平面按 2x2 采样，奇数起点会把 U/V 对拆开。 */
+    /* The colour plane is sampled by 2x2 and the odd number starts by opening the U/V pair. */
     if ((x & 1) || (y & 1))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 与 DeriveImage 同理：SyncSurface 会放行未就绪的 surface，
-     * 拷像素之前必须在这里等到帧真的到手。 */
+    /* As with DeriveImage, SyncSurface lets a surface through before it is ready,
+     * The copy has to wait here until the frame really gets to it. */
     VAStatus wait = dmd_surface_wait(drv, surface);
     if (wait != VA_STATUS_SUCCESS)
         return wait;
 
-    /* 诊断：把 surface 原始缓冲整块落盘，用来区分
-     * "解码器给的就不对" 和 "拷进 VAImage 时几何算错"。 */
+    /* Diagnostic: Distinguishing the original surface buffers from the fall drive
+     * "The decoder gives wrong" and "the geometry error of the time you cuffed VAImage." */
     {
         const char *dp = getenv("DMD_SURF_DUMP");
         if (dp) {
@@ -889,7 +889,7 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
                 if (fp) {
                     fwrite(sd->data, 1, sd->data_size, fp);
                     fclose(fp);
-                    dmd_log("SURF_DUMP: surface=%u %zu 字节 "
+                    dmd_log("SURF_DUMP: surface=%u %zu bytes "
                             "stride=%u slice=%u w=%u h=%u\n",
                             (unsigned)surface, sd->data_size,
                             sd->stride, sd->slice_height,
@@ -928,8 +928,8 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         return VA_STATUS_ERROR_SURFACE_BUSY;
     }
 
-    /* surface 还没解出来就 GetImage：按 VA-API 语义隐式同步。
-     * ffmpeg 会先 vaSyncSurface，但别的消费者未必。 */
+    /* The search is still open.
+     * ffmpeg will be vaSyncSurface first, but other consumers may not be. */
     if (s->state == DMD_SURFACE_PENDING) {
         VAStatus st = dmd_surface_sync_locked(drv, surface,
                                               DMD_FRAME_TIMEOUT_MS);
@@ -937,7 +937,7 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
             pthread_mutex_unlock(&drv->lock);
             return st;
         }
-        /* sync 期间放过锁，重新查找。 */
+        /* Unlock the lock during sync, re-search. */
         s = dmd_find_surface_locked(drv, surface);
         img = dmd_find_image_locked(drv, image);
         if (!s || !img) {
@@ -953,9 +953,9 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         }
     }
 
-    /* image 与 surface 的位深必须一致：跨位深搬运要么丢精度（10→8）
-     * 要么读出垃圾（8→10），都不是本驱动该做的事（那是 VPP）。
-     * 消费者拿 P010 image 配 NV12 surface 时明确拒绝，别给半对的像素。 */
+    /* The depth of the image must be consistent with the depth of the surface: cross-positioning deep or disabling (10:8)
+     * Either you read the trash (8 ff 10) or you don't drive it (that's VPP).
+     * Consumers explicitly refuse to match P010 image with NV12 surface, and don't give half-to-one pixels. */
     const int img_ten_bit = img->image.format.fourcc == VA_FOURCC_P010;
     const int surf_ten_bit = s->format == VA_RT_FORMAT_YUV420_10;
     if (img->image.format.fourcc != VA_FOURCC_NV12 && !img_ten_bit) {
@@ -964,33 +964,33 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     }
     if (img_ten_bit != surf_ten_bit) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("GetImage: 位深不符 image=%.4s(%d) surface=%.4s(%d)\n",
+        dmd_log("GetImage: bit depth mismatch image=%.4s(%d) surface=%.4s(%d)\n",
                 (const char *)&img->image.format.fourcc, img_ten_bit,
                 surf_ten_bit ? "P010" : "NV12", surf_ten_bit);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
     const unsigned int spb = surf_ten_bit ? 2u : 1u;
 
-    /* 起点必须落在 surface 内；尺寸超出则**裁到真实帧并把余下填 0**，
-     * 而不是整笔拒绝。
+    /* The starting point must be inside the surface; size beyond ** to the real frame and fill the rest 0**,
+     * Not a whole rejection.
      *
-     * 为什么不能按旧行为要求"请求区域完全落在 surface 缓冲内"：
-     * AV1 换分辨率时 ffmpeg 复用同一个 VA context，surface 池与 VAImage
-     * 仍是建池时的 1920x1080，而帧回来时 surface 已缩到 1280x736。
-     * 此时两种做法都错：
-     *   - 报错 → 客户端拿不到任何像素，整个会话废掉；
-     *   - 不裁剪地按 surface 行距整块搬 → 色度平面按 slice_height=1088
-     *     去读，而真数据的色度在 736 行处，结果是每帧色度全错
-     *     （实测换分辨率后 25/25 帧 md5 不符，而 surface 缓冲本身逐字节
-     *      正确 —— 缺陷就在这一拷）。
-     * 裁剪 + 补零后，客户端按自己声明的行距取左上角的真实区域，像素对得上。 */
+     * Why can't the request area be left completely within the buffer of the surface, as required by the old behavior:
+     * AV1 ffmpeg to repeat the same VA contact, summer pool and VAImage when changing resolution
+     * Still the 1920x1080 when the pool was built, and the frame came back shrunk to 1280x736.
+     * At this point, both approaches are wrong:
+     *   - Wrong report — the client can't get any pixels, the whole session is dead;
+     *   - without cropping the surface line and moving the whole block * color level slick_height=1088
+     *     To read, the true data is colored at 736 lines, and the result is that every frame is all wrong.
+     *     25/25 frame md5 does not match, and the surface buffer itself is bytes.
+     *      The right -- the flaw is in this case.
+     * After cropping + zero, the client takes the true area of the upper left corner at the line spacing that you declare, and the pixels are right. */
     if ((unsigned int)x >= s->stride / spb || (unsigned int)y >= s->slice_height) {
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("GetImage: 起点 %d,%d 已在 surface 之外 %u×%u(%u 字节行)\n",
+        dmd_log("GetImage: origin %d,%d is outside the %u×%u surface (%u bytes per row)\n",
                 x, y, s->stride / spb, s->slice_height, s->stride);
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
-    /* 目标 image 必须装得下请求的尺寸。 */
+    /* Target image must be fitted with the requested dimensions. */
     if (width > img->image.width || height > img->image.height) {
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -1002,13 +1002,13 @@ VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         copy_w = src_w_samp - (unsigned int)x;
     if ((unsigned int)y + copy_h > s->slice_height)
         copy_h = s->slice_height - (unsigned int)y;
-    /* 色度 2x2 采样，奇数宽高会把 U/V 对拆开，向下取偶。 */
+    /* Samples of 2x2 colours, with odd widths that open U/V pairs and pull the number down. */
     copy_w &= ~1u;
     copy_h &= ~1u;
 
-    /* 兜底：色度源平面在 src + stride*slice，只有 data_size 能证明它存在。
-     * 正常情况下 surface_store_frame_locked 已保证 stride*slice*3/2 ≤
-     * data_size（装不下的帧根本不会入库），这里防的是别的路径漏改。 */
+    /* Bottom: The color source level is in src + stride*slick, only data_size can prove it exists.
+     * Normally, the situation has been secured and the system has been secured.
+     * Data_size (the unfilled frame is not in the vault at all) and here is another path. */
     {
         unsigned int avail_rows =
             (unsigned int)(s->data_size / ((size_t)s->stride * 3 / 2));

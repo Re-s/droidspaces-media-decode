@@ -1,172 +1,172 @@
 /*
- * v4l2_backend —— 直接对 msm_vidc 的 V4L2 M2M 接口解码，绕开 MediaCodec/Codec2。
+ * v42_backend - Decode V4L2 M2M interface directly to msm_vidc and bypass MediaCodec/Codec2.
  *
- * 存在理由：SM8750 的 Codec2 层缺 AV1 支持 —— c2.qti.av1.decoder 在组件创建
- * 阶段就失败，logcat 可见
+ * Reason for Existence: AV1 support for SM8750 for Codec2 -- c2.qti.av1. decoder created in component
+ * The stage failed, logcat visible
  *     QC2VppFilterCaps: Unknown codectype=c2.qti.av1.decoder
  *     QueryrequiredInfos from downstream failed!
- * 下游 VPP filter 不认识 AV1，组件起不来。但硬件与内核驱动完全可用：
- * /dev/video32 的 OUTPUT_MPLANE 枚举出 AV10，实测 V4L2 直通能解出帧，
- * 且像素与 ffmpeg 软解逐点完全一致（tools/v4l2_dec_probe.c 的验证结论）。
+ * VPP filter downstream does not know AV1 and the component cannot rise. But hardware and kernel drive are fully available:
+ * The UOTPUT_MPLANE item of /dev/video32 lists AV10, which is a direct transmission to the V4L2 that can decode the frame, and the following:
+ * And pixels are fully consistent with the ffmpeg soft resolution point (testing conclusion for tools/v4l2_dec_probe.c).
  *
- * ⚠️ 上面这段是 0.3.x 的定位，已过时：0.4.0 起**全部** codec 都走本后端，
- * 没有 MediaCodec 那条路了（daemon 已删除）。
+ * The above section is a 0.3.x location, which is outdated: 0.4.0 ** all** codec is on the back end,
+ * No MediaCodec that way.
  *
- * 关键约束（都是实测踩出来的，改动时务必保持）：
+ * Key constraints (all measured and modified to be maintained):
  *
- * ⚠️ 本段在 0.4.1 被整体重写。此前记录的"nabu 的 video32 解码路径起不来"
- *    这一结论**已被推翻** —— nabu 上现在能解出与 ffmpeg 软解逐字节一致的
- *    1080p 帧（300/300 帧 MD5 相同，两个不同码流各自整流一致）。
- *    当时缺的不是缓冲类型、不是 ION heap、不是权限、也不是固件能力，
- *    而是下面第 4/6/7/8 条这四项 msm_vidc 私有协议要求。
- *    厂商内核出处：MiCode/Xiaomi_Kernel_OpenSource 分支 nabu-r-oss。
+ * This paragraph is rewritten in 0.4.1 as a whole. The previously recorded "video32 decoding path of nabu" does not start."
+ *    This conclusion** has been reversed ** — nabu can now be deconstructed with ffmpeg sobrete
+ *    1080 p Frame (300/300 frame MD5 is the same and two different streams are identical).
+ *    The lack of buffer type, Ion head, no privileges, no solidity, was not a problem.
+ *    The four private agreements are required by article 4/6/7/8 below.
+ *    Source: MiCode/Xiaomi_Kernel_OpenSource branch nabu-r-oss.
  *
- * 1. 缓冲类型：msm_vidc **只接受 V4L2_MEMORY_USERPTR**，
- *    MMAP 与 DMABUF 的 REQBUFS 都返回 EINVAL
+ * 1. Type of buffer: msm_vidc** only V4L2_MEMORY_USERPTR**,
+ *    Both MMAP and DMABUF REQBUFS return EINVAL
  *    （q->io_modes = VB2_MMAP | VB2_USERPTR，msm_vidc.c:1548）。
  *
- *    但 USERPTR 是个名义值 —— 驱动的 vb2_mem_ops.get_userptr 是桩函数：
+ *    But USERPTR is a nominal value -- a driver vb2_mem_ops.get_userptr is a stubble function:
  *        static void *vidc_get_userptr(...) { return (void *)0xdeadbeef; }
  *                                              (msm_vidc.c:717-720)
- *    真正的缓冲来源是
+ *    The real source of buffer is
  *        b->m.planes[i].m.fd        = b->m.planes[i].reserved[0];
  *        b->m.planes[i].data_offset = b->m.planes[i].reserved[1];
  *                                              (msm_vidc.c:533-536)
- *    也就是 **dmabuf fd 必须写进 plane.reserved[0]**，m.userptr 被完全忽略。
- *    映射发生在 QBUF 时（msm_vidc_common.c:6693-6708 的 msm_smem_map_dma_buf）。
- *    这解释了当年"USERPTR 整条流程走完却出不了帧"的困局。
+ *    That is, **dmabuf fd must be written into plane.reserved [0]**, m.userptr completely ignored.
+ *    Maps occur at QBUF (msm_vidc_common.c: 6693-6708 msm_smem_map_dma_buf).
+ *    This explains the "USERPTR process ended without getting out of the frame" trap.
  *
- *    缓冲来源：nabu 无 dma_heap，只有 /dev/ion，system heap id=**25**
- *    （用 ION_IOC_HEAP_QUERY 问内核，不要逐位试探 mask）。
+ *    Buffer source: nabu no dma_heap, only /dev/ion, system head id=**25**
+ *    (Use ION_IOC_HEAP_QUERY to ask the kernel, do not test mask on location).
  *
- * 2. S_FMT(OUTPUT) 必须先用一个**不同的分辨率**做 dummy 调用。
- *    驱动在分辨率与当前值相同时提前返回，跳过 plane_sizes 赋值：
- *        if (fourcc 相同 && width 相同 && height 相同) {
+ * S_FMT (OUTPUT) must first be called by a dumimmy with a ** different resolution**.
+ *    Drives to return early when the resolution is equal to the current value, skips the plain_sizes grant:
+ *        If (fourcc is the same & & west is the same & height) {
  *            dprintk("No change in OUTPUT port params"); return 0;
  *        }                                     (msm_vdec.c:732-738)
- *    driver open 后 OUTPUT 默认就是 1920x1088，直接设目标分辨率必然命中它，
- *    sizeimage 永远回填 0。实测：直接设 → 0；先 1280x720 再设 → 16588800。
+ *    After the target open, the OUTPUT defaults to 1920x1088, which is directly targeted and will be hit.
+ *    sizeimage was 0 when configured directly, and 16588800 after an initial 1280x720 S_FMT.
  *
- * 3. 输入输出分辨率必须严格相等，本设备不支持缩放：
+ * 3. The output resolution for input must be strictly equal and this device does not support scaling:
  *        if (!scale_x.min || !scale_x.max || !scale_y.min || !scale_y.max) {
  *            if (input_w * input_h != output_w * output_h) return -ENOTSUPP;
  *        }                                     (msm_vidc_common.c:5613-5625)
- *    所以 1080p 要用 1920x**1088**（CAPTURE 的对齐值），不是 1080。
- *    尺寸不符时 STREAMON 报 524 (ENOTSUPP)，而非 EINVAL —— 可用来区分。
+ *    So 1080p uses 1920x**1088** (capture values for CAPTURE), not 1080.
+ *    STREAMON 524 (ENOTSUPP) instead of EINVAL - which can be distinguished when size does not match.
  *
- * 4. **必须启用 SECONDARY 分流模式**（这是当年缺的决定性一项）：
+ * 4. ** Must activate SECANDRY diversion mode** (this is the decisive element missing from the year):
  *        V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base + 22 = 0x00992016
  *        V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_SECONDARY = 1
- *                                     (厂商 v4l2-controls.h:865-869)
- *    PRIMARY（默认）下 CAPTURE 直接充当 DPB，start_streaming() 恒返回
- *    -EINVAL。SECONDARY 启用 HAL_BUFFER_OUTPUT2，DPB 与 OPB 分离，
- *    msm_vidc.c:1214-1222 会额外调 msm_comm_set_output_buffers()
- *    让驱动自行分配 DPB，校验路径完全不同。
- *    单一变量对照实测：SECONDARY → STREAMON(OUT) OK；PRIMARY → EINVAL。
- *    附带好处：CAPTURE 可用线性 NV12，不必解 UBWC 的 Q128。
+ *                                     (Producer v4l2-controls.h: 865-869)
+ *    CAPTURE under PRIMARY (default) directly returns DPB, start_streaming()
+ *    -EINVAL. SECONDARY Enables HAL_BUFER_OUTPUT2, DPB separate from OPB,
+ *    msm_vidc.c: 1214-1222 will be extra adjusted msm_comm_set_output_buffers()
+ *    Let the driver assign the DPB himself, the path is completely different.
+ *    Single variable is measured by: SECONDARY  ⁇  STREAMON (OUT) OK; PRIMARY  ⁇  EINVAL.
+ *    Accompanied benefit: CAPTURE has linear NV12, without having to solve UBWC's Q128.
  *
- * 5. 私有控制项基址（厂商 v4l2-controls.h:684）：
+ * 5. Private control project site (plant v422-controls.h:684);
  *        V4L2_CID_MPEG_MSM_VIDC_BASE = V4L2_CTRL_CLASS_MPEG|0x2000 = 0x00992000
- *    与 OMX HAL 活体 strace 对照出的初始化项：
+ *    Initializations against OMX HAL live object:
  *        0x00992003 base+3  VIDEO_OUTPUT_ORDER    = 0
- *        0x00992011 base+17 VIDEO_EXTRADATA       = 2, 25, 31, 29（连设四种）
+ *        0x00992011 base+17 VIDEO_EXTRADATA = 2, 25, 31, 29 (four consecutive)
  *        0x00992038 base+56 VIDEO_LOWLATENCY_MODE = 1
- *    注意 base+15 SYNC_FRAME_DECODE 设 1 会把 MIN_BUFFERS 压到 out=1 cap=1，
- *    不适用于正常解码。
+ *    Note that base+15 SYNC_FRAME_DECADE 1 will press MIN_BUFFERS out=1 cap=1,
+ *    Not applicable to normal decoding.
  *
- *    ⚠️ 此前记录的"QUERYCTRL 0 项、S_CTRL EINVAL、这个节点没有控制项"
- *    是**错的**：QUERYCTRL 确实枚举不出私有 CID（它们不在标准控制框架里），
- *    但直接 S_CTRL 这些 id 是**成功**的。用 QUERYCTRL 的结果推断控制项
- *    不存在会得出相反结论。（G_CTRL 不校验 id、拿 0xDEADBEEF 也返回成功
- *    这一点仍然成立，别用它验证控制项存在。）
+ *    ⁇  previously recorded "QUERYCTRL 0, S_CTRL EINVAL, no control item at this node"
+ *    ** Wrong**: QUERYCTRL does not list the private CID (they are not in the standard control framework).
+ *    But directly S_CTRL these ids are **successful**. Use QUERYCTRL results to extrapolate control items
+ *    The opposite conclusion is reached if there is no one. (G_CTRL does not verify id, take 0xDEADBEEF and returns success.)
+ *    This is still valid, and it is not used to verify that the control item exists.
  *
- * 6. STREAMON 的真实语义：**第一个是假通过，第二个承担全部校验**。
- *        case OUTPUT_MPLANE: if (CAPTURE 已 streaming) rc = start_streaming();
- *        case CAPTURE_MPLANE: if (OUTPUT 已 streaming) rc = start_streaming();
+ * 6. The true semantic of STREAMON:** The first was false passage and the second was fully certified**.
+ *        Case OPPUT_MPLANE: if (CAPTURE already streaming) rc = start_streaming();
+ *        Case CAPTURE_MPLANE: if (OUTPUT already streaming) rc = start_streaming();
  *                                              (msm_vidc.c:1294-1302)
- *    第一个 STREAMON 因对侧未 streaming 而**跳过** start_streaming()。
- *    所以"CAPTURE 先 STREAMON 就成功"是假象，失败只是被推迟到第二个。
- *    ⚠️ 这也推翻了旧注释第 2 条的"必须两阶段、不能双向一起 STREAMON"：
- *    SECONDARY 模式下不需要等事件才配 CAPTURE，两侧先配好再让第二个
- *    STREAMON 触发校验即可。
+ *    The first STREAMON ** skipped**start_streaming () due to the fact that the side was not streaming.
+ *    So "Capture first streamon succeeds" is a false image, failure is just postponed to the second.
+ *    This also overturns the old note 2 "must be two stages, not two-way together" Streamon:
+ *    The SECANDRY mode doesn't need to wait for an event to match CAPTURE, and the two sides are set before the second.
+ *    The Streamon trigger verification is sufficient.
  *
- * 7. **必须订阅厂商私有事件**，驱动从不发标准 V4L2_EVENT_SOURCE_CHANGE：
+ * ** Must subscribe to private vendor events**, driven by never issuing criteria V4L2_EVENT_SOURCE_CHANGE:
  *        V4L2_EVENT_MSM_VIDC_START = V4L2_EVENT_PRIVATE_START + 0x1000
- *                                  = 0x08001000   (厂商 videodev2.h:2290-2305)
+ *                                  = 0x0800000 (planter videodev2.h: 2290-2305)
  *          +1 FLUSH_DONE   +2 PORT_SETTINGS_CHANGED_SUFFICIENT
  *          +3 PORT_SETTINGS_CHANGED_INSUFFICIENT  +4 BITDEPTH_CHANGED
  *          +5 SYS_ERROR    +6 RELEASE_BUFFER_REFERENCE
  *          +7 RELEASE_UNQUEUED_BUFFER
- *    只订阅标准 SOURCE_CHANGE 会导致 poll 永不返回 POLLPRI ——
- *    当年"等 SOURCE_CHANGE 永不到达"就是这个原因，不是固件没响应。
+ *    Subscription only to the standard SOURCE_CHANGE will lead to poll never returning to POLLPRI...
+ *    That's why "Wait for Source_Change never arrives," not that the solids didn't respond.
  *
- * 8. 每个 PORT_SETTINGS 事件都要让固件离开 in_reconfig，且两种事件的
- *    处理**不一样**。驱动在事件处理里无条件置 inst->in_reconfig = true
- *    （msm_vidc_common.c:1761），固件随后停在 reconfig 等待态。
- *    msm_comm_session_continue() 只有两个调用点：
- *      a. CAPTURE 的 start_streaming() 内，条件 in_reconfig
+ * 8. Every PORT_SETTENGS event is to leave the solid in_reconfig, and both
+ *    Processing ** Different **. Driven inst->in_reconfig = true
+ *    (msm_vidc_common.c:1761) The solids were then stopped in reconfig waiting state.
+ *    There are only two calls:
+ *      a. Start_streaming() in_reconfig
  *                                              (msm_vidc.c:1240-1252)
- *      b. msm_vidc_comm_cmd() 的 V4L2_QCOM_CMD_SESSION_CONTINUE 分支
+ *      b. branch of V4L2_QCOM_CMSION_CONTINUE ()
  *                                              (msm_vidc_common.c:4155)
  *
- *    · +2 SUFFICIENT（几何未变）→ 走 (b)：VIDIOC_DECODER_CMD + cmd=5
- *      （videodev2.h:1991），不动队列状态。
- *      ⚠️ 老内核（msm8998）由内核自动 continue，但 sm8150 一代改成
- *      **userspace 必须自己发**，否则永久卡在等 FBD。
- *    · +3 INSUFFICIENT（要求重配 OPB）→ 必须走 (a)，序列见第 12 条。
+ *    +2 SUFFICIENT (alternate)  ⁇  (b): VIDIOC_DECODER_CMD+cmd=5
+ *      (videodev2.h:1991), do not move in queue status.
+ *      ⁇  msm8998 from kernel autocontinue, but sm8150 generation to
+ *      **userpace must send it himself** otherwise it's permanently stuck waiting for FBD.
+ *    +3 IFFIENT (requires re-equipment OPB)  ⁇  Must go (a), sequence as per Article 12.
  *
- *    ⚠️ 不能做成会话级一次性闩锁：Firefox seek/ABR 会在同一 fd 上反复
- *    收到事件，漏发一次固件就停在 in_reconfig 直到上层超时。
+ *    The platinum cannot be made into a session-level single lock: Firefox seek/ ABR will repeat on the same fd
+ *    In the case of a breach, the drop of the solid stopped in_reconfig until the upper layer was over-timed.
  *
- * 9. **设备必须用 O_NONBLOCK 打开**。事件队列空时 VIDIOC_DQEVENT 会阻塞在
- *    内核 v4l2_event_dequeue()，poll 循环再也回不来。
- *    定位方式：/proc/PID/wchan 显示 v4l2_event_dequeue，
- *    /proc/PID/syscall 显示 29 (ioctl) + 0x80885659 (VIDIOC_DQEVENT)。
+ * ** Device must be opened with O_NONBLONK**.
+ *    The kernel v4l2_event_dequeue(), the poll cycle will never return.
+ *    Positioning method: /proc/PID/wchan displays v4l2_event_dequeue,
+ *    /proc/PID/syscall shows 29 (ioctl) + 0x80885659 (VIDOC_DQEVENT).
  *
- * 10. CAPTURE 几何的两个坑：
- *     · slice_height 不要用 sizeimage 反推。3137536*2/(1920*3) = 1089.16
- *       → 1089，而真实值是 1088，多出的一行会让上层 nv12_copy 越界
- *       SIGSEGV。直接用 f.fmt.pix_mp.height。
- *     · G_FMT(CAPTURE) 可能返回 open 时的残留默认值 1920x1088，
- *       不随 S_FMT(OUTPUT) 联动（4K 码流实测），必须用 OUTPUT 侧协商值覆盖；
- *       覆盖 width 后驱动也不回填 bytesperline，stride 要自己兜底。
+ * Two geometric pits for CAPTURE:
+ *     . slick_height does not reverse the sizeimage. 3137536*2/(1920*3) = 1089.16
+ *       ~ 1089, the real value is 1088, and the extra line will allow the upper level to cross. nv12_copy
+ *       SIGSEGV. Use f.fmt.pix_mp.night.
+ *     The default value of the residual value of 1920x1088 for the possible return of the open value of G_FMT(CAPTURE),
+ *       (a) Not associated with S_FMT (OUTPUT) (4K-code flow) and must be covered with the OUTPUT side consultation value;
+ *       Overwrite the width after the drive does not fill the bytesperline, stride has to take the bottom of the wheel.
  *
- * 11. 输出 1088 行含 8 行对齐填充，取有效区要按 1080 裁剪。
- *     ⚠️ 比对正确性时别让参考端也输出 1088 行 —— 填充数据参与比对会让
- *     所有行错位，得出"PSNR 只有 25.9 dB"的假结论（本会话踩过）。
+ * 11. Output 1088 line contains 8 line alignment filling, valid area to be conditioned to 1080.
+ *     ⁇  do not let the reference end output 1088 lines - fill data participation matches
+ *     All the lines are misallocated, and the false conclusion is that "PSNR only 25.9 dB" (this session has been stepped on).
  *
- * 12. **PORT_SETTINGS_INSUFFICIENT 的重配序列（0.4.4，见 cap_reconfig）。**
- *     浏览器 seek / ABR 清晰度切换会在同一 fd 上反复触发它。正规序列
- *     （厂商 OMX omx_vdec_v4l2.cpp 的 execute_omx_flush + PortDisable）：
+ * **PORT_SETTENGS_INSUFFICIENT re-sequence sequence (0.4.4; see cap_reconfig).**
+ *     Browser seek/ ABR clarity switch will trigger it repeatedly on the same fd. Formal sequence
+ *     (Eppecute_omx_flush + PortDisabled by OMX omx_vdec_v4l2.cpp):
  *
  *       DECODER_CMD{cmd=4 FLUSH, flags=FLUSH_CAPTURE}
- *       → 把固件交还的 CAPTURE 缓冲全部 DQ 掉，等 FLUSH_DONE(+1)
+ *       ~ The CAPTURE buffer returned with the solids is all DQ off, waiting for FLUSH_DonE(+1)
  *       → STREAMOFF(CAPTURE)
- *       → REQBUFS(CAPTURE, 0)      ← memory 必须仍是 USERPTR
- *       → 释放 dma-buf fd / 解映射  ← 只能在 REQBUFS(0) 之后
- *       → 按新几何重配 + QBUF + STREAMON(CAPTURE)
- *       → 内核在这次 STREAMON 里自动下发 session_continue
+ *       REQBUFS (CAPTURE, 0) must remain USERPTR
+ *       ⁇  Release dma-buf fd/ demap  ⁇  only after REQBUFS(0)
+ *       *Ration by New Geometry + QBUF + STREAMON (CAPTURE)
+ *       * The core automatically sends message_continue in this STREAMON
  *
- *     ⚠️ 第一步的 flush 不可省。内核注释（msm_vidc.c:1240-1252）把
- *     "all output buffers have been flushed and freed"列为 continue 的
- *     前置条件。跳过它直接 STREAMOFF 时 24 个 OPB 仍在固件手里，随后的
- *     STREAMON(CAPTURE) 恒 EINVAL 并连锁 SYS_ERROR ——
- *     0.4.3 及更早据此误判为"msm_vidc 不允许 CAPTURE 重启"，是错的。
+ *     The first step of the flush is inevitable. The kernel comment (msm_vidc.c:1240-1252) reads:
+ *     "all output Buffers have been flushed and laid"
+ *     Precondition. 24 OPs were still in the hands of the solid when it jumped directly from STREAMOFF.
+ *     STREAMON (CAPTURE) EINVAL with a chain SYS_ERROR --
+ *     0.4.3 The earlier misconstrued as "msm_vidc does not allow CAPTURE to restart", is wrong.
  *
- *     ⚠️ 全程只能动 CAPTURE。msm_vidc_streamoff() 用 `if (!in_reconfig)`
- *     守卫，所以 reconfig 期间的 STREAMOFF(CAPTURE) 不会拆 session；但
- *     STREAMOFF(OUTPUT) / REQBUFS(OUTPUT,0) 会走 RELEASE_RESOURCES_DONE，
- *     已排队的 ETB 全部丢失。
+ *     The full process can only be moved by CAPTURE.
+ *     Guards, so the STREAMOFF (CAPTURE) during reconfig will not open session; but
+ *     STREAMOFF(OUTPUT)/ REQBUFS(OUTPUT, 0) will go to RELEASE_RESOURCES_DONE,
+ *     The ETBs in line are all lost.
  *
- *     实测（Firefox，H.264/HEVC，含 seek 与 856x480↔1920x1080 切换）：
- *     9 次 INSUFFICIENT 全部重配成功，SYS_ERROR 0、2s flush 空等 0、
- *     5s SyncSurface 超时 0、会话重建 0，2977 帧配对，
- *     DestroyContext 送入/取回完全平衡（如 1080/1080）。
+ *     Actual (Firefox, H.264/HEVC, including a switch between seek and 856x480 ⁇ 1920x1080):
+ *     Nine times INSUFFICENT was fully reset, SYS_ERROR 0, 2s flush, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ *     5s SyncSurface 0, session reconstruction 0,2977 frames pairing,
+ *     DestroyContext sends/takes back fully balanced (e.g. 1080/1080).
  *
- * 验证状态（0.4.1，nabu / Snapdragon 860 / kernel 4.14）：
- *     t.h264        1080p  300 帧  整流 MD5 与 ffmpeg 软解一致
- *     real1080p     1080p         整流 MD5 与 ffmpeg 软解一致
- *     s_3840x2160   4K            能出帧但帧数非整（166.18），内容不符，待查
+ * Validation state (0.4.1, nabu / Snapdragon 860 / kennel 4.14):
+ *     t.h264 1080p 300 Frames MD5 is consistent with ffmpeg solution
+ *     Real1080p 1080p Surge MD5 is softened with ffmpeg
+ *     s_3840x2160 4K can be framed but not complete (166.18), content not in line, to be investigated
   */
 #ifndef DMD_V4L2_BACKEND_H
 #define DMD_V4L2_BACKEND_H
@@ -174,15 +174,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 与 decode-daemon.c 的 CodecId 对应（wire id，追加式，不可重排）。
+/* CordecID corresponding to decode-deaem.c (wire id, supplement, not re-allocated).
  *
- * ⚠️ 0.4.2 更正：VP8 恢复启用，编号 3 就是它原本的号（不是新占号）。
- * 此前两条否定理由都不成立：
- *   - "硬件没有 VP80 格式" —— 错，ENUM_FMT 实测列出
- *     MPG2/H264/HEVC/VP80/VP90，VP80 在列；
- *   - "驱动侧缺码流重建" —— 也不成立，decode.c 的 vp8_build_frame()
- *     已实现 RFC 6386 §9.1 的 uncompressed data chunk 合成。
- * 缺的只是 profiles.c 的声明、映射，与 codec_to_fourcc 的 VP80 一项。 */
+ * ⁇  0.4.2 Corrigendum: VP8 is reactivated, number 3 is its original number (not the new number).
+ * The two previous negative reasons were not established:
+ *   - " Hardware does not have VP80 format" - Wrong, ENM_FMT field list
+ *     MPG2/H264/HEVC/VP80/VP90, in column VP80;
+ *   - "Driving side default stream reconstruction" -- also non-convinced, vp8_build_frame()
+ *     Uncompressed data § 9.1 of RFC 6386 is achieved.
+ * All that is missing is the statement, the map, and the VP80 item of codec_to_sourcecc. */
 enum {
     DMD_V4L2_CODEC_H264 = 0,
     DMD_V4L2_CODEC_HEVC = 1,
@@ -192,14 +192,14 @@ enum {
     DMD_V4L2_CODEC_MPEG2 = 5,
 };
 
-#define DMD_V4L2_MAX_OUT 8    /* 输入（码流）缓冲数 */
-#define DMD_V4L2_MAX_CAP 24   /* 输出（像素）缓冲数，须 >= 驱动要求的最小值 */
+#define DMD_V4L2_MAX_OUT 8    /* Enter (bitstream) buffers */
+#define DMD_V4L2_MAX_CAP 24   /* Output (pixel) buffers, if > = minimum value required for driver */
 
 struct dmd_v4l2_buf {
-    int      dbuf_fd;         /* dma-heap 分配的 dmabuf，-1 表示未分配 */
-    void    *map;             /* mmap 到用户空间的地址，NULL 表示未映射 */
+    int      dbuf_fd;         /* dma-heap assigned dmabuf, 1 = undistributed */
+    void    *map;             /* mmap to userspace address, NULL means unmap */
     size_t   length;
-    int      queued;          /* 1 = 已在驱动队列里 */
+    int      queued;          /* 1 = Already in drive queue */
     int      hardware_error;  /* Last nonempty CAPTURE had V4L2_BUF_FLAG_ERROR. */
 };
 
@@ -208,94 +208,94 @@ struct dmd_v4l2_dec {
     /* Borrowed from the owning session, which retains it across deferred IO. */
     struct dmd_video_stats *video_stats;
     int      fd;                              /* /dev/videoN */
-    int      heap_fd;                         /* dma_heap 或 /dev/ion 的 fd */
-    int      heap_kind;                       /* 见 v4l2_backend.c 的 HEAP_* */
-    unsigned ion_mask;                        /* ION system heap 的 mask */
+    int      heap_fd;                         /* fd of dma_heap or /dev/ion */
+    int      heap_kind;                       /* See HEAP_* of v42_backend.c */
+    unsigned ion_mask;                        /* Ion system head, mask. */
 
-    int      out_w, out_h;                    /* OUTPUT 侧协商出的对齐尺寸 */
-    /* 码流位深 >8bit。CAPTURE 协商时据此选 P010（10bit 半平面）而不是
-     * NV12：固件对 10bit 流若被强配 NV12，会**照解不误地吐出 10bit 采样**，
-     * 但把每个采样的低 8 位当成一个像素写进缓冲（实测 a_10b：像素值恰好
-     * 等于 v10 & 0xFC，结构全对、数值全错）。所以位深必须在协商前告知。 */
+    int      out_w, out_h;                    /* Align sizes from the OPTPUT side */
+    /* Set before CAPTURE negotiation when the bitstream exceeds 8 bits.
+     * Request P010 to keep the full sample values. Forcing NV12 can produce
+     * correctly structured output with truncated sample values.
+     * The a_10b probe returned v10 & 0xFC for each sample in that case. */
     int      ten_bit;
-    int      w, h;                            /* 协商后的对齐尺寸 */
-    int      crop_w, crop_h;                  /* 有效显示区域 */
-    unsigned in_size;                         /* OUTPUT 单缓冲字节数 */
-    unsigned cap_size;                        /* CAPTURE 单缓冲字节数 */
-    int      stride;                          /* CAPTURE 的行距 */
-    int      slice_height;                    /* CAPTURE 的平面高度 */
+    int      w, h;                            /* Align sizes for consultation */
+    int      crop_w, crop_h;                  /* Show range effectively */
+    unsigned in_size;                         /* OUTPUT single buffer bytes */
+    unsigned cap_size;                        /* CASTOURE Single Buffet Bytes */
+    int      stride;                          /* Line spacing for CAPTURE */
+    int      slice_height;                    /* plane height of CAPTURE */
 
     int      n_out, n_cap;
     struct dmd_v4l2_buf out[DMD_V4L2_MAX_OUT];
     struct dmd_v4l2_buf cap[DMD_V4L2_MAX_CAP];
 
-    int      cap_planes;                      /* CAPTURE 平面数（含 extradata） */
-    size_t   extra_size;                      /* extradata 平面字节数 */
+    int      cap_planes;                      /* CAPTURE plane (including extradata) */
+    size_t   extra_size;                      /* square bytes of extradata */
     struct dmd_v4l2_buf extra[DMD_V4L2_MAX_CAP];  /* extradata dmabuf */
-    int      reconfig_done;                   /* 保留：曾用于一次性 CONTINUE 闩锁，现已不再置位 */
-    int      cap_recfg_count;                 /* CAPTURE 重配次数（诊断用） */
-    int      cap_ready;                       /* 1 = 已完成分辨率协商并 STREAMON */
-    /* 1 = 本次 setup_capture 是流中换分辨率触发的，几何以 G_FMT 报回的新值为准，
-     * 不得再用 OUTPUT 协商值覆盖（那是首次协商防残留用的，方向正好相反）。 */
+    int      reconfig_done;                   /* Reservation: Used for one-time CONTINUE lock, no longer in place */
+    int      cap_recfg_count;                 /* CAPTURE Reassemble (defiguring) */
+    int      cap_ready;                       /* 1 = Resolution consultation completed and STREAMON */
+    /* 1 = This setup_capture is triggered by a resolution change in flow, geometrically based on the new value returned by G_FMT,
+     * The OUTPUT consultation value should no longer be used to cover (it was the first time that the negotiations were for residual protection, in the opposite direction). */
     int      trust_gfmt;
-    int      fmt_dirty;                       /* 1 = 重配后几何已变，会话层须重发格式 */
+    int      fmt_dirty;                       /* 1 = Geometry changed after reset, session layer has to be re-mixed */
     int      out_streaming, cap_streaming;
-    int      buf_mem;                         /* 队列内存模式 V4L2_MEMORY_* */
-    int      draining;                        /* 已送 EOS，等剩余帧 */
+    int      buf_mem;                         /* Queue Memory Mode V4L2_MEMORY_* */
+    int      draining;                        /* Sended EOS, waiting for the remaining frame */
     int      saw_eos;
 };
 
 /*
- * 打开解码器并完成 OUTPUT 侧配置（第一阶段）。
- * codec_id 目前只支持 DMD_V4L2_CODEC_AV1。
- * w/h 是客户端声明的尺寸，用于初始 S_FMT；真实尺寸由 SOURCE_CHANGE 后
- * G_FMT(CAPTURE) 给出，可能不同（如 1080 → 1088 对齐）。
- * 返回 0 成功，-1 失败（失败时已清理，无需再调 close）。
+ * Opens the decoder and completes the OUTPUT side configuration (phase 1).
+ * The only support currently available is MDD_V4L2_CODEC_AV1.
+ * w/h is the size declared by the client for the initial S_FMT; real size is after SOURCE_CHANGE
+ * G_FMT (CAPTURE) gives different results (e.g. 1080  ⁇  1088 alignment).
+ * returns 0 successful, 1 failed (cleaned at failure, no further close-up).
  */
 int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h);
 
 /*
- * 送一个访问单元。data/len 是完整的 temporal unit（AV1）。
- * pts_us 原样透传给驱动的 timestamp，出帧时回传，用于与提交序号配对。
- * 返回 0 成功入队，1 表示当前无空闲输入缓冲（调用方应先收帧再重试），
- * -1 表示出错。
+ * Sends a access module. Data/len is the full temporal unit.
+ * pts_us as-sale pass-driven timestamp, back-to-back when the frame is out, to match the submission serial number.
+ * returns 0 to be successfully joined,1 indicating that there is currently no free input buffer (the caller should take the frame before retrying).
+ * -1 means there's been an error.
  */
 int dmd_v4l2_send(struct dmd_v4l2_dec *d, const uint8_t *data, size_t len,
                   uint64_t pts_us);
 
 /*
- * 取一帧。阻塞至多 timeout_ms。
- * 成功时 *out_data 指向 NV12 数据（属于后端的 dmabuf 映射，调用方须在
- * dmd_v4l2_release 之前用完），*out_len 为字节数，*out_pts 为回传的时间戳。
- * 返回 1 拿到帧，0 超时（无帧），-1 出错，2 表示收到 EOS（流结束）。
+ * Receive one frame, waiting at most timeout_ms.
+ * On success, out_data points into the backend DMA-BUF mapping. Use it
+ * before dmd_v4l2_release. out_len is the byte count and out_pts the timestamp.
+ * Returns 1 for a frame, 0 for a timeout, -1 on failure, and 2 for EOS.
  *
- * 首次调用会顺带完成第二阶段（等 SOURCE_CHANGE → 配置 CAPTURE），
- * 所以调用方在 send 首个单元之后必须开始 recv，否则协商不会推进。
+ * The first receive waits for SOURCE_CHANGE and sets up CAPTURE. Start
+ * receiving after submitting the first unit so negotiation can proceed.
  */
 int dmd_v4l2_recv(struct dmd_v4l2_dec *d, uint8_t **out_data, size_t *out_len,
                   uint64_t *out_pts, int *out_index, int timeout_ms);
 
-/* 把 recv 拿到的帧缓冲还给驱动。index 用 recv 输出的值。 */
+/* Returns the frame buffers obtained by recv to the driver. Index uses the value of the recv output. */
 int dmd_v4l2_release(struct dmd_v4l2_dec *d, int index);
 
-/* 送 EOS，让驱动吐出流水线里剩余的帧。之后继续 recv 直到返回 2。
- * 这是**不可逆**的：之后不应再送料。用于会话收尾。 */
+/* Send EOS to drive the remaining frame in the stream line. Continue recv until return 2.
+ * This is **reversible**: no more material should be delivered. For the end of the session. */
 int dmd_v4l2_drain(struct dmd_v4l2_dec *d);
 
 
-/* 关闭并释放全部资源。可重复调用。 */
+/* Closes and releases all resources. Recalls are available. */
 void dmd_v4l2_close(struct dmd_v4l2_dec *d);
 
 /*
- * 探测：本机的 V4L2 解码节点是否支持该 codec。
- * 不打开会话，只做 ENUM_FMT，代价很低。用于 daemon 启动时决定后端。
- * 返回 1 支持，0 不支持。
+ * Detection: Whether the V4L2 decoding node on this machine supports the codec.
+ * Do not open the session, just do ENUM_FMT, at a very low cost. Use the daemon to decide backend at startup.
+ * returns 1 support, 0 not supported.
  */
 int dmd_v4l2_probe(int codec_id);
 
-/* codec_id → 设备 OUTPUT 枚举里实际存在的 fourcc（AV1 在 'AV01'/'AV10'
- * 两个候选里按枚举结果挑，其余 codec 用标准值）。返回 0 = 该 codec
- * 不被本设备固件支持。 */
+/* Codec_id — Devices:
+ * The two candidates are selected by the number of names, the rest of the codec is given by standard values. returns 0 = the codec
+ * Not supported by this device solid. */
 uint32_t dmd_v4l2_pick_fourcc(int codec_id);
 
 #endif /* DMD_V4L2_BACKEND_H */

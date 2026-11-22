@@ -1,13 +1,13 @@
-/* 排空路径会不会产生黑帧/重复帧？
+/* Will the emptiness path produce black frames/repeated frames?
  *
- * 浏览器画面"中间黑屏一闪一闪"，而驱动日志里看到同一个 POC 反复出现。
- * 两个可疑点：
- *   1) 排空后重送 CSD，解码器可能吐出一个未初始化/全黑的缓冲
- *   2) flush 丢弃了参考帧，之后的 P/B 帧解出来是坏的
+ * The browser image "Middle black screen flashes" and the driver log sees the same POC recurring.
+ * Two suspicious points:
+ *   1) Reload CSD after empty, the decoder may eject an uninitialized/all-black buffer
+ *   2) Flush discards the reference frame, and the P/B unwinding is bad
  *
- * 这里直连 daemon，按浏览器的节奏（送 3 个单元就排空取帧）跑一遍，
- * 逐帧检查 Y 平面亮度均值：远低于正常值即为黑帧。
- * 同时记录每帧的前若干字节指纹，用来发现重复帧。
+ * Here goes the daemon, running at the browser rhythm (three units are sent and the frame is empty).
+ * Check the average brightness of the Y plane by frame: a black frame is much lower than normal.
+ * The first bytes of fingerprints of each frame are also recorded for the purpose of detecting duplicate frames.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -47,7 +47,7 @@ static long next_nalu(long from, long *len)
     return -1;
 }
 
-/* Y 平面亮度均值：黑帧接近 16（BT.601 的 black level） */
+/* Y plane brightness mean: Black frame close to 16 (black level for BT.601) */
 static double luma_mean(const unsigned char *y, int stride, int w, int h)
 {
     double sum = 0;
@@ -60,7 +60,7 @@ static double luma_mean(const unsigned char *y, int stride, int w, int h)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/root/decode-test/test1080.h264";
-    if (load(path) < 0) { fprintf(stderr, "读不了 %s\n", path); return 1; }
+    if (load(path) < 0) { fprintf(stderr, "I can’t read it. %s\n", path); return 1; }
 
     unsigned char *sps = NULL, *pps = NULL;
     long sps_len = 0, pps_len = 0, off = 0, len;
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
         else if (nut == 1 || nut == 5) { vo[nv] = off - 3; vl[nv] = len + 3; nv++; }
         off += len;
     }
-    printf("码流: %d 个 VCL\n\n", nv);
+    printf("bitstream: %d  VCL\n\n", nv);
 
     struct dmd_session_config cfg;
     dmd_session_config_init(&cfg);
@@ -82,7 +82,7 @@ int main(int argc, char **argv)
     cfg.height = 1088;
     struct dmd_error e;
     struct dmd_session *s = dmd_session_create(&cfg, &e);
-    if (!s) { fprintf(stderr, "建会话失败: %s\n", e.msg); return 1; }
+    if (!s) { fprintf(stderr, "Create session failed: %s\n", e.msg); return 1; }
 
     dmd_session_send_unit(s, sps, sps_len);
     dmd_session_send_unit(s, pps, pps_len);
@@ -91,16 +91,16 @@ int main(int argc, char **argv)
     unsigned long long prev_sig = 0;
     int sent = 0;
 
-    /* 模拟浏览器：每送 3 个单元就排空取帧 */
+    /* Simulate browser: free frame per 3 units sent */
     while (sent < nv && total < 60) {
         for (int k = 0; k < 3 && sent < nv; k++, sent++)
             dmd_session_send_unit(s, data + vo[sent], vl[sent]);
 
         if (dmd_session_drain(s) != DMD_OK) {
-            fprintf(stderr, "排空失败: %s\n", dmd_session_last_error(s));
+            fprintf(stderr, "Queued Failed: %s\n", dmd_session_last_error(s));
             break;
         }
-        int need_rebuild = 1;   /* 排空后 daemon 侧已 EOS，取完帧要重建 */
+        int need_rebuild = 1;   /* EOS, recreate frame after emptying */
 
         struct dmd_frame fr;
         while (dmd_session_next_frame(s, &fr, 2000) == DMD_OK) {
@@ -109,9 +109,9 @@ int main(int argc, char **argv)
             int w = 1920, h = 1080;
             double mean = luma_mean(fr.data, stride, w, h);
 
-            /* 指纹：取若干散点，避免只看开头误判 */
-            /* 指纹要覆盖整幅画面。早期版本只取 64 个稀疏点，
-             * 把亮度明显不同的相邻帧误报成"完全相同"。 */
+            /* Fingerprint: take a number of points and avoid reading only the first sentence. */
+            /* Fingerprints cover the entire picture. Only 64 thin spots were taken in the early version.
+             * "The same" is wrongly reported for the adjacent frame, which is clearly different in intensity. */
             unsigned long long sig = 0;
             for (int r = 0; r < h; r += 8)
                 for (int cc = 0; cc < w; cc += 8)
@@ -123,18 +123,18 @@ int main(int argc, char **argv)
             if (is_black) black++;
             if (is_dup) dup++;
             if (is_black || is_dup || total <= 6)
-                printf("帧%3d: 亮度均值 %6.2f %s%s\n", total, mean,
-                       is_black ? " ← 黑帧!" : "", is_dup ? " ← 与上一帧完全相同!" : "");
+                printf("frame%3d: Brightness Mean %6.2f %s%s\n", total, mean,
+                       is_black ? " ← Black Frame!" : "", is_dup ? " ← Same as the previous frame.!" : "");
             prev_sig = sig;
             dmd_session_release_frame(s, &fr);
         }
 
-        /* 驱动的真实行为：排空后会话进入 EOS，下次送料前重建并重送参数集，
-         * 从非 IDR 帧续传。这里照做，才能测到端到端的画面正确性。 */
+        /* Real behavior driven: EOS after the session is empty, recreated and re-retransmitted the argument set before the next feed.
+         * Continues from non-IDR frames. Do it here so that you can see the end-to-end image correctness. */
         if (need_rebuild) {
             dmd_session_destroy(s);
             s = dmd_session_create(&cfg, &e);
-            if (!s) { fprintf(stderr, "重建失败: %s\n", e.msg); break; }
+            if (!s) { fprintf(stderr, "Rebuilding failed: %s\n", e.msg); break; }
             dmd_session_send_unit(s, sps, sps_len);
             dmd_session_send_unit(s, pps, pps_len);
 
@@ -142,11 +142,11 @@ int main(int argc, char **argv)
     }
 
     dmd_session_destroy(s);
-    printf("\n=== 结论 ===\n");
-    printf("共 %d 帧：黑帧 %d，重复帧 %d\n", total, black, dup);
+    printf("\n=== Conclusions ===\n");
+    printf("Total %d Frame: Black Frame %d,Repeat Frame %d\n", total, black, dup);
     if (black == 0 && dup == 0)
-        printf("✓ 排空路径本身不产生黑帧/重复帧 → 黑屏另有原因\n");
+        printf("✓ Draining produced no black or duplicate frames. Look elsewhere for the black screen.\n");
     else
-        printf("✗ 排空路径会产生异常帧 → 这就是黑屏的来源\n");
+        printf("✗ The emptied path creates the anomaly.\n");
     return 0;
 }

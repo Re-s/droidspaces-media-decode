@@ -1,5 +1,5 @@
-/* 直接用 dmd_client.h 的 session API 解码，复现驱动的调用序列。
- * 目的：把范围从"驱动 + session 层"压到"仅 session 层"。 */
+/* Recreates the call sequence driven by dmd_client.h 's message API decoding.
+ * Exercise the session layer independently of the VA-API driver. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,13 +7,13 @@
 #include "dmd_client.h"
 int main(int argc,char**argv){
     int n=atoi(argv[2]);
-    /* argv[3]=whole：整条流一次 send_unit，用于验证送料粒度。
-     * 上一轮定界发现：合成流按帧切分送料只出 1 帧，而源码流一个
-     * temporal unit 含多帧。需要能测"多帧一单元"才能证实该假设。 */
+    /* Argv [3] =whole: whole strip flow send_unit for verification of grain size of the delivery material.
+     * Last round of delimitation found: Synthetic stream distribution by frame cut out only 1 frame, and source stream one
+     * The scenario is supported by a multi-frame frame. */
     int whole = (argc>3 && argv[3][0]=='w');
-    /* argv[3]=frame：按 OBU_FRAME 切单元（每帧一单元），而非按 TD 切。
-     * 源码流一个 TU 常含多帧，按 TD 切会把多帧塞进一个单元。
-     * 需要区分"单元=TU"与"单元=单帧"两种送料方式。 */
+    /* Argv [3] = flame: press OBU_FRAME (one unit per frame) instead of TD.
+     * A TU that has a lot of frames, press TD to plug them into a cell.
+     * A distinction needs to be made between "unit=TU" and "module=one frame" for the delivery. */
     int perframe = (argc>3 && argv[3][0]=='f');
     FILE*f=fopen(argv[1],"rb");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
     uint8_t*d=malloc(sz);fread(d,1,sz,f);fclose(f);
@@ -32,11 +32,11 @@ int main(int argc,char**argv){
     cfg.codec=4; cfg.width=1920; cfg.height=1080;
     struct dmd_error err; memset(&err,0,sizeof(err));
     struct dmd_session*s=dmd_session_create(&cfg,&err);
-    if(!s){printf("create 失败: %s\n",err.msg);return 1;}
+    if(!s){printf("create failed: %s\n",err.msg);return 1;}
 
     int sent=0,got=0;
     if(perframe){
-        /* 逐 OBU 扫描，每遇 OBU_FRAME(6) 就连同其前的 TD/SEQ 作为一个单元送出。 */
+        /* Scanning on OBU, whenever OBU_FRAME(6) meets, together with its predecessor TD/SEQ sent out as a unit. */
         long i=0, ustart=0; int nu2=0;
         while(i<sz){
             unsigned char h=d[i]; int t=(h>>3)&0xF; long j=i+1;
@@ -61,12 +61,12 @@ int main(int argc,char**argv){
             if(r==0){got++;dmd_session_release_frame(s,&fr);}
             else if(r==1)break;
         }
-        printf("session API: 送 %d 单元, 收 %d 帧\n",sent,got);
+        printf("session API: Send %d Module, Take it. %d frame\n",sent,got);
         dmd_session_destroy(s);return 0;
     }
     if(whole){
         int rc=dmd_session_send_unit(s,d,sz);
-        printf("整块送入 %ld 字节 rc=%d\n",sz,rc);
+        printf("Whole %ld bytes rc=%d\n",sz,rc);
         if(rc==0){
             sent=1;
             for(int loop=0;loop<200;loop++){
@@ -76,24 +76,24 @@ int main(int argc,char**argv){
                 else if(r==1)break;
             }
         }
-        printf("session API: 送 %d 单元, 收 %d 帧\n",sent,got);
+        printf("session API: Send %d Module, Take it. %d frame\n",sent,got);
         dmd_session_destroy(s);return 0;
     }
     for(int k=0;k<nu;k++){
         int rc=dmd_session_send_unit(s,d+offs[k],lens[k]);
-        if(rc!=0){printf("send_unit[%d] 失败 rc=%d: %s\n",k,rc,dmd_session_last_error(s));break;}
+        if(rc!=0){printf("send_unit[%d] failed rc=%d: %s\n",k,rc,dmd_session_last_error(s));break;}
         sent++;
-        /* 模拟驱动：每送一个尝试取一帧 */
+        /* Simulate driver: each sent tries to get a frame */
         struct dmd_frame fr; memset(&fr,0,sizeof(fr));
         int fr_rc=dmd_session_next_frame(s,&fr,100);
         if(fr_rc==0){got++;dmd_session_release_frame(s,&fr);}
     }
-    /* 收尾：继续取剩余帧 */
+    /* End of story: Continue with the remaining frame */
     for(int loop=0;loop<40;loop++){
         struct dmd_frame fr; memset(&fr,0,sizeof(fr));
         int rc=dmd_session_next_frame(s,&fr,200);
         if(rc==0){got++;dmd_session_release_frame(s,&fr);}
         else if(rc==1){printf("EOS\n");break;}
     }
-    printf("session API: 送 %d 单元, 收 %d 帧\n",sent,got);
+    printf("session API: Send %d Module, Take it. %d frame\n",sent,got);
     dmd_session_destroy(s);return 0;}

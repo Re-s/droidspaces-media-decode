@@ -1,24 +1,24 @@
-/* AV1 OBU 反向合成。
+/* AV1 OBU inverted.
  *
- * 为什么需要这个文件：VA-API 把 AV1 的解码参数以**结构化字段**交给驱动
- * （VADecPictureParameterBufferAV1），码流侧只给**裸 tile 载荷**——
- * 不含任何 OBU 封装。而下游 MediaCodec 要的是完整 AV1 OBU 流。
+ * Why this file is needed: VA-API delivers the AV1 decoding parameters to the driver **structured fields**
+ * (VADecPictureParameter BufferAV1) The code side is given only to **naked Tile load**-
+ * No OBU envelopes are available. Downstream MediaCodec wants the full AV1 OBU stream.
  *
- * libva 自己把这件事说清楚了（/usr/include/va/va_dec_av1.h:643-645）：
+ * Libva herself made this clear (/usr/include/va/va_dec_av1.h: 643-645):
  *   "host decoder is responsible to parse out the per tile information.
  *    And the bit stream in sent to driver in per tile granularity."
- * 同文件 :637-638 还注明 VASliceParameterBufferAV1 "actually means
+ * Same file: 637-638 and also indicates VASLiceParameter BufferAV1 "actually means
  * VATileParameterBufferAV1"。
  *
- * ⚠️ 这与 VP9 的情形完全不同，别照搬。VP9 的 slice data 本身就是完整帧
- * （va_dec_vp9.h:274-284），所以那条路零重建成立；AV1 走同样的路会送出
- * 非法码流——实测首字节 0xd0（forbidden_bit=1、OBU 类型 10 是保留值），
- * 解码器报 "No sequence header available"，一帧也解不出。
+ * This is completely different from the VP9 situation, not the same. The Slick Data of VP9 is the complete frame.
+ * So that road was re-established; AV1 would be sent out on the same path.
+ * Illegal stream - actual first byte 0xd0 (forbidden_bit=1, OBU type 10 is a reserved value)
+ * The decoder is "No security header available", and no frame can be solved.
  *
- * 位写入原语复用 bitstream.h：AV1 的 f(n) 与 H.264/HEVC 的 u(n) 编码方式
- * 一致（都是 MSB 优先的固定位宽，AV1 规范 4.10.2 对 f(n) 的定义），
- * 已核对 dmd_bw_put_bits 的实现确认位序相同。AV1 特有的变长编码
- * （leb128 / uvlc / le）在本文件补齐。
+ * bits to repeat bitstream.h: f(n) of AV1 and u(n) of H.264/HEVC
+ * Consistency (all MSB preferred fixed bit width, AV1 norm 4.10.2 definition of f(n)),
+ * The de-dentation sequence for dmd_bw_put_bits is the same. AV1 unique long code
+ * (leb128/ uvlc/le) is completed in this document.
  */
 #ifndef DMD_AV1_BITSTREAM_H
 #define DMD_AV1_BITSTREAM_H
@@ -28,7 +28,7 @@
 
 #include "bitstream.h"
 
-/* OBU 类型（AV1 规范 6.2.2 表 obu_type）。 */
+/* OBU type (AV1 Regulation 6.2.2 Table obu_type). */
 enum {
     DMD_OBU_SEQUENCE_HEADER        = 1,
     DMD_OBU_TEMPORAL_DELIMITER     = 2,
@@ -41,183 +41,183 @@ enum {
     DMD_OBU_PADDING                = 15,
 };
 
-/* leb128 最大字节数（AV1 规范 4.10.5：最多 8 字节）。 */
+/* The maximum bytes of the eb128 (AV1 norm 4.10.5: maximum 8 bytes). */
 #define DMD_LEB128_MAX 8
 
-/* ---------------------------------------------------------------- 变长编码 */
+/* - - - - - - - - - - - - - - - - - - - - - - - Longer codes */
 
-/* leb128(v)：小端 7 位分组，每字节高位是"还有后续"标志。
- * 写入 out，返回字节数；out_cap 不足返回 0。 */
+/* LEB128(v): A small 7-bit group with a byte height marked "and follow."
+ * Write out, returns bytes;out_cap is not enough to return 0. */
 size_t dmd_av1_leb128(uint64_t v, unsigned char *out, size_t out_cap);
 
-/* leb128 的编码长度，不实际写入——用于先算 obu_size 占几字节。 */
+/* The encoded length of the leb128 is not actually written - bytes used to calculate the obu_size first. */
 size_t dmd_av1_leb128_len(uint64_t v);
 
-/* uvlc()：AV1 规范 4.10.3。前导零计数 + 尾数，用于 frame_header 里
- * 少数字段（如 timing_info 的 num_units_in_display_tick 不用它，
- * 但 delta_frame_id 之类要）。 */
+/* uvlc(): AV1 Regulation 4.10.3. The leading zero count + the tail number used for the frame_header
+ * The number of small numbers (e.g. number_info's num_units_in_display_tick) does not need it.
+ * The blog is a blog of the blog Elaa, which is a blog of the blog Elaaa, which is a blog of the blog Elaa. */
 void dmd_av1_put_uvlc(struct dmd_bitwriter *bw, uint32_t v);
 
-/* le(n)：AV1 规范 4.10.4。n 字节小端整数，**必须字节对齐时调用**。 */
+/* le (n): AV1 Regulation 4.10.4.n Byte Integer,** which must be called when the byte is aligned**. */
 void dmd_av1_put_le(struct dmd_bitwriter *bw, uint64_t v, int nbytes);
 
-/* ns(n)：AV1 规范 4.10.7 的非对称二值编码。tile_info 里
- * context_update_tile_id 与 tile 尺寸推导会用到。 */
+/* ns(n): AV1 specification 4.10.7 asymmetrical double-value encoding.
+ * Context_update_tile_id and tile sizes are used. */
 void dmd_av1_put_ns(struct dmd_bitwriter *bw, uint32_t v, uint32_t n);
 
-/* su(n)：AV1 规范 4.10.6 的有符号定长。global_motion 等处用。 */
+/* su(n): AV1 regulates the sign length of 4.10.6. Global_motion etc. */
 void dmd_av1_put_su(struct dmd_bitwriter *bw, int32_t v, int nbits);
 
-/* ------------------------------------------------------------------ 对齐 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - Alignment */
 
-/* byte_alignment()：AV1 规范 5.3.5。补零至字节边界。
- * ⚠️ 与 H.264 的 rbsp_trailing_bits 不同——AV1 **不写** stop bit，
- * 纯补零。用错会让解码器把填充位当语法元素读。 */
+/* Byte_alignment(): AV1 Reg. 5.3.5.
+ * Unlike the ribsp_trailing_bits of H.264 -- AV1 ** stop bit,
+ * Pure zero. Errors allow the decoder to read the fill as a grammar element. */
 void dmd_av1_byte_align(struct dmd_bitwriter *bw);
 
-/* trailing_bits()：AV1 规范 5.3.4。写一个 1 再补零至字节边界。
- * 用于 OBU **payload 结尾**（sequence_header_obu 与
- * frame_header_obu 结尾要，tile_group_obu 结尾不要）。 */
+/* Trailing_bits(): AV1 Regulator 5.3.4. Write a 1 then add zero to bytes boundary.
+ * For OBU **payload ending** (segment_header_obu and
+ * The end of the page is not the end of the sentence. */
 void dmd_av1_trailing_bits(struct dmd_bitwriter *bw);
 
-/* ---------------------------------------------------------------- OBU 头 */
+/* - - - - - - - - - - - - - - - - - - - - Head of the OBU */
 
-/* ------------------------------------------------------- 序列头合成（2/4） */
+/* - - - - - - - - - - - - - - - - - - - Sequence head synthesis (2/4) */
 
-/* 从 VADecPictureParameterBufferAV1 合成一个完整的 OBU_SEQUENCE_HEADER
- * （含 OBU 头 + payload + trailing_bits）。
+/* Combine a complete OBU_SEQUENCE_HEADER from VADecPictureParameter BufferAV1
+ * (includes OBU headers + payload + trading_bits).
  *
- * pic 是 const void* 而非具体类型：本头文件刻意不 include va_dec_av1.h，
- * 免得把 libva 依赖扩散到只需要比特原语的调用方。实现里转型。
+ * Pic is the const void* not the specific type: this file is deliberately not intended to be include vá_dec_av1.h, but is not intended to be a part of the current document.
+ * So that libva can be spread to the user that only needs bits of original language.
  *
- * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+ * Write out, returns the total bytes; the capacity is insufficient or the parameter is returned illegally. */
 size_t dmd_av1_build_sequence_header(const void *pic,
                                      unsigned char *out, size_t out_cap);
 
-/* --------------------------------------------- OBU_FRAME 组装（3/4 + 4/4） */
+/* - - - - - - - - - - - - - - OBU_FRAME assembly (3/4 + 4/4) */
 
 /*
- * 自洽 DPB 状态（影子参考帧管理）。
+ * Self-regulation DPB status (shadow frame management).
  *
- * 为什么需要它：refresh_frame_flags 与 ref_frame_idx 都由本模块写入码流，
- * 而 VA-API 不提供 refresh_frame_flags（那是编码器的 GOP 决策，随源码流
- * 被解析后丢弃）。解决办法不是去还原编码器的选择，而是自己维护一套
- * **自洽**的槽位分配：我说本帧存进槽 k，之后引用它时就报槽 k。
- * 解码器只要求两者一致，不要求与原编码器相同。
+ * Why it is needed: both refresh_frame_flags and ref_frame_idx are written by this module into the stream, and the user is not allowed to write about it.
+ * VA-API does not provide refresh_frame_flags (that's the encoder's GOP decision, with the source stream)
+ * Disassembleded. The solution is not to restore the encoder, but to maintain one.
+ * ** Schlot allocation**: I said this frame is stored in k, and then I reported k when it was quoted.
+ * The decoder only requires the sameness of the two, not the same as the original encoder.
  *
- * 由调用方（每个解码 context）持有一份，跨帧保持。
- * 新建 context 时整体清零即为初始状态。
+ * Holds one copy of each decoding context, held across frames.
+ * New confext is the initial state when the whole package is zero.
  */
 struct dmd_av1_dpb {
-    /* ⚠️ 影子表存**本驱动的帧号**（frame_seq，从 1 起），不是 surface id。
-     * ffmpeg 会回收复用 surface：同一个 VASurfaceID 先后属于不同帧
-     * （实测 160 帧样本里 oh1 与 oh7 同用 surface 6），surface 做身份
-     * 会把死帧和复用它的活帧混为一谈。0 表示空槽。 */
-    int         dpb_shadow[8];     /* 槽 -> 该槽当前存的帧号 */
-    unsigned    dpb_order_hint[8]; /* 槽 -> 该槽帧的 order hint。
-                                    * error_resilient 帧的帧头要逐槽写出
-                                    * （规范 5.9.2 的 ref_order_hint[i]）。 */
-    unsigned    dpb_next_slot;     /* 下一个要写入的槽，8 槽轮转 */
-    int         frame_seq;         /* 已合成帧计数，本帧号 = ++frame_seq */
+    /* ⁇  Shadowwatch** This is a driven frame number** (frame_seq, from 1), not a surface id.
+     * ffmpeg recovers the recovery search: the same VASURfaceID is in different frames
+     * "Ox1 with oh7" "Surface 6" is "surface"
+     * It's a mix of dead frames and reused living frames. */
+    int         dpb_shadow[8];     /* Slot - - The current frame number of the slot */
+    unsigned    dpb_order_hint[8]; /* The slot-- the frame of the slot is over.
+                                    * The frame of the error_resilient frame is to be written by slot.
+                                    * (Ref_order_hint[i] for 5.9.2). */
+    unsigned    dpb_next_slot;     /* Next slot to write, 8 slots turn */
+    int         frame_seq;         /* Synthetic frame count, this frame = ++frame_seq */
 
-    /* surface -> 最近拥有它的帧号。引用翻译与 E 识别都要经过它：
-     * ref_frame_map 里给的是 surface，而同一 surface 可能属于多个
-     * 历史帧，"最近拥有者"正是还活着的那个（死帧的 surface 被回收后
-     * 归新帧所有）。表满时线性替换最旧一项。 */
+    /* The reference translation and E recognition are all through it:
+     * ref_frame_map gives a surface, and the same surface may belong to more than one.
+     * The historical frame, the recently owned, is the one still alive.
+     * New frame. Linear replacement of the oldest item on full time. */
     struct { VASurfaceID surf; int frame; } surf_hist[64];
     int         surf_hist_n;
 
-    /* 上一帧 refresh_frame_flags 字段在其帧头内的**位**偏移。
-     * 正确值要等下一帧的 ref_frame_map 才能算出，届时用它就地改写。
-     * SIZE_MAX 表示上一帧没有该字段（KEY+show 帧不写入）。 */
+    /* The previous frame refresh_frame_flags field ** bits within its frame ** offset.
+     * The correct value is to be calculated by waiting for the next frame ref_frame_map, which is then rewrited on the ground.
+     * SIZE_MAX indicates that the previous frame does not contain the field (KEY+show frame does not write). */
     size_t      last_refresh_bitpos;
 
-    /* 上一帧（即 last_refresh_bitpos 所属那一帧）的 order hint。
-     * patch 反算出真实 refresh 后要把该帧登记进影子槽，槽的 order hint
-     * 是解码器推导 skipModeAllowed（5.9.22）的输入，必须一起记。 */
+    /* The last frame (the last_refresh_bitpos) is the order hit.
+     * Catch to rewrite the real refresh and then register the frame into the shadow slot, order hit
+     * It is the input of the decoder to skipModeAllowed (5.9.22), which must be recorded together. */
     unsigned    last_oh;
 
-    /* 同理记录 disable_frame_end_update_cdf 的位偏移。
+    /* Distortion of the same record.
      *
-     * 为什么需要：双趟解码（第一趟 refresh=0 只取像素，第二趟带真实
-     * refresh 补 DPB）会让 AV1 的**帧上下文回写**发生两次。规范 7.19
-     * 里帧解码结束时执行
+     * Why? Double-checking. First refresh=0 for pixels only. Second one for real.
+     * Refresh refill DPB) will allow the ** frame reset of AV1 to occur twice.
+     * Execute when the frame decodes
      *     if ( !disable_frame_end_update_cdf )
      *         SetFrameContext( ref_frame_idx[ primary_ref_frame ] )
-     * 把本帧的 CDF/delta-q/环路滤波等终态**拷贝**进 primary 参考帧所在
-     * 槽的上下文。第一趟已经把它改成本帧终态，第二趟再读就是错的起点
-     * —— 于是第二趟解出一帧垃圾并放进 DPB，后续引用全废。
+     * Copy the frame's CDF/delta-q/ ring filtering terminal** into the Primariy reference frame
+     * The slot context. The first time it was changed to the cost frame, the second time it was read again was the wrong starting point.
+     * So the second time a piece of garbage was removed and placed in the DPB, and the subsequent quotes were all gone.
      *
-     * 修法：第一趟把这一位强制写 1（不回写），第二趟还原成源码流真值
-     * （由它完成唯一一次回写）。两趟的起点上下文相同 → 第二趟像素与
-     * 第一趟逐位相同，DPB 与 CDF 同时正确。
-     * SIZE_MAX 表示码流里没有这个字段（disable_cdf_update=1 时推断为 1，
-     * 本来就不回写，无需处理）。 */
+     * Reverse: First time write this mandatory 1 (no reply) and second time restore to source stream value
+     * (It performs the only rewriting). The starting context is the same for two trips — the second pixel and the second pixel.
+     * The first time was the same, the DPB was right with the CDF.
+     * SIZE_MAX indicates that this field is not in the stream (disable_cdf_update=1 extrapolated to 1, the number of the people who are not in the stream is 1 , the number of the people who are in the stream is 1 , the number of the people who are in the stream is 1 , the number of people who are in the stream
+     * It's not written back, it's not done. */
     size_t      last_endupd_bitpos;
 
-    /* 上一帧的 ref_frame_map 快照，用于与本帧的 map 做差分。 */
+    /* The previous frame ref_frame_map snapshot, used to score the difference with the frame ' s map. */
     VASurfaceID prev_ref_map[8];
     int         prev_valid;
 
-    /* ---- 全局运动参数的按槽备份（规范 5.9.24 / 7.11.3.6）----
+    /* - Replenishment of global motion parameters (regulation 5.9.24 / 7.11.3.6) -
      *
-     * gm_params 是**差分编码**：本帧的符号相对 primary 参考帧的参数算出，
-     * 解码器用的那份 prev 存在它自己 DPB 的槽里。我们合成码流时若按别的
-     * 值编码，硬件重建出来的参数就和源码流不同，运动补偿（进而像素）就错。
-     * 所以必须按槽镜像一份，与 dpb_shadow 同步更新：槽 k 存的是哪一帧，
-     * gm_slot[k] 就是那一帧的 7×6 参数（**重建后**的值，即 VA 的 wmmat）。
+     * gm_params are ** differential **: the symbols of this frame are derived from parameters relative to the prism frame,
+     * The prev used by the decoder is in its own DPB slot. If we use another button when we synthesize the flow,
+     * Value encoding, the parameters of the hardware reconstructed differ from the source stream, and the motion compensation (and therefore the pixel) is wrong.
+     * So you have to mirror one of the slots and update it in sync with dpb_shadow: which frame does the slot k store,
+     * gm_slot[k] is the 7x6 parameter for that frame (** value after reconstruction**, i.e. wmmat for VA).
      *
-     * 两份表都只在"帧真正进槽"时更新：
-     *   - 普通帧：像素趟 refresh=0 不进槽，等 DPB 趟（patch_prev_refresh
-     *     反算出真值后就地改写）才登记，故新增 gm_pending 暂存本帧参数；
-     *   - KEY/全刷帧：规范推断全刷，build_frame 里直接写满 8 槽。
-     * 时序与硬件一致：EndPicture(k+1) 先 patch（本帧进槽）再合成 k+1，
-     * 硬件也是先收 repair(k) 再收 pixel(k+1)。 */
+     * Both tables are updated only when the frame really goes down:
+     *   - Normal frame: pixel trip refresh=0 no slot, waiting for DPB trip (watch_prev_refresh)
+     *     (b) Rewrite the register only after the real value has been calculated) and therefore add gm_pending suspense frame parameters;
+     *   - KEY/All-out brush: Standard deductions are full, eight slots are written in build_frame.
+     * Time sequence is consistent with hardware: EndPicture(k+1) paste (this frame chute) then synthesizes k+1,
+     * Hardware is also collected first repair (k) and then pixel (k+1). */
     struct dmd_av1_gm { int32_t p[7][6]; } gm_slot[8];
-    struct dmd_av1_gm gm_pending;      /* 最近合成帧的参数 */
-    int               gm_pending_frame;/* 它属于哪一帧（frame_seq），0=无 */
+    struct dmd_av1_gm gm_pending;      /* Arguments for the most recent synthetic frame */
+    int               gm_pending_frame;/* Which frame does it belong to? 0 = none. */
 
-    /* 源 DPB 在上一帧解码时踢出的帧（E_{k-1} = map_{k-1} \ map_k），
-     * 以帧号表示。源编码器保证被踢出的帧不会再被任何后续帧引用
-     * （死了），本驱动让当前帧占它的影子槽，就永远不会覆盖活引用。
-     * 单槽差分算不出（如 KEY 全刷后的多槽变化）时置 valid=0。 */
+    /* Source DPB kicked the frame (E_k- ⁇ map_k) when the previous frame was decoded,
+     * In frame number. The source encoder guarantees that the kicked frame will not be cited in any subsequent frame.
+     * (Death) This driver lets the current frame take its shadow slot, and it never covers live references.
+     * The single slot difference is not counted (e.g., multiple slot changes after KEY has been fully brushed) and the value = 0 is not counted. */
     int         evict_frame;
     int         evict_valid;
 };
 
 /*
- * 用本帧的 ref_frame_map 反算**上一帧**的 refresh_frame_flags，并就地改写
- * 上一帧已合成的字节。
+ * Refresh_frame_map-composition from the frame**
+ * The bytes of the previous frame that have been synthesized.
  *
- * 原理（实测验证，4 帧全部命中源码流真实值 1/8/32/64）：
- *   第 N 帧的 refresh_frame_flags = 第 N+1 帧 map 与第 N 帧 map 的差异位
- * 因为"本帧写入了哪些槽"正是在下一帧的 DPB 快照里显现出来的。
+ * Rationale (as measured, 4 frames have all the source flow real values 1/8/32/64):
+ *   Frame N refresh_frame_flags = variance between frame N+1 Map and frame N
+ * Because "what slots are written in this frame" is just the next DPB snapshot.
  *
- * 这是唯一可行的推导方式。已否决的四种（细节见 .c 内注释）：
- *   1. 在本帧 ref_frame_map 里找 current_frame —— 该数组是解码**前**快照
- *   2. 本帧 map 与**上**帧 map 差分 —— 方向错，给出的是上帧的 refresh
- *   3. 恒 1 或 8 槽轮转 1<<slot —— 无法表达 refresh=0（不占槽的帧），
- *      而真实序列里这类帧占三分之一
- *   4. 取第一个空槽 / 未被引用的槽 —— 实测仅首帧碰对
+ * This is the only possible way to deduce. Four of the rejected (see note in .c for details):
+ *   Find Current_frame in this frame -- this array is decoded**
+ *   This frame map is split between the **frame map -- the wrong direction is given as the top frame refresh
+ *   A constant 1 or 8 sink rotation 1 < <slot > - cannot express refresh=0 (not a slot frame),
+ *      And this kind of frame is one third of the real sequence.
+ *   Taking the first empty slot / unquoted slot - only first frame is checked
  *
- * prev_frame_bytes 指向上一帧帧头所在的缓冲（调用方保存），
- * 该缓冲必须在本次调用时仍然有效且尚未送入解码器。
+ * The prev_frame_bytes point to the buffer where the upper bow is (caller saver)
+ * The buffer must remain in effect at the time of this call and has not been sent to the decoder.
  */
-/* 合成一个 show_existing_frame 帧头 OBU（规范 5.9.2）。
+/* Synthesizes a show_existing_frame frame OBU (regulation 5.9.2).
  *
- * 硬件不输出 show_frame=0 的帧（符合规范），但会为每个 SEF 头复显一次。
- * 源码流正是这么做的：150 个 OBU_FRAME 里只有 80 个 show_frame=1，
- * 另外 70 帧靠 70 个 SEF 头复显，合计 150 帧输出。
- * 实测源码流直喂硬件是"送 150 收 150"，而缺 SEF 头的合成流只收 80。
+ * Hardware does not export a frame (comply with the norm) of show_frame=0, but it is resurfaced for each SEF.
+ * This is how the source stream is: out of 150 OBU_FRAME, only 80 show_frame=1, and the number of users is 80.
+ * Another 70 frames are resurfaced by 70 SEFs, with 150 frames in total.
+ * The actual source flow feed is " one hundred fifty for 150" for hardware, while the synthetic stream without SEF head is only 80 for.
  *
- * 结构极简（实测源码流的 SEF 全是 2 字节）：
- *     OBU 头 0x1a（type=3 FRAME_HEADER, has_size=1）
+ * The structure is extremely simple (all SEFs in the actual source stream are 2 bytes):
+ *     OBU Head 0x1a (type=3 FRAME_HEADER, has_size=1)
  *     leb128 size = 1
- *     载荷 1 字节：show_existing_frame(1)=1 + frame_to_show_map_idx(3)
+ *     Load 1 bytes: show_existing_frame(1)=1 + frame_to_show_map_idx(3)
  *                  + trailing_bits
- * 例：map_idx=6 → 载荷 0xe8；map_idx=5 → 0xd8；map_idx=3 → 0xb8。
+ * Example: Map_idx=6  ⁇  load 0xe8; Map_idx=5 ⁇ 0xd8; Map_idx=3 ⁇ 0xb8.
  *
- * buf 至少 4 字节。返回写入长度，失败返回 0。 */
+ * Buff at least 4 bytes. Returns writing length, failed to return 0. */
 size_t dmd_av1_build_show_existing(unsigned char *buf, size_t cap,
                                    unsigned map_idx);
 
@@ -228,74 +228,74 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 size_t prev_bitpos,
                                 int prev_frame);
 
-/* 本帧的参考帧在影子 DPB 里是否都找得到（即硬件能否解这一帧）。
+/* Whether this frame of reference is found in the shadow DPB (i.e. whether hardware can solve this frame).
  *
- * 为什么必须问这个：消费者把"槽里没有帧"表达成 ref_frame_map[i] =
- * VA_INVALID_ID（把进度条拖到 GOP 中间、或码流被截断时就是这种），此时
- * 合成流只能透传源槽号，硬件于是被要求去引用一个**从未填充过**的 DPB 槽。
- * msm_vidc 对这种帧的行为是既不吐 CAPTURE 缓冲也不回错误事件 —— 实测
- * 首帧即 inter 的流：提交 1 单元、取回 0 帧，SyncSurface 等满 5s 超时，
- * 调用方（ffmpeg）就此放弃整条码流（rc=251）。软解 dav1d 的行为是丢掉这些
- * 帧、从码流里下一个 KEY 继续出帧。所以调用方遇到本函数返回 0 时应当
- * **不提交硬件**，直接把 surface 按空壳交付，流程才不会断。
+ * Why do you have to ask? The consumer has reached the "no frame" watch.
+ * VA_INVALID_ID (this is the way to drag the progress bar to the GOP middle or when the stream is cut off)
+ * Synthetic flows can only pass through the source slot, and hardware is then required to quote a DPB slot that has never been filled**.
+ * The msm_vidc behavior of this frame is neither vomiting nor responding to CAPTURE buffers - actual measurements
+ * The first frame is the inter stream: submit a module, retrieve 0 frames, SyncSurface etc. is 5 ss overtime,
+ * The caller (ffmpeg) thus abandoned the entire bar stream (rc=251). Soft resolution dav1d's behavior was to throw away these.
+ * Frame, next KEY from the stream continues to exit the frame. So the caller should return 0 when this function returns
+ * ** No hardware submitted**, directs the surface to the shell, and the process is not broken.
  *
- * 只有 INTER 且真会读取参考的帧需要判断：KEY/INTRA_ONLY/SWITCH 不读参考，
- * allow_intrabc 与 reference_select=0 也不读，一律返回 1。
- * 判据只覆盖解码器真正取用的槽位（LAST 与 ALTREF，规范 5.9.2），
- * 其余槽位是填充值，指向空槽不影响解码。
+ * Only INTER and really read reference frames need to be judged: KEY/INTRA_ONLY/SWITCH does not read reference, but the only thing that is not available is that it is not possible to read the frame.
+ * Allow_intrabc and reference_second=0 do not read, returns 1.
+ * The decision only covers the slots actually used by the decoder (LAST and ALTREF, regulation 5.9.2),
+ * The remaining slots are filled with values and point to empty slots without coding.
  *
- * 实测安全边界：健康码流（1800 帧样本取前 300 帧，2100 个引用）返回 0
- * 的次数为 **0**，因此不会误伤正常播放。 */
+ * Actually measured safe boundary: Health stream (1,800 frames before 300 frames, 2100 references) returns 0
+ * The number of times is **0**, so there is no risk of any injury to the normal broadcast. */
 int dmd_av1_refs_resolvable(const void *pic, struct dmd_av1_dpb *dpb);
 
-/* 一个 tile 的位置与长度描述，供 dmd_av1_build_frame() 组装 tile_group。 */
+/* A text description of the position and length of a Tile to assemble tile_group. */
 struct dmd_av1_tile {
     const unsigned char *data;
     size_t               len;
 };
 
-/* 合成一个完整的 OBU_FRAME(6)：帧头 + byte_alignment + tile_group。
+/* Synthesizes a complete OBU_FRAME(6): frame + byte_alignment + tile_group.
  *
- * ⚠️ 为什么用 OBU_FRAME 而不是分离的 FRAME_HEADER(3) + TILE_GROUP(4)：
- * 实测 dav1d 对分离形式报 "Failed to read unit 0 (type 3)"，而合并形式
- * 直接通过。libaom 生成的真实码流用的也是 OBU_FRAME。
+ * Why do you use OBU_FRAME instead of the separated FAME_HEADER(3) + TILLE_GRUP(4):
+ * "Failed to read unit 0 (type 3)", and merged.
+ * Directly through. The real bitstream generated by libaom is also used by OBU_FRAME.
  *
- * ⚠️ 关键差别：OBU_FRAME 内的帧头结尾用 **byte_alignment（纯补零）**，
- * 而不是 trailing_bits（写 1 再补零）—— 规范 5.10.1 frame_obu() 里
- * frame_header_obu() 之后紧跟 byte_alignment()。用错会让 tile_group
- * 的起始位置偏移，dav1d 就是这么报错的。
+ * ⁇  Key difference: at the end of the frame in OBU_FRAME, **byte_alignment**,
+ * Instead of traying_bits (writing 1 and then zeroing) - Regulation 5.10.1 frame_obu()
+ * The error allows the tile_group to follow the text of the video.
+ * That's how you mistook the initial position.
  *
- * tiles 按 tile_row-major 顺序给出，数量必须等于 tile_cols*tile_rows。
- * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+ * tiles in the order of tile_row-major must be equal to tile_cols*tile_rows.
+ * Write out, returns the total bytes; the capacity is insufficient or the parameter is returned illegally. */
 size_t dmd_av1_build_frame(const void *pic,
                            const struct dmd_av1_tile *tiles, int num_tiles,
                            unsigned char *out, size_t out_cap,
                            struct dmd_av1_dpb *dpb);
 
-/* ------------------------------------------------------- 帧头合成（3/4） */
+/* - - - - - - - - - - - - - - - - - - Frame synthesis (3/4) */
 
-/* 从 VADecPictureParameterBufferAV1 合成一个完整的 OBU_FRAME_HEADER
- * （含 OBU 头 + payload + trailing_bits）。
+/* Combine a complete OBU_FRAME_HEADER from VADecPictureParameter BufferAV1
+ * (includes OBU headers + payload + trading_bits).
  *
- * tile_cols/tile_rows 取自 pic 参数；tile_size_bytes 固定 4 字节，
- * 与第 4 步 tile_group 里写 tile_size_minus_1 的宽度必须一致。
+ * Tile_cols/ tile_rows from pic parameters; tile_size_bytes fix 4 bytes,
+ * The width of the tile_size_minus_1 written in step 4 tile_group must be consistent.
  *
- * 写入 out，返回总字节数；容量不足或参数非法返回 0。 */
+ * Write out, returns the total bytes; the capacity is insufficient or the parameter is returned illegally. */
 size_t dmd_av1_build_frame_header(const void *pic,
                                   unsigned char *out, size_t out_cap,
                                   struct dmd_av1_dpb *dpb);
 
-/* obu_header() + obu_size（AV1 规范 5.3.1/5.3.2）。
+/* obu_header() + obu_size (AV1 Reg. 5.3.1/5.3.2).
  *
- * 位布局（共 1 字节，无 extension 时）：
- *   obu_forbidden_bit    f(1)  必须 0
+ * Bit layout (1 bytes without extension):
+ *   obu_forbidden_bit f(1) must 0
  *   obu_type             f(4)
- *   obu_extension_flag   f(1)  本驱动恒 0（不用可扩展层）
- *   obu_has_size_field   f(1)  本驱动恒 1（low-overhead 格式需要）
- *   obu_reserved_1bit    f(1)  必须 0
+ *   obu_extension_flag f(1) this driver is constant 0 (no scalable layer)
+ *   obu_has_size_field f(1) this driver is constant1 (low-overhead format needs)
+ *   obu_reserved_1bit f(1) must 0
  *
- * 写入 out（头 1 字节 + leb128 编码的 payload_len），返回总字节数；
- * out_cap 不足返回 0。调用方随后把 payload 追加在返回位置之后。 */
+ * Write out (first 1 byte + payload_len) coded to re-enter total byte numbers;
+ * Out_cap is not enough to return 0. The caller then adds the payload to the returned position. */
 size_t dmd_av1_obu_header(int obu_type, size_t payload_len,
                           unsigned char *out, size_t out_cap);
 

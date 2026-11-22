@@ -1,21 +1,21 @@
-/* 从 VA-API 的 HEVC 参数缓冲合成 VPS/SPS/PPS NALU。
+/* Composes the HEVC parameter from VA-API to a buffer VPS/SPS/PPS NALU.
  *
- * 为什么要合成：V4L2 有状态解码器要的是标准 Annex B 码流，而 ffmpeg 通过 VA-API
- * 交给我们的是**已解析成结构体**的参数集。原始 SPS/PPS 字节流不会传下来，
- * 只能按 H.265 语法重新写出来。
+ * Why synthesis: V4L2 with state decoding is for standard Annex B stream, and ffmpeg through VA-API
+ * The original SPS/PPS byte will not pass down, but will be the most important part of the story.
+ * It can only be rewritten in H.265.
  *
- * 原始 slice header 和 CABAC 载荷仍在 slice data buffer 中。源 SPS 没有
- * 短期参考集表时保留原转发路径；有表时 hevc_slice.c 从本帧 VA DPB 的 POC
- * 与 RPS 标记重建等价内联集，只替换相应 header 位段及 PPS id，保留其它
- * header 字段和 CABAC 载荷，并重做字节对齐、emulation prevention。
+ * Original slick header and CABAC load are still in slick data buffer. Source SPS does not
+ * Maintain the original forwarding path when short reference set; when table is available, the POC from VA DPB
+ * Recreate the equivalency set with the RPS tag, replace only the corresponding header bits and PPS id, keep other
+ * Header field and CABAC load with re-do byte alignment, emulsion preparation.
  *
- * ── VA-API 缺失、必须推导的字段 ───────────────────────────
- * profile_tier_level 的大部分、conformance window、VUI、
- * 以及 st_ref_pic_set 的内容都不在 VA-API 里。处理见下面各处注释。
+ * ─--------------------------------------------------------------------------------------------------------
+ * Most of the profile_tier_level, Conformance window, VUI,
+ * And the contents of st_ref_pic_set are not in VA-API. See the notes below for this treatment.
  *
- * VA-API 只给 SPS 短期参考集个数，不给表内容，因此新 SPS 的表设为空，
- * 不能直接照抄旧 slice 的 SPS 索引。新路径需要完整 long-format slice 参数；
- * 对缺失的长期 SPS 表、自定义缩放矩阵等仍明确拒绝，不推测必要参数。
+ * VA-API only gives SPS short reference series number, not table content, so the new SPS table is empty.
+ * Could not copy the SPS index directly from the old slick. The new path requires a full long-format slice parameter;
+ * The missing long-term SPS tables, custom scaling matrices, etc. are still categorically rejected without extrapolating the necessary parameters.
  */
 
 #include <string.h>
@@ -24,10 +24,10 @@
 #include "driver.h"
 #include "bitstream.h"
 
-/* ---------------------------------------------------------------- 字段推导 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - field reasoning */
 
-/* general_profile_idc：VA-API 不提供，从 VAProfile 映射。
- * 入口会核对 profile/位深，不能把未知 profile 静默声明成 Main。 */
+/* General_profile_idc: VA-API does not provide, from VAProfile map.
+ * The entrance will check the profile/ bit depth and the unknown profile cannot be silently declared as Main. */
 static unsigned int hevc_profile_idc(VAProfile profile)
 {
     switch (profile) {
@@ -40,10 +40,10 @@ static unsigned int hevc_profile_idc(VAProfile profile)
     }
 }
 
-/* general_level_idc = 30 × level。按分辨率取一个刚好够用的档位。
+/* General_level_idc = 30 x level. Take a slate by resolution.
  *
- * 宁可偏高：level 只是能力声明，报高了解码器仍按实际码流解，
- * 报低了则可能被拒。这里按 H.265 表 A.6 的 MaxLumaPs 取。 */
+ * It's better than being tall: the power statement is just that the reporting understanding code still runs with actual code.
+ * If you understate it, you may be refused. Here you can use Max LumaPs in Table H.265 A.6. */
 static unsigned int hevc_level_idc(unsigned int w, unsigned int h)
 {
     unsigned int luma = w * h;
@@ -59,10 +59,10 @@ static unsigned int hevc_level_idc(unsigned int w, unsigned int h)
 
 /* profile_tier_level()：H.265 7.3.3。
  *
- * VA-API 只有 profile 与分辨率，其余按"Main profile 的常规取值"填：
- * general_profile_compatibility_flag 只置对应 profile 那一位，
- * progressive_source + frame_only_constraint 置 1（我们不处理场编码）。
- * 这些 flag 是能力声明，解码器不会据此改变解码行为。 */
+ * VA-API Only profile with resolution, the rest is filled with "General take-out for Main profile":
+ * Set only the bit for the selected profile in general_profile_compatibility_flag,
+ * The program is now being used to create a new system for the use of the Internet.
+ * These flags are power statements, and the decoder will not change the decoding behavior. */
 static void put_ptl(struct dmd_bitwriter *bw, VAProfile profile,
                     unsigned int w, unsigned int h)
 {
@@ -72,7 +72,7 @@ static void put_ptl(struct dmd_bitwriter *bw, VAProfile profile,
     dmd_bw_put_flag(bw, 0);             /* general_tier_flag = Main tier */
     dmd_bw_put_bits(bw, pidc, 5);       /* general_profile_idc */
 
-    /* general_profile_compatibility_flag[32]：只置自己那一位 */
+    /* general_profile_compatibility_flag[32]: set only the bit for this profile. */
     for (int i = 0; i < 32; i++)
         dmd_bw_put_flag(bw, i == (int)pidc);
 
@@ -88,15 +88,15 @@ static void put_ptl(struct dmd_bitwriter *bw, VAProfile profile,
     dmd_bw_put_flag(bw, 0);
 
     dmd_bw_put_bits(bw, hevc_level_idc(w, h), 8);   /* general_level_idc */
-    /* sps_max_sub_layers_minus1 固定为 0，所以没有 sub_layer 的 PTL */
+    /* sps_max_sub_layers_minus1 fixed to 0, so there is no PTL for sub_layer */
 }
 
 /* ---------------------------------------------------------------- VPS */
 
 /* VPS：H.265 7.3.2.1。
  *
- * 解码单层码流其实用不到 VPS 的多层信息，但 MediaCodec 的 CSD 通常期望
- * VPS+SPS+PPS 三件套，缺 VPS 有些解码器会拒。这里写一个最小可用的单层 VPS。 */
+ * Decoding the single layer stream is not functional enough to provide VPS multilayer information, but MediaCodec's CSD usually expects
+ * VPS+SPS+PPS sets, VPS missing, some decoding devices are rejected. Write a minimum available single layer of VPS here. */
 static size_t build_vps_rbsp(const VAPictureParameterBufferHEVC *pp,
                              VAProfile profile,
                              unsigned char *out, size_t cap)
@@ -105,7 +105,7 @@ static size_t build_vps_rbsp(const VAPictureParameterBufferHEVC *pp,
     dmd_bw_init(&bw, out, cap);
 
     dmd_bw_put_bits(&bw, 0, 4);         /* vps_video_parameter_set_id */
-    dmd_bw_put_bits(&bw, 3, 2);         /* vps_base_layer_internal/available: 保留位=3 */
+    dmd_bw_put_bits(&bw, 3, 2);         /* vps_base_layer_international/aviable: reserved = 3 */
     dmd_bw_put_bits(&bw, 0, 6);         /* vps_max_layers_minus1 */
     dmd_bw_put_bits(&bw, 0, 3);         /* vps_max_sub_layers_minus1 */
     dmd_bw_put_flag(&bw, 1);            /* vps_temporal_id_nesting_flag */
@@ -115,13 +115,13 @@ static size_t build_vps_rbsp(const VAPictureParameterBufferHEVC *pp,
             pp->pic_width_in_luma_samples, pp->pic_height_in_luma_samples);
 
     dmd_bw_put_flag(&bw, 0);            /* vps_sub_layer_ordering_info_present_flag */
-    /* 只有 sub_layer 0：三个 ue(v) */
+    /* Sub_layer 0: three ue (v) */
     dmd_bw_put_ue(&bw, pp->sps_max_dec_pic_buffering_minus1);
-    /* ⚠️ 不要写 0：Chrome H265Decoder 按 sps_max_num_reorder_pics 决定
-     * 何时 OutputPicture。写 0 会让它每解一帧就立刻输出，画面变成
-     * 解码序 0→4→2→1。VA-API 没有这个字段的绝对值，只给
-     * NoPicReorderingFlag；未置位时用 DPB 上限作不放大的上界
-     * （与 H.264 合成 SPS 用 num_ref_frames 同一策略）。 */
+    /* ⁇ : Chrome H265Decoder by sps_max_num_reorder_pics
+     * When OutputPicture. Write 0. It'll get out every frame and it'll be a picture.
+     * Decoding sequence 0:04:2 §1. VA-API does not have the absolute value of this field, just for
+     * NoPicReplacedingFlag;exceeding the DPB cap without a scaling
+     * (Same strategy as H.264 for synthetic SPS with num_ref_frames). */
     dmd_bw_put_ue(&bw, pp->pic_fields.bits.NoPicReorderingFlag
                           ? 0u : (unsigned)pp->sps_max_dec_pic_buffering_minus1);
     dmd_bw_put_ue(&bw, 0);              /* vps_max_latency_increase_plus1 */
@@ -160,9 +160,9 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
     dmd_bw_put_ue(&bw, pp->pic_width_in_luma_samples);
     dmd_bw_put_ue(&bw, pp->pic_height_in_luma_samples);
 
-    /* conformance_window_flag：VA-API 不提供裁剪窗口。
-     * 写 0 表示无裁剪 —— 解码尺寸就是编码尺寸。真实裁剪信息由 daemon
-     * 从 MediaCodec 的 crop 字段获得并回传给驱动，所以这里不写不影响最终显示。 */
+    /* The crop window is not available for the user.
+     * Write 0 for no crop -- decoding size is code size. Real crop information is by daemon
+     * Gets and returns the drive from the mediaCodec field. Therefore, there is no effect on the final display. */
     dmd_bw_put_flag(&bw, 0);
 
     dmd_bw_put_ue(&bw, pp->bit_depth_luma_minus8);
@@ -173,21 +173,21 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
     dmd_bw_put_ue(&bw, pp->sps_max_dec_pic_buffering_minus1);
     /* sps_max_num_reorder_pics / sps_max_latency_increase_plus1。
      *
-     * ── 实测结论：这两个值对本驱动的解码结果没有影响 ──────────
-     * 单变量实测（jinjie_265.mp4 60 帧，真实 SPS 为 reorder=2 latency=5，
-     * 用 DMD_CSD_DUMP 逐字节确认覆盖已真正写进比特流）：
-     *   reorder = 0,1,2,4,7 → 全部 md5 PASS
-     *   latency = 0,5,9     → 全部 md5 PASS
-     * 原因：硬件走 OUTPUT_ORDER=1（解码序输出），重排由消费者的 DPB 负责，
-     * MediaCodec 侧不依据 CSD 里这两个值决定吐帧时机。
+     * ─ Test findings: these two values have no effect on the decoding results driven by this — — — — — — — — — — — — — — — — — — — — — — — — —
+     * Single variable actual (jinjie_265.mp460 frames, real SPS for reorder=2 latency=5,
+     * Confirm bytes with DMD_CSD_DUMP that the overlay is actually written into the bits stream:
+     *   Reorder = 0,1,2,4,7 * all md5 PASS
+     *   Latency = 0, 5, 9 * all md5 PASS
+     * Reason: Hardware takes the OTPUT_ORDER=1 (decoding sequence output), reordered to the consumer's DPB,
+     * MediaCodec side does not determine the timing of the vomiting based on these two values in the CSD.
      *
-     * ⚠️ 所以不要再把这里当成"帧序问题"的修复点 —— 曾有一轮据此推测
-     * "写 0 会让解码器按解码序吐帧、画面变成 0→4→2→1"并改成写 DPB 上限，
-     * 那个改动实际上是无效的（改前改后 md5 同样 PASS）。
-     * 保留写 DPB 上限只是因为它比写 0 更接近真值，不是因为它修了什么。
+     * So don't think of this place as a fixation point for the "framework problem" -- there was a round of speculation.
+     * "O will make the decoding machine slate, the image becomes 0  ⁇ 4  ⁇ 2" and then write the DPB cap.
+     * That change is not actually valid (md5 same as PASS).
+     * Keep writing the DPB cap just because it's closer to the real value than writing 0, not because it fixes anything.
      *
-     * VA-API 没有这两个字段的数值，只给 NoPicReorderingFlag，
-     * 所以无法还原真值；未置位时用 DPB 上限作不放大的上界。 */
+     * VA-API does not have the values for these two fields, only for NopicReording Flag,
+     * So the original value cannot be restored; the DPB ceiling is used as a non-magnification upper limit when not set. */
     dmd_bw_put_ue(&bw, pp->pic_fields.bits.NoPicReorderingFlag
                           ? 0u : (unsigned)pp->sps_max_dec_pic_buffering_minus1);
     dmd_bw_put_ue(&bw, 0);              /* sps_max_latency_increase_plus1 */
@@ -200,10 +200,10 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
     dmd_bw_put_ue(&bw, pp->max_transform_hierarchy_depth_intra);
 
     /* scaling_list_enabled_flag。
-     * 置位时本应跟 sps_scaling_list_data_present_flag 与整张缩放表，
-     * 而 VA-API 把缩放表放在独立的 VAIQMatrixBufferHEVC 里。
-     * 这里写 present=0，表示"用默认缩放表" —— 只有当码流真的用了
-     * 自定义缩放表时才会不一致，那种情况由调用方拒绝（见 dmd_hevc_can_build）。 */
+     * The position should be with sps_scaling_list_data_present_flag and the entire scalator.
+     * And VA-API puts the scale table in a separate VAIQMatrix BufferHeVC.
+     * Here is the present=0 for "Default Scale table" -- only if the stream really works.
+     * The list is not consistent when defined, and that is rejected by the caller (see dmd_hevc_can_build). */
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.scaling_list_enabled_flag);
     if (pp->pic_fields.bits.scaling_list_enabled_flag)
         dmd_bw_put_flag(&bw, 0);        /* sps_scaling_list_data_present_flag */
@@ -220,9 +220,9 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
         dmd_bw_put_flag(&bw, pp->pic_fields.bits.pcm_loop_filter_disabled_flag);
     }
 
-    /* VA-API 不提供原始 SPS 参考集定义；hevc_slice.c 将受支持的
-     * Main/Main10 8/10 位码流改写为显式切片内参考集，因此这里声明 0 个 SPS 集合。
-     * 保留旧集合个数而不提供定义会破坏后续语法解析。 */
+    /* VA-API does not provide original SPS reference set definition; hevc_slice.c will be supported
+     * Main/ Main10 8/10 bit stream has been recast as a reference set in the visible slice, so here you can declare 0 SPS pools.
+     * Keeping old pool numbers without providing definitions undermines subsequent grammar interpretation. */
     dmd_bw_put_ue(&bw, 0);
 
     dmd_bw_put_flag(&bw, pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag);
@@ -281,8 +281,8 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferHEVC *pp,
     if (pp->pic_fields.bits.tiles_enabled_flag) {
         dmd_bw_put_ue(&bw, pp->num_tile_columns_minus1);
         dmd_bw_put_ue(&bw, pp->num_tile_rows_minus1);
-        /* uniform_spacing_flag：VA-API 总是给出显式的 column_width/row_height，
-         * 所以写 0 并原样输出，避免依赖"均匀划分"的假设。 */
+        /* Unform_spacing_flag: VA-API always gives a clear column_width/row_right, and then the word "save" is used to be used to make a clear-cut message.
+         * So write 0 and produce as it is, avoiding relying on the assumption of "altitude." */
         dmd_bw_put_flag(&bw, 0);
         for (int i = 0; i < pp->num_tile_columns_minus1; i++)
             dmd_bw_put_ue(&bw, pp->column_width_minus1[i]);
@@ -293,8 +293,8 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferHEVC *pp,
 
     dmd_bw_put_flag(&bw, pp->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag);
 
-    /* deblocking_filter_control_present_flag：VA-API 没有这个字段本身，
-     * 但它是下面三项的开关。只要其中任何一项非默认值就必须置 1。 */
+    /* VA-API has no deblocking_filter_control_present_flag field,
+     * But it is a switch for the following three. Any one of these is not the default value. */
     int dbf_ctrl = pp->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag ||
                    pp->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag ||
                    pp->pps_beta_offset_div2 || pp->pps_tc_offset_div2;
@@ -308,8 +308,8 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferHEVC *pp,
         }
     }
 
-    /* pps_scaling_list_data_present_flag：同 SPS，缩放表在独立 buffer 里，
-     * 这里声明不存在，用默认表。 */
+    /* The blog is a blog of the blog "The World of Youth" (Standing), which is a blog of the Global Voices community.
+     * Here you can state that it does not exist. Use the default table. */
     dmd_bw_put_flag(&bw, 0);
 
     dmd_bw_put_flag(&bw, pp->slice_parsing_fields.bits.lists_modification_present_flag);
@@ -321,10 +321,10 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferHEVC *pp,
     return bw.overflow ? 0 : dmd_bw_bytes(&bw);
 }
 
-/* ---------------------------------------------------------------- 对外接口 */
+/* - - - - - - - - - - - - - - - - - - - - - - - External interfaces */
 
-/* 参数集层面的支持检查；有源 SPS 短期参考表时，slice 重写还会独立验证
- * long-format 参数与 DPB。无法证明等价的字段不猜测。返回 0 = 不支持。 */
+/* Support check at the argument set level; slick rewrite will be independently validated when the source SPS short reference table is available
+ * Long-format arguments with DPB. No field can be shown to be unsuspecting. returns 0 = not supported. */
 int dmd_hevc_can_build(const VAPictureParameterBufferHEVC *pp)
 {
     if (!pp)
@@ -373,8 +373,8 @@ static int hevc_profile_matches_picture(const VAPictureParameterBufferHEVC *pp,
     }
 }
 
-/* 把 RBSP 包成带起始码的 NALU：
- * [00 00 00 01][nal_unit_header 2 字节][转义后的 RBSP] */
+/* Wrap RBPP into a NALU with a starting code:
+ * [00:00 01] [nal_unit_head 2 bytes] [RBSP as transposition] */
 static size_t emit_nalu(unsigned int nal_unit_type,
                         const unsigned char *rbsp, size_t rbsp_len,
                         unsigned char *out, size_t cap)

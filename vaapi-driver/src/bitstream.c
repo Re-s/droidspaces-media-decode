@@ -1,4 +1,4 @@
-/* H.264/HEVC 共用的比特流写入原语实现。见 bitstream.h。 */
+/* H.264/HEVC shares bitstream writing in the original language. See bitstream.h. */
 
 #include <string.h>
 
@@ -44,11 +44,11 @@ void dmd_bw_put_flag(struct dmd_bitwriter *bw, int v)
     dmd_bw_put_bits(bw, v ? 1u : 0u, 1);
 }
 
-/* ue(v)：Exp-Golomb 无符号。写法是 (leadingZeros) 1 (info)，
- * 其中 codeNum+1 的二进制长度决定前导零个数。 */
+/* : Exp-Golom unsigned. Write is (LaidingZeros) 1 (info),
+ * Of which the binary length of codeNum+1 determines the number of zeros to lead. */
 void dmd_bw_put_ue(struct dmd_bitwriter *bw, uint32_t v)
 {
-    if (v == 0xFFFFFFFFu) { /* v+1 会回绕 */
+    if (v == 0xFFFFFFFFu) { /* v+1 will be back */
         bw->overflow = 1;
         return;
     }
@@ -56,15 +56,15 @@ void dmd_bw_put_ue(struct dmd_bitwriter *bw, uint32_t v)
     int nbits = 0;
     while ((val >> nbits) != 0)
         nbits++;
-    /* nbits-1 个前导零，然后 val 的 nbits 位（最高位那个 1 就是分隔符）。
-     * v==0 时 nbits==1，前导零个数为 0 —— 不能调 dmd_bw_put_bits(.,.,0)，
-     * 它会把 nbits<=0 判成溢出。 */
+    /* nbits-1 zero for the lead, then val's nbits bit (the top one is the separator).
+     * v = nbits=1 at 0 - cannot be adjusted dmd_bw_put_bits(...,.,0),
+     * It'll overflow the nbits < =0. */
     if (nbits > 1)
         dmd_bw_put_bits(bw, 0, nbits - 1);
     dmd_bw_put_bits(bw, val, nbits);
 }
 
-/* se(v)：Exp-Golomb 有符号。映射 0,1,-1,2,-2,... → 0,1,2,3,4,... */
+/* s(v): Exp-Golumb has symbols. Map 0, 1, 1, 2, 2, 2, 2, 0, 1, 2, 3, 4,... */
 void dmd_bw_put_se(struct dmd_bitwriter *bw, int32_t v)
 {
     uint32_t code;
@@ -75,7 +75,7 @@ void dmd_bw_put_se(struct dmd_bitwriter *bw, int32_t v)
     dmd_bw_put_ue(bw, code);
 }
 
-/* rbsp_trailing_bits：一个 1 位，然后补零到字节边界。 */
+/* rbsp_trailing_bits: one bit, then zero to byte boundary. */
 void dmd_bw_rbsp_trailing(struct dmd_bitwriter *bw)
 {
     dmd_bw_put_flag(bw, 1);
@@ -83,17 +83,17 @@ void dmd_bw_rbsp_trailing(struct dmd_bitwriter *bw)
         dmd_bw_put_flag(bw, 0);
 }
 
-/* 已写出的字节数（必须在 rbsp_trailing 之后调用，此时已对齐）。 */
+/* The number of bytes written (must be called after rbsp_trailing, is aligned at this time). */
 size_t dmd_bw_bytes(const struct dmd_bitwriter *bw)
 {
     return bw->bit_pos == 0 ? bw->byte_pos : bw->byte_pos + 1;
 }
 
-/* ------------------------------------------------- emulation prevention 转义 */
+/* - - - - - - - - - - - - - - - Conversion to */
 
-/* 把 RBSP 转成 SODB/EBSP：每遇到 00 00 0x（x <= 3）就插入一个 03。
- * MediaCodec 收到的是完整 NALU，必须是转义后的形式，否则解析器会把
- * 数据里偶然出现的 00 00 01 当成起始码。 */
+/* Convert RBPSP into SODB/EBSP: Insert a 03 every 0000 0x (x < = 3) encountered.
+ * MediaCodec received the complete NALU, which must be in a transliterated form, otherwise the solver would have taken it.
+ * The random occurrence of 000001 in the data is used as a starting code. */
 size_t dmd_rbsp_escape(const unsigned char *rbsp, size_t len,
                           unsigned char *out, size_t out_cap)
 {

@@ -1,34 +1,34 @@
 #!/bin/bash
-# 双契约回归：同一条流分别按 ffmpeg 契约与 Chrome 契约验证像素正确性。
+# Double-contract return: the same stream uses the ffmpeg and chrome contracts separately to verify the accuracy of pixels.
 #
-# ── 为什么需要它 ────────────────────────────────────────────────
-# 普通 md5 回归**只覆盖 ffmpeg 契约**，证明不了 Chrome 路径正确。
+# ── Why do you need it? ────────────────────────────────────────────────
+# Normal md5 returns** only covers ffmpeg compacts**, which does not justify chrome paths.
 #
-# ffmpeg 走 vaDeriveImage / vaGetImage 读像素，这两个入口在驱动里都调
-# dmd_surface_wait() 兜底等帧（src/image.c:169 / :283）。所以即使
-# vaEndPicture 返回时像素还没写进 surface，ffmpeg 也会在 map 时等到，
-# md5 照样全绿。
+# ffmpeg Let’s go. vaDeriveImage / vaGetImage Read pixels. Both entrances are adjusted in the drive.
+# dmd_surface_wait() The bottom line.（src/image.c:169 / :283）。So even if...
+# vaEndPicture The pixels were not written when the return took place. surface，ffmpeg And so will he. map Wait till the time comes.，
+# md5 It’s all green.。
 #
-# 而 Chrome 的契约完全不同（chromium 源码 + 驱动日志双向确认）：
-#   1. CreateSurfaces 之后、任何解码之前就 vaExportSurfaceHandle 拿 dmabuf
-#   2. 之后只 vaBeginPicture / vaRenderPicture / vaEndPicture
-#   3. 从不 vaSyncSurface / vaQuerySurfaceStatus / vaDeriveImage
-#      （实测计数：Sync 0 次，Firefox 同场景 1500 次）
-#   4. 靠自己的软件 DPB 决定何时把 surface 交给合成器采样
-# 也就是说 **像素必须在 vaEndPicture 返回时就已就位**。
+# The contract for Chrome is completely different (chromium source + driver log double-directional confirmation):
+#   1. CreateSurfaces And then, before any decoding. vaExportSurfaceHandle Take it. dmabuf
+#   2. And then only vaBeginPicture / vaRenderPicture / vaEndPicture
+#   3. Never vaSyncSurface / vaQuerySurfaceStatus / vaDeriveImage
+#      (Sync 0, Firefox co-situation 1,500)
+#   4. With your own software. DPB - I’ll decide when to put it. surface Hand over to synth sampler
+# That is, **Pixels must be in place when väEndPicture returns**.
 #
-# 本项目第 2、3 轮都因为只看 md5 而误判"已修复"，实际浏览器仍跳帧。
+# The project in Round 2 and 3 was misjudged "reconstructed" by looking only at md5 and the actual browser still jumped.
 #
-# ── 做法 ────────────────────────────────────────────────────────
-# DMD_NO_MAP_WAIT=1 关掉 map 时的兜底等待。ffmpeg 仍送全套参数缓冲
-# （解码正确性有保证），但像素必须在 map 那一刻就位，否则读到空缓冲
-# → md5 立刻不一致。于是"Chrome 会不会采到未写完的 surface"变成可自动
-# 判定的回归，不必靠人眼盯浏览器。
+# ── Practice ────────────────────────────────────────────────────────
+# DMD_NO_MAP_WAIT=1 disables the fallback wait when mapping. FFmpeg still submits all parameter buffers.
+# But pixels must be in position at the moment of the Map, otherwise they can read the empty buffer.
+# → md5 Immediately inconsistent. So, yes."Chrome Will you get it to the unfinished part? surface"Be automatic
+# The return is determined without eye-to-eye viewing the browser.
 #
-# ⚠️ 不要用 tools/probe_chrome_order.c 替代本脚本：那个探针不送
-# VAPictureParameterBuffer，解码本身就不成立（详见其文件头的实测记录）。
+# Do not replace the script with the table/ probe_chrome_order.c: the probe is not sent
+# VAPictureParameterBuffer，Decoding itself is not viable (for details see the actual records on the header of the document)）。
 #
-# 用法：regress_chrome_contract.sh [ffmpeg路径] [驱动build目录]
+# Usage: regress_chrome_contract.sh [ffmpeg path] [Driver build directory]
 
 set -u
 
@@ -36,10 +36,10 @@ FF="${1:-/home/master/Documents/DSHWK/vatest/sysroot/usr/bin/ffmpeg}"
 DRV="${2:-$(cd "$(dirname "$0")/../build" && pwd)}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$(dirname "$(dirname "$FF")")/lib/aarch64-linux-gnu"
 
-if [ ! -x "$FF" ]; then echo "找不到 ffmpeg: $FF"; exit 2; fi
-if [ ! -f "$DRV/msm_drm_drv_video.so" ]; then echo "找不到驱动: $DRV"; exit 2; fi
+if [ ! -x "$FF" ]; then echo "Not found ffmpeg: $FF"; exit 2; fi
+if [ ! -f "$DRV/msm_drm_drv_video.so" ]; then echo "No driver found: $DRV"; exit 2; fi
 
-echo "驱动: $(strings "$DRV/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
+echo "Driver: $(strings "$DRV/msm_drm_drv_video.so" | grep -m1 'DroidSpaces V4L2')"
 echo
 
 pass=0; fail=0
@@ -49,7 +49,7 @@ check() {
     shift 3
     local extra=("$@")
 
-    [ -f "$file" ] || { printf '%-22s SKIP（缺素材）\n' "$name"; return; }
+    [ -f "$file" ] || { printf '%-22s SKIP（Shortage of material）\n' "$name"; return; }
 
     local sw hw_ff hw_cr
     sw=$("$FF" -v error -i "$file" -frames:v "$frames" \
@@ -74,7 +74,7 @@ check() {
     else
         fail=$((fail+1))
         [ "$b" = FAIL ] && [ "$a" = PASS ] && \
-            echo "    ↑ 仅 Chrome 契约失败 = 存在采样窗口，浏览器会看到跳帧"
+            echo "    ↑ Only Chrome The contract failed. = A sampling window exists, and the browser will see the jump frame."
     fi
 }
 
@@ -85,27 +85,27 @@ check "H.264"            "$V/test.h264"        60
 check "HEVC"             "$V/test.hevc"        60
 check "VP9"              "$V/test.vp9.ivf"     60
 check "VP8"              "$V/test.vp8.ivf"     60
-check "HEVC B帧 150"     "$C/jinjie_265.mp4"   150
-check "HEVC B帧 300"     "$C/jinjie_265.mp4"   300
-check "慢速编号流"       "$C/order_slow.mp4"   40
-check "无B帧对照"        "$C/noB_slow.mp4"     40
-# 放大在飞帧数：surface 池更大 ⇒ ffmpeg 更晚回收 ⇒ 更接近 Chrome 的猛提交
-check "在飞放大 x16"     "$C/order_slow.mp4"   40  -extra_hw_frames 16
+check "HEVC B frame 150"     "$C/jinjie_265.mp4"   150
+check "HEVC B frame 300"     "$C/jinjie_265.mp4"   300
+check "Slow-number stream"       "$C/order_slow.mp4"   40
+check "None B Frame Contrast"        "$C/noB_slow.mp4"     40
+# Zoom in in on the frame number: bigger surface pool, late recovery of effmpeg, closer to the intense submission of Chrome
+check "It’s flying in. x16"     "$C/order_slow.mp4"   40  -extra_hw_frames 16
 
 echo
-echo "合计: $pass 通过, $fail 失败"
+echo "Total: $pass Pass., $fail failed"
 
-# 真实采样窗口计数：只统计 PENDING（已提交、像素未到）。
-# IDLE 是 ffmpeg 解码前的能力探测，每次运行恰好 1 次，与跳帧无关。
+# Real sample window count: PENDING only (submitted, not available pixels).
+# IDLE Yes. ffmpeg Capability detection before decoding, which runs just right on each time. 1 The second time, it’s not about the jump.。
 if [ -f "$C/order_slow.mp4" ]; then
     log=$(mktemp)
     DMD_NO_MAP_WAIT=1 DMD_VA_LOG=1 LIBVA_DRIVER_NAME=msm_drm \
         LIBVA_DRIVERS_PATH="$DRV" "$FF" -v error -hwaccel vaapi \
         -hwaccel_output_format nv12 -i "$C/order_slow.mp4" \
         -frames:v 40 -f null - 2>"$log" >/dev/null
-    echo "采样窗口(PENDING): $(grep -c '已提交但像素未到' "$log")"
-    echo "EndPicture 写入  : $(grep -c '返回前写入' "$log")"
-    echo "后台线程收帧     : $(grep -c 'ORDER reap' "$log")"
+    echo "Pending surface samples: $(grep -c 'submitted but pixels are not ready' "$log")"
+    echo "EndPicture frame writes: $(grep -c 'wrote before returning' "$log")"
+    echo "Background frame receives: $(grep -c 'ORDER reap' "$log")"
     rm -f "$log"
 fi
 

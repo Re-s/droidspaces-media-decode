@@ -1,20 +1,20 @@
 /*
- * v4l2_dec_probe —— 直接用 V4L2 M2M 接口解一段 AV1 码流。
+ * v4l2_dec_probe - Dissect a AV1 stream directly from the V4L2 M2M interface.
  *
- * 用途：完全绕开 MediaCodec / Codec2 / vendor HAL，直接对
- * /dev/video32（msm_vidc_decoder）跑标准的 V4L2 stateful 解码流程。
- * 这是判定"AV1 解不出来是硬件/内核驱动的问题，还是上层 Codec2 的问题"
- * 的关键实验。
+ * Use: Completely bypassed MediaCodec / Codec2 / vendor HAL, direct
+ * /dev/video32(msm_vidc_decode) running standard V4L2 stateful decoding process.
+ * This is a determination of whether "AV1 is a hardware/kernel-driven problem or a problem with the upper Codec2 problem."
+ * Key experiments.
  *
- * 背景：SM8750 上硬件确实枚举出 AV10（V4L2 ENUM_FMT 实测），但
- * c2.qti.av1.decoder 在组件创建阶段就失败（QueryrequiredInfos from
- * downstream failed），dshmon 报 vidcHw=false。若本程序能解出帧，
- * 说明硬件与内核驱动可用、故障在 Codec2 层；若同样失败，则是更底层的问题。
+ * Background: SM8750 hardware identified AV10 (V4L2 ENUM_FMT) but
+ * c2.qti.av1.decoder failed during the component creation phase (QueryrequiredInfos from
+ * If you can unblock the program, you can use the software to help you.
+ * Description of hardware and kernel drive available and malfunctioning in the Codec2 layer; if the same fails, it is a lower problem.
  *
- * 用法（需 root）:
- *     v4l2_dec_probe <file.obu> [单元数]
+ * Usage (need root):
+ *     v42_dec_probe<file.obu> [units]
  *
- * 交叉编译：本机若为 aarch64 可直接 cc -O2 -static。
+ * Cross-compilation: This machine can be directly cc-O2-static if it is aarch64.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -33,8 +33,8 @@
 #define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '1', '0')
 #endif
 
-/* dma-heap 的 ioctl 定义（linux/dma-heap.h 在 NDK/glibc 头里可能缺失，
- * 直接内联 —— ABI 是稳定的内核接口）。 */
+/* The octl definition of dma-heap (linux/dma-heap.h may be missing in the NDK/glibc header, but the NDK/ glibc can be missing.
+ * Direct in-line - ABI is a stable kernel interface. */
 struct dma_heap_allocation_data {
     __u64 len;
     __u32 fd;
@@ -43,15 +43,15 @@ struct dma_heap_allocation_data {
 };
 #define DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0, struct dma_heap_allocation_data)
 
-/* msm_vidc 只接受 DMABUF 内存模型：REQBUFS 虽然报 capabilities 里有 MMAP，
- * 但 QUERYBUF 给出的 offset 无法 mmap（返回 ENODEV）。实测必须走 dma-heap。 */
+/* The MSMP is a model that is not available in the RTBP, but is used to keep the memory of the MMAP, which is a model that is not available in the RMFP.
+ * But the QUERYBUF gives outfset cannot map (back to ENODEV). The actual measurements must go dma-heap. */
 static int dmabuf_alloc(size_t len)
 {
     static int heap_fd = -1;
     if (heap_fd < 0) {
         heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
         if (heap_fd < 0) {
-            fprintf(stderr, "  打开 /dev/dma_heap/system 失败: %s\n", strerror(errno));
+            fprintf(stderr, "  open /dev/dma_heap/system failed: %s\n", strerror(errno));
             return -1;
         }
     }
@@ -60,15 +60,15 @@ static int dmabuf_alloc(size_t len)
     d.len = len;
     d.fd_flags = O_RDWR | O_CLOEXEC;
     if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &d) < 0) {
-        fprintf(stderr, "  dma_heap 分配 %zu 字节失败: %s\n", len, strerror(errno));
+        fprintf(stderr, "  dma_heap allocate %zu Bytes failed: %s\n", len, strerror(errno));
         return -1;
     }
     return (int)d.fd;
 }
 
 #define DEV       "/dev/video32"
-#define NUM_OUT   6      /* 输入（码流）缓冲数 */
-#define NUM_CAP   8      /* 输出（像素）缓冲数 */
+#define NUM_OUT   6      /* Enter (bitstream) buffers */
+#define NUM_CAP   8      /* Output (pixels) buffers */
 #define MAX_UNITS 512
 
 struct unit { size_t off, len; };
@@ -77,11 +77,11 @@ struct buf  { void *start; size_t length; int dbuf_fd; };
 static int xioctl(int fd, unsigned long req, void *arg, const char *name)
 {
     int r = ioctl(fd, req, arg);
-    if (r < 0) fprintf(stderr, "  %s 失败: %s\n", name, strerror(errno));
+    if (r < 0) fprintf(stderr, "  %s failed: %s\n", name, strerror(errno));
     return r;
 }
 
-/* 按 OBU_TEMPORAL_DELIMITER(type=2) 切分裸 OBU 流。 */
+/* Cut the naked OBU stream by the OBU_TEMPORAL_DELIMITER(type=2) */
 static int split_tu(const uint8_t *d, size_t len, struct unit *out, int cap)
 {
     int n = 0;
@@ -127,14 +127,14 @@ static int req_bufs(int fd, enum v4l2_buf_type type, int count)
     rb.type = type;
     rb.memory = V4L2_MEMORY_DMABUF;
     if (xioctl(fd, VIDIOC_REQBUFS, &rb, "REQBUFS") < 0) return -1;
-    printf("  REQBUFS(%s) -> %u 个\n",
+    printf("  REQBUFS(%s) -> %u \n",
            type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ? "OUTPUT" : "CAPTURE",
            rb.count);
     return (int)rb.count;
 }
 
-/* 为每个缓冲分配一个 dmabuf 并映射到用户空间（供 memcpy 填码流 / 读像素）。
- * 大小取 V4L2 报的 sizeimage —— 驱动已按 AV1 与对齐规则算好。 */
+/* Assigns one dmabuf to each buffer and maps it to the user space (for memcpy fill stream/ read pixels).
+ * Size of sizeimage for V4L2 -- driver is calculated by the AV1 alignment rule. */
 static int alloc_bufs(int fd, enum v4l2_buf_type type, int count,
                       struct buf *bufs, size_t size)
 {
@@ -145,8 +145,8 @@ static int alloc_bufs(int fd, enum v4l2_buf_type type, int count,
         bufs[i].start = mmap(NULL, size, PROT_READ | PROT_WRITE,
                              MAP_SHARED, bufs[i].dbuf_fd, 0);
         if (bufs[i].start == MAP_FAILED) {
-            /* 映射失败不致命：QBUF 只需要 fd，填数据才需要映射。
-             * 对 CAPTURE 侧我们只统计帧数，不读像素，可以容忍。 */
+            /* The map failed is not fatal: QBUF only needs fd to fill in the data to map.
+             * We only count frames, don't read pixels, and we can tolerate them. */
             bufs[i].start = NULL;
         }
     }
@@ -157,7 +157,7 @@ static int alloc_bufs(int fd, enum v4l2_buf_type type, int count,
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "用法: %s <file.obu> [单元数]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <file.obu> [Number of units]\n", argv[0]);
         return 2;
     }
     int limit = (argc > 2) ? atoi(argv[2]) : 8;
@@ -172,13 +172,13 @@ int main(int argc, char **argv)
     struct unit units[MAX_UNITS];
     int nu = split_tu(data, (size_t)fsz, units, MAX_UNITS);
     if (limit > 0 && limit < nu) nu = limit;
-    printf("码流: %ld 字节，切出 %d 个 temporal unit（首个 %zu 字节）\n",
+    printf("bitstream: %ld Bytes, cut out %d  temporal unit(First %zu bytes)\n",
            fsz, nu, nu ? units[0].len : 0);
 
     int fd = open(DEV, O_RDWR);
-    if (fd < 0) { fprintf(stderr, "打开 %s: %s\n", DEV, strerror(errno)); return 1; }
+    if (fd < 0) { fprintf(stderr, "open %s: %s\n", DEV, strerror(errno)); return 1; }
 
-    /* 1. 设置 OUTPUT 侧格式为 AV1 */
+    /* 1. Setup UPPUT side format to AV1 */
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -188,57 +188,57 @@ int main(int argc, char **argv)
     fmt.fmt.pix_mp.num_planes = 1;
     fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 4 * 1024 * 1024;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt, "S_FMT(OUTPUT/AV1)") < 0) {
-        fprintf(stderr, "→ 硬件/驱动拒绝 AV1 输入格式\n"); close(fd); return 1;
+        fprintf(stderr, "→ hardware/Driver Reject AV1 Enter Format\n"); close(fd); return 1;
     }
     printf("  S_FMT(OUTPUT) OK: %ux%u sizeimage=%u\n", fmt.fmt.pix_mp.width,
            fmt.fmt.pix_mp.height, fmt.fmt.pix_mp.plane_fmt[0].sizeimage);
     unsigned in_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
-    /* 1.5 订阅事件。V4L2 stateful 解码的标准流程要求：
-     *   送入首个含序列头的单元 → 驱动解析出真实分辨率 →
-     *   发 V4L2_EVENT_SOURCE_CHANGE → 应用重新 G_FMT/REQBUFS(CAPTURE) →
-     *   才开始出帧。
-     * 不订阅事件就直接双向 STREAMON 并灌数据，驱动无从告知分辨率协商结果，
-     * 固件会按错误的假设解析 —— 实测表现为 av1DecParseFrame 报错、0 帧。 */
+    /* 1.5 Subscription events. Standard process requirements for V4L2 status:
+     *   Send the first unit with the serial header * Driver to decipher the true resolution *
+     *   V4L2_EVENT_SOURCE_CHANGE — Applying the G_FMT/REQBUFS (CAPTURE)  ⁇
+     *   Only then does the decoder start producing frames.
+     * The non-subscription event is directly a two-way STREAMON and then the data is injected, driving the failure to communicate the resolution to the outcome of the consultation.
+     * Solids are parsed according to an incorrect hypothesis - the actual measurements are av1DecParseFrame, 0 frames. */
     {
         struct v4l2_event_subscription sub;
         memset(&sub, 0, sizeof(sub));
         sub.type = V4L2_EVENT_SOURCE_CHANGE;
         if (xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub, "SUBSCRIBE(SOURCE_CHANGE)") == 0)
-            printf("  已订阅 SOURCE_CHANGE\n");
+            printf("  Subscriptions SOURCE_CHANGE\n");
         memset(&sub, 0, sizeof(sub));
         sub.type = V4L2_EVENT_EOS;
         if (xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub, "SUBSCRIBE(EOS)") == 0)
-            printf("  已订阅 EOS\n");
+            printf("  Subscriptions EOS\n");
     }
 
-    /* ---- 第一阶段：只开 OUTPUT，送首个含序列头的单元，等分辨率协商 ----
+    /* - Phase I: only OUTPUT, sending the first module with the serial head, etc. resolution consultation
      *
-     * V4L2 stateful 解码的正确次序（内核文档 dev-decoder.rst）：
+     * The correct order of decoding of V4L2 status (kernel document dev-decoder.rst):
      *   S_FMT(OUTPUT) → REQBUFS(OUTPUT) → STREAMON(OUTPUT)
-     *   → 送含序列头的单元 → 驱动发 SOURCE_CHANGE
-     *   → G_FMT(CAPTURE) 拿真实尺寸 → REQBUFS/STREAMON(CAPTURE) → 出帧
+     *   ⁇  Unit with sequence head  ⁇  Driver SOURCE_CHANGE
+     *   *G_FMT(CAPTURE) takes real dimensions * REQBUFS/ STREAMON(CAPTURE) * Frame out
      *
-     * 早先把两侧一起 STREAMON 再灌数据，跳过了协商，固件按错误假设解析，
-     * 表现为 av1DecParseFrame 报 AV1 ERROR、0 帧。 */
+     * The earlier streamon refilled the data, jumped over the negotiations, the solids were misconstrued.
+     * The video is available in the AV1 ERROR, 0 frames. */
     int n_out = req_bufs(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, NUM_OUT);
     if (n_out <= 0) { close(fd); return 1; }
 
     struct buf out_bufs[NUM_OUT];
     memset(out_bufs, 0, sizeof(out_bufs));
     if (alloc_bufs(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, n_out, out_bufs, in_size) < 0) {
-        fprintf(stderr, "  OUTPUT dmabuf 分配失败\n"); close(fd); return 1;
+        fprintf(stderr, "  OUTPUT dmabuf Distribution Failed\n"); close(fd); return 1;
     }
-    printf("  OUTPUT dmabuf OK: %d x %u 字节\n", n_out, in_size);
+    printf("  OUTPUT dmabuf OK: %d x %u bytes\n", n_out, in_size);
 
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     if (xioctl(fd, VIDIOC_STREAMON, &type, "STREAMON(OUTPUT)") < 0) { close(fd); return 1; }
 
-    /* 送首个单元（含 OBU_SEQUENCE_HEADER） */
+    /* Send the first module (including OBU_SEQUENCE_HEADER) */
     int sent = 0;
     {
         if (!out_bufs[0].start) {
-            fprintf(stderr, "  OUTPUT[0] 未映射，无法填码流\n"); close(fd); return 1;
+            fprintf(stderr, "  OUTPUT[0] Unmaped, Unable to fill the stream\n"); close(fd); return 1;
         }
         memcpy(out_bufs[0].start, data + units[0].off, units[0].len);
         struct v4l2_buffer b; struct v4l2_plane p[1];
@@ -251,10 +251,10 @@ int main(int argc, char **argv)
         p[0].bytesused = (unsigned)units[0].len;
         if (xioctl(fd, VIDIOC_QBUF, &b, "QBUF(OUTPUT[0])") < 0) { close(fd); return 1; }
         sent = 1;
-        printf("  已送首单元 %zu 字节，等 SOURCE_CHANGE…\n", units[0].len);
+        printf("  Sended First Module %zu Bytes, wait SOURCE_CHANGE…\n", units[0].len);
     }
 
-    /* 等 SOURCE_CHANGE 事件 */
+    /* Wait for SOURCE_CHANGE events */
     int got_src_change = 0;
     for (int i = 0; i < 20 && !got_src_change; i++) {
         struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLOUT };
@@ -263,7 +263,7 @@ int main(int argc, char **argv)
             struct v4l2_event ev;
             memset(&ev, 0, sizeof(ev));
             if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
-                printf("  事件: type=%u%s\n", ev.type,
+                printf("  Events: type=%u%s\n", ev.type,
                        ev.type == V4L2_EVENT_SOURCE_CHANGE ? " (SOURCE_CHANGE)" : "");
                 if (ev.type == V4L2_EVENT_SOURCE_CHANGE) got_src_change = 1;
             }
@@ -277,9 +277,9 @@ int main(int argc, char **argv)
         }
     }
     if (!got_src_change)
-        printf("  ⚠ 未收到 SOURCE_CHANGE，仍继续尝试（部分驱动不发该事件）\n");
+        printf("  ⚠ Not received SOURCE_CHANGE,Continue trying (partially driven not to send the event))\n");
 
-    /* ---- 第二阶段：按驱动给出的真实格式配置 CAPTURE ---- */
+    /* - Phase 2: Configure CAPTURE in real format given by driver - */
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     if (xioctl(fd, VIDIOC_G_FMT, &fmt, "G_FMT(CAPTURE)") < 0) { close(fd); return 1; }
@@ -291,7 +291,7 @@ int main(int argc, char **argv)
            (char)((fmt.fmt.pix_mp.pixelformat >> 24) & 0xFF),
            fmt.fmt.pix_mp.plane_fmt[0].sizeimage);
 
-    /* 显式设为 NV12（驱动默认可能是 QCOM 压缩格式 Q08C，我们要线性 NV12） */
+    /* Show set NV12 (Driver default may be QCOM compression format Q08C, we want linear NV12) */
     fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt, "S_FMT(CAPTURE/NV12)") < 0) { close(fd); return 1; }
     unsigned cap_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
@@ -302,7 +302,7 @@ int main(int argc, char **argv)
     struct buf cap_bufs[NUM_CAP];
     memset(cap_bufs, 0, sizeof(cap_bufs));
     if (alloc_bufs(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, n_cap, cap_bufs, cap_size) < 0) {
-        fprintf(stderr, "  CAPTURE dmabuf 分配失败\n"); close(fd); return 1;
+        fprintf(stderr, "  CAPTURE dmabuf Distribution Failed\n"); close(fd); return 1;
     }
     for (int i = 0; i < n_cap; i++) {
         struct v4l2_buffer b; struct v4l2_plane p[1];
@@ -316,9 +316,9 @@ int main(int argc, char **argv)
     }
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     if (xioctl(fd, VIDIOC_STREAMON, &type, "STREAMON(CAPTURE)") < 0) { close(fd); return 1; }
-    printf("  CAPTURE 就绪（%d 缓冲），继续送余下单元\n", n_cap);
+    printf("  CAPTURE ready(%d Continue with the remaining units\n", n_cap);
 
-    /* ---- 送剩余单元并收帧 ---- */
+    /* - Send the remaining units and take the frame */
     int frames = 0, next = 1, dumped = 0;
     for (int loop = 0; loop < 60; loop++) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLOUT | POLLPRI };
@@ -333,16 +333,16 @@ int main(int argc, char **argv)
             b.memory = V4L2_MEMORY_DMABUF; b.m.planes = p; b.length = 1;
             if (ioctl(fd, VIDIOC_DQBUF, &b) == 0) {
                 frames++;
-                printf("  ★ 解出帧 %d: index=%u bytesused=%u\n",
+                printf("  ★ Undo Frame %d: index=%u bytesused=%u\n",
                        frames, b.index, p[0].bytesused);
-                /* 落盘首个非空帧，供离线像素校验（判断是否真图像而非全灰）。 */
+                /* The first non-empty frame on the fall plate is used for offline pixel verification (judgment of whether the image is real rather than full ash). */
                 if (p[0].bytesused > 0 && !dumped && cap_bufs[b.index].start) {
                     FILE *df = fopen("/data/local/tmp/av1_frame0.nv12", "wb");
                     if (df) {
                         fwrite(cap_bufs[b.index].start, 1, p[0].bytesused, df);
                         fclose(df);
                         dumped = 1;
-                        printf("    → 已落盘 %u 字节到 /data/local/tmp/av1_frame0.nv12\n",
+                        printf("    → Disk %u Bytes to /data/local/tmp/av1_frame0.nv12\n",
                                p[0].bytesused);
                     }
                 }
@@ -376,11 +376,11 @@ int main(int argc, char **argv)
             struct v4l2_event ev;
             memset(&ev, 0, sizeof(ev));
             if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0)
-                printf("  事件: type=%u\n", ev.type);
+                printf("  Events: type=%u\n", ev.type);
         }
     }
 
-    printf("结论: 送入 %d 单元，V4L2 直接解出 %d 帧\n", sent, frames);
+    printf("Conclusions: Send In %d Module,V4L2 Just clear it out. %d frame\n", sent, frames);
 
     type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     ioctl(fd, VIDIOC_STREAMOFF, &type);

@@ -12,14 +12,12 @@
 *.su
 *.idb
 *.pdb
-# coredump：调试驱动崩溃时会在工作目录留下几百 MB 的 core
-# （0.4.1 那次是 362MB），别让它进仓库。
+# Driver crashes can leave core dumps of several hundred MB in the working directory.
 core
 core.[0-9]*
 
 # Build output
-# 用锚定路径而非裸名：裸名 "decode-client" 会匹配任意深度的同名文件或目录，
-# 将来若把客户端源码目录命名成 decode-client/ 就会被整个吞掉。
+# Anchor these patterns so a source directory of the same name is still tracked.
 /build/
 /client/build/
 
@@ -47,10 +45,10 @@ Thumbs.db
 *.mp4
 *.mkv
 *.avi
-# VA-API driver 构建产物
+# VA-API driver build outputs
 vaapi-driver/build/
 vaapi-driver/build-*/
 
-# 发布产物：只作为 GitHub Release 资产上传，不进仓库
+# Release outputs are uploaded as GitHub Release assets.
 rel/
 ksu-module/dmd-probe

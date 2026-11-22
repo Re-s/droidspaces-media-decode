@@ -1,19 +1,19 @@
 /*
- * probe_nalu_feed —— 按 Annex-B 真实 NALU 边界喂料，验证是否能触发 SOURCE_CHANGE
+ * Probe_nalu_feed -- press Annex-B for real NALU border feed to verify that SOURCE_CHANGE is triggered
  *
- * 与 probe_device_support.c 的区别：那个按固定大小切块，这个按起始码切出
- * 完整 NALU。msm_vidc 是 stateful 解码器，理论上要求每个 OUTPUT buffer
- * 至少是一个完整 NALU —— 本探针用来排除"切块方式不对"这个可能。
+ * Difference to probe_device_support.c: the cut of the block by fixed size, the cut of the box by starting number
+ * Complete NALU. msm_vidc is a stateful decoder, which theoretically requires each OPPUTbuffer
+ * At least a complete NALU -- this probe is used to rule out the possibility of "unright cut."
  *
- * 实测（第 86 轮，nabu 内核 4.14）：
- *   NALU[0] type=7 (SPS)  30 字节    QBUF ok
- *   NALU[1] type=8 (PPS)   9 字节    QBUF ok
- *   NALU[2] type=6 (SEI) 690 字节    QBUF ok
- *   NALU[3] type=5 (IDR) 22857 字节  QBUF ok
- *   → 仍无 SOURCE_CHANGE
- * 所以喂料切分不是 nabu 解码路径起不来的原因。
+ * Actual (86th round, nbu kernel 4.14):
+ *   NALU [0] type=7 (SPS) 30 bytes QBUF ok
+ *   NALU[1] type=8 (PPS) 9 bytes QBUF ok
+ *   NALU[2] type=6 (SEI) 690 bytes QBUF ok
+ *   NALU[3] type=5 (IDR) 22857 bytes QBUF ok
+ *   ⁇ There is still no SOURCE_CHANGE
+ * So feeding severing is not the reason the nabu decoding path does not start.
  *
- * 编译：cc -O2 -o probe_nalu_feed probe_nalu_feed.c
+ * cc-O2-o probe_nalu_feed probe_nalu_feed.c
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -25,8 +25,8 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <linux/videodev2.h>
-/* 按 Annex-B 起始码切出真正的 NALU，而不是任意切块。
- * msm_vidc 是 stateful 解码器，要求每个 OUTPUT buffer 至少是完整 NALU。*/
+/* Press the Annex-B starting to cut out the real NALU, not any block.
+ * msm_vidc is a stateful decoder requiring that each OTPUT buffer be at least complete NALU.*/
 static unsigned char *slurp(const char *p, size_t *n){
     FILE *f=fopen(p,"rb"); if(!f) return NULL;
     fseek(f,0,SEEK_END); *n=ftell(f); fseek(f,0,SEEK_SET);
@@ -42,8 +42,8 @@ static size_t next_sc(const unsigned char*d,size_t n,size_t from){
 int main(int argc,char**argv){
     const char*path=argc>1?argv[1]:"/tmp/loc.h264";
     size_t flen=0; unsigned char*data=slurp(path,&flen);
-    if(!data){printf("  读不到 %s\n",path);return 1;}
-    printf("  文件 %zu 字节\n", flen);
+    if(!data){printf("  Can’t read. %s\n",path);return 1;}
+    printf("  Documentation %zu bytes\n", flen);
 
     int fd=open("/dev/video32",O_RDWR|O_CLOEXEC);
     struct v4l2_format f; memset(&f,0,sizeof f);
@@ -57,7 +57,7 @@ int main(int argc,char**argv){
 
     struct v4l2_requestbuffers rb; memset(&rb,0,sizeof rb);
     rb.count=4; rb.type=f.type; rb.memory=V4L2_MEMORY_USERPTR;
-    if(ioctl(fd,VIDIOC_REQBUFS,&rb)){printf("  REQBUFS 失败\n");return 1;}
+    if(ioctl(fd,VIDIOC_REQBUFS,&rb)){printf("  REQBUFS failed\n");return 1;}
 
     struct v4l2_event_subscription sub; memset(&sub,0,sizeof sub);
     sub.type=V4L2_EVENT_SOURCE_CHANGE; ioctl(fd,VIDIOC_SUBSCRIBE_EVENT,&sub);
@@ -65,7 +65,7 @@ int main(int argc,char**argv){
 
     void*bufs[4]; for(int i=0;i<4;i++) bufs[i]=aligned_alloc(4096,isz);
 
-    /* 前 4 个 NALU 逐个送（含 SPS/PPS/IDR） */
+    /* The first 4 NALUs are delivered individually (including SPS/PPS/IDRs) */
     size_t pos=next_sc(data,flen,0);
     for(int i=0;i<4 && pos<flen;i++){
         size_t end=next_sc(data,flen,pos+3);
@@ -79,14 +79,14 @@ int main(int argc,char**argv){
         pl[0].m.userptr=(unsigned long)bufs[i];
         pl[0].length=isz; pl[0].bytesused=len;
         int q=ioctl(fd,VIDIOC_QBUF,&b);
-        printf("  NALU[%d] type=%u %zu 字节 QBUF=%s\n",i,nal_type,len,
+        printf("  NALU[%d] type=%u %zu bytes QBUF=%s\n",i,nal_type,len,
                q==0?"ok":strerror(errno));
         struct pollfd pf={.fd=fd,.events=POLLPRI};
         poll(&pf,1,2000);
         if(pf.revents&POLLPRI){
             struct v4l2_event ev; memset(&ev,0,sizeof ev);
             ioctl(fd,VIDIOC_DQEVENT,&ev);
-            printf("  ✓✓ SOURCE_CHANGE 在第 %d 个 NALU 后到达！\n",i);
+            printf("  ✓✓ SOURCE_CHANGE At %d  NALU We’re on our way.!\n",i);
             struct v4l2_format cf; memset(&cf,0,sizeof cf);
             cf.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
             ioctl(fd,VIDIOC_G_FMT,&cf);
@@ -96,7 +96,7 @@ int main(int argc,char**argv){
         }
         pos=end;
     }
-    printf("  ✗ 前 4 个 NALU 后仍无 SOURCE_CHANGE\n");
+    printf("  ✗ Front 4  NALU Not yet. SOURCE_CHANGE\n");
 done:
     close(fd); free(data); return 0;
 }

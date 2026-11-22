@@ -1,24 +1,24 @@
-/* vaExportSurfaceHandle：把 surface 导出成 dmabuf（DRM_PRIME_2）。
+/* vExportSurfaceHandle: Export the surface to dmabuf (DRM_PRIME_2).
  *
- * 为什么必须实现：**Firefox 取帧只走这条路**。
- * `FFmpegVideoDecoder::CreateImageVAAPI`（FFmpegVideoDecoder.cpp:1649）拿到
- * 解码帧后立刻调 `GetVAAPISurfaceDescriptor` → `vaExportSurfaceHandle`，
- * 失败就返回 `NS_ERROR_DOM_MEDIA_DECODE_ERR`，播放器随即 ProcessFlush()
- * 并重建成**软解**。整个过程没有任何错误日志，也**没有回退到拷贝的路径** ——
- * 症状就是"硬解出 1 帧然后永久软解"，极难定位（我们靠给未实现桩加日志才发现）。
+ * Why must it be done: **Firefox takes the frame only this way**.
+ * `FFmpegVideoDecoder: :CreateImageVAAPI ' (FFmpegVideoDecoder.cpp:1649)
+ * `GetVAAPIsureDescriptor '  ⁇ ExportSurfaceHandle ' ,
+ * Failed returns `NS_ERROR_DOM_MEDIA_DECODE_ERR ', and the player will then be enabled to perform the processFlush()
+ * and recreated as **Soft **. There was no error log, ** no return to the copy path** ** **
+ * The symptoms are "hardly uncollaborate a frame and then permanently softly decipher" and extremely difficult to locate (we only find it by adding logs to the unrealized treasuries).
  *
- * ffmpeg 命令行不需要它：`hwdownload` 走 vaDeriveImage + vaMapBuffer。
- * 所以此前一直"ffmpeg 全绿、浏览器不动"。
+ * ffmpeg command line does not need it: `hwdownload ' Walk vaDeriveImage + vaMapBuffer.
+ * So it's been "ffmpeg all green, browser still."
  *
- * 这不是零拷贝。MediaCodec 那块输出内存我们拿不到 fd（容器 ION 不可用、
- * 无 /dev/dma_heap、NDK 也不暴露输出缓冲的 fd）。做法是 surface 本身就分配在
- * msm_drm 的 dumb buffer 里（见 decode.c 的 surface_alloc_dumb），
- * daemon 回传的帧直接拷进这块可导出内存 —— 拷贝次数和原来一样，
- * 但多了"能被 GL/合成器导入"这个关键能力。
+ * This is not a zero copy. MediaCodec, that output memory we can't get.
+ * No /dev/dma_head, NDK does not reveal an output buffer fd. The way it is distributed is by itself
+ * inside an msm_drm dumb buffer (see surface_alloc_dumb in decode.c),
+ * The frame of the return of the daemon is directly copied into this box to export the memory -- the number of copies is the same as before.
+ * But there's more of the key "capable of being imported into GL/Synthesizer."
  */
 
 #include <stdlib.h>
-#include <fcntl.h> /* O_CLOEXEC —— drm.h 的 DRM_CLOEXEC 是它的别名 */
+#include <fcntl.h> /* O_CLOEXEC — drm.h DRM_CLOEXEC is its alias */
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -37,30 +37,30 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     if (!drv || !descriptor)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 只支持 DRM_PRIME_2。Firefox 传的正是这个；老的 DRM_PRIME（v1）
-     * 结构不同，不声明支持比给个错结构安全。 */
+    /* Support only DRM_PRIME_2. Firefox transmits this; the old DRM_PRIME(v1)
+     * Different structures, without stating support for security compared to wrong structures. */
     if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
-        dmd_log("ExportSurfaceHandle: 不支持的 mem_type=0x%x\n", mem_type);
+        dmd_log("ExportSurfaceHandle: Unsupported mem_type=0x%x\n", mem_type);
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
-    /* ⚠️ 不要在这里等帧就绪。
+    /* Don't wait here for the frame to be ready.
      *
-     * 原来这里调 dmd_surface_wait()，理由写的是"Firefox 是在拿到解码帧之后
-     * 才导出的"。那对 Firefox 成立，但 **Chrome 的顺序正好相反**：它在
-     * CreateSurfaces 之后、提交任何解码之前就调 vaExportSurfaceHandle 拿
-     * dmabuf fd 去建输出纹理，拿到 fd 才开始喂码流。
+     * Turns out this is the dmd_survey_wait() for the reason that Firebox was obtained after the decoding frame was obtained.
+     * ". The Firefox set up, but the order of **Chrome is the opposite. ** It's:
+     * Call the ExportSurfaceHandle after the CreateSurfaces and before submitting any decoding
+     * dmabuf fd to build output texture and get fd before it starts feeding the stream.
      *
-     * 于是 surface 还是 IDLE，dmd_surface_wait() 按设计拒绝（它防的是读一个
-     * 从未解码的 surface），export 返回 INVALID_SURFACE，Chrome 侧报
+     * So the surface is still IDLE, dmd_surface_wait() refused by design (it is read out to read one)
+     * Uncoded surface, export returns INVALID_SURFACE, Chrame profile
      *     media/gpu/vaapi/vaapi_wrapper.cc:2756
      *     vaExportSurfaceHandle failed, VA error: invalid VASurfaceID
-     * 随后整条硬解路径被放弃 —— 实测「送入 0 单元, 收到 0 帧」。
+     * The entire hard-line path was then abandoned -- the actual "incoming 0 units, received 0 frames".
      *
-     * 关键区别：**导出 dmabuf 不读像素**，只交出 fd 与几何描述。
-     * 缓冲生命周期由 surface 持有，何时写入由解码决定；消费方本来就要
-     * 等 vaSyncSurface 才采样。真正需要「必须已解码」这个前提的是
-     * GetImage / DeriveImage 那条读像素的路径，那里的 IDLE 拦截不变。 */
+     * Key difference: ** Export dmabuf does not read pixel**, only hand over fd with geometry.
+     * Buffer life cycle is held by the surface, when writing is decoded; consumers would have wanted it.
+     * The real need is to decode the premise that it has to be.
+     * GetImage / DeriveImage that read pixel path where IDLE intercepts are unchanged. */
 
     pthread_mutex_lock(&drv->lock);
     struct dmd_surface *s = dmd_find_surface_locked(drv, surface_id);
@@ -78,10 +78,10 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     }
 
     if (!s->exportable || !s->dumb_handle || s->dumb_drm_fd < 0) {
-        /* 分配时回落成普通 heap 了（dumb buffer 不可用）。
-         * 明确报不支持，别给出一个假的 fd。 */
+        /* The distribution is returned to normal header (dumb buffer is not available).
+         * Do not give a fake ld if you clearly say you don't support it. */
         pthread_mutex_unlock(&drv->lock);
-        dmd_log("ExportSurfaceHandle: surface %u 不是可导出内存\n",
+        dmd_log("ExportSurfaceHandle: surface %u Not export memory\n",
                 (unsigned)surface_id);
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
@@ -98,23 +98,23 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     unsigned int format = s->format;
     pthread_mutex_unlock(&drv->lock);
 
-    /* 标准 P010 把有效 10bit 放在每个 16bit LE 字的高位（15:6），
-     * 因而分离层使用 R16 / GR1616；这也是 Mesa 的 P010 平面表示。
-     * 按 16bit UNORM 采样不会暗 64 倍：中性 UV 的存储值是 0x8000，
-     * 不是 0x0200。只有低位对齐的私有格式才需要另一套解释，不能冒充 P010。
-     * 描述符正确不代表消费者的 EGL/GL/Vulkan 路径一定支持这些平面格式。 */
+    /* Standard P010 Place valid 10bit at the height of each 16bit LE (15:6),
+     * The separation layer is therefore R16/GR161616; this is also the P010 plane for Mesa.
+     * Based on 16bit UNORM sample not dark 64 times: neutral UV storage value 0x8000,
+     * Not 0x0200. Only a private format that is low-levelly aligned requires another explanation and cannot be assumed as P010.
+     * The EGL/GL/Vulkan path, which correctly does not represent the consumer, will support these plane formats. */
 
-    /* 导出 fd 时不持锁：ioctl 是内核调用，且调用方拿到 fd 后由它负责 close。 */
+    /* Export fd without lock: octl is an internal approval call and the caller gets the fd and it is responsible for close. */
     struct drm_prime_handle prime;
     memset(&prime, 0, sizeof(prime));
     prime.handle = handle;
-    /* DRM_CLOEXEC 就是 O_CLOEXEC 的别名（drm.h），用它避免额外包含 fcntl.h。
-     * fd 必须 CLOEXEC：驱动跑在浏览器进程里，泄漏到子进程是安全问题。 */
+    /* DRM_CLOEXEC is the alias O_CLOEXEC (drm.h), which is used to avoid extra inclusion of fcntl.h.
+     * fd Must CLOEXEC: Drive in browser processes, leaking to subprocess is a security issue. */
     prime.flags = DRM_CLOEXEC;
     if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
         prime.flags |= DRM_RDWR;
     if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
-        dmd_log("ExportSurfaceHandle: PRIME_HANDLE_TO_FD 失败\n");
+        dmd_log("ExportSurfaceHandle: PRIME_HANDLE_TO_FD failed\n");
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
@@ -151,15 +151,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     desc->width = disp_w;
     desc->height = disp_h;
 
-    /* 单个 dmabuf object 承载 Y 与 UV 两个平面。 */
+    /* A single dmabuf object carries two plane planes of Y and UV. */
     desc->num_objects = 1;
     desc->objects[0].fd = prime.fd;
     desc->objects[0].size = (uint32_t)total;
     desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
 
-    /* Firefox 与 Chrome 都传 VA_EXPORT_SURFACE_SEPARATE_LAYERS（Chrome 实测
-     * flags=0x5），要求 Y / UV 各成一层。
-     * 合并成一层（NV12/P010 单 layer）仅在传 COMPOSED_LAYERS 时使用。 */
+    /* Firefox and Chrome by VA_EXPORT_SURFACE_SEPARATE_LAYERS (Chrome Factoring)
+     * flags=0x5), requesting Y/ UV to form one layer each.
+     * Merge into one layer (NV12/P010 single player) only for the distribution of COMPOSED_LAYERS. */
     if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
         desc->num_layers = 1;
         desc->layers[0].drm_format =
@@ -173,15 +173,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[0].pitch[1] = stride;
     } else {
         desc->num_layers = 2;
-        /* Y 平面：NV12 为 R8；MSB 对齐的 P010 为 R16。 */
+        /* Y plane: NV12 for R8; MSB for P010 for R16. */
         desc->layers[0].drm_format = ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
         desc->layers[0].num_planes = 1;
         desc->layers[0].object_index[0] = 0;
         desc->layers[0].offset[0] = 0;
         desc->layers[0].pitch[0] = stride;
-        /* UV 平面：交织的 Cb/Cr，逻辑宽高各减半，每个采样占 2/4 字节，
-         * 字节 pitch 与 Y 相同。GR1616 的 LE 低字是 R（Cb），高字是 G（Cr）。
-         * offset 用存储 slice_height 而非显示高，保留 Y 平面对齐填充。 */
+        /* UV plane: interwoven Cb/Cr, with a reduction in logic width, with 2/4 bytes per sample,
+         * Bytes pitch is the same as Y. The low letter for GR161616 is R(Cb) and the high word is G(Cr).
+         * With storage slick_height instead of display height, keep Y-Pick-Up Fill. */
         desc->layers[1].drm_format = ten_bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
         desc->layers[1].num_planes = 1;
         desc->layers[1].object_index[0] = 0;
@@ -189,15 +189,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[1].pitch[0] = stride;
     }
 
-    /* 诊断黑帧：DMD_VA_LUMA=1 时抽样算 Y 平面亮度均值并打进日志。
+    /* Diagnosed black frame: The average lightness of the plane is calculated for Y and entered into the log at the time of the sample of DMD_VA_LUMA=1.
      *
-     * ⚠️ 这个计数**只对 Firefox 路径有意义**。Chrome 是在解码之前就导出
-     * surface（见上面第 46 行那段），此刻像素注定是全零 —— 0.4.7 实测
-     * 一次 MSE 压测 162 次采样全部报"黑帧"，而帧本身是正常解出来并写进
-     * surface 的。所以别拿它在 Chrome 上判画质，会得出反的结论。
+     * ⁇  This count** only means to the Firefox path**. Chrame is exported before decoding
+     * This is a time when pixels are destined to be zero -- 0.4.7 for live measurements.
+     * One MSE pressure, 162 times all "Black Frames," which itself is normal and written.
+     * The surface. So don't use it to frame chrome, and it'll be counter-conclusive.
      *
-     * 为什么还需要它：Firefox 在 vaSyncSurface 之后才导出，采样点落在
-     * 像素写完之后，这时下面那段"UV 全零 = 纯绿"的判据才成立。 */
+     * Why do you need it? Firefox is not exported until after vSyncSurface, the sampling site is dropped.
+     * When the pixels are finished, the following section of the UV is established. */
     if (getenv("DMD_VA_LUMA")) {
         const unsigned char *y = s->data;
         if (y && s->data_size >= (size_t)stride * 16) {
@@ -207,13 +207,13 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
             for (size_t k = 0; k < y_lim; k += 1499) { sum += y[k]; cnt++; }
             double mean = cnt ? sum / cnt : 0;
 
-            /* 只看 Y 判不出绿屏：纯绿的判据在 UV。
-             * NV12 的 UV 全零经限制范围 BT.601 转 RGB 得到 R≈0,G≈135,B≈0，
-             * 也就是那个标志性的纯绿；而正常画面的 UV 应围绕 128 波动
-             * （128 表示无色偏）。所以这里统计 UV 均值与"接近 0 的比例"，
-             * 让驱动自己就能回答"交给浏览器的像素是不是绿的"，
-             * 不必依赖截图 —— KWin 出于安全会拒绝未授权进程抓屏，
-             * XWayland 也拿不到 Wayland 原生窗口内容。 */
+            /* Only Y cannot be judged green: the pure green verdict is in UV.
+             * UV for NV12 is completely bound by BT.601 and RGB gets R ⁇ 0, G ⁇ 135, B ⁇ 0,
+             * That's the green color of the sign; and the normal UV should be around 128 fluctuations.
+             * (128 means colorless). So here's the UV mean ratio to "approx. 0"
+             * "The pixels given to the browser are green."
+             * KWin does not have to rely on the screenshot - it is safe to refuse the unauthorized process to capture the screen.
+             * XWayland does not get the content of the Wayland original window. */
             double uv_sum = 0; int uv_cnt = 0, uv_zero = 0;
             size_t uv_end = y_lim + (size_t)stride * slice_h / 2;
             if (uv_end > s->data_size) uv_end = s->data_size;
@@ -226,19 +226,19 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
             double uv_zero_pct = uv_cnt ? 100.0 * uv_zero / uv_cnt : 0;
             int greenish = (uv_cnt > 0 && uv_zero_pct > 80.0);
 
-            dmd_log("像素: surface=%u Y均值 %.1f UV均值 %.1f UV近零 %.0f%%%s%s\n",
+            dmd_log("pixels: surface=%u Y Mean %.1f UV Mean %.1f UV Near zero. %.0f%%%s%s\n",
                     (unsigned)surface_id, mean, uv_mean, uv_zero_pct,
-                    mean < 20.0 ? "  ← 黑帧" : "",
-                    greenish ? "  ← 纯绿!" : "");
+                    mean < 20.0 ? "  ← Black Frame" : "",
+                    greenish ? "  ← Pure green!" : "");
         }
     }
 
-    /* 把消费方真实传入的 flags 一起打出来。
+    /* The real user's fly-in.
      *
-     * 为什么必须在驱动里打：Firefox 经 libva 的 driver vtable 进入这里，
-     * 不走公共符号 vaExportSurfaceHandle()，所以 LD_PRELOAD 拦不到
-     * （实测 RDD 确实加载了 hook 库，但没有任何记录产生）。
-     * 只有这里能确定它走的是 COMPOSED 还是 SEPARATE 分支。 */
+     * Why must you hit Firefox in the drive by libva's dryer vtable to enter here,
+     * Do not go public sign vExportSurfaceHandle(), so LD_PRELOAD cannot stop
+     * (Reconfirmed that RDD did load the Hook library, but no records were generated).
+     * Only here can be sure whether it's going to COMPOSED or SEPARATE branch. */
     dmd_log("ExportSurfaceHandle: surface=%u -> fd=%d %ux%u stride=%u "
             "slice_h=%u uv_offset=%u flags=0x%x%s%s%s layers=%u fmt0=%.4s%s%s\n",
             (unsigned)surface_id, prime.fd, disp_w, disp_h, stride,
@@ -251,9 +251,9 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
             desc->num_layers > 1
                 ? (const char *)&desc->layers[1].drm_format : "");
 
-    /* 标记这个 surface 走的是"导出 dmabuf 自己采样"的契约。
-     * EndPicture 据此决定是否必须在返回前把像素同步写进 surface ——
-     * 只有这类消费者（Chrome）需要，ffmpeg/Firefox 有 map 兜底。
+    /* Mark this surface and walk with the "Exit dmabuf to sample yourself".
+     * EndPicture therefore decides whether pixels must be synchronized to the surface before returning...
+     * Only such consumers (Chrome) need ffmpeg/ Firefox with a cap to go around.
      * WRITE export is a separate producer contract (OBS texture input). It
      * does not change IDLE/PENDING/READY or make undecoded pixels readable. */
     s->exported = 1;

@@ -1,14 +1,14 @@
-/* profile / entrypoint / config 查询与 config 对象管理
+/* Profile / enterpoint / config query and config object management
  *
- * 声明的能力严格对应 /dev/video32 上 msm_vidc 能提供的解码器：
- * 协议 codec 取值 0=H.264 1=HEVC 2=VP9 3=VP8(已废弃) 4=AV1。
- * V4L2 直通下已真机端到端验证：H.264 300/300、HEVC 12/12、VP9 P0 50/50
- * （均逐字节等于软解）。AV1 帧数一致但像素未通过，详见 doc/av1-v4l2-status.md。
- * VP8 未实现：驱动侧缺 VP8 的码流重建（RFC 6386 uncompressed chunk 合成）。
- * ⚠️ 注意不是硬件不支持 —— 实测 /dev/video32 的 OUTPUT 格式确实含 VP80，
- * 见本文件下方声明表的更正说明。
- * HEVC Main10/P010 已在 SM8750P 通过像素验证，使用 HEVC10=1 独立启用；
- * 默认仍关闭，待更多平台/应用验证。VP9 Profile2、H.264 High10 不在此范围。
+ * The declared capability is strictly matched by the codec that can be provided by msm_vidc on /dev/video32:
+ * Protocol codec extraction 0=H.264 1=HEVC 2=VP9 3=VP8 (derelicted) 4=AV1.
+ * V4L2 Verified from end-to-end with direct access H.264 300/300, HEVC 12/12, VP9 P0 50/50
+ * (all bytes equal to soft resolution). AV1 frames are identical but not adopted in pixels, as detailed in doc/av1-v4l2-status.md.
+ * VP8 Not achieved: The driver is missing the cipher flow re-establishment of VP8 (RFC 6386 uncompressed chank synthesis).
+ * Note that the hardware is not not supported - the OUTPUT format of /dev/ video32 does contain VP80, but the U.S.B.
+ * See the explanation of corrections to the statement below this document.
+ * HEVC Main10/P010 has been validated in pixels by SM8750P and is independently enabled with HEVC10=1;
+ * The default remains closed pending further platform/application validation. VP9 Profile2, H.264 High10 is not in this range.
  */
 
 #include <string.h>
@@ -54,24 +54,24 @@ static void encode_dimensions(VAProfile profile, unsigned *min_w, unsigned *min_
     }
 }
 
-/* 本驱动支持的 profile 集合。顺序即 vainfo 的输出顺序。
+/* This driver supports the profile collection. The order is the output order of the vainfo.
  *
- * ⚠️ 只列**解码路径真的通了**的 profile。声明了但解不出来比不声明更糟 ——
- * 消费者会选中我们然后失败，而它本来可以直接走软解。
+ * ⁇  Only list ** decoding path really works ** profile. Declarations are worse than non-declared –
+ * The consumer will select us and then fail, and it could have been softened.
  *
- * HEVC（VAProfileHEVCMain）曾因"码流转发未实现"被移除过一段时间 ——
- * 那时声明它属于虚报，Firefox 的 vaapitest 探针会读成 CODEC_HW_HEVC
- * （GfxInfo.h:63 的 1<<8）。现在 hevc_bitstream.c 已实现 VPS/SPS/PPS 合成
- * 并真机验证（1080p/4K/720p 逐字节一致、长流 1500 帧、seek 全通），
- * 所以重新声明。
- * （那句"探针输出 368 = H264|VP8|VP9|HEVC 名实相符"已过时：
- *   VP8 声明已移除，探针位图不再包含 CODEC_HW_VP8。）
+ * The HEVC (VAProfileHeVCMain) was removed for a while because of "bitstream forwarding not realized" --
+ * It was declared false, and the Vapitest probe of Firefox read into CODEC_HW_HEVC
+ * (GfxInfo.h:63 of 1 <8 < > > ) hevc_bitstream.c has now achieved VPS/SPS/PPS synthesis
+ * The video is available in the blog of the blog "The Acquis" (http://www.flickr.com/) and the real machine (1080p/4K/720p by byte, long stream 1500 frames, Seek all).
+ * So re-stated.
+ * "The probe output of 368 = H264  ⁇ VP8 ⁇ VP9 ⁇ HEVC" is outdated:
+ *   VP8 declared removed and the probe bitmap no longer contains CODEC_HW_VP8.
  *
- * HEVC 的 SPS 参考集可在受支持的 Main 8 位流中，根据 VA DPB/POC
- * 重建为显式切片内参考集。SPS 长期参考表、自定义缩放表和未知切片
- * 边界等仍须经过 dmd_hevc_can_build / hevc_slice.c 的限制检查；
- * Main10 复用这些限制，并额外严格核对 10 位参数与 P010 输出；
- * 不能将受限支持解释为任意 HEVC 流均已验证。
+ * The SPS reference set for HEVC can be found in the supported Main 8-bit stream based on VA DPB/POC
+ * Recreates as a reference set in a visible slice. SPS long-term reference table, custom scale table and unknown slice
+ * (c) The border is still subject to restricted checks by dmd_hevc_can_build/hevc_slice.c;
+ * Main10 to reuse these limitations and to check the 10-bit parameter against P010 output with additional rigour;
+ * Restricted support cannot be interpreted as being verified as being arbitrary.
  */
 static const VAProfile dmd_profiles[] = {
     VAProfileH264ConstrainedBaseline,
@@ -85,106 +85,106 @@ static const VAProfile dmd_profiles[] = {
     VAProfileHEVCMain10,
 #endif
 #ifdef DMD_PROBE_10BIT_PROFILES
-    /* 探测专用（-DDMD_PROBE_10BIT_PROFILES）：声明 10bit profile 好让
-     * ffmpeg 愿意把 Main10 / VP9 Profile2 码流交过来，配合运行时的
-     * DMD_PROBE_10BIT=1 判定固件是否真能解。
-     * 此旧诊断开关同时声明尚未验证的 VP9 Profile2；Main10 请用独立
-     * HEVC10=1。QP10/Q12A 等私有探测布局不属于标准 P010 支持。 */
+    /* Specialized for detection (-DMDD_PROBE_10BIT_PROFILES): declaration 10bit profile
+     * ffmpeg willing to hand over the Main10/ VP9 Profile2 code flow to match the running time
+     * DMD_PROBE_10BIT=1 Determines whether solids are really solventable.
+     * This old diagnostic switch also declares VP9 Profile2 not yet verified; Main10 please use standalone
+     * HEVC10=1. Private detection layouts such as QP10/Q12A do not qualify for P010 support. */
     VAProfileVP9Profile2,
 #endif
-    /* VP8：0.4.2 重新声明。
+    /* VP8:0.4.2 Restatement.
      *
-     * 此前不声明的理由（见下方原注释）是"驱动侧没写码流重建"，但那已经
-     * 不成立 —— decode.c 的 vp8_build_frame() 实现了 RFC 6386 §9.1 的
-     * uncompressed data chunk 合成（frame tag + key frame 的 start code
-     * 与尺寸），参数收集（VASliceParameterBufferVP8 /
-     * VAPictureParameterBufferVP8）与 build_unit 的 DMD_CODEC_VP8 分支
-     * 也都在位。缺的只是这里的声明和 dmd_profile_to_codec 的映射两道闸门。
+     * The reason I didn't say before was "Driver unwritten stream" but that's already been...
+     * Unestablished — vp8_build_frame() to achieve RFC 6386 § 9.1
+     * Start code for uncompressed data chuck synthesis (frame tag + key frame)
+     * & Size, parameter collection (VASLiceParameter BufferVP8/
+     * DMD_CODEC_VP8 branch for VAPictureParameter BufferVP8) and build_unit
+     * All that is missing is the declaration and the mapping of two gates in dmd_profile_to_codec.
      *
-     * 硬件侧同样确认可用：VIDIOC_ENUM_FMT 在 /dev/video32 的 OUTPUT 侧
-     * 列出 MPG2/H264/HEVC/VP80/VP90，VP80 在列。 */
+     * Hardware side is equally valid: VIDIOC_ENUM_FMT on / dev/ video32 side of OTPUT
+     * Lists MPG2/H264/HEVC/VP80/VP90, column VP80. */
     VAProfileVP8Version0_3,
 #ifdef DMD_ENABLE_MPEG2
-    /* MPEG-2：⚠️ **暂不声明**（需 -DDMD_ENABLE_MPEG2 才启用）。
+    /* MPEG-2:  ⁇  Not yet ** (to be activated only with -DDDDD_ENABLE_MPEG2).
      *
-     * 实现是完整的：mpeg2_bitstream.c 合成出的码流与 ffmpeg 原始流
-     * **逐字节完全一致**（实测第 1 帧 82620 字节、第 2 帧 129038 字节，
-     * 差异数 0；层次 seq → ext → GOP → picture → ext → slice 也一致）。
-     * 合成正确性因此可以认为已证实。
+     * Achieved as complete: mpeg2_bitstream.c synthesized stream with ffmpeg original stream
+     * ** Bytes identical** (actually 1 frame 82620 bytes, 2 frame 129038 bytes,
+     * There were zero byte differences, and the seq → ext → GOP → picture → ext → slice order matched.)
+     * The synthesis correctness can therefore be considered proven.
      *
-     * 但送入 /dev/video32 后 Venus 固件在第 2 个单元处报 SYS_ERROR，
-     * 一帧不吐。既然码流与固件自己能解的原始流没有任何字节差异，
-     * 问题不在合成，而在这颗固件（SM8150）对 MPG2 的送料路径 ——
-     * 待查方向：OUTPUT sizeimage 只有 1958400（H.264/HEVC 是 16588800），
-     * 而单帧实际 129038 字节虽然装得下，但固件可能对 MPEG-2 要求
-     * 按 GOP/序列边界而非逐帧送料。
+     * But after sending /dev/video32, the Venus solid was in the 2nd Unit newspaper SYS_ERROR, which is a very good source of information about the situation in the country.
+     * A frame doesn't vomit. Since there is no by-product difference between the stream and the original stream that the solid itself can solve,
+     * The problem is not synthesis, but the SM8150 feed path for MPG2 in this solid device...
+     * For further investigation, OUTPUT sizeimage is only 1958400 (16588800 for H.264/HEVC),
+     * And the single frame actually 129038 bytes can be loaded, but the solid may be MPEG-2 required
+     * The border with the GOP/S sequence is not a frame-by-frame delivery.
      *
-     * 在能真正出帧之前声明它属于虚报：ffmpeg 的 -hwaccel vaapi 遇到
-     * 已声明的 profile 不会回落软解，会直接失败退出。 */
+     * Declares that it is false: ffmpeg's-hwackel vaapi encounters
+     * The declared profile will not fall soft, will simply fail to exit. */
     VAProfileMPEG2Main,
 #endif
 #ifdef DMD_ENABLE_AV1
-    /* 开发/调试专用：-DDMD_ENABLE_AV1 才声明 AV1。
-     * 发布版不声明（理由见下方注释），但本设备仍需要能直接测硬件链路，
-     * 所以用编译期开关而不是删掉代码 —— 免得每次调试都手改源文件。 */
+    /* Development/debug special: -DDDD_ENABLE_AV1 is the only AV1 declaration.
+     * The release is not stated (for reasons, see comment below), but the device still needs to be able to directly monitor the hardware chain.
+     * So use the compiler switch instead of deleting the code -- so that every debug can be manually changed. */
     VAProfileAV1Profile0,
 #endif
-    /* ⚠️ AV1 暂不声明（0.4.0 发布版）。
+    /* ⁇  AV1 is not declared (0.4.0 release).
      *
-     * AV1 硬解在本设备上确实可用，但驱动侧的码流合成尚未完全正确：
-     * 实测帧数与 dav1d 一致（150），码流合成 145/150 逐字节相同，
-     * 而像素只有 17/30 个不同画面（软解 30）——
-     * 缺的是 70 个 show_existing_frame 复显帧，详见 doc/av1-v4l2-status.md。
+     * AV1 hardline is available on this device, but the synthesizing of the driver is not yet fully correct:
+     * The number of frames is the same as dav1d (150), the synthesizing 145/150 by bytes,
+     * And there are only 17/30 different images in pixels (soft resolution 30) --
+     * The missing are 70 show_existing_frames, which are detailed in doc/av1-v4l2-status.md.
      *
-     * 在像素校验通过之前声明 AV1 属于虚报：Firefox / ffmpeg 会据此
-     * 把 AV1 解码任务交过来，得到的是重复帧与花屏，比回落软解更糟。
-     * 映射（dmd_profile_to_codec 的 VAProfileAV1Profile0 分支）保留 ——
-     * 它本身无害，等像素通过后把这一行加回声明表即可。
-     * 开发调试用 -DDMD_ENABLE_AV1 编译即可声明（见上方 #ifdef），
-     * 不必手改源文件。
+     * Declares AV1 is a false statement before the pixel verification is passed: Firefox/ ffmpeg will follow
+     * Hand over the AV1 decoding task, and get double frames and flower screens, which are worse than a downscaling.
+     * Map (dmd_profile_to_code)
+     * It is not in itself a good thing, but it can be added to the statement form after the pixels are passed.
+     * The project is a pilot project to develop a version of the pilot - DMDD_ENABLE_AV1 (see #ifdef above) and a new version of the project is available.
+     * No manual changes to source files.
      *
-     * ⚠️ 实测确认的一个行为差异：发布版（不声明 AV1）下，
-     * ffmpeg 的 `-hwaccel vaapi` 遇到未声明的 profile **不会静默回落**，
-     * 而是直接失败退出（rc=69）：
+     * ⁇  One confirmed difference in behaviour: under the release (not declaring AV1) the number of people who are not allowed to live in the country is not the same as the number of people who live in the country.
+     * `-hwackel vaapi ' of ffmpeg meets an undeclared profile ** not to return silently **, but to be able to do so.
+     * Instead, it exits immediately with status 69:
      *     No support for codec av1 profile 0.
      *     Your platform doesn't support hardware accelerated AV1 decoding.
-     * 这是 ffmpeg 的既有语义（-hwaccel 是硬性要求，非"尽力而为"），
-     * 不是本驱动的缺陷 —— 同一码流不带 -hwaccel 时纯软解正常出 30 帧。
-     * 若要自动回落需用 `-hwaccel auto` 或不指定 -hwaccel。
-     * Firefox 走的是能力探测路径，不声明即不会尝试，不受此影响。
+     * This is the ffmpeg's established semantic (-hwaccel is a mandatory requirement, not "do what you can" ),
+     * Not a bug in this drive -- a simple soft resolution of 30 frames when the same stream does not contain -hwaccle.
+     * Use `-hwacel auto ' or not specified -hwacel for auto-dropping.
+     * Firefox is a capability-detector path that is not attempted without a declaration.
      *
-     * ⚠️ VP8 已移除声明（V4L2 直通改造的一部分）。
+     * VP8 has removed the declaration (V4L2 direct to part of the adaptation).
      *
-     * ⚠️⚠️ 更正（第 80 轮实测）：此前这里写"msm_vidc 的 V4L2 层没有
-     * VP80 格式"，**那是错的**。在本机 /dev/video32 上用
-     * VIDIOC_ENUM_FMT 枚举 OUTPUT 侧格式，实测输出：
+     * ⁇  (80th round of live measurements): No V4L2 floor from "msm_vidc"
+     * VP80 format ", ** that's wrong**. Use this on /dev/ video32
+     * INDIOC_ENUM_FMT emulation OF UTPUT side format, actual output:
      *     MPG2  H264  HEVC  VP80  VP90
-     * VP80 明确在列，硬件路径是存在的。
-     * （节点身份已核实：driver=msm_vidc_driver card=msm_vidc_vdec，
-     *   不是枚举失败或探测了错的节点。）
+     * VP80 is clearly in line, hardware paths exist.
+     * (Node ID verified: msm_vidc_driver card=msm_vidc_vdec,
+     *   Not an enumeration failure or detection of incorrect nodes.
      *
-     * 真正不声明 VP8 的理由是**驱动侧没实现它的码流重建**：
-     * VA-API 只给 partition 数据，缺 RFC 6386 §9.1 的 uncompressed chunk，
-     * 需要像 h264/hevc/av1 那样单独写一个合成器，目前没写。
-     * v4l2_backend.c 的 codec 映射对 VP8 返回 0 是这个决定的结果，
-     * 不是硬件能力的反映 —— 此前把它当成了硬件事实，属于因果倒置。
+     * The real reason why VP8 is not stated is that the driver did not recreate its stream:
+     * VA-API only gives data for the partion, missing RFC 6386 § 9.1 uncompressed chiunk,
+     * A synth like h264/hevc/av1 is required and is not written at this time.
+     * The codec map of vP8 returns 0 is the result of this decision.
+     * It's not a reflection of hardware capacity -- it was treated as a hardware fact, and it was a cause-effect reversal.
      *
-     * 所以在实现合成器之前仍不声明（声明了会虚报，Firefox 的 vaapitest
-     * 探针会据此报告 CODEC_HW_VP8 并把任务交过来，然后失败），
-     * 但这是**待实现**而非**不可能**。
+     * So don't say it until the synthesizer is in place.
+     * The probe will report the mission to CODEC_HW_VP8 and then fail.
+     * But that is** to be achieved** and not** impossible**.
      *
-     * 协议 codec 编号 3 保留不复用（见 dmd_client.h:63、
-     * v4l2_backend.h:46），以免与旧 daemon 的线协议撞号。
-     * dmd_profile_to_codec 里的映射也一并移除：
-     * 留着会让 vaCreateConfig 对 VP8 返回成功。 */
+     * Protocol codec 3 Retention not repeated (see dmd_cliet.h:63,
+     * v42_backend.h:46) to avoid collision with the old daemon's line protocol.
+     * The map in dmd_profile_to_codec is also removed:
+     * Keep it will allow vCreateConfig to return to success on VP8. */
 };
 
 #define DMD_NUM_PROFILES ((int)(sizeof(dmd_profiles) / sizeof(dmd_profiles[0])))
 
 int dmd_profile_supported(VAProfile profile)
 {
-    /* 与 dmd_QueryConfigProfiles 的运行时过滤保持一致：固件不支持的
-     * codec 即使在静态表里也不算支持。 */
+    /* Align with dmd_QueryConfigProfiles: Solid not supported
+     * Even in the static form, codec is not supported. */
     if (profile == VAProfileMPEG2Main && !dmd_v4l2_probe(DMD_CODEC_MPEG2))
         return 0;
     if (profile == VAProfileVP8Version0_3 && !dmd_v4l2_probe(DMD_CODEC_VP8))
@@ -199,10 +199,10 @@ int dmd_profile_supported(VAProfile profile)
     return 0;
 }
 
-/* profile → 协议 codec id。
- * 高位深 profile 未验证故不映射。
- * HEVCMain 保留映射但**不在 dmd_profiles 里声明**：映射本身无害，
- * 等 HEVC 码流转发实现后只需把 profile 加回声明表即可。 */
+/* The protocol.
+ * High depth profile is not mapd without authentication.
+ * HEVCMAin reserves the map but does not ** state in dmd_profiles that: The map itself is harmless, but the map is not a good idea.
+ * Once the HEVC stream is implemented, just add the profile back to the statement form. */
 int dmd_profile_to_codec(VAProfile profile)
 {
     switch (profile) {
@@ -214,11 +214,11 @@ int dmd_profile_to_codec(VAProfile profile)
         return DMD_CODEC_HEVC;
     case VAProfileVP9Profile0:
         return DMD_CODEC_VP9;
-    /* VP8：0.4.2 恢复映射，码流重建见 decode.c 的 vp8_build_frame()。 */
+    /* PP8:0.4.2 Restore map, stream reconstruction see vp8_build_frame(). */
     case VAProfileVP8Version0_3:
         return DMD_CODEC_VP8;
-    /* MPEG-2：Simple 与 Main 走同一条 V4L2 路径（MPG2 fourcc）。
-     * Simple 只是限制了 B 帧与色度格式，码流语法是 Main 的真子集。 */
+    /* MPEG-2: Simple takes the same V4L2 path as Main (MPG2 sourcecc).
+     * Simple simply limits B frames and color formatting, and the syntax is the true collection of Main. */
     case VAProfileMPEG2Simple:
     case VAProfileMPEG2Main:
         return DMD_CODEC_MPEG2;
@@ -231,9 +231,9 @@ int dmd_profile_to_codec(VAProfile profile)
     case VAProfileVP9Profile2:
         return DMD_CODEC_VP9;
 #endif
-    /* AV1 Profile0 = Main（8/10bit 4:2:0），Profile1 = High（含 4:4:4）。
-     * 只映射 Profile0：MediaCodec 的 video/av01 不区分 profile，由码流
-     * 序列头自述，但 4:4:4 的输出格式不是 NV12，本驱动的帧回传假设不成立。 */
+    /* AV1 Profile0 = Main (8/10bit 4:2-0), Profile1 = High (including 4:4:4).
+     * Video/ av01 of VideoCodec only map profile0: Undifferentiated profile by bitstream
+     * Sequence headers self-explanatory, but the output format of 4:4:4 is not NV12 and this driver's frameback hypothesis is not valid. */
     case VAProfileAV1Profile0:
         return DMD_CODEC_AV1;
     default:
@@ -247,13 +247,13 @@ VAStatus dmd_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list,
     if (!ctx || !profile_list || !num_profiles)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 运行时能力过滤：静态表只是"驱动实现了码流重建"的声明，最终能不能
-     * 解还要看本机固件。内核 6.6 的新 msm_vidc 上 MPG2/VP80 已从 OUTPUT
-     * 枚举消失（S_FMT 静默回落 H.264，dmesg 报 "unsupported codec"），
-     * 按静态表声明的 VP8 会让消费者把任务交过来然后失败 —— 比不声明
-     * 更糟。probe 用 ENUM_FMT 一次拿全，代价可忽略。 */
+    /* Run capability filtering: The static statement is a statement that "drives re-establishment of the stream", and eventually can it be?
+     * Check the machine solid. New msm_vidc MPG2/VP80 from the kernel is already available from EUTPUT
+     * The list of names disappeared (S_FMT silently returned to H.264, dmesg newspaper "unsupported codec" ), which is a very interesting story.
+     * VP8s are kept in static form, and they're going to let the consumer turn over the task and fail.
+     * Worse. Probe with ENUM_FMT at full cost. */
     static int probed = 0;
-    static unsigned probed_mask = 0;   /* bit: DMD_CODEC_* 值 */
+    static unsigned probed_mask = 0;   /* bit: value of DMD_CODEC_* */
     if (!probed) {
         static const struct { VAProfile p; int codec; } map[] = {
             { VAProfileMPEG2Main, DMD_CODEC_MPEG2 },
@@ -310,7 +310,7 @@ VAStatus dmd_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
     return VA_STATUS_SUCCESS;
 }
 
-/* 该 profile 允许的 RTFormat。
+/* The profile allows RTFormat.
  *
  * HEVC Main10 and AV1 Profile0 can carry 8- or 10-bit samples. The frame's
  * syntax and target surface select NV12/P010; this does not imply conversion
@@ -352,8 +352,8 @@ VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
     if (encoding)
         encode_dimensions(profile, &min_w, &min_h, &max_w, &max_h);
 
-    /* VA-API 约定：调用方传入想查的 attribute type，driver 填 value；
-     * 不支持的项必须填 VA_ATTRIB_NOT_SUPPORTED 而不是报错。 */
+    /* VA-API protocol: caller to enter attachment type, value;
+     * Unsupported entries must be filled in VA_ATTRIB_NOT_SUPPORTED instead of misreporting. */
     for (int i = 0; i < num_attribs; i++) {
         if (encoding) {
             switch (attrib_list[i].type) {
@@ -383,7 +383,7 @@ VAStatus dmd_GetConfigAttributes(VADriverContextP ctx, VAProfile profile,
             attrib_list[i].value = DMD_MAX_HEIGHT;
             break;
         case VAConfigAttribDecSliceMode:
-            /* daemon 接收的是完整 Annex B 数据单元，对应 normal slice 模式。 */
+            /* Damon receives the full AnnetB data module corresponding to the nonmal slice mode. */
             attrib_list[i].value = vpp ? VA_ATTRIB_NOT_SUPPORTED : VA_DEC_SLICE_MODE_NORMAL;
             break;
         default:
@@ -463,8 +463,8 @@ VAStatus dmd_CreateConfig(VADriverContextP ctx, VAProfile profile,
 
         memset(cfg, 0, sizeof(*cfg));
         cfg->in_use = 1;
-        /* ID 从 1 开始：0 留作 VA_INVALID_ID 之外的"未初始化"哨兵，
-         * 避免调用方把 0 误当合法 config。 */
+        /* ID from 1:0 left for "not initialized" sentries outside VA_INVALID_ID,
+         * Avoids calling parties mistaking 0 as legal config. */
         cfg->id = (VAConfigID)(drv->next_config_id++);
         cfg->profile = profile;
         cfg->entrypoint = entrypoint;
@@ -483,12 +483,12 @@ VAStatus dmd_CreateConfig(VADriverContextP ctx, VAProfile profile,
         dmd_log("CreateConfig: profile=%d entrypoint=%d -> config=%u\n",
                 (int)profile, (int)entrypoint, (unsigned)*config_id);
     else
-        dmd_log("CreateConfig: 槽位耗尽（上限 %d）\n", DMD_MAX_CONFIGS);
+        dmd_log("CreateConfig: Depletion of slots (ceiling) %d)\n", DMD_MAX_CONFIGS);
 
     return status;
 }
 
-/* 在已加锁的前提下按 ID 查找 config。 */
+/* Press ID to find config subject subject to locking. */
 static struct dmd_config *find_config_locked(struct dmd_driver *drv,
                                              VAConfigID id)
 {
@@ -539,25 +539,25 @@ VAStatus dmd_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
         *profile = cfg->profile;
         *entrypoint = cfg->entrypoint;
 
-        /* 回报**驱动支持的属性**，不是回显 CreateConfig 的入参。
+        /* Reward**Driver supports **, not echo CreateConfig entry.
          *
-         * 这里曾直接把 cfg->attribs 抄回去 —— 对 ffmpeg 与 Firefox 有效，
-         * 因为它们建 config 时自己就传了 RTFormat，回显恰好等于真值。
+         * The ffmpeg and Firefox are valid for the ffmpeg and the ffrefox, which are the only ones that have been copied back here.
+         * Because they're sending RTFormat when they build config, and the recollection is exactly the same as the real one.
          *
-         * 但 Chrome **不传任何属性**建 config，然后调本函数查询驱动
-         * 支持什么。回显模式下它拿到 num_attribs=0，读不到 RTFormat，
-         * 于是 FillProfileInfo_Locked 判定该 profile 不可用 ——
-         * 六个 profile 全部枚举失败，硬解完全不可用。
+         * But chrome** does not pass any attributes** construct config and then call function query driver
+         * What you're supporting. In echo mode, it gets num_attribs=0, it doesn't read RTFormat,
+         * So FillProfileInfo_Locked determined that the profile was not available...
+         * The six profiles failed and hard-copy is totally unavailable.
          *
-         * VA-API 的语义是"驱动声明能力"，回显是错的。现在无论
-         * CreateConfig 传了什么，RTFormat 一定出现在返回集里。 */
+         * VA-API semantic is "drive the ability to declare," and it's wrong to say it now, either.
+         * CreateConfig has something that RTFormat must be in the back episode. */
         int n = 0;
         int have_rtformat = 0;
         const uint32_t rt = rt_formats_for_profile(cfg->profile);
 
         for (int i = 0; i < cfg->num_attribs && n < DMD_MAX_CONFIG_ATTRIBUTES; i++) {
             if (cfg->attribs[i].type == VAConfigAttribRTFormat) {
-                /* 用驱动真实支持的值覆盖调用方传入的值 */
+                /* Use the actual supported value to overwrite the caller's input */
                 attrib_list[n].type = VAConfigAttribRTFormat;
                 attrib_list[n].value = rt;
                 have_rtformat = 1;
@@ -592,7 +592,7 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     if (!drv || !num_attribs)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* config 必须有效 —— 消费者据此判断该配置下的 surface 能力。 */
+    /* Config must be effective -- consumers judge the capacity of the configuration 's surface. */
     pthread_mutex_lock(&drv->lock);
     struct dmd_config *cfg = find_config_locked(drv, config);
     VAProfile cfg_profile = cfg ? cfg->profile : VAProfileNone;
@@ -612,7 +612,7 @@ VAStatus dmd_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config,
     const int eight_bit = (rt & VA_RT_FORMAT_YUV420) != 0;
     const int ten_bit = (rt & VA_RT_FORMAT_YUV420_10) != 0;
 
-    /* VA-API 约定的两段式查询：attrib_list 为 NULL 时只回报数量。 */
+    /* The two-part query agreed upon by VA-API: only the amount of return when the attrib_list is NULL. */
     const unsigned int needed = 4u + eight_bit + ten_bit + (encoding ? 1u : 0u);
     if (!attrib_list) {
         *num_attribs = needed;
@@ -685,16 +685,16 @@ VAStatus dmd_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
     if (!ctx || !format_list || !num_formats)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 线性半平面两种：NV12(8bit) 与 P010(10bit)。
+    /* Linear half-plane: NV12 (8bit) and P010 (10bit).
      *
-     * ⚠️ *num_formats 是**入参时也是数组容量**（libva 的 in/out 约定），
-     * 只在容量够时才写第二项 —— 否则踩调用方的栈。 */
+     * *num_formats is ** the array capacity when entering ** (libva in/out of the agreement),
+     * Write the second one only when the capacity is enough -- otherwise step on the caller's pad. */
     const int cap = *num_formats;
 
     memset(&format_list[0], 0, sizeof(format_list[0]));
     format_list[0].fourcc = VA_FOURCC_NV12;
     format_list[0].byte_order = VA_LSB_FIRST;
-    format_list[0].bits_per_pixel = 12; /* 平面式 YUV420 每像素 12 bit */
+    format_list[0].bits_per_pixel = 12; /* plane YUV420 per pixel 12 bit */
 
     *num_formats = 1;
     if (cap < 2)
@@ -703,7 +703,7 @@ VAStatus dmd_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list,
     memset(&format_list[1], 0, sizeof(format_list[1]));
     format_list[1].fourcc = VA_FOURCC_P010;
     format_list[1].byte_order = VA_LSB_FIRST;
-    format_list[1].bits_per_pixel = 12; /* 名义位数；有效 10bit 由 fourcc 表达 */
+    format_list[1].bits_per_pixel = 12; /* nominal;effective 10bit expressed by sourcecc */
 
     *num_formats = 2;
     return VA_STATUS_SUCCESS;
@@ -720,8 +720,8 @@ VAStatus dmd_QuerySubpictureFormats(VADriverContextP ctx,
     if (!ctx || !num_formats)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 不支持 subpicture（叠加字幕等）。返回 0 个格式而非报错：
-     * 消费者据此跳过 subpicture 路径。 */
+    /* Not supported subpicture (subtitles, etc.). returns 0 format instead of misreporting:
+     * Consumers skip the subcepture path accordingly. */
     *num_formats = 0;
     return VA_STATUS_SUCCESS;
 }
@@ -735,7 +735,7 @@ VAStatus dmd_QueryDisplayAttributes(VADriverContextP ctx,
     if (!ctx || !num_attributes)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 无可调显示属性（亮度/对比度等由消费者自行处理）。 */
+    /* No-tiff properties (blogness/comparison, etc., are handled by consumers themselves). */
     *num_attributes = 0;
     return VA_STATUS_SUCCESS;
 }
@@ -747,7 +747,7 @@ VAStatus dmd_GetDisplayAttributes(VADriverContextP ctx,
     if (!ctx || (num_attributes > 0 && !attr_list))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-    /* 我们不声明任何显示属性，因此任何查询都标记为不支持。 */
+    /* We do not declare any display properties, so any queries are marked as unsupported. */
     for (int i = 0; i < num_attributes; i++)
         attr_list[i].flags = VA_DISPLAY_ATTRIB_NOT_SUPPORTED;
 

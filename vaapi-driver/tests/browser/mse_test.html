@@ -1,14 +1,14 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>MSE 分段喂流帧序校验</title>
+<title>MSE streaming test</title>
 <style>
  body{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:10px}
  video,canvas{width:400px;background:#000}
  pre{background:#1b1b1b;padding:8px;font-size:12px;max-height:300px;overflow:auto}
 </style>
-<h3>MSE 分段喂流帧序校验</h3>
-<p>用 MediaSource 分块 append，复现在线播放路径（而非 file:// 直读）。<br>
-可选 seek 干扰，用来暴露 seek 后的帧序/时间戳问题。</p>
+<h3>MSE streaming test</h3>
+<p>Append media chunks through MediaSource to exercise streaming playback.<br>
+Enable the optional seek to test frame delivery and timestamps after a seek.</p>
 <video id="v" muted playsinline></video>
 <canvas id="c" width="1280" height="720" style="display:none"></canvas>
 <pre id="l">init</pre>
@@ -56,13 +56,13 @@ function finish(reason){
     totalVideoFrames:pq.totalVideoFrames||0,
     droppedVideoFrames:pq.droppedVideoFrames||0
   };
-  out.textContent='done '+reason+' 采样'+samples.length+' 回退'+back;
+  out.textContent='done '+reason+' samples='+samples.length+' backward='+back;
   fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},
                    body:JSON.stringify(rep)}).catch(()=>{});
 }
 
-if(!window.MediaSource){ out.textContent='无 MediaSource'; finish('no-mse'); }
-else if(!MediaSource.isTypeSupported(MIME)){ out.textContent='不支持 '+MIME; finish('mime-unsupported'); }
+if(!window.MediaSource){ out.textContent='MediaSource unavailable'; finish('no-mse'); }
+else if(!MediaSource.isTypeSupported(MIME)){ out.textContent='unsupported '+MIME; finish('mime-unsupported'); }
 else {
   const ms=new MediaSource();
   v.src=URL.createObjectURL(ms);
@@ -70,10 +70,10 @@ else {
     const sb=ms.addSourceBuffer(MIME);
     let buf;
     try { buf=new Uint8Array(await (await fetch(SRC)).arrayBuffer()); }
-    catch(e){ out.textContent='取流失败 '+e; return finish('fetch-error'); }
+    catch(e){ out.textContent='Fetch failed: '+e; return finish('fetch-error'); }
     events.push('fetched '+buf.length+'B');
 
-    // 分块 append，模拟网络分段到达
+    // Append in chunks to simulate network delivery.
     let off=0;
     function pump(){
       if(off>=buf.length){
@@ -81,19 +81,19 @@ else {
         events.push('endOfStream');
         return;
       }
-      if(sb.updating) return;             // updateend 会再驱动
+      if(sb.updating) return;             // Retry on updateend.
       const end=Math.min(off+CHUNK, buf.length);
       try{ sb.appendBuffer(buf.subarray(off,end)); }
-      catch(e){ events.push('append失败 '+e); return finish('append-error'); }
+      catch(e){ events.push('append failed '+e); return finish('append-error'); }
       off=end;
     }
     sb.addEventListener('updateend', ()=>{
       pump();
       if(v.paused && v.readyState>=2) v.play().catch(()=>{});
     });
-    /* 兜底驱动播放：整段 append 很快就 endOfStream，此后 updateend 不再触发，
-     * 若那时 readyState 还没到 HAVE_CURRENT_DATA 就没人调 play() 了。
-     * 实测症状是只采到 1 帧然后 timeout（totalVideoFrames=4）。 */
+    /* When data is appended in one chunk, updateend can run before the
+     * video reaches HAVE_CURRENT_DATA. Also start playback when data is
+     * ready, or the test can time out after sampling only one frame. */
     v.addEventListener('loadeddata', ()=>v.play().catch(()=>{}));
     v.addEventListener('canplay',    ()=>v.play().catch(()=>{}));
     const kick=setInterval(()=>{
@@ -108,9 +108,9 @@ else {
     function cb(now,md){
       samples.push({mtIdx:Math.round(md.mediaTime*FPS), mt:+md.mediaTime.toFixed(4),
                     sig:signature()});
-      out.textContent='采样 '+samples.length+'/'+TARGET+'\n'+
+      out.textContent='Samples '+samples.length+'/'+TARGET+'\n'+
                       samples.map(s=>s.mtIdx).join(' ');
-      // 采到一半时插一次 seek，复现在线播放里的跳转
+      // Seek forward once halfway through the sample window.
       if(DOSEEK && !seekDone && samples.length===Math.floor(TARGET/2)){
         seekDone=true;
         const t=Math.max(0, v.currentTime+2);

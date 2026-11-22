@@ -1,5 +1,5 @@
-/* 复现驱动的调用节奏：送 1 单元 → 等帧（100ms 超时）→ 再送
- * 与 nodrain 的"紧密连续送料"对照，判定问题是否出在节奏上。 */
+/* Recover driven call rhythm: Send 1 module  ⁇  Framework (100ms timeout)
+ * Compared with the norain "snail stream" to determine whether the problem is on rhythm. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +7,7 @@
 #include "v4l2_backend.h"
 int main(int argc,char**argv){
     int n=atoi(argv[2]);
-    int pattern=(argc>3)?atoi(argv[3]):0;  /* 0=紧密 1=送一等一 */
+    int pattern=(argc>3)?atoi(argv[3]):0;  /* 0: burst, 1: submit and wait one at a time */
     FILE*f=fopen(argv[1],"rb");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
     uint8_t*d=malloc(sz);fread(d,1,sz,f);fclose(f);
     long offs[64],lens[64];int nu=0;long i=0;
@@ -21,7 +21,7 @@ int main(int argc,char**argv){
         i=e;}
     if(n<nu)nu=n;
     struct dmd_v4l2_dec dec;
-    if(dmd_v4l2_open(&dec,4,1920,1080)<0){printf("open 失败\n");return 1;}
+    if(dmd_v4l2_open(&dec,4,1920,1080)<0){printf("open failed\n");return 1;}
     int sent=0,got=0;
     for(int k=0;k<nu;k++){
         while(dmd_v4l2_send(&dec,d+offs[k],lens[k],(uint64_t)(k+1)*1000)==1){
@@ -29,7 +29,7 @@ int main(int argc,char**argv){
             if(dmd_v4l2_recv(&dec,&fd,&fl,&fp,&fi,50)==1){got++;dmd_v4l2_release(&dec,fi);}
         }
         sent++;
-        if(pattern==1){  /* 模拟驱动：每送一个就尝试收一次 */
+        if(pattern==1){  /* Simulation drive: try to collect every delivery */
             uint8_t*fd;size_t fl;uint64_t fp;int fi;
             int r=dmd_v4l2_recv(&dec,&fd,&fl,&fp,&fi,100);
             if(r==1){got++;dmd_v4l2_release(&dec,fi);}
@@ -41,5 +41,5 @@ int main(int argc,char**argv){
         if(r==1){got++;dmd_v4l2_release(&dec,fi);}
         else if(r==2)break;
     }
-    printf("节奏=%s 送 %d 单元, 收 %d 帧\n",pattern?"送一等一":"紧密",sent,got);
+    printf("Rhythm=%s Send %d Module, Take it. %d frame\n",pattern?"First class.":"Close",sent,got);
     dmd_v4l2_close(&dec);return 0;}

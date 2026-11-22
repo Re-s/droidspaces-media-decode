@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""接收 play.html 的测量结果并落盘。
+"""Save a playback measurement posted by play.html to /result.
 
-页面在采样结束时 POST 一条 JSON 到 /result。Wayland 下拿不到窗口标题
-（xdotool / wmctrl 都取不到），所以用这条 HTTP 回传代替。
+Wayland does not expose the window title to xdotool or wmctrl. The page
+posts its JSON results over HTTP instead. The server exits after one report.
 
-用法: sink.py [输出文件] [端口]
-拿到一条结果就退出，便于脚本串联。
+Usage: sink.py [output file] [port]
 """
 import json
 import sys
@@ -48,7 +47,7 @@ class H(BaseHTTPRequestHandler):
 
 
 srv = HTTPServer(("127.0.0.1", PORT), H)
-print(f"[sink] 等待结果 -> {OUT} (port {PORT})", flush=True)
+print(f"[sink] Waiting for results -> {OUT} (port {PORT})", flush=True)
 try:
     srv.serve_forever()
 except SystemExit:

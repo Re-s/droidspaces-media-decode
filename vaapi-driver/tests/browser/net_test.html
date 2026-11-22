@@ -11,7 +11,7 @@ function fin(r){if(done)return;done=true;
  const pq=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
  const idx=f.map(x=>x.i);let b=0,j=[];
  for(let k=1;k<idx.length;k++)if(idx[k]<idx[k-1]){b++;if(j.length<12)j.push(idx[k-1]+'->'+idx[k]);}
- out.textContent='done '+r+' 采样'+idx.length+' 回退'+b;
+ out.textContent='done '+r+' samples='+idx.length+' backward='+b;
  fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({label:q.get('mode')||'net',reason:r,frameIdx:idx,
    mediaTimes:f.map(x=>+x.t.toFixed(4)),backwardCount:b,backwardSamples:j,

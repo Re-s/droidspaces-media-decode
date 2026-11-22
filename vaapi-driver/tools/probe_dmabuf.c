@@ -1,16 +1,16 @@
-/* 能否用 msm_drm 自己分配并导出 dmabuf？
+/* Can you use msm_drm to distribute and export dmabuf?
  *
- * 这决定 vaExportSurfaceHandle 能不能实现 —— 而它是 Firefox 硬解的硬性要求
- * （CreateImageVAAPI 必须拿到 DRM_PRIME_2 描述符，没有回退到拷贝的路径）。
+ * This determines whether the vExportSurfaceHandle can be achieved -- and it's a hard-wipeed requirement for Firefox.
+ * (CreateImageVAAPI must get DRM_PRIME_2 descriptors, no return to the path of the copy).
  *
- * 之前的结论是"零拷贝这条路是死的"，依据是 ION 不可用、没有 /dev/dma_heap、
- * NDK MediaCodec 无法导出输出缓冲的 fd。但那三条都是在说
- * **"拿不到 MediaCodec 自己那块内存的 fd"**，而这里要问的是另一件事：
- * 我们能不能自己分配一块可导出的 dmabuf，然后把解码结果拷进去？
- * 那样依然是"CPU 拷一次"，但对 Firefox 就够了 —— 它要的只是一个
- * 能被 GL/合成器导入的 dmabuf fd，并不要求零拷贝。
+ * The previous conclusion was that "The Zero Copy Road is Dead" based on the basis that Ion is not available, no /dev/dma_heap,
+ * NDK MediaCodec cannot export the fd that produces the buffer. But all three are saying
+ * ** "No MediaCodec can get its own memory of the fd,"** and here's another thing:
+ * Can we just divide a piece of exported dmabuf and then make a copy of the decoding?
+ * That's still "crushing the CPU," but Firefox is enough -- it's just one thing.
+ * dmabuf fd that can be imported by GL/Synthesizer does not require a zero copy.
  *
- * 用 GEM 通用接口试，不引 libdrm 的 msm 私有头。
+ * Try with GEM Universal Interface, without quoting the msm private head of libdram.
  */
 #include <stdio.h>
 #include <string.h>
@@ -25,47 +25,47 @@ int main(void)
 {
     const char *dev = "/dev/dri/renderD128";
     int fd = open(dev, O_RDWR | O_CLOEXEC);
-    if (fd < 0) { printf("打不开 %s: %s\n", dev, strerror(errno)); return 1; }
+    if (fd < 0) { printf("It won’t open. %s: %s\n", dev, strerror(errno)); return 1; }
 
-    /* 1) 先看驱动名 */
+    /* 1) The driver name first */
     struct drm_version ver;
     char name[64] = {0};
     memset(&ver, 0, sizeof(ver));
     ver.name = name;
     ver.name_len = sizeof(name) - 1;
     if (ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0)
-        printf("驱动: %s %d.%d.%d\n", name, ver.version_major,
+        printf("Driver: %s %d.%d.%d\n", name, ver.version_major,
                ver.version_minor, ver.version_patchlevel);
 
-    /* 2) DUMB buffer：GEM 的通用分配接口，很多驱动都支持。
-     *    1920x1088 NV12 需要 stride*height*3/2。用 8bpp 单平面凑够大小。 */
+    /* 2) DUMB buffer: GEM 's Universal Allocation Interface, supported by many drivers.
+     *    1920x1088 NV12 requires stride*height*3/2. */
     struct drm_mode_create_dumb creq;
     memset(&creq, 0, sizeof(creq));
     creq.width  = 1920;
-    creq.height = 1088 * 3 / 2;   /* NV12 总行数 */
+    creq.height = 1088 * 3 / 2;   /* NV12 Total rows */
     creq.bpp    = 8;
     if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) != 0) {
-        printf("DRM_IOCTL_MODE_CREATE_DUMB 失败: %s\n", strerror(errno));
-        printf("→ dumb buffer 不可用（render node 通常不支持 dumb，属正常）\n");
+        printf("DRM_IOCTL_MODE_CREATE_DUMB failed: %s\n", strerror(errno));
+        printf("→ dumb buffer unavailable(render node Not usually supported dumb,Normal)\n");
         close(fd);
         return 2;
     }
-    printf("dumb buffer 分配成功: handle=%u stride=%u size=%llu\n",
+    printf("dumb buffer Distribution Success: handle=%u stride=%u size=%llu\n",
            creq.handle, creq.pitch, (unsigned long long)creq.size);
 
-    /* 3) 关键一步：能否导出成 dmabuf fd */
+    /* 3) Key step: Is it possible to export to dmabuf fd */
     struct drm_prime_handle prime;
     memset(&prime, 0, sizeof(prime));
     prime.handle = creq.handle;
     prime.flags  = DRM_CLOEXEC | DRM_RDWR;
     if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
-        printf("PRIME_HANDLE_TO_FD 失败: %s\n", strerror(errno));
+        printf("PRIME_HANDLE_TO_FD failed: %s\n", strerror(errno));
         close(fd);
         return 3;
     }
-    printf("✓ 导出 dmabuf fd = %d\n", prime.fd);
-    printf("→ vaExportSurfaceHandle 可以实现：自己分配可导出 buffer，\n");
-    printf("  把 daemon 回传的帧拷进去，再交出 fd\n");
+    printf("✓ Export dmabuf fd = %d\n", prime.fd);
+    printf("→ vaExportSurfaceHandle Achieved: Exportable by assigning yourself buffer,\n");
+    printf("  Take it. daemon The back frame is in. Give it to me. fd\n");
     close(prime.fd);
     close(fd);
     return 0;

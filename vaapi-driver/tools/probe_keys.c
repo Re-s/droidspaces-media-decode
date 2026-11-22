@@ -1,10 +1,10 @@
-/* 能否让 MediaCodec 在浅队列（3 个输入单元）就吐首帧？
+/* Can you get MediaCodec to spit the header frame in the shallow queue (3 input units)?
  *
- * 这是"根治黑帧"的关键：若能做到，就完全不需要排空/重建，
- * 参考帧链不断，画面自然正确。已知 low-latency=1 无效（滞后仍是 4）。
+ * It's the key to the "black-control frame": if we can do this, we don't need to emptify/rebuild at all.
+ * The frame of reference is constantly in place, and the image is naturally correct. Low-latency=1 known to be invalid (delay is still 4).
  *
- * 这里逐个试候选配置，量每种配置下的滞后深度（送几个 VCL 才出首帧）。
- * 滞后 <= 3 即为可用。
+ * Here, try the profile one by one, measuring the lag depth of each configuration (a few VCLs are sent out of the frame).
+ * A lag of < = 3 is available.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,7 +50,7 @@ static unsigned char *sps, *pps;
 static long sps_len, pps_len, vo[64], vl[64];
 static int nv;
 
-/* 返回滞后深度：送第几个 VCL 时首帧出现。-1 = 送完 8 个都没出 */
+/* Returns the lag depth: The first frame appears when sending the first VCL. 1 = 8 undelivered */
 static int measure(const char *label, void (*tweak)(AMediaFormat *))
 {
     AMediaCodec *c = AMediaCodec_createDecoderByType("video/avc");
@@ -62,7 +62,7 @@ static int measure(const char *label, void (*tweak)(AMediaFormat *))
     if (tweak) tweak(fmt);
 
     if (AMediaCodec_configure(c, fmt, NULL, NULL, 0) != AMEDIA_OK) {
-        printf("%-46s configure 失败\n", label);
+        printf("%-46s configure failed\n", label);
         AMediaFormat_delete(fmt); AMediaCodec_delete(c);
         return -2;
     }
@@ -85,7 +85,7 @@ static int measure(const char *label, void (*tweak)(AMediaFormat *))
         memcpy(ib, data + vo[i], vl[i]);
         AMediaCodec_queueInputBuffer(c, bi, 0, vl[i], (int64_t)i * 33333, 0);
 
-        /* 给足时间：确认不是"来不及"而是"真不出" */
+        /* Give me time: Make sure it's not "no time," but "no time." */
         for (int spin = 0; spin < 15; spin++) {
             AMediaCodecBufferInfo info;
             ssize_t oi = AMediaCodec_dequeueOutputBuffer(c, &info, 20000);
@@ -97,9 +97,9 @@ static int measure(const char *label, void (*tweak)(AMediaFormat *))
         }
     }
 
-    printf("%-46s 滞后 %s%s\n", label,
-           lag < 0 ? "未出帧" : (lag == 1 ? "1" : lag == 2 ? "2" : lag == 3 ? "3" : "4+"),
-           (lag > 0 && lag <= 3) ? "  ← 可用!" : "");
+    printf("%-46s Delay %s%s\n", label,
+           lag < 0 ? "No frame out." : (lag == 1 ? "1" : lag == 2 ? "2" : lag == 3 ? "3" : "4+"),
+           (lag > 0 && lag <= 3) ? "  ← Available!" : "");
 
     AMediaCodec_stop(c);
     AMediaCodec_delete(c);
@@ -136,7 +136,7 @@ static void k_numref(AMediaFormat *f) {
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/data/local/tmp/test1080.h264";
-    if (load(path) < 0) { printf("读不了 %s\n", path); return 1; }
+    if (load(path) < 0) { printf("I can’t read it. %s\n", path); return 1; }
 
     long off = 0, len;
     while ((off = next_nalu(off, &len)) >= 0 && nv < 64) {
@@ -146,18 +146,18 @@ int main(int argc, char **argv)
         else if (nut == 1 || nut == 5) { vo[nv] = off - 3; vl[nv] = len + 3; nv++; }
         off += len;
     }
-    if (!sps || !pps || nv < 8) { printf("码流不足\n"); return 1; }
-    printf("目标：滞后 <= 3（消费者稳态在飞 3 帧）\n\n");
+    if (!sps || !pps || nv < 8) { printf("We’re running out of yards.\n"); return 1; }
+    printf("Target: behind schedule <= 3(Consumer stability is flying. 3 frame)\n\n");
 
-    measure("① 默认（无任何键）", k_none);
-    measure("② low-latency=1（当前 daemon 用的）", k_lowlat);
+    measure("① Default (no key))", k_none);
+    measure("② low-latency=1(current daemon It’s for.)", k_lowlat);
     measure("③ low-latency + max-output-reorder-frames=0", k_maxreorder);
     measure("④ vendor.qti-ext-dec-low-latency.enable=1", k_vendorlowlat);
     measure("⑤ vendor.qti-ext-dec-picture-order.enable=1", k_vendorpicorder);
-    measure("⑥ vendor 两个都开", k_vendorboth);
+    measure("⑥ vendor Both of them.", k_vendorboth);
     measure("⑦ low-latency + output-delay=0", k_outputdelay);
     measure("⑧ vendor low-latency + output-delay + reorder=0", k_numref);
 
-    printf("\n若有任一配置滞后 <= 3，就能彻底不用排空/重建，黑帧问题随之消失。\n");
+    printf("\n If any configuration lags <= 3,I’ll be completely free of the drain./Rebuild, black frame problems disappear..\n");
     return 0;
 }

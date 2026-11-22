@@ -1,28 +1,28 @@
 /*
- * probe_av1_feed —— 把 AV1 OBU temporal unit 直送 /dev/video32，绕过 VA-API 驱动
+ * Probe_av1_feed -- direct AV1 OBU temporal unit /dev/ video32, bypassing VA-API driver
  *
- * 用途：判定"AV1 出帧不对"是驱动的码流合成有问题，还是硬件/内核侧的问题。
- * 这是第 68 轮定位 AV1 缺陷的关键手段 —— 当年用的是 tools/av1_probe.py
- * （走 daemon 线协议）。daemon 在 0.4.0 已删除，故重写为 V4L2 版。
+ * Uses: whether the "AV1" frame is determined to be a driver-driven coding stream synthesis or a hardware/kernel side issue.
+ * This is the key to 68th wheel positioning AV1 defects -- the sames/ av1_probe. py used in the year.
+ * (go daemon line protocol). Daemon was deleted at 0.4.0, so rewrite to V4L2.
  *
- * 判据：
- *   直送源码流能吐满帧   → 硬件没问题，缺陷在驱动的 OBU 合成
- *   直送源码流也吐不满   → 硬件/内核侧的问题，与合成无关
+ * The verdict is:
+ *   Direct source stream can fill the frame  ⁇  Hardware is fine, bug is driving OBU synthesis
+ *   • Hardware/kernel side problem, not synthesis.
  *
- * 历史结论（第 68 轮，用 daemon 版探针测得，判据同上）：
- *   源码流 av1_1080p.obu 直送：送 150 单元、收 **150** 帧
- *   驱动合成流：           送 150 单元、收  **80** 帧
- * 两条流的 OBU 构成差异只有一项：源码流含 70 个 show_existing_frame
- * FRAME_HEADER，合成流一个都没有。所以硬件会为每个 SEF 头复显一次，
- * 缺的正是这 70 个头 —— 这条结论当年推翻了"SEF 复显由 ffmpeg 自行完成"。
+ * Historical conclusions (round 68, measured with daemon probes, as per the following:
+ *   Source stream av1_1080p.obu direct: transport 150 units, take **150** frame
+ *   Driver of synthetic streams: Send 150 units, take **80** frame
+ * Two streams of OBU make up only one difference: 70 source streams show_existing_frame
+ * FRAME_HEADER, None of the synthetic streams. So hardware will resurface for every SEEF.
+ * The missing is this 70 head -- this conclusion was reversed in the year that "SEF rediscovers that ffmpeg did it himself."
  *
- * 用法：
+ * Usage:
  *   cc -O2 -o probe_av1_feed probe_av1_feed.c
- *   ./probe_av1_feed <file.obu> [单元数上限]
+ *   .../probe_av1_feed<file.obu> [cell ceiling]
  *
- * ⚠️ burst 语义：一次性灌入全部单元再统一收帧。AV1 解码器有 output delay，
- * 逐单元等帧会死锁（它要收满 N 个输入才吐第一帧，而我们在等第一帧）。
- * 这个坑当年在 daemon 版上踩过，这里沿用 burst。
+ * ⁇ burg semantic: AV1 decoder with output delay,
+ * The lock is locked on a unit-by-unit basis (it has to fill up with N input before throwing up the first frame, and we're waiting for the first frame).
+ * This pit was stepped on the daemon page, and it's the only place we're gonna be.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -37,7 +37,7 @@
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 
-/* dma-heap 分配（本内核 OUTPUT/CAPTURE 都只收 DMABUF）。 */
+/* dma-heap allocation (the core of which is OTPUT/CAPTURE only receives DMABUF). */
 struct dma_heap_allocation_data {
     __u64 len;
     __u32 fd;
@@ -74,7 +74,7 @@ static unsigned char *slurp(const char *p, size_t *n)
     return b;
 }
 
-/* 读 leb128，返回值，*len 写入占用字节数。 */
+/* Read the lib128, return the value, *len writes the byte count. */
 static uint64_t leb128(const unsigned char *d, size_t cap, size_t *len)
 {
     uint64_t v = 0; size_t i = 0;
@@ -86,7 +86,7 @@ static uint64_t leb128(const unsigned char *d, size_t cap, size_t *len)
     return v;
 }
 
-/* 从 pos 起找下一个 temporal delimiter 的偏移（即下一个 TU 的开始）。 */
+/* Find the next deviation from pos (the next TU). */
 static size_t next_td(const unsigned char *d, size_t n, size_t pos)
 {
     size_t p = pos;
@@ -95,7 +95,7 @@ static size_t next_td(const unsigned char *d, size_t n, size_t pos)
         int has_size = (d[p] >> 1) & 1;
         size_t hdr = 1;
         if ((d[p] >> 2) & 1) hdr++;            /* extension */
-        if (!has_size) return n;               /* 无 size 字段，无法继续 */
+        if (!has_size) return n;               /* No size field, cannot continue */
         size_t szlen = 0;
         uint64_t sz = leb128(d + p + hdr, n - p - hdr, &szlen);
         size_t total = hdr + szlen + (size_t)sz;
@@ -109,15 +109,15 @@ static size_t next_td(const unsigned char *d, size_t n, size_t pos)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "用法: %s <file.obu> [单元数上限]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <file.obu> [Unit ceiling]\n", argv[0]);
         return 2;
     }
     const int cap_units = (argc > 2) ? atoi(argv[2]) : 0;
 
     size_t flen = 0;
     unsigned char *data = slurp(argv[1], &flen);
-    if (!data) { fprintf(stderr, "读不到 %s\n", argv[1]); return 1; }
-    printf("  输入 %s，%zu 字节\n", argv[1], flen);
+    if (!data) { fprintf(stderr, "Can’t read. %s\n", argv[1]); return 1; }
+    printf("  Enter %s,%zu bytes\n", argv[1], flen);
 
     int fd = open("/dev/video32", O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("  open /dev/video32"); free(data); return 1; }
@@ -131,8 +131,8 @@ int main(int argc, char **argv)
     f.fmt.pix_mp.num_planes = 1;
     f.fmt.pix_mp.plane_fmt[0].sizeimage = 8 << 20;
     if (ioctl(fd, VIDIOC_S_FMT, &f) < 0) {
-        printf("  S_FMT(AV10) 失败: %s\n", strerror(errno));
-        printf("  → 该设备的 msm_vidc 可能不支持 AV1；用 v4l2_enum_fmt 确认\n");
+        printf("  S_FMT(AV10) failed: %s\n", strerror(errno));
+        printf("  → The device msm_vidc Maybe not. AV1;Use v4l2_enum_fmt Confirm\n");
         close(fd); free(data); return 1;
     }
     const size_t isz = f.fmt.pix_mp.plane_fmt[0].sizeimage;
@@ -142,22 +142,22 @@ int main(int argc, char **argv)
     memset(&rb, 0, sizeof(rb));
     rb.count = 64; rb.type = f.type; rb.memory = V4L2_MEMORY_DMABUF;
     if (ioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
-        printf("  REQBUFS(OUTPUT/DMABUF) 失败: %s\n", strerror(errno));
+        printf("  REQBUFS(OUTPUT/DMABUF) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     printf("  REQBUFS(DMABUF) ok，count=%u\n", rb.count);
-    /* 8 个 OUTPUT dmabuf（本内核 OUTPUT 只收 DMABUF，不支持 MMAP）。 */
+    /* 8 OTPUT dmabuf (the core of this UTPUT only receives DMABUF and does not support MMAP). */
     void *bufs[64];
     int ofd[64];
     for (int i = 0; i < 64; i++) {
         ofd[i] = dmabuf_alloc(isz);
         if (ofd[i] < 0) {
-            printf("  dma_heap 分配 OUTPUT %d 失败: %s\n", i, strerror(errno));
+            printf("  dma_heap allocate OUTPUT %d failed: %s\n", i, strerror(errno));
             close(fd); free(data); return 1;
         }
         bufs[i] = mmap(NULL, isz, PROT_READ | PROT_WRITE, MAP_SHARED, ofd[i], 0);
         if (bufs[i] == MAP_FAILED) {
-            printf("  mmap(OUTPUT dmabuf %d) 失败: %s\n", i, strerror(errno));
+            printf("  mmap(OUTPUT dmabuf %d) failed: %s\n", i, strerror(errno));
             close(fd); free(data); return 1;
         }
     }
@@ -169,11 +169,11 @@ int main(int argc, char **argv)
 
     unsigned t = f.type;
     if (ioctl(fd, VIDIOC_STREAMON, &t) < 0) {
-        printf("  STREAMON(OUTPUT) 失败: %s\n", strerror(errno));
+        printf("  STREAMON(OUTPUT) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
 
-    /* 切分并 burst 灌入（缓冲已映射）。 */
+    /* Cut and burst into (buffer map). */
 
     size_t pos = 0, sent = 0;
     int got_sc = 0;
@@ -195,7 +195,7 @@ int main(int argc, char **argv)
         pl[0].length = (unsigned)isz; pl[0].bytesused = len;
 
         if (ioctl(fd, VIDIOC_QBUF, &b) < 0) {
-            /* 队列满是正常的，回收一个再试。 */
+            /* The queue is full and normal, and one is recycled again. */
             struct pollfd pf = { .fd = fd, .events = POLLOUT | POLLPRI };
             poll(&pf, 1, 500);
             if (pf.revents & POLLPRI) {
@@ -203,7 +203,7 @@ int main(int argc, char **argv)
                 if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0 &&
                     ev.type == V4L2_EVENT_SOURCE_CHANGE && !got_sc) {
                     got_sc = 1;
-                    printf("  ✓ SOURCE_CHANGE 在第 %zu 个单元后到达\n", sent);
+                    printf("  ✓ SOURCE_CHANGE At %zu Unit is arriving.\n", sent);
                 }
             }
             struct v4l2_buffer d; struct v4l2_plane dp[1];
@@ -211,12 +211,12 @@ int main(int argc, char **argv)
             d.type = f.type; d.memory = V4L2_MEMORY_DMABUF;
             d.m.planes = dp; d.length = 1;
             if (ioctl(fd, VIDIOC_DQBUF, &d) < 0) {
-                printf("  第 %zu 个单元 QBUF 失败且无缓冲可回收: %s\n",
+                printf("  number %zu Units QBUF Failed without buffer to recover: %s\n",
                        sent, strerror(errno));
                 break;
             }
             if (ioctl(fd, VIDIOC_QBUF, &b) < 0) {
-                printf("  第 %zu 个单元重试 QBUF 仍失败: %s\n",
+                printf("  number %zu Retry Unit QBUF Still failed: %s\n",
                        sent, strerror(errno));
                 break;
             }
@@ -224,7 +224,7 @@ int main(int argc, char **argv)
         sent++;
         pos = end;
     }
-    printf("  送入 %zu 个 temporal unit\n", sent);
+    printf("  Send In %zu  temporal unit\n", sent);
 
     if (!got_sc) {
         struct pollfd pf = { .fd = fd, .events = POLLPRI };
@@ -232,18 +232,18 @@ int main(int argc, char **argv)
             struct v4l2_event ev; memset(&ev, 0, sizeof(ev));
             if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
                 got_sc = 1;
-                printf("  ✓ SOURCE_CHANGE 在灌完后到达\n");
+                printf("  ✓ SOURCE_CHANGE We’re here after the irrigation.\n");
             }
         }
     }
     if (!got_sc) {
-        printf("  ✗ 始终没有 SOURCE_CHANGE —— 固件没解析码流\n");
-        printf("  → 这与码流内容无关，是设备的解码会话起不来；\n");
-        printf("    先跑 probe_device_support 确认该设备是否可用\n");
+        printf("  ✗ Never. SOURCE_CHANGE —— Solid does not parse code stream\n");
+        printf("  → It’s not about the flow. It’s about the decoding session.;\n");
+        printf("    Run first. probe_device_support Confirm whether the equipment is available\n");
         close(fd); free(data); return 1;
     }
 
-    /* CAPTURE 侧协商并收帧。 */
+    /* CAPTURE side-view consultation and collection. */
     struct v4l2_format cf;
     memset(&cf, 0, sizeof(cf));
     cf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -262,7 +262,7 @@ int main(int argc, char **argv)
     memset(&crb, 0, sizeof(crb));
     crb.count = 64; crb.type = cf.type; crb.memory = V4L2_MEMORY_DMABUF;
     if (ioctl(fd, VIDIOC_REQBUFS, &crb) < 0) {
-        printf("  REQBUFS(CAPTURE) 失败: %s\n", strerror(errno));
+        printf("  REQBUFS(CAPTURE) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     void *cb[64];
@@ -300,15 +300,15 @@ int main(int argc, char **argv)
             FILE *df = fopen(nm, "wb");
             if (df) { fwrite(cb[d.index], 1, csz, df); fclose(df); }
         }
-        ioctl(fd, VIDIOC_QBUF, &d);          /* 立刻还回去继续收 */
+        ioctl(fd, VIDIOC_QBUF, &d);          /* Return it now and keep it. */
     }
 
-    printf("\n  ===== 结果 =====\n");
-    printf("  送入 %zu 单元，收到 %zu 帧\n", sent, frames);
+    printf("\n  ===== result =====\n");
+    printf("  Send In %zu Unit, copy. %zu frame\n", sent, frames);
     if (frames >= sent)
-        printf("  → 硬件能吐满：AV1 缺陷在驱动的 OBU 合成侧\n");
+        printf("  → Hardware can be filled with it.:AV1 The bug is driving. OBU Synthetic Sides\n");
     else
-        printf("  → 硬件只吐 %zu/%zu：先排查硬件/内核侧，再看合成\n",
+        printf("  → Hardware only vomits. %zu/%zu:Check the hardware first./kernel side, look at synthesis.\n",
                frames, sent);
 
     close(fd); free(data);

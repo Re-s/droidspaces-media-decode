@@ -1,37 +1,37 @@
-/* 复现 Chrome 的 VA-API 使用模式，脱离浏览器定位 vaEndPicture 失败。
+/* The VA-API mode for the recurrence of Chrome failed to locate vEndPicture from the browser.
  *
- * 为什么需要它：Chrome 的失败只在浏览器里出现，而浏览器有太多变量
- * （GPU 进程、沙箱、合成器、播放节奏）。ffmpeg 复现不了，因为它的用法
- * 和 Chrome 在两个关键点上不同：
+ * Why it is needed: Chrome's failure only occurs in the browser, which has too many variables
+ * (GPU process, sandbox, synthesizer, play rhythm) ffmpeg cannot be repeated because of its usage
+ * Unlike Chrome, on two key points:
  *
- *   1. Chrome 建 config **不传任何属性**（ffmpeg 会传 RTFormat）
- *   2. Chrome 一次性提交大批解码请求，不等取帧（ffmpeg 严格交错）
+ *   Chrome construct config** does not pass any properties** (ffmpeg will pass RTFormat)
+ *   2. Chrome submitted a large number of decoding requests at one time, with no reference to the frame (ffmpeg strictly staggered)
  *
- * 本探针把这两点分别做成开关，逐个验证哪一个触发 vaEndPicture 失败。
+ * This probe turns the two points into switches, which, on a case-by-case basis, triggers the failure of vEndPicture.
  *
- * 用法：
- *   probe_chrome_pattern <h264/h265 裸流> [--no-attrib] [--burst N] [--codec hevc]
+ * Usage:
+ *   Probe_chrome_pattern <h264/h265 Naked [-no-attrib] [-burg N] [-codec hevc]
  *
- *   --no-attrib   建 config 时不传 RTFormat（Chrome 行为）
- *   --burst N     连续提交 N 帧后才开始取帧（默认 1 = 严格交错）
- *   --codec hevc  用 HEVC（默认 h264）
+ *   -no-attrib construct config without RTFormat (Chrome Behaviour)
+ *   --burst N is submitted continuously to N frames before the frame is removed (default 1 = strict staggered)
+ *   - ..codec hevc with HEVC (default h264)
  *
- * 判定：只看 vaEndPicture / vaSyncSurface 的返回码与失败时机。
+ * Determined: Only the return code and failure timing of vEndPicture/ vASyncSurface.
  *
- * ⚠️ 两条局限，读输出前必须知道：
+ * ⁇  Two limitations, which must be known before reading the output:
  *
- * 1. **不检查画面内容**。它只能定位"调用失败"，绝不能用来判断解码是否
- *    正确 —— 那必须逐字节比对软解基线。（本项目已因"只数帧数不看像素"
- *    栽过三次。）
+ * 1. ** No check of the contents**. It can only locate "call failure" and must not be used to determine whether the decoding is correct.
+ *    Correct -- that must be a byte-to-by-the-line softening baseline.
+ *    Three times.
  *
- * 2. **本探针不发送参数集（SPS/PPS/VPS），只送 VCL slice。**
- *    所以解码器本来就无法正常解码，`vaSyncSurface 失败` 数偏高是**预期
- *    行为**，不是驱动缺陷。实测一次典型输出是"同步成功=29 Sync失败=59"，
- *    那 59 次失败**全部来自本探针自身不完整**，看到它不要去查驱动。
+ * 2. ** This probe does not send the Set of Parameters (SPS/PPS/VPS), only VCL slice**.
+ *    So the decoding device could not have been decoded properly. `vaSyncSurface failed ' , the high number is **
+ *    Behaviour**, not drive defects. A typical output is "Sync Success=29 Sync Failure=59,"
+ *    And that 59 failures** all came from the incompleteness of the probe itself, and see it do not look for the drive.
  *
- *    本探针唯一有意义的观测量是 **vaEndPicture 的返回码与首次失败位置** ——
- *    它反映驱动内部状态机（队列容量、背压）的行为，与画面无关。
- *    要验证解码正确性，用 ffmpeg 逐字节比对，不要用这个。
+ *    The only meaningful observation of this probe is the return code and the first failed position of **vaEndPicture** —
+ *    It reflects the behaviour of the internal state-driven machine (queuing capacity, back pressure) and is not relevant to the image.
+ *    To verify the decoding correct, use ffmpeg to match bytes, do not use this.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -48,12 +48,12 @@ static const char *st(VAStatus s)
     return vaErrorStr(s);
 }
 
-/* 找下一个 Annex-B 起始码，返回 NALU 起点与长度 */
+/* Find a next Annex-B startup, returns NALU start and length */
 static int next_nalu(const uint8_t *b, size_t len, size_t *pos,
                      const uint8_t **out, size_t *out_len)
 {
     size_t i = *pos;
-    /* 跳到起始码 */
+    /* Jump to Start Code */
     while (i + 3 < len) {
         if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1)
             break;
@@ -79,7 +79,7 @@ static int next_nalu(const uint8_t *b, size_t len, size_t *pos,
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "用法: %s <裸流> [--no-attrib] [--burst N] [--codec hevc]\n",
+        fprintf(stderr, "Usage: %s <Naked.> [--no-attrib] [--burst N] [--codec hevc]\n",
                 argv[0]);
         return 2;
     }
@@ -97,8 +97,8 @@ int main(int argc, char **argv)
     if (burst < 1)
         burst = 1;
 
-    printf("模式: %s属性 / burst=%d / codec=%s\n",
-           no_attrib ? "不传" : "传", burst, is_hevc ? "hevc" : "h264");
+    printf("Mode: %s Properties / burst=%d / codec=%s\n",
+           no_attrib ? "No, no, no." : "Pass.", burst, is_hevc ? "hevc" : "h264");
 
     FILE *f = fopen(path, "rb");
     if (!f) { perror("fopen"); return 1; }
@@ -107,7 +107,7 @@ int main(int argc, char **argv)
     fseek(f, 0, SEEK_SET);
     uint8_t *buf = malloc((size_t)fsz);
     if (!buf || fread(buf, 1, (size_t)fsz, f) != (size_t)fsz) {
-        fprintf(stderr, "读文件失败\n"); return 1;
+        fprintf(stderr, "Failed to read file\n"); return 1;
     }
     fclose(f);
 
@@ -115,7 +115,7 @@ int main(int argc, char **argv)
     if (drm_fd < 0) { perror("open renderD128"); return 1; }
 
     VADisplay dpy = vaGetDisplayDRM(drm_fd);
-    if (!dpy) { fprintf(stderr, "vaGetDisplayDRM 失败\n"); return 1; }
+    if (!dpy) { fprintf(stderr, "vaGetDisplayDRM failed\n"); return 1; }
 
     int major, minor;
     VAStatus s = vaInitialize(dpy, &major, &minor);
@@ -126,7 +126,7 @@ int main(int argc, char **argv)
 
     VAProfile prof = is_hevc ? VAProfileHEVCMain : VAProfileH264High;
 
-    /* ---- 关键差异 1：建 config 时传不传属性 ---- */
+    /* - Key difference 1: no properties to pass on when building config */
     VAConfigID cfg;
     if (no_attrib) {
         s = vaCreateConfig(dpy, prof, VAEntrypointVLD, NULL, 0, &cfg);
@@ -139,13 +139,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "vaCreateConfig: %s\n", st(s)); return 1;
     }
 
-    /* Chrome 会回查驱动声明了什么 —— 复现这一步 */
+    /* Reproduce Chrome querying the entry points advertised by the driver. */
     {
         VAConfigAttrib got[16];
         int n = 16;
         VAProfile p2; VAEntrypoint e2;
         s = vaQueryConfigAttributes(dpy, cfg, &p2, &e2, got, &n);
-        printf("QueryConfigAttributes: %s  返回 %d 个属性",
+        printf("QueryConfigAttributes: %s  return %d Properties",
                st(s), s == VA_STATUS_SUCCESS ? n : 0);
         if (s == VA_STATUS_SUCCESS) {
             int has_rt = 0;
@@ -154,7 +154,7 @@ int main(int argc, char **argv)
                     has_rt = 1;
                     printf("  RTFormat=0x%x", got[i].value);
                 }
-            printf("  %s\n", has_rt ? "（含 RTFormat ✓）" : "（缺 RTFormat ✗）");
+            printf("  %s\n", has_rt ? "(Ham RTFormat ✓)" : "(Not available RTFormat ✗)");
         } else {
             printf("\n");
         }
@@ -174,7 +174,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "vaCreateContext: %s\n", st(s)); return 1;
     }
 
-    /* ---- 关键差异 2：连续提交 burst 帧后才取帧 ---- */
+    /* - Key difference 2: continuously submitting burst frame before removing frame - */
     size_t pos = 0;
     const uint8_t *nalu; size_t nlen;
     int submitted = 0, synced = 0, endpic_fail = 0, sync_fail = 0;
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
         if (nlen == 0)
             continue;
         int nut = is_hevc ? ((nalu[0] >> 1) & 0x3f) : (nalu[0] & 0x1f);
-        /* 只提交 VCL：h264 1..5 / hevc 0..31 */
+        /* Submission only VCL: h264 1.5 /hevc 0.31 */
         int is_vcl = is_hevc ? (nut <= 31) : (nut >= 1 && nut <= 5);
         if (!is_vcl)
             continue;
@@ -195,11 +195,11 @@ int main(int argc, char **argv)
 
         s = vaBeginPicture(dpy, ctx, tgt);
         if (s != VA_STATUS_SUCCESS) {
-            printf("vaBeginPicture 第 %d 帧失败: %s\n", submitted, st(s));
+            printf("vaBeginPicture number %d Frame Failed: %s\n", submitted, st(s));
             break;
         }
 
-        /* 送一个 slice data buffer（内容不重要，本探针只看调用成败） */
+        /* Send a slick data buffer (the probe is not important, it's only for call success) */
         VABufferID bid;
         s = vaCreateBuffer(dpy, ctx, VASliceDataBufferType,
                            (unsigned)nlen, 1, (void *)nalu, &bid);
@@ -212,11 +212,11 @@ int main(int argc, char **argv)
             if (first_fail_at < 0) {
                 first_fail = s;
                 first_fail_at = submitted;
-                printf("★ vaEndPicture 首次失败于第 %d 帧: %s\n",
+                printf("★ vaEndPicture First failed %d frame: %s\n",
                        submitted, st(s));
             }
             if (endpic_fail > 5) {
-                printf("失败过多，停止\n");
+                printf("Too many failures. Stop.\n");
                 break;
             }
         } else {
@@ -225,14 +225,14 @@ int main(int argc, char **argv)
         }
         submitted++;
 
-        /* 攒够 burst 才取帧 */
+        /* We'll have to save enough for the frame. */
         if (nin >= burst) {
             for (int k = 0; k < nin; k++) {
                 VAStatus ss = vaSyncSurface(dpy, surf[inflight[k]]);
                 if (ss != VA_STATUS_SUCCESS) {
                     sync_fail++;
                     if (sync_fail <= 3)
-                        printf("  vaSyncSurface 失败: %s\n", st(ss));
+                        printf("  vaSyncSurface failed: %s\n", st(ss));
                 } else {
                     synced++;
                 }
@@ -244,13 +244,13 @@ int main(int argc, char **argv)
             break;
     }
 
-    printf("\n结果: 提交=%d 同步成功=%d EndPicture失败=%d Sync失败=%d\n",
+    printf("\n result: Submit=%d Sync successfully=%d EndPicture failed=%d Sync failed=%d\n",
            submitted, synced, endpic_fail, sync_fail);
     if (first_fail_at >= 0)
-        printf("首次 EndPicture 失败: 第 %d 帧, %s\n",
+        printf("First EndPicture failed: number %d frame, %s\n",
                first_fail_at, st(first_fail));
     else
-        printf("EndPicture 全程无失败\n");
+        printf("EndPicture No failure at all.\n");
 
     vaDestroyContext(dpy, ctx);
     vaDestroySurfaces(dpy, surf, NSURF);

@@ -1,22 +1,22 @@
 /*
- * dmd_client.h - decode-daemon 客户端库（供 VA-API driver 内部使用）
+ * dmd_clit.h - decode-daemon client library (for internal use by VA-API triver)
  *
- * 这个库把「容器侧作为 Android decode-daemon 的客户端」这件事封装成一个
- * 不透明会话句柄。它最终会被链进 msm_drm_drv_video.so，由 libva 在
- * Firefox / ffmpeg 进程里 dlopen，因此遵守宿主插件的硬约束：
+ * This library sealed the "android side client for Android decode-daemon" thing into one.
+ * The handle of the opacity session. It's eventually chained to msm_drm_drv_video.so by libva.
+ * & & & & & & & & & & ;
  *
- *   - 绝不 exit() / abort() / assert()：任何错误都通过返回码上报
- *   - 绝不写 stdout；日志走 stderr，且默认静默，DMD_VA_LOG=1 才开
- *   - 无全局/静态可变状态：所有状态在 struct dmd_session 内，
- *     同进程内可并发开多个会话（每个会话一条 TCP 连接、一个 MediaCodec 实例）
- *   - 所有阻塞操作带超时：内部一律 poll + 非阻塞 fd，超时返回 DMD_ERR_TIMEOUT
- *   - 发送用 MSG_NOSIGNAL：对端断开不会给宿主进程投 SIGPIPE
- *   - 所有 fd 带 CLOEXEC：宿主可能 fork/exec，不泄漏 fd
- *   - 只依赖 libc + pthread（实际未用 pthread 原语，但目标链接里已有）
+ *   - Never extra() / abort() / asert(): Any error is reported by return code
+ *   - Never write stdout; log leaves stderr, and by default silent, DMD_VA_LOG=1
+ *   - No global/static variable state: all states are in the sruct dmd_session,
+ *     Multiple sessions can be organized in parallel with the process (one TCP connection per session, one MediaCodec example)
+ *   - Timeout for all blockages: internal Poll + non-barrier fd, time-out return to DMD_ERR_TIMEOUT
+ *   - Send MSG_NOSIGNAL: SIGPIPE is not cast for host process when the end is disconnected
+ *   - All fd with CLOEXEC: host may fork/exec, do not leak fd
+ *   - Reliminating only libc + pthread (actually not used pthread, but already in target link)
  *
- * 传输模式对调用方是透明的：SHM 模式下 dmd_frame.data 指向共享内存池，
- * TCP 模式下指向会话内部缓冲。两种情况都必须调用 dmd_session_release_frame，
- * 之后 data 失效。这是本库的主要价值 —— 调用方不必分两条路径。
+ * Transfer mode is transparent to the user: dmd_frame.data points to shared memory pools in the SHM mode.
+ * TCP mode points to the internal buffer of the session. Both cases must be called,
+ * The data lapses after that. This is the primary value of this library -- the caller does not have to divide two paths.
  */
 #ifndef DMD_CLIENT_H
 #define DMD_CLIENT_H
@@ -28,94 +28,94 @@
 extern "C" {
 #endif
 
-/* ------------------------------------------------------------ 返回码 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - Return to code */
 /*
- * 约定：0 成功，正数是非错误的流状态，负数是错误。
- * 出错后可用 dmd_session_last_error() 取人类可读的原因（含 errno 描述）。
+ * Commitment 0 Success, positive number is a non-correct flow state and negative number is a mistake.
+ * The reason why humans can read (including errno description) can be found after an error.
  */
 enum {
     DMD_OK            =  0,
-    DMD_EOS           =  1,   /* 对端已关闭写端，且不会再有帧 */
+    DMD_EOS           =  1,   /* The counter is closed and there is no frame. */
 
-    DMD_ERR_INVAL     = -1,   /* 参数非法 */
-    DMD_ERR_NOMEM     = -2,   /* 内存分配失败 */
-    DMD_ERR_CONNECT    = -3,  /* connect 失败或超时 */
-    DMD_ERR_REJECTED  = -4,   /* daemon 拒绝握手，见 dmd_error.handshake_status */
-    DMD_ERR_IO        = -5,   /* V4L2 ioctl 或读写失败 */
-    DMD_ERR_TIMEOUT   = -6,   /* 等待超时 */
-    DMD_ERR_PROTOCOL  = -7,   /* 收到不符合协议的字节 */
-    DMD_ERR_STATE     = -8,   /* 会话状态不允许该操作（如已 finish_input 后再发） */
-    DMD_ERR_TOOBIG    = -9    /* 数据单元/帧超出上限（当前无产生点，留作边界检查） */
-    /* ⚠️ 曾有 DMD_ERR_ENDPOINT_MISMATCH = -10，用于 socket 架构下
-     * "客户端 stat 到的 endpoint 与 daemon 上报的不一致"。
-     * 0.4.0 起驱动直接打开 /dev/video32，没有 endpoint 也没有 daemon，
-     * 该错误码零产生点，已删除。 */
+    DMD_ERR_INVAL     = -1,   /* Parameter Invalid */
+    DMD_ERR_NOMEM     = -2,   /* Memory distribution failed */
+    DMD_ERR_CONNECT    = -3,  /* Failed or timeout for connect */
+    DMD_ERR_REJECTED  = -4,   /* Daemon refuses to shake hands, see dmd_error.handshake_status */
+    DMD_ERR_IO        = -5,   /* V4L2 octl or read-write failed */
+    DMD_ERR_TIMEOUT   = -6,   /* Waiting for timeout */
+    DMD_ERR_PROTOCOL  = -7,   /* Bytes received that do not conform to the protocol */
+    DMD_ERR_STATE     = -8,   /* Session state does not allow the operation (if already finished_input) */
+    DMD_ERR_TOOBIG    = -9    /* Data module/framework exceeded the ceiling (no generation point at present, reserved for border check) */
+    /* ⁇  Used to be DMD_ERR_ENDPOT_MISMATCH =-10 for the socket architecture
+     * "Customer stat to endpoint inconsistent with the report of the daemon."
+     * /dev/video32, no endpoint and no daemon,
+     * The error code zero-point was deleted. */
 };
 
-/* codec id。0.4.0 前是线协议的一部分（与已删除的 decode-daemon.c 的
- * CodecId 逐值一致），现在只在驱动内部用于选择 V4L2 pixelformat。
- * ⚠️ 仍然只能在末尾追加、不可重排：这些值散布在 profiles.c 的能力表与
- * dmd_v4l2_session.c 的格式映射里，重排不会报错但会静默解错码。 */
+/* codec id. The pre-line is part of the line agreement (with deleted decode-daemon.c).
+ * CodecID is a value-by-value-consistency (CodecID), which is now used only internally to select V4L2 pixelformat.
+ * ⁇  Still only add at the end, not re-allocated: these values are spread in the ability table for profiles.c
+ * In the format map of dmd_v4l2_session.c, re-allocation will not be misreported but will be silently decoded. */
 enum {
     DMD_CODEC_H264  = 0,
     DMD_CODEC_HEVC  = 1,
     DMD_CODEC_VP9   = 2,
     DMD_CODEC_VP8   = 3,
     DMD_CODEC_AV1   = 4,
-    DMD_CODEC_MPEG2 = 5   /* 0.4.2 追加：硬件 ENUM_FMT 列出 MPG2 */
+    DMD_CODEC_MPEG2 = 5   /* 0.4.2 Append: Hardware ENM_FMT Listing MPG2 */
 };
 
-/* 帧数据传输模式 */
+/* Frame Data Transfer Mode */
 enum {
     DMD_XFER_TCP = 0,
     DMD_XFER_SHM = 1
 };
 
-/* 上行数据单元上限（与 daemon 的 MAX_FRAME 一致，超出会被 daemon 判为非法长度） */
+/* Upline Data Unit cap (same as MAX_FRAME in daemon, beyond the length that will be convicted illegal by daemon) */
 #define DMD_MAX_UNIT_BYTES (8u * 1024u * 1024u)
-/* 下行帧的合理性上限。注意它必须远大于 DMD_MAX_UNIT_BYTES：
- * 4K NV12 单帧就是 12441600 字节，daemon 的 8MB 只约束输入侧。 */
+/* The frame below is a reasonable ceiling. Note that it must be much larger than the DMD_MAX_UNIT_BYTES:
+ * 4K NV12 single frame is 12441600 bytes, 8MB of daemon only binds the input side. */
 #define DMD_MAX_FRAME_BYTES (64u * 1024u * 1024u)
 
-/* ------------------------------------------------------------ 配置 */
-/* V4L2 直通只需要这五项。
- * 0.3.x 这里还有 port / sock_path / want_shm 三个字段（daemon 的 TCP 端口、
- * Unix socket 路径、是否请求 SHM 传输）—— 会话改为直接打开 /dev/video32 后
- * 它们不再被任何代码读取，已在 0.4.0 删除。 */
+/* - - - - - - - - - - - - - - - - - - - - - - configuration */
+/* V4L2 straight up just needs these five.
+ * 0.3.x There are also three fields of port / lock_path / want_shm (TCP ports, ports, ports, ports, and
+ * Unix matcht path, request SHM transfer) - change session to direct /dev/ video32
+ * They are no longer read by any code, have been deleted at 0.4.0. */
 struct dmd_session_config {
     int      codec;             /* DMD_CODEC_* */
     int      width;             /* 96..8192 */
     int      height;            /* 96..4320 */
-    int      connect_timeout_ms;/* <=0 表示用默认 2000 */
-    int      io_timeout_ms;     /* 单次收发的默认超时，<=0 表示用默认 5000 */
-    /* 码流位深 >8bit 时置 1：CAPTURE 侧要 P010 而不是 NV12。
-     * 会话建立时通常还不知道（vaCreateContext 不带位深），所以留一个
-     * 后置设置口 dmd_session_set_ten_bit()，在首次 EndPicture 拿到
-     * 逐帧参数后写进来 —— CAPTURE 协商发生在更晚的 SOURCE_CHANGE。 */
+    int      connect_timeout_ms;/* < =0 for default 2000 */
+    int      io_timeout_ms;     /* Default timeout for single incoming and outgoing, <=0 for 5,000 */
+    /* The CapTure side should be P010 instead of NV12 for > 8bit depth.
+     * The session was usually created without knowing it. So leave one.
+     * Postset port dmd_session_set_ten_bit(), obtained at the first EndPicture
+     * Write it down by frame parameter -- CAPTURE consultations take place later in the SOURCE_CHANGE. */
     int      ten_bit;
 };
 
-/* 用默认值填充 cfg（H.264、2s/5s 超时）。cfg 为 NULL 时无操作。 */
+/* Fills cfg with default values (H.264, 2s/5s timeout). cfg is NULL without action. */
 void dmd_session_config_init(struct dmd_session_config *cfg);
 
-/* ------------------------------------------------------------ 错误详情 */
+/* - - - - - - - - - - - - - - - - - - - - - - - Error details */
 struct dmd_error {
     int  code;              /* DMD_ERR_* */
-    int  handshake_status;   /* code==DMD_ERR_REJECTED 时为 daemon 的 status
-                              * 1=版本不支持 2=codec 不支持 3=分辨率超范围
-                              * 4=缺少握手；其他情况为 0 */
-    char msg[192];          /* 人类可读原因，总是以 '\0' 结尾 */
+    int  handshake_status;   /* code=status for daemon at DMD_ERR_REJECTED
+                              * 1 = Version does not support 2 = codec Not supported 3 = Resolution Exceeding
+                              * 4 = Lack of handshake; other cases 0 */
+    char msg[192];          /* Human readable reasons always end with '\\0 ' */
 };
 
-/* ------------------------------------------------------------ 格式 */
+/* Format */
 /*
- * 解码器输出缓冲的几何信息，来自 daemon 的格式描述块。
+ * The geometric information for the decoder output buffer is derived from the formatting descriptor block of the daemon.
  *
- * buf_width/buf_height 是**填充后的**缓冲尺寸（Venus 把宽对齐 128、高对齐 32，
- * 1080p 输出 1920x1088）；真实显示区由 crop 给出，且 crop 是**闭区间**：
- *   显示宽 = crop_right - crop_left + 1
- *   显示高 = crop_bottom - crop_top + 1
- * 定位 UV 平面必须用 stride/slice_height：UV 起点 = stride * slice_height。
+ * Buff_width/buf_night is ** buffer size after filling (Venus aligns the width to 128, the height to 32, and the size of the buffer to be used to create a new environment for the benefit of the population).
+ * 1080p output 1920x1088; real display area is given by Crop and the corp is **closed room**:
+ *   Show width = crop_right - crop_ left + 1
+ *   Show height = crop_bottom - crop_top +1
+ * Positioning UV plane must use the stride/ slick_height: UV starting point = stride*slice_height.
  */
 struct dmd_format {
     int buf_width;
@@ -126,28 +126,28 @@ struct dmd_format {
     int crop_top;
     int crop_right;
     int crop_bottom;
-    int valid;          /* 0 = 还没收到过格式块 */
-    int changes;        /* 收到格式块的次数，>1 说明流内分辨率变过 */
+    int valid;          /* 0 = No format block received */
+    int changes;        /* Number of times format blocks are received >1 which indicates a change in the resolution inside the stream */
 };
 
-/* 显示尺寸便捷取值（crop 闭区间换算），fmt 无效时返回 0 */
+/* Show size-a-clip (crop closed), returns 0 when fmt is invalid */
 int dmd_format_display_width(const struct dmd_format *fmt);
 int dmd_format_display_height(const struct dmd_format *fmt);
 
-/* ------------------------------------------------------------ 帧 */
+/* - - - - - - - - - - - - - - - - - - Frameworks */
 /*
- * 一帧 NV12 数据。data 的所有权始终属于库：
- *   SHM 模式 → 指向共享内存槽位，release 时把状态字置 0 归还给 daemon
- *   TCP 模式 → 指向会话内部接收缓冲，release 只是把它标记为可复用
- * 两种情况下 release 之后 data 都失效，调用方要么用完再 release，
- * 要么自己先拷走。忘记 release 在 SHM 模式下会让 daemon 约 1 秒后判定
- * 客户端卡死并结束会话，因此 release 是强制的。
+ * A frame NV12 data. Data ownership is always in the library:
+ *   SM mode  ⁇  Point to shared memory slots to return status 0 to daemon when release
+ *   TCP Mode Point to the internal reception of buffers, release just to mark it as reusable
+ * Both cases release and the data lapse, either the caller runs out or the caller uses it,
+ * Or you can either torture it yourself. Forget about the decision in the SHM mode.
+ * Clients are stuck and end the session, so release is mandatory.
  */
 struct dmd_frame {
     uint8_t *data;
     size_t   size;
 
-    /* 帧头声明的尺寸（daemon 用的是缓冲尺寸，与 fmt.buf_* 一致） */
+    /* Frame size (daemon with buffer size, same as fmt.buf_*) */
     uint32_t width;
     uint32_t height;
 
@@ -155,15 +155,15 @@ struct dmd_frame {
      * is unchanged, but a known bad CAPTURE is not a successful output. */
     int hardware_error;
 
-    /* 该帧对应的**输入单元序号**（1 起），0 = daemon 未提供。
+    /* The frame** corresponds to the unit serial number** (1 event), 0 = Damon not provided.
      *
-     * 由 daemon 在 queueInputBuffer 时写入 presentationTimeUs，
-     * MediaCodec 原样带到输出帧上。用途是精确配对：调用方据此就知道
-     * 这一帧属于第几次提交，**无需知道解码器按什么顺序出帧**。
-     * 旧 daemon 不带此字段时为 0，调用方需回退到按顺序推断。 */
+     * By daemon when queueInputBuffer writes pre-existing Times,
+     * MediaCodec is brought to the output frame as it is. The use is for a precise pairing: the caller will know about it accordingly.
+     * This frame was submitted several times,** and it is not necessary to know how the decoder came out in the order in which it was submitted**.
+     * Old daemon is 0 when it does not have this field, and the caller returns to the inference in order. */
     uint32_t unit_seq;
 
-    /* 该帧生效的几何信息，从最近一次格式描述块复制而来，随帧自洽 */
+    /* Geometric information that is valid for the frame is copied from the last formatted description block and is self-directed */
     int stride;
     int slice_height;
     int crop_left;
@@ -171,73 +171,73 @@ struct dmd_frame {
     int crop_right;
     int crop_bottom;
 
-    int      shm_slot;   /* >=0 = SHM 槽位号；-1 = TCP 内部缓冲 */
-    uint64_t seq;        /* 会话内帧序号，从 0 起 */
+    int      shm_slot;   /* > = 0 = SHM slot number; 1 = TCP internal buffer */
+    uint64_t seq;        /* Session internal frame number, starting with 0 */
 };
 
-/* ------------------------------------------------------------ 会话 */
+/* - - - - - - - - - - - - - - - - - - Sessions */
 struct dmd_session;
 struct dmd_video_stats;
 /* Retains telemetry independently of the VA context's/deferred IO lifetime. */
 void dmd_session_set_video_stats(struct dmd_session *session,
                                  struct dmd_video_stats *stats);
 
-/* 会话建立之后再告知位深：vaCreateContext 阶段还拿不到位深（AV1 的
- * bit_depth_idx 在首个 PPB 里），而 CAPTURE 协商要等首个单元送出后的
- * SOURCE_CHANGE，所以必须赶在那之前调这里。ten_bit 非 0 → CAPTURE 用
- * P010。CAPTURE 已配好后再调用是无效操作（会打日志）。 */
+/* Notify depth after session is created: the vaCreateContext stage is not ready for AV1
+ * Bit_depth_idx in the first PPB) while CAPTURE consultation waits for the first module to be sent
+ * SOURCE_CHANGE, SO WE HAVE TO MOVE HERE BEFORE THAT.
+ * P010. CAPTURE is ready to call as invalid (with logs). */
 void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit);
 
 /*
- * 建立会话：连接 daemon、完成握手、（若请求）领取共享内存池。
- * 返回 NULL 表示失败；err 非 NULL 时写入失败原因（含 daemon 的拒绝码）。
- * 失败时不会有任何 fd 或映射泄漏。
+ * Creates a session: connects to daemon, completes handshake, receives (if requested) a shared memory pool.
+ * Returns NULL for failure;err is not NULL for failure (including the refusal code for daemon).
+ * There will be no fd or map leaks when failure occurs.
  */
 struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
                                        struct dmd_error *err);
 
-/* 释放会话：关连接、解映射、释放缓冲。s 为 NULL 时无操作。 */
+/* Release session: Close connection, demap, release buffer. S is NULL without action. */
 void dmd_session_destroy(struct dmd_session *s);
 
 /*
- * 送一个数据单元。
- *   H.264/HEVC：一个 NALU，**必须带 Annex B 起始码**（3 或 4 字节）——
- *               daemon 靠起始码定位 nal_unit_header 识别 SPS/PPS/VPS
- *   VP8/VP9：   一个完整帧，**不得带起始码**
- * 本库不替调用方补起始码：补错会静默破坏码流，交由上层显式负责。
- * H.264/HEVC 缺起始码时直接返回 DMD_ERR_PROTOCOL，早失败早发现。
- * 返回 DMD_OK / DMD_ERR_*。
+ * Sends a data module.
+ *   H.264/HEVC: an NALU,** must have annex B starting code** (3 or 4 bytes) -
+ *               Daemon locates nal_unit_header recognition by starting code
+ *   VP8/VP9: A complete frame** without a starting code**
+ * The library does not replace the caller's initials: the error is then quietly destroyed and placed in the top-level overt.
+ * H.264/HEVC returns to DMD_ERR_PROTOCOL when the starting code is missing.
+ * returns DSD_OK/DMD_ERR_*.
  */
 int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len);
 
 /*
- * 关闭写端（shutdown(SHUT_WR)），触发 daemon 送 EOS 并 flush 解码器。
- * 送入的数据单元数 != 返回的帧数（排队、重排序、参数集不产帧），
- * 因此必须调用本函数才能取到全部剩余帧。可重复调用（幂等）。
+ * Closes the write (SHUT_WR) triggers the daemon send EOS and Flush codec.
+ * Number of data units sent! = number of frames returned (queuing, reordering, parameter set not producing),
+ * This function must therefore be called to get all the remaining frames. You can repeat the call (sing, etc.).
  */
 int dmd_session_finish_input(struct dmd_session *s);
 
 /*
- * 可逆排空：送 V4L2_DEC_CMD_STOP 逼解码器吐出在手的帧，收齐后复位
- * 并重送 CSD —— 与 finish_input 的区别是**会话之后仍然可用**。
+ * Reversed empty: drop the frame from the V4L2_DEC_CMD_STOP to the frame in hand, and reset when it is collected
+ * The difference between CSD and finish_input is ** that is still available after the session**.
  *
- * 用途：消费者只保持少量帧在飞（浏览器是 3 帧），而解码器有 B 帧时要收到
- * 第 4 个输入单元才吐首帧，双方互等。此时调用本函数即可拿到帧且不作废会话。
- * 原先只能用 finish_input 打破互等，代价是每次都要重建会话
- * （实测每帧 155 ms，播放慢 4.7 倍）。
+ * Purpose: Consumers keep only a small number of frames flying (the browser is 3 frames), while decoder is received when the B frames are available
+ * The 4th input unit is used to throw up the frame, each waiting for the other. This function is called to get the frame and not to use the session.
+ * The only way to break each other is to use the finish_input at the cost of rebuilding the session.
+ * (Specify 155 ms per frame, slow 4.7 times).
  *
- * 排空后硬件会重新协商格式，next_frame 内部自动消费，调用方无感。
- * 返回 DMD_OK / DMD_ERR_*。
+ * The hardware is re-negotiated after the drain, and the nett_frame is automatically consumed internally and is unsatisfied.
+ * returns DSD_OK/DMD_ERR_*.
  */
 int dmd_session_drain(struct dmd_session *s);
 
 /*
- * 取下一帧。timeout_ms <0 表示用配置里的 io_timeout_ms。
- * 返回 DMD_OK 拿到帧、DMD_EOS 流结束、DMD_ERR_TIMEOUT 暂时无帧（会话仍可用）、
- * 其他负值为错误。内部自动消费格式描述块并更新 dmd_session_format()。
+ * Take the frame. Timeeout_ms<0 means the io_timeout_ms in the configuration.
+ * returns DMD_OK to frame, DSD_EOS end, DMD_ERR_TIMEOT temporarily without frame (the session is still available),
+ * Other negative values are errors. The internal autoconsuming formatte profile block is updated and dmd_session_format(s).
  *
- * 注意：帧头到达后剩余字节按 io_timeout_ms 收，不会因为 timeout_ms 很小而
- * 留下半帧；超时只发生在「一个字节都还没来」的边界上。
+ * Note: The remaining bytes after the frame arrives by io_timeout_ms, not because the timeout_ms are small.
+ * Half a frame; the time spent on the border "no one byte has yet come."
  */
 int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
                            int timeout_ms);
@@ -249,45 +249,45 @@ int dmd_session_next_frame(struct dmd_session *s, struct dmd_frame *out,
 int dmd_session_try_next_frame(struct dmd_session *s, struct dmd_frame *out);
 
 /*
- * 归还帧。SHM 模式归还槽位，TCP 模式解除内部缓冲占用。
- * 两种模式都必须调用，无条件调用是安全的（f 为 NULL 或已归还时无操作）。
+ * The frame is returned. The SHM mode is returned to slots, the TCP mode is released from internal buffers.
+ * Both models must be called and the unconditional call is safe (f NULL or when returned inoperable).
  */
 int dmd_session_release_frame(struct dmd_session *s, struct dmd_frame *f);
 
-/* 最近一次格式描述块的内容。返回的指针在会话生命期内有效。 */
+/* The contents of the last formatted description block. The returned pointer is valid during the session lifetime. */
 const struct dmd_format *dmd_session_format(const struct dmd_session *s);
 
-/* 最近一次错误的人类可读原因；无错误时返回空字符串，绝不返回 NULL。 */
+/* The last error is human readable; returns empty string without error, never returns NULL. */
 const char *dmd_session_last_error(const struct dmd_session *s);
 
-/* 最近一次错误码（DMD_ERR_*），无错误时 0 */
+/* Last error code (DMD_ERR_*), 0 when no error */
 int dmd_session_last_error_code(const struct dmd_session *s);
 
-/* 实际生效的传输模式：DMD_XFER_TCP / DMD_XFER_SHM。
- * 请求 SHM 也可能因交接失败被静默降级，用它核实。 */
+/* Transfer mode in effect: DMD_XFER_TCP/DMD_XFER_SHM.
+ * The request may also be downgraded silently by the failure of the handover, using it to verify. */
 int dmd_session_xfer_mode(const struct dmd_session *s);
 
-/* 底层 socket fd，供调用方自己 poll（不要 close 它） */
+/* Bottom block fd, caller's popup */
 int dmd_session_fd(const struct dmd_session *s);
 
-/* 统计：送入的数据单元数 / 取出的帧数 */
+/* Statistics: Number of data units sent / frame taken */
 uint64_t dmd_session_units_sent(const struct dmd_session *s);
 uint64_t dmd_session_frames_received(const struct dmd_session *s);
 
-/* 已解好、在 session 待取队列里等调用方来拿的帧数，以及该队列容量。
+/* Number of frames that have been solved and are being collected by the callers in the session to-do queue, and the capacity of the queue.
  *
- * 为什么需要暴露它：session 的待取队列（容量 = CAPTURE 缓冲数 24）比驱动
- * 侧的待配对队列（DMD_MAX_SURFACES = 64）小得多。队列里每一帧都占着一个
- * 未归还的 CAPTURE 缓冲，占满时 msm_vidc 无处写新帧、连输入缓冲也不再
- * 回收，send_unit 于是永久背压。
+ * Why it needs to be exposed: the to-do queue of the session (volume = CAPTURE buffer 24) relative to the driver
+ * Side-to-side pairing (DMD_MAX_SURFACES=64) is much smaller. Each frame in the queue is held by one.
+ * Unrefunded CAPTURE buffer, msm_vidc unwritten, not even input buffers
+ * Recover, send_unit so permanently back down.
  *
- * 后果是驱动侧那条 `pending_count >= DMD_MAX_SURFACES` 的背压保护**永远
- * 等不到触发**：64 > 24，session 早在它之前就锁死了。实测（ffmpeg
- * `-hwaccel_output_format vaapi -f null -`，消费者全程不调 vaSyncSurface /
- * vaExportSurfaceHandle）：36 次 EndPicture 提交、0 次取帧，日志刷
- * "背压超时: pend=24/24 OUTPUT在驱动=8/8 CAPTURE在驱动=0/24" 后挂死。
+ * The result is the back-up protection of the driver `pending_count > = DMD_MAX_SURFACES ' ** forever
+ * The trigger cannot be activated **64 > 24, session locked long before it.
+ * `-hwaccel_output_format vaapi-f null- ' , consumers are not at all vaSyncSurface/
+ * vExportSurfaceHandle: 36 times EndPicture submission, 0 times frame extraction, log brush
+ * "end=24/24 UPPUT Hanged after driver=8/8 CAPTURE =0/24".
  *
- * 驱动侧据此改为按 session 队列水位提前排空，而不是等自己的队列满。 */
+ * The driver then changes to the water slot to the session line to be empty in advance, instead of waiting for its own queue to be full. */
 int dmd_session_frames_pending(const struct dmd_session *s);
 int dmd_session_pending_capacity(const struct dmd_session *s);
 

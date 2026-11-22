@@ -1,34 +1,33 @@
 #!/bin/bash
-# 用克隆 profile 做多轮测量，交替 A/B 两个驱动构建以消除系统状态漂移。
+# Alternate between two driver builds using a cloned Firefox profile to limit system-load drift.
 #
-# 为什么要交替：这台设备 load average 常年 12-13，单个配置连测多轮会被
-# 时段性负载污染（实测同配置同素材跑出过 0.84% 与 38.61%）。
-# A/B 交替能让两个配置暴露在同一段时间窗口里，差值才有意义。
+# The test device typically has a load average around 12–13. The same build
+# and clip dropped 0.84% and 38.61% in separate runs. Alternating keeps
+# measurements for the two builds close in time.
 #
-# ⚠️ 绝不使用用户的真实 profile：反复 pkill -9 会损坏它
-# （踩过一次，profile 起不来、留下 Telemetry.FailedProfileLocks.txt）。
-# 每轮从 /tmp/fxclone 复制一份干净副本。
+# Use a clean template copy for each round. Repeated forced termination can
+# damage the user's real profile and leave Telemetry.FailedProfileLocks.txt.
 #
-# 用法: ab.sh <轮数> <A驱动目录> <B驱动目录> [素材] [秒数]
+# Usage: ab.sh <rounds> <driver A directory> <driver B directory> [clip] [seconds]
 
 set -u
-ROUNDS=${1:?轮数}
-DRV_A=${2:?A 驱动目录}
-DRV_B=${3:?B 驱动目录}
+ROUNDS=${1:?Number of rounds required}
+DRV_A=${2:?A Driver Directory}
+DRV_B=${3:?B Driver Directory}
 FILE=${4:-h264_long.mp4}
 SECS=${5:-20}
 PERF=/home/master/MP5WS/research/perf
 CLONE=/tmp/fxbase
 
 cd "$PERF" || exit 1
-[ -d "$CLONE" ] || { echo "缺少 $CLONE"; exit 1; }
+[ -d "$CLONE" ] || { echo "Missing $CLONE"; exit 1; }
 
-run_one() {   # $1=标签 $2=驱动目录 $3=输出json
+run_one() {   # $1=Label $2=Driver Directory $3=Output json
     local tag=$1 drv=$2 out=$3
     pkill -9 -x firefox-esr >/dev/null 2>&1
     sleep 2
-    # 整目录复制预热过的模板：扩展已装、缓存已建，启动只需几秒。
-    # 首次用未预热的模板时 Firefox 要装 14 个扩展，45s 窗口不够，全轮超时。
+    # The entire directory reproduces preheated templates: extensions are loaded, caches are built, start is only in seconds.
+    # The first time you use an unheated template, Firefox will have 14 extensions, 45s windows will not be enough, and the full time is over.
     rm -rf /tmp/fxrun
     cp -r "$CLONE" /tmp/fxrun
     rm -f /tmp/fxrun/lock /tmp/fxrun/.parentlock
@@ -72,11 +71,11 @@ for i in $(seq 1 "$ROUNDS"); do
         if [ "$side" = A ]; then drv=$DRV_A; else drv=$DRV_B; fi
         r=$(run_one "$side$i" "$drv" "/tmp/ab_$side$i.json")
         case "$r" in
-            TIMEOUT)  echo "  轮$i-$side: 超时" ;;
-            SOFTWARE) echo "  轮$i-$side: ⚠️ 走了软解，不计入" ;;
+            TIMEOUT)  echo "  Round $i-$side: timed out" ;;
+            SOFTWARE) echo "  Round $i-$side: Skipped software decode" ;;
             *)
                 set -- $r
-                printf "  轮%s-%s: 丢帧 %6s%%  %s fps  丢帧秒 %s\n" "$i" "$side" "$1" "$2" "$3"
+                printf "  Round %s-%s: dropped frames %6s%%  %s fps  seconds with drops %s\n" "$i" "$side" "$1" "$2" "$3"
                 if [ "$side" = A ]; then AV+=("$1"); else BV+=("$1"); fi
                 ;;
         esac
@@ -85,11 +84,11 @@ done
 
 summarize() {
     local name=$1; shift
-    [ $# -eq 0 ] && { echo "$name: 无样本"; return; }
+    [ $# -eq 0 ] && { echo "$name: No sample"; return; }
     printf '%s\n' "$@" | sort -n | awk -v n=$# -v nm="$name" '
     {a[NR]=$1; s+=$1}
     END{ mid=(n%2)?a[(n+1)/2]:(a[n/2]+a[n/2+1])/2
-         printf "%s: 中位 %.2f%%  均值 %.2f%%  范围 %.2f-%.2f%%  (n=%d)\n",
+         printf "%s: median %.2f%%  mean %.2f%%  range %.2f-%.2f%%  (n=%d)\n",
                 nm, mid, s/n, a[1], a[n], n }'
 }
 echo

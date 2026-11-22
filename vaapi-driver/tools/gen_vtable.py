@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""从 va_backend.h 精确抽取 VADriverVTable 的全部函数指针签名。
+"""Extract function-pointer signatures from VADriverVTable in va_backend.h.
 
-用途：VA-API driver 必须填满 libva 强制校验的所有 vtable 槽位，
-任一为 NULL 会导致 vaInitialize 失败。手抄 60+ 个签名易错，这里做确定性抽取。
+libva requires every checked vtable slot during vaInitialize. Extract
+signatures directly from the header to avoid transcribing them by hand.
 
-输出：JSON 列表 [{name, ret, params:[{type, name}]}, ...]
+Output: JSON list [{name, ret, params: [{type, name, array}]}, ...].
 """
 import json
 import re
@@ -15,22 +15,22 @@ HEADER = sys.argv[1] if len(sys.argv) > 1 else "container-headers/va_backend.h"
 with open(HEADER, encoding="utf-8") as fh:
     src = fh.read()
 
-# 1) 切出 struct VADriverVTable { ... };
+# 1) Extract struct VADriverVTable { ... };
 m = re.search(r"struct VADriverVTable\s*\{(.*?)\n\};", src, re.S)
 if not m:
-    sys.exit("未找到 struct VADriverVTable")
+    sys.exit("Could not find struct VADriverVTable")
 body = m.group(1)
 
-# 2) 去注释（/* */ 与 //）
+# 2) Strip block and line comments.
 body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
 body = re.sub(r"//[^\n]*", "", body)
 
-# 3) 匹配函数指针成员：<ret>(*name)(params);
-#    头文件里形如 "VAStatus(*vaTerminate)(VADriverContextP ctx);"
-# 注意：头文件里返回类型与 (*name) 之间可能换行（如 vaExportSurfaceHandle），
-# 所以返回类型部分要允许换行，否则会漏槽位。
+# 3) Match function-pointer members, such as <ret>(*name)(params);
+#    For example: VAStatus(*vaTerminate)(VADriverContextP ctx);
+# The return type and (*name) may be on separate lines, as for
+# vaExportSurfaceHandle. Allow newlines in the return type pattern.
 pattern = re.compile(
-    r"([A-Za-z_][A-Za-z_0-9 \t\*\r\n]*?)"       # 返回类型（可跨行）
+    r"([A-Za-z_][A-Za-z_0-9 \t\*\r\n]*?)"       # Return type may span lines.
     r"\(\s*\*\s*([A-Za-z_][A-Za-z_0-9]*)\s*\)"  # (*name)
     r"\s*\((.*?)\)\s*;",                        # (params);
     re.S,
@@ -44,17 +44,17 @@ for ret, name, params in pattern.findall(body):
         plist = []
     else:
         plist = []
-        # 参数间以逗号分隔；vtable 里没有函数指针型参数，简单切分即可
+        # The vtable has no function-pointer parameters, so split on commas.
         for part in raw.split(","):
             part = part.strip()
-            # 分离类型与参数名：最后一个标识符是名字（数组形如 name[3]）
+            # The last identifier is the parameter name, optionally followed by dimensions.
             mm = re.match(r"^(.*?)([A-Za-z_][A-Za-z_0-9]*)\s*((?:\[[^\]]*\])*)$", part)
             if not mm:
-                sys.exit(f"无法解析参数 {part!r} in {name}")
+                sys.exit(f"Could not parse parameter {part!r} in {name}")
             ptype, pname, arr = mm.group(1).strip(), mm.group(2), mm.group(3)
             plist.append({"type": ptype, "name": pname, "array": arr})
     funcs.append({"name": name, "ret": ret, "params": plist})
 
 json.dump(funcs, sys.stdout, indent=1, ensure_ascii=False)
 print()
-print(f"# 共 {len(funcs)} 个 vtable 槽位", file=sys.stderr)
+print(f"# {len(funcs)} vtable slots", file=sys.stderr)

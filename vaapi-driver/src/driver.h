@@ -1,7 +1,7 @@
-/* DroidSpaces MediaCodec VA-API driver — 内部数据结构与公共声明
+/* DroidSpaces MediaCodec VA-API triver -- Internal Data Structure and Public Statements
  *
- * 本驱动被 libva 以 dlopen 方式加载进消费者进程（vainfo / ffmpeg / Firefox），
- * 因此遵守插件规矩：不 exit/abort、不写 stdout、日志默认静默、全部入口线程安全。
+ * This driver is loaded into the consumer process (vainfo/ ffmpeg/ Firefox) by libva in dlopen, and is used to use the & & & & & & & & & & & & & & & & & & & & & & & ; ;
+ * Therefore, the plugins are followed: no exit/about, no stdout, log default silence, all entrance threads are secure.
  */
 
 #ifndef DMD_DRIVER_H
@@ -15,7 +15,7 @@
 #include <va/va_dec_hevc.h>
 #include <va/va_dec_vp8.h>
 #include <va/va_dec_vp9.h>
-/* struct drm_state 定义在这里，va_backend.h 只做前向声明。 */
+/* The rule drm_state is defined here, vá_backend.h only makes forward declarations. */
 #include <va/va_drmcommon.h>
 #include <va/va_vpp.h>
 #include <va/va_backend_vpp.h>
@@ -35,57 +35,57 @@
 
 struct dmd_encode;
 
-/* 驱动版本，随 vendor 串一起被消费者看到。
- * 注意 ffmpeg 按 vendor 串匹配 vaapi_driver_quirks 名单；我们不在名单内，
- * 走 standard behaviour，即要求语义标准。 */
-/* ⚠️ 发版时必须同步：本串经 DMD_VENDOR_STRING 显示在 vainfo 的
- * "Driver version" 里，是用户可见信息。曾长期停在 0.3.3 而项目已到
- * 0.3.7（落后 4 版），用户按 vainfo 报 bug 时会指向错误的版本。
- * 同步清单：本文件、CHANGELOG.md。
- * （ksu-module/module.prop 曾在清单里，0.4.0 起 KSU 模块已整体删除。） */
-/* 0.4.0：架构改为驱动内 V4L2 直通（不再经 unix socket 与 Android 侧
- * decode-daemon / MediaCodec）。vendor 串里的 "MediaCodec" 随之去掉 ——
- * 它现在描述的是一条已经不存在的路径。 */
-/* 0.4.1：nabu（Snapdragon 860 / kernel 4.14）解码路径打通。补齐 msm_vidc 的
- * 四项私有协议要求（SECONDARY 分流模式 / 私有事件订阅 / SESSION_CONTINUE /
- * O_NONBLOCK），缓冲传递改为 USERPTR + plane.reserved[0]。
- * 五个码流整流 MD5 与 ffmpeg 软解逐字节一致。详见 CHANGELOG。 */
-/* 0.4.2：新增 VP8 硬解（90/90 帧 md5 与软解逐字节一致）；修复消费者不逐帧
- * 取帧时的 CAPTURE 背压死锁（`-f null` 场景由 40s 挂死变 3s 正常退出）。
- * 10bit 与 MPEG-2 经实测判定受固件限制，实现置于编译开关后不声明。
- * 详见 CHANGELOG。 */
-/* 0.4.3：修复浏览器绿屏。根因是 CAPTURE 残留几何——G_FMT(CAPTURE) 总返回
- * msm_vidc 的默认 1920x1088，覆盖宽高后 bytesperline/sizeimage 驱动不回填，
- * 而原有保护只查下限，于是 720p 沿用了 1080p 的 stride=1920：每行错位
- * 640 字节，且 slice_height 被反推成 492（真实 736），每帧截断。
- * 另修首帧纯绿（NV12 的 UV=0 是最大色偏，转 RGB 恰好是纯绿，应填 128）。
- * 新增多分辨率与分辨率切换回归——旧回归全是 1080p，恰好等于默认几何，
- * 永不触发该分支，这个缺陷因此长期未被发现。 */
-/* 0.4.7（预发布 rc1）：AV1 硬解可用。本内核 msm_vidc 的 AV1 fourcc 是非标准
- * AV10；硬件只对 show_frame=1 的帧吐像素，而 VA-API 不传 refresh_frame_flags，
- * 故用"像素趟 + DPB 修复趟"两遍法补齐槽位与帧上下文回写；影子 DPB 按本驱动
- * 帧号记账以适配消费者的 surface 复用。真流（B 站 1080p60，1800 帧）与软解
- * 逐字节一致，吞吐 120~190fps。另按固件能力运行时门控 VP8/MPEG-2（本机不支持，
- * 此前虚报 profile）。详见 CHANGELOG。 */
+/* Driver version, seen by consumers with vendor.
+ * Note that ffmpeg matches the list of vaapi_driver_quirks by applying the vendor string; we are not on the list, but we are not on the list.
+ * Stand down before we get a semantic standard. */
+/* ⁇ Sync distribution must be synchronized: this string is displayed in vainfo by DSD_VENDOR_STRING
+ * In "Driver Version" is the user-observable message. It's been parked on 0.3.3 for a long time and the project has arrived.
+ * 0.3.7 (Regular 4), the user points to the wrong version when reporting bugs on vainfo.
+ * Synchronization List: This document, CHANGELOG.md.
+ * (ksu-module/module. prop previously in the list, 0.4.0 of KSU modules were deleted as a whole. */
+/* 0.4.0: Restructure to drive V4L2 direct (no longer unix block side with Android)
+ * Decode-daemon / MediaCodec. vendor 's "MediaCodec" is removed from the string...
+ * It now describes a path that no longer exists. */
+/* 0.4.1: Nabu (Snapdragon 860 / kennel 4.14) decode path connected.
+ * Four private agreement requirements (SECONDARY diversion mode / Private event subscription / SESSION_CONTINUE/
+ * O_ONBLONK), buffer transfer to USERPTR + plain.reserved [0].
+ * Five-yard flow MD5 corresponds to the ffmpeg solution by bytes. See CHANGELOG for details. */
+/* 0.4.2: New VP8 hardwire (90/90 frame md5 consistent with soft resolution by bytes); fix consumer not to go by frame
+ * CapTure back-lock when the frame is removed (`-f null ' scene from 40s to 3s normal exit).
+ * 10bit and MPEG-2 were measured as being limited by solids, and were not declared after compilation switches.
+ * See for more information at CHANGELOG. */
+/* 0.4.3: Fix the browser green screen. Root cause is the CAPTURE residual geometry - G_FMT(CAPTURE) returns total
+ * The default for msm_vidc is 1920x1088, which is not filled in after the width of the coverage bytesperline/size drive, and the default is not filled out.
+ * The original protection only checked the lower limit, so 720p followed the 1080p stride=1920:a misposition of each line
+ * 640 bytes, and slick_height is reversed to 492 (real 736), each frame cut.
+ * Another frame is pure green (UV = 0 for NV12 is the largest color deviation, RGB is exactly pure green and should be filled in 128).
+ * Newly increased resolution and resolution switchback -- all old returns are 1080 p, which is exactly the default geometry.
+ * The branch was never triggered, and the defect was thus long undetected. */
+/* 0.4.7 (pre-published rc1: AV1 hardwired is available. AV1 sourcecc of this kernel msm_vidc is not standard
+ * AV10; hardware only for frame pixels showing_frame=1, while VA-API does not transfer refresh_frame_flags,
+ * So double-twice "pixel + DPB fix" to rewrite slots and frame context; Shadow DPB is driven by this
+ * Frames record the consumer 's surface reuse. Real flow (B station 1080p601800 frames) and soft resolution
+ * Bytes, bytes, toss 120~190fps.
+ * Previously falsely declared profile. See for more details at CHANGELOG. */
 #define DMD_DRIVER_VERSION "0.5.0-dev"
-/* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
- * 例：0.4.3+60534cf2 / 0.4.3+60534cf2-dirty。这样 vainfo 能明确报告
- * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */
+/* Makefile injects every time a building is built: git short hash, with -dirty when no changes are submitted in the workspace.
+ * Example: 0.4.3 + 60534cf2 / 0.4.3 + 60534cf2-dirty. This way vainfo can report clearly.
+ * Firefox actually dlopen is the version.so, the search browser problem is no longer based on file time guess. */
 #ifndef DMD_BUILD_ID
 #define DMD_BUILD_ID "manual"
 #endif
 #define DMD_VENDOR_STRING "DroidSpaces V4L2 VA-API driver " \
                           DMD_DRIVER_VERSION "+" DMD_BUILD_ID
 
-/* 设备硬件解码能力，来自 /vendor/etc/media_codecs.xml（真机取证）。
- * H.264/HEVC 解码器规格：96x96 ~ 8192x4320，并发实例 16，支持 adaptive-playback。 */
+/* Device hardware decoding capability from /vendor/etc/media_codes.xml (real machine taking evidence).
+ * H.264/HEVC Codec specification: 96x96 ~ 8192x4320, with example 16, supports adaptive-playback. */
 #define DMD_MIN_WIDTH 96
 #define DMD_MIN_HEIGHT 96
 #define DMD_MAX_WIDTH 8192
 #define DMD_MAX_HEIGHT 4320
 
-/* libva 要求 max_* 字段全部 > 0（va/va.c 的 CHECK_MAXIMUM），
- * 且这些值是消费者分配查询数组的依据，必须 >= 我们实际返回的数量。 */
+/* Libva requests that all fields be > 0 (CHECK_MAXIMUM for va/ va.c).
+ * And these values are the basis for consumer distribution of query arrays, which must > = the amount we actually return. */
 #define DMD_MAX_PROFILES 16
 #define DMD_MAX_ENTRYPOINTS 4
 #define DMD_MAX_CONFIG_ATTRIBUTES 32
@@ -93,8 +93,8 @@ struct dmd_encode;
 #define DMD_MAX_SUBPIC_FORMATS 4
 #define DMD_MAX_DISPLAY_ATTRIBUTES 4
 
-/* 同时存活的 config 对象上限。VA-API 的 config 极轻量，
- * 消费者通常只建 1-2 个；给足余量即可。 */
+/* The ceiling for the config object that also survives. VA-API's config is very light.
+ * Consumers usually only build one or two; the full amount is enough. */
 #define DMD_MAX_CONFIGS 32
 
 /* Per-context queue depth is separate from the display-wide object table.
@@ -104,104 +104,104 @@ struct dmd_encode;
 /* Retain the unit identity for consumption without writing a reused target. */
 #define DMD_DISCARD_SURFACE ((VASurfaceID)0xFFFFFFFEu)
 
-/* MediaCodec 的输出滞后深度（实测值，见 vaapi-driver/tools 里的 probe_lag）：
- * 有 B 帧的 H.264 流要送进第 4 个输入单元才吐出第 1 帧，无 B 帧时是 1。
+/* The output depth of MediaCodec is lagging (real values, see probe_lag in vaapi-driver/tools):
+ * The H.264 stream with B frames is sent into the 4th input unit to throw out the 1st frame, without B frames.
  *
- * SyncSurface 用它作为"放行额度"：在飞帧数低于此值时不阻塞消费者，
- * 让它继续送料把流水线填满；达到之后才真正阻塞等帧。
- * 取 6（滞后 4 再留 2 的余量）—— 太小会退回死锁，太大会让队列变长、
- * 增加延迟且浪费 surface。
+ * SyncSurface uses it as the "freeze" level: it does not block consumers when the number of frames is below this value.
+ * It continues to deliver materials to fill the stream lines; it reaches the frame that really blocks them.
+ * Take 6 (delay 4 and leave 2 left behind) -- too small to return the lock, too small to allow the queue to grow,
+ * This adds latency and wastes surfaces.
  *
- * ⚠️ 跨目录耦合（历史，socket 架构时期）：daemon 侧的 SHM_SLOTS 必须
- * >= 本值。历史事故：SHM_SLOTS=4 < 本值 6，第 5 帧必然撞池满，daemon 在
- * 1 秒后判死并杀掉会话 —— 4K + 慢消费者场景 10/10 丢帧（238/300）。
- * V4L2 直通架构下这条耦合消失了（没有 SHM 池），但约束换成了
- * V4L2 的 CAPTURE 缓冲数（DMD_V4L2_MAX_CAP，实测驱动给 24）。
+ * ⁇  Cross directory coupling (historical, socket-structured period): SHM_SLOTS on the side of daemon must
+ * > = Current value. Historical accident: SHM_SLOTS=4 < value 6, frame 5 must hit pool full, daemon in
+ * 1 second to die and kill session - 4K + Slow Consumer scene 10/10 Drop frame (238,300).
+ * V4L2 The coupling disappeared under the straight frame (no SHM pool), but the restraints were replaced.
+ * The number of CAPTURE buffers for V4L2 (DMD_V4L2_MAX_CAP, actual driver to 24).
  *
- * 取值 12 的依据（V4L2 直通实测）：msm_vidc 的输出滞后比 MediaCodec 深。
- * 原值 6 是按 MediaCodec 的实测滞后（有 B 帧时 4）定的，换到 V4L2 后
- * 表现为：ffmpeg 送 6 单元即停下等帧，而解码器此时只吐了 2 帧，
- * SyncSurface 等 2000ms 超时 → 触发排空 → 会话终结 → 4 帧待配对，
- * ffmpeg 报 internal decoding error。
- * 而直连后端实测送 10 单元可稳定解出 10 帧，故取 12（10 再留 2 余量），
- * 且 12 < 24 不会撞 CAPTURE 缓冲上限。
+ * Basis for taking value 12 (V4L2 direct-live): msm_vidc output lags further than MediaCodec.
+ * Original value 6 is based on the actual time lag of MediaCodec (B frame 4) for V4L2
+ * The ffmpeg sent 6 units, i.e. stopped the frame, and the decoder threw up only 2 frames.
+ * SyncSurface et al. 2000ms timed out  ⁇  triggering emptiness  ⁇  4 frames to match  ⁇
+ * The ffmpeg newspaper internal decoding error.
+ * And the direct backend takes 10 units to stabilize the 10 frames, so take 12 (10 left 2 more),
+ * And 12 < 24 will not hit CAPTURE buffer cap.
  *
- * ⚠️ 0.4.1 修正：12 是 MediaCodec daemon 时代的值，V4L2 直通的真实滞后是 7。
+ * ⁇  0.4.1 Amendment: 12 is the value of the MediaCodec daemon era, and the real lag in V4L2 direct traffic is 7.
  *
- * research/slowfeed.c 直接打 V4L2（绕过 VA-API 与本驱动）实测，1080p H.264：
- *     [送 1..7]  已收 0        ← 送满 7 个单元都不出帧
- *     [送 8]     已收 1        ← 第 8 个才吐首帧
- *     [送 9..]   已收 2,3,4…   ← 之后 1:1 稳定跟随
- * fast（连送，模拟 ffmpeg）与 slow（逐帧等，模拟 Firefox）两种节奏结论一致：
- * 滞后都是 7，且 OUTPUT 缓冲从不掉到 0 —— 慢速送料本身没有问题。
+ * Research/slowfeed.c Directly hit V4L2 (bypassing VA-API and this drive)
+ *     [Deliver 1.7] 0  ⁇  Full 7 units undone
+ *     [Send 8] 1  ⁇  collected 8th to throw up the top frame
+ *     [Send 9..] Received 2,3,4... after 1:1 steady follow
+ * The fast (consequent, simulate ffmpeg) is consistent with the slow (simulating Firefox, etc.) rhythm:
+ * The lag is seven and the OUTPUT buffer never falls to zero -- slow delivery is not in itself a problem.
  *
- * 配合 OUTPUT_ORDER=1（解码序，滞后降到 4）后取 5：
- * 实测解码序下 pending 稳定在 6 > 滞后 4，解码器不欠料，可以安全真阻塞。
- * 阈值留 7 时 pending=6 够不到，仍有 1057 次放行 / 15 次阻塞、丢帧 15.5%。
+ * Retrieve OTPUT_ORDER=1 (decoding sequence, lag to 4) after taking 5:
+ * The decoding sequence is used to stabilize the feed at 6 > 4 and the decoder is not unexpected and can be safely blocked.
+ * The threshold is set at 7 and the threshold is not enough, with 1,057 / 15 blocking and loss of frame 15.5%.
  *
- * 历史值 7 的理由（显示序时代）：pending < 7 时解码器确实还欠料，Sync 必须放行让消费者继续送，
- * 否则双方互等。实测把它改成 4 就是这样卡死的：Firefox 每帧阻塞 5s 超时、
- * 触发 flush、会话反复重建（日志里 6 次「会话已重建」），fps 掉到 0.4。
- * pending >= 7 时流水线已满、下一帧必到，于是真阻塞等帧 —— 对靠 dmabuf
- * 零拷贝采样的消费者（Firefox/Chrome 不调 DeriveImage，见 export.c）这是
- * 唯一正确做法，它们没有"map 时再等"那条兜底路径。
- * 留 12 的后果：pending 稳定在 5 永远够不到 12，于是每帧都放行、谎报就绪，
- * Firefox 采到未填充的缓冲 —— 实测 847 解码 / 792 丢弃 = 93.5%，画面不动。 */
+ * The reason for the historical value 7 (sequence times shown): the pending < 7-hour decoder is really unanticipated, and Sync must release it to the consumer for further delivery.
+ * Otherwise, the two sides will wait. The test is to change it to four, and it's this way: Firefox, every frame block, 5s, time out.
+ * Triggers flash, re-recreated session(six times "re-established session" in the log), fps drops to 0.4.
+ * Coming > = 7 hours is full, the next frame is due, so the frame is blocked and so on - for dmabuf
+ * Consumers of zero copies sampled (DeriveImage, see export.c)
+ * The only way is right, they don't have the "map time" to wait for that trail.
+ * The consequences of leaving 12: putting steady at 5 is never enough for 12, so every frame is released and falsely declared.
+ * Firefox takes an unfilled buffer - 847 decoding / 792 discard = 93.5%, the image remains intact. */
 #define DMD_PIPELINE_DEPTH 5
 
-/* 队列满时为腾空位收一帧的等待上限。
+/* The line is full with a frame for empty spaces.
  *
- * 短一点：这条路径在 EndPicture 里（提交路径），等太久会拖慢提交。
- * 长一点：太短则腾不出空位、白白返回失败。
- * 200ms 足够 MediaCodec 在正常负载下吐出一帧（实测 1080p p95 约 10ms）。 */
+ * Shorter: This path is in EndPicture, and it will be submitted too late.
+ * Longer: too short to be empty and to return to the failed position.
+ * 200ms is enough for MediaCodec to throw up a frame under normal load (actual 1080p p 95 about 10ms). */
 #define DMD_BACKPRESSURE_MS 200
 
-/* 等这么久（毫秒）仍取不到帧，才认定上游不再送料、执行不可逆的 flush。
+/* After so long (ms) the frame was not taken, the upstream feed was determined to be non-reversible.
  *
- * 必须是固定值，不能按调用方的超时推算：调用方的耐心不是"流已结束"的证据。
- * Firefox 用很短的超时轮询 vaSyncSurface，按比例推算会得到极小的阈值，
- * 才送 3 帧就误判流结束 → flush → 会话作废 → 永久回落软解。 */
+ * It must be fixed and cannot be extra-duration to the caller: the caller's patience is not evidence of "end of current".
+ * Firefox uses a very short time-over query on vSyncSurface, which is proportionally calculated to get very small thresholds, and is used to create a very small number of people who are not allowed to spend time on the Internet.
+ * The frame 3 is the end of the misdirection  ⁇  Flush  ⁇  session is dead  ⁇  permanent downs and softs. */
 #define DMD_FLUSH_AFTER_MS 2000
-/* context 上限对齐 media_codecs.xml 声明的并发解码实例数（16）。 */
+/* Number of simultaneous decoded examples declared by context cap alignment media_codes.xml (16). */
 #define DMD_MAX_CONTEXTS 16
-/* buffer 上限：每帧 4 个左右（pic param / IQ matrix / slice param / slice data），
- * ffmpeg 在 EndPicture 后才 Destroy，同时存活量与 DPB 深度相关。 */
+/* Buffer cap: about 4 per frame (pic param / IQ matrix / slick param / slice data).
+ * ffmpeg is only after EndPicture Destroy, and survival is associated with the depth of the DPB. */
 #define DMD_MAX_BUFFERS 256
-/* image 上限：ffmpeg 每次 map 建一个、unmap 即销毁，同时存活量很小。 */
+/* Image cap: ffmpeg builds one, unmap, destruction at a time with very little survival. */
 #define DMD_MAX_IMAGES 64
 
-/* 缓冲几何对齐：Venus 解码器输出宽对齐 128、高对齐 32
- * （1080p → 1920x1088，真机取证）。surface 按此预分配，
- * 保证 daemon 回来的帧一定装得下，不必等到收到格式块才分配。 */
+/* Bump geometric alignment: Venus decoder output wide alignment 128, high alignment 32
+ * (Photo, the machine takes evidence)
+ * The frame that ensures that the daemon returns must be filled and not be distributed until the form block is received. */
 #define DMD_WIDTH_ALIGN 128
 #define DMD_HEIGHT_ALIGN 32
 
-/* 等一帧从 daemon 回来的上限。driver 跑在宿主进程里，绝不允许无限等：
- * 超时返回错误让消费者自己决定重试或放弃，比挂死整个进程好。
+/* When a frame returns from the daemon, the ceiling. Driver runs in the host process and is never allowed to wait indefinitely:
+ * It is better to take the time to get the wrong back and let the consumer decide to try again or give up than to hang the whole process.
  *
- * ⚠️ 跨目录耦合：daemon 侧的 SHM_SLOT_WAIT_MS（src/decode-daemon.c）
- * 必须 > 本值。本值是客户端愿意等一帧的时长，daemon 等空闲槽位的上限
- * 若比它短，底层就会在调用方还愿意等的时候先放弃并中止会话。
- * 历史事故：daemon 只等 1000ms < 本值 5000ms，把本可正常完成的解码
- * 变成丢帧。调大本值时必须同步检查 SHM_SLOT_WAIT_MS。 */
+ * ⁇  Cross-catalogue coupling: SHM_SLOT_WAIT_MS (src/decode-daemon.c) on the side of daemon
+ * This value is the maximum available slot for free slots like daemon, which the client wants to wait for.
+ * If it is shorter, the bottom level will give up and suspend the conversation when the caller is willing to wait.
+ * Historical accident: daemon waits only for 1000 ms < value 5000 ms, decodes that could have been done properly
+ * To drop frame. SHM_SLOT_WAIT_MS must be checked simultaneously when resetting the large value. */
 #define DMD_FRAME_TIMEOUT_MS 5000
 
-/* 一个 surface：VA-API 的解码目标，持有一块 NV12 缓冲。
+/* A surface: VA-API decode target, holding a NV12 buffer.
  *
- * 数据流：EndPicture 把 slice data 送给 daemon 并把 surface 挂进 context 的
- * 待解码队列；SyncSurface 从 daemon 取帧、按 FIFO 顺序填进队首 surface 的缓冲。
+ * Data stream: EndPicture send slick data to daemon and hang the surface into conft
+ * To decode; SyncSurface takes frames from daemon and fills the first surface buffer in the FIFO order.
  */
 struct dmd_import;
 struct dmd_surface {
     int in_use;
     VASurfaceID id;
-    /* 请求尺寸（显示尺寸，ffmpeg 传 1920x1080）。VAImage 以此为准。 */
+    /* The requested size (sizes shown, ffmpeg fax 1920x1080). VAImage refers to this. */
     unsigned int width;
     unsigned int height;
     /* Decoded display rectangle may be smaller than the application's pool
      * dimensions (e.g. an FFmpeg 1088-row pool carrying 1080 visible rows). */
     unsigned int visible_width, visible_height, visible_x, visible_y;
-    /* 缓冲几何：宽对齐 128、高对齐 32 后的值，data 按此分配。 */
+    /* Batch geometry: Wide alignment 128, values after high alignment 32, data distributed as this. */
     unsigned int buf_width;
     unsigned int buf_height;
     unsigned int stride;
@@ -212,52 +212,52 @@ struct dmd_surface {
     /* Read-only, externally owned NV12 input. The import owns duplicated
      * descriptors/mappings; an in-flight snapshot retains it independently. */
     struct dmd_import *imported;
-    /* dumb buffer 后备存储：exportable 非 0 表示 data 是 mmap 出来的可导出
-     * 内存，可通过 DRM_IOCTL_PRIME_HANDLE_TO_FD 导出 dmabuf fd。
-     * Firefox 取帧走 vaExportSurfaceHandle，没有它就整条流回落软解；
-     * 分配失败时回落普通 heap（exportable=0），ffmpeg 的 hwdownload 仍可用。 */
+    /* Dombbuffer reserve storage: exportable not 0 means that data is exported from mmap
+     * Memory, exported dmabuf fd via DRM_IOCTL_PRIME_HANDLE_TO_FD.
+     * Firefox takes the frame away from the vExportSurfaceHandle, without which the whole stream is softened;
+     * Falls normal header (exportable=0) when allocating fails, and hwdownload of ffmpeg is still available. */
     uint32_t dumb_handle;
     size_t dumb_size;
     int exportable;
-    /* 释放 dumb buffer 需要当初分配它的 drm fd。存在 surface 上而不是让
-     * 释放函数多收一个参数 —— 这样不可能传错 fd。 */
+    /* Release the dombbuffer requires the original drm fd assigned to it. There is a surface instead of a let-off.
+     * Release function takes one argument -- this makes it impossible to pass on the wrong fd. */
     int dumb_drm_fd;
-    /* 常驻的 dmabuf fd，仅用于 DMA_BUF_IOCTL_SYNC 做 cache 维护。
+    /* dmabuf fd, used only for DMA_BUF_IOCTL_SYNC cache maintenance.
      *
-     * 为什么要常驻：CPU memcpy 写进 dumb buffer 的 mmap 后，数据可能还停在
-     * D-cache 里；GPU 通过 dmabuf 采样会读到旧内容（实测表现为纯绿屏）。
-     * dumb buffer 的映射是 VM_PFNMAP，msync 直接返回 EINVAL，所以必须用
-     * DMA_BUF_IOCTL_SYNC —— 而它需要一个 dmabuf fd。
-     * 与 vaExportSurfaceHandle 交给调用方的那个 fd 分开持有：那个的生命周期
-     * 归调用方（它负责 close），不能拿来做内部同步。-1 = 不可用。 */
+     * Why stay: data may still be available after CPU memcpy writes dumb buffer 's mmap
+     * In D-cache; GPU reads old content (in fact, it is a pure green screen) through dmabuf sampling.
+     * The map of dumb buffer is VM_PFNMap, msync returns directly to EINVAL, so it must be used
+     * DMA_BUF_IOCTL_SYNC -- and it needs a dmabuf fd.
+     * Separated from the fd that vExportSurfaceHandle handed to the caller: that life cycle
+     * Recaller (which is responsible for close) cannot be used for internal synchronisation. 1 = not available. */
     int dumb_sync_fd;
-    /* 曾被 vaExportSurfaceHandle 导出过。
+    /* He was exported by the vaExportSurfaceHandle.
      *
-     * 用途：区分消费者契约，决定 EndPicture 是否必须立刻把像素写进 surface。
-     * Chrome 会在解码前导出全部 dmabuf，之后只 EndPicture、从不 Sync/GetImage，
-     * 所以它的 surface 必须在 EndPicture 返回前就写好；
-     * ffmpeg/Firefox 走 DeriveImage/GetImage，那里有 dmd_surface_wait 兜底，
-     * 不需要在 EndPicture 里同步 memcpy —— 而那次 memcpy 会让吞吐减半
-     * （实测 jinjie 300 帧：76.8 → 34.8 fps）。 */
+     * Use: Distinguishing consumer contracts to determine whether EndPicture must immediately write pixels into the surface.
+     * Chrome will export all dmabuf before decoding, and then only EndPicture, and never Sync/GetImage, but the only way to get a new one is to get a new one.
+     * So it must be written before EndPicture returns;
+     * ffmpeg/Firefox go DeriveImage/GetImage, where dmd_surface_wait
+     * No need to sync memcpy in EndPicture -- and that memcpy would cut the spitting by half.
+     * (Destination of jinjie 300 frames: 76.8 § 34.8 fps). */
     int exported;
     /* A successful WRITE_ONLY/READ_WRITE PRIME export permits the application
      * to supply encoder input directly through this local NV12 allocation.
      * This grants no decode readiness: the producer must complete GPU writes
      * before BeginPicture, and ordinary pixel-read APIs retain IDLE checks. */
     int external_write_exported;
-    /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
-     * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
+    /* Decoding status: 0 = freetime (VASURfaceReady), 1 = submitted pending decoding (VASURACERendering),
+     * 2 = frame ready (VASURfaceReady and data valid). */
     int state;
-    /* 该 surface 上一次解码的结果，SyncSurface 返回它。 */
+    /* The last decoding result of the surface returns it. */
     VAStatus decode_status;
-    VAContextID context; /* 提交时所属 context，未提交为 VA_INVALID_ID */
+    VAContextID context; /* Context at the time of submission, not submitted as VA_INVALID_ID */
 };
 
 #define DMD_SURFACE_IDLE 0
 #define DMD_SURFACE_PENDING 1
 #define DMD_SURFACE_READY 2
 
-/* 一个 buffer：VA-API 参数/码流缓冲。 */
+/* A buffer: VA-API parameter/code flow buffer. */
 struct dmd_buffer {
     int in_use;
     VABufferID id;
@@ -274,17 +274,17 @@ struct dmd_buffer {
     int coded_pending;
 };
 
-/* 一个 image：VAImage 的后备存储。data 是普通 heap 内存
- * （容器内 ION/dma_heap 均不可用，dmabuf 零拷贝这条路已被否掉）。 */
+/* An image: VAImage reserve storage. Data is a normal heap memory
+ * (ION/dma_head in containers is not available and the dmabuf zero copy has been dropped). */
 struct dmd_image {
     int in_use;
     VAImageID id;
-    VABufferID buf_id; /* 供 vaMapBuffer 用的伪 buffer ID */
+    VABufferID buf_id; /* Fake id for vamapBuffer */
     VAImage image;
     unsigned char *data;
     size_t data_size;
     int mapped;
-    /* derive 出来的 image 绑定在某个 surface 上；CreateImage 的为 VA_INVALID_ID */
+    /* Devereve immersion tied to a surface; CreateImage is VA_INVALID_ID */
     VASurfaceID derived_from;
     int acquired_fd;
     int handle_acquired;
@@ -292,24 +292,24 @@ struct dmd_image {
     int map_sync_started;
 };
 
-/* 一个 context：config + render target 集合 + 一条 V4L2 解码会话。
+/* A context:config + reder trage + a V4L2 decoding session.
  *
- * 待解码队列 pending[] 是 VA-API 乱序语义与 MediaCodec 流式语义之间的桥。
+ * The to decode queue pending[] is the bridge between the VA-API semantic and the MediaCodec fluid syntax.
  *
- * ⚠️ 配对规则按 codec 分两种，因为两侧的顺序不一定相同：
+ * ⁇  The pairing rule is divided into two categories by codec, as the order of the two sides may not be the same:
  *
- * - VP9/VP8（无帧重排）：ffmpeg 的提交顺序 == daemon 的出帧顺序，
- *   直接 FIFO 配对（取队首）。实测严格 1 进 1 出。
+ * - VP9/VP8 (no frame rehearsing): ffmpeg's submission order = frame order = daemon,
+ *   Direct FIFO pairing (take the first team). Strict 1 in and 1 out.
  *
- * - H.264/HEVC（有 B 帧重排）：ffmpeg 按**解码顺序**调 EndPicture，
- *   而 MediaCodec 按**显示顺序**吐帧 —— 两者不同序！
- *   本流实测解码序 I P B B B...（P 在第 2 位，因为 B 要参考它），
- *   显示序 I B B B P...。若按 FIFO 配对，第 2 个提交（P 的 surface）
- *   会被填进第 2 个输出（B 的内容），从第 2 帧起全错。
- *   所以必须按 POC（显示顺序）配对：daemon 的第 k 帧给 POC 第 k 小的 surface。
- *   POC 取自 VAPictureParameterBufferH264.CurrPic.TopFieldOrderCnt，
- *   ffmpeg 传的是已解包的 field_poc[0]（vaapi_h264.c:74），
- *   不是码流里 6 bit 会回绕的 poc_lsb，故可直接比较大小。
+ * - H.264/HEVC (with B reorder): ffmpeg by ** decoding ** EndPicture,
+ *   And MediaCodec shows the **-- the **-- the two are different!
+ *   PB B... (P at 2 bit, because B is to refer to it),
+ *   Display order I B B B P... The second submission (P-surface) if FIFO pairs
+ *   is filled in in the second output (B content), which is wrong from frame 2.
+ *   So you must pair with POC (sequence of display): the first k frame of daemon to POC the second k surface.
+ *   The POC is taken from VAPictureParameter Buffer H264.CurrPic. TopFieldOrderCnt.
+ *   ffmpeg is a disassembled field_poc [0] (vaapi_h264.c:74), which is a very important part of the story.
+ *   Not 6 bits in the stream will return to poc_lsb, so you can directly compare size.
  */
 struct dmd_context {
     int in_use;
@@ -331,114 +331,114 @@ struct dmd_context {
     unsigned int picture_height;
     int flag;
 
-    /* V4L2 解码会话。惰性创建：CreateContext 时建，失败则留 NULL 由
-     * EndPicture 重试 —— 建 context 时 daemon 不可用不该让整个初始化失败。 */
+    /* V4L2 decoding session. Inert creation: Create Context when built, leaving NULL by
+     * EndPicture Try Again - When creating context, daemon cannot be used to let the whole initialization fail. */
     struct dmd_session *session;
-    int session_failed; /* 建会话失败过，避免每帧重试拖慢失败路径 */
-    /* 本 context 的会话正在被拆（销毁已挂起或即将挂起）。收帧线程见到它就不
-     * 再对这个槽位开新 IO —— 没有这个标志，交还 io_busy 到"拆"之间的窗口里
-     * 收帧线程会把刚要销毁的会话重新抓起来用。 */
+    int session_failed; /* The building session failed, avoiding the delay of the failure path in each frame */
+    /* Ben context is being removed (destruction is already or is about to be hung).
+     * New IO for this slot -- without this sign, return io_busy to the window between "dismant."
+     * The frame-trace will re-take the session that was just about to be destroyed. */
     int retiring;
 
-    /* 待解码队列：EndPicture 提交的 surface。
-     * VP9/VP8 取队首；H.264/HEVC 取 pending_poc 最小者（见结构体头注释）。 */
+    /* Pending decoding Queue: Surface from EndPicture.
+     * VP9/VP8 Take the head of the team; H.264/HEVC Take the smallest ending_poc (see structure head comment). */
     VASurfaceID pending[DMD_MAX_SURFACES];
     int32_t pending_poc[DMD_MAX_SURFACES];
-    /* 所属 coded video sequence 序号：POC 每逢 IDR 会重置，跨序列比 POC
-     * 大小没有意义，所以排序时先比 seq 再比 POC。 */
+    /* Corded video sequence number: every IDR will be reset over the POC
+     * Size doesn't make sense, so sort it out first over seq and then over POC. */
     unsigned int pending_seq[DMD_MAX_SURFACES];
-    /* 该 surface 对应的**提交序号**（第几次向 daemon 送数据单元，1 起）。
-     * daemon 把它作为 PTS 原样回传到帧上（dmd_frame.unit_seq），
-     * 于是配对可以精确匹配，而不必假设解码器的出帧顺序。 */
+    /* This surface corresponds to the submission serial number** (1 for the first data module sent to the daemon).
+     * The Daemon returns it as a PTS back to the frame (dmd_frame.unit_seq), which is a very important tool for the development of the new system.
+     * The pairing then matches precisely without the need to assume the frame order of the decoder. */
     uint64_t pending_unit[DMD_MAX_SURFACES];
     int pending_head;
     int pending_count;
-    /* 硬件静默丢帧的检测（仅 AV1 用）。
+    /* Test for silent drop of frame by hardware (AV1 only).
      *
-     * 出帧跟随入序，所以"比队首更晚提交的单元都已经出帧了、队首那个却
-     * 迟迟不回"就是队首被硬件吞掉的证据 —— 每越过队首配走一帧加一，
-     * 队首正常配走则清零。实测触发点：1080p60 第 1665 帧（order_hint 回绕
-     * 处），硬件吞掉 unit 3323/3324 且从不回传，调用方在 vaSyncSurface 上
-     * 干等满 5 秒后整条码流中止 —— 一个丢帧不该毁掉整段播放。 */
+     * The frame follows the order, so the units that were submitted later than the first team have already been framed and the first team has been set up.
+     * "Delaying" is evidence of the hardware that swallowed the head of the team -- a frame plus one for each one that passes through the head.
+     * The header is normally set to go with zero. Actual trigger point: 1080p60 1665 (order_hint return)
+     * ) unit 3333/3324 never returned, the caller is on vSyncSurface
+     * The entire bar stream stops after five full seconds of dry-scrambling -- a frameless frame should not destroy the whole segment. */
     int av1_head_stall;
-    /* 已判定作废的单元号。若硬件之后才把那一帧吐出来，取帧路径据此丢弃；
-     * 不记就会在队列里"无匹配项"而退回顺序推断 —— 那会把后续配对整体
-     * 错位（0.4.5 实测 Chrome 98.6% 配错，见 dmd_pending_take_locked 注释）。 */
+    /* The number of the unit is determined to be disabled. If the hardware is not used to spit out the frame, the frame path is dropped;
+     * If you don't remember, you're going to be in the queue "no matches" and then you're going back to the sequence -- that's going to pair the next one.
+     * Incorrect pairing affected 98.6% of Chrome frames in 0.4.5. See dmd_pending_take_locked. */
     uint64_t av1_dead_unit[8];
     int av1_dead_head;
     int av1_dead_count;
-    /* 已提交的数据单元计数，给 pending_unit 发号。 */
+    /* Number of data units submitted, signaled to sending_unit. */
     uint64_t units_submitted;
-    /* 本会话已交付给消费者的帧数，纯诊断用。
+    /* The text has been delivered to consumers in number and is purely diagnostic.
      *
-     * 曾用它做"启动预热窗口"：前 N 帧内 Sync 对已入队 surface 也只探测不死等，
-     * 想借此消除启动阶段的丢帧簇。A/B 交替实测否证了这个改法
-     * （research/perf/ab.sh，各 4-5 轮）：
-     *     无预热     中位 3.50%（范围 1.82-39.84%）
-     *     预热 240 帧 中位 5.97%（范围 4.25-45.20%）
-     * 没有收益，反而偏差，已回退。计数本身留着，看会话交付量很方便。 */
+     * The first time I was using it as a "start preheating window": the former N frame Sync was only detecting the presence of the team and the presence of the virus.
+     * To eliminate the loss of the start-up phase. A/B alternated to test whether the change was confirmed.
+     * (research/perf/ab.sh, 4-5 rounds each):
+     *     No preheat 3.50% median (range 1.82-39.84%)
+     *     240 frames medium 5.97% (range 4.25-45.20%)
+     * The numbers are kept and the delivery of the session is easy. */
     uint64_t frames_out;
-    /* daemon 是否回传 unit_seq（运行时从帧里观测，非编译期假设）。
-     * 有它就能精确配对，且说明 daemon 已开跟随输入序输出（滞后 1）。 */
+    /* Whether daemon returns unit_seq (observation from frame at running time, non-compilation period assumptions).
+     * With this, you can match the exact pair and indicate that the daemon has followed the input sequence to output (delay 1). */
     int daemon_has_unit_seq;
-    /* 本帧的 POC，RenderPicture 从 pic param 取、EndPicture 随 surface 入队。
-     * 仅 H.264/HEVC 有意义。 */
+    /* The POC, RenderPicture from the pic param, EndPicture with the surface.
+     * H.264/HEVC only makes sense. */
     int32_t current_poc;
     int have_current_poc;
-    /* frame_num 在每个 IDR 处归零（规范 7.4.3），用它检测新序列 ——
-     * 不能用 POC 比较，因为解码序内 POC 本来就起伏。 */
+    /* Fame_num to zero in every IDR (regulation 7.4.3), using it to detect new sequences -
+     * PoC cannot be compared because POC is in the decoding sequence and is inflexing. */
     unsigned int current_frame_num;
     int32_t last_poc;
     unsigned int last_frame_num;
     int have_last_poc;
     unsigned int last_seq;
 
-    /* 当前 BeginPicture 选定的目标 surface，EndPicture 用完清空 */
+    /* Current BeginPictures selection */
     VASurfaceID current_target;
-    /* 本帧累积的码流数据（RenderPicture 可能分多次给 slice data） */
+    /* The flow data accumulated in this frame (RenderPicture may be divided into several different times to slick data) */
     unsigned char *slice_data;
     size_t slice_len;
     size_t slice_cap;
-    /* 本帧的 VP8 slice 参数，合成 uncompressed chunk 需要 */
+    /* VP8 slice parameter for this frame, synthesized uncompressed chunk required */
     int have_vp8_slice_param;
     VASliceParameterBufferVP8 vp8_slice_param;
     int have_vp8_pic_param;
     VAPictureParameterBufferVP8 vp8_pic_param;
 
-    /* MPEG-2：sequence/picture header 只存在于 pic param 与 IQ matrix 里，
-     * slice data 只有 slice 层字节，必须反向合成（见 mpeg2_bitstream.c）。 */
+    /* MPEG-2: Security header only exists in the pic param and IQ matrix,
+     * slick data only slices bytes, which must be inverted (see mpeg2_bitstream.c). */
     int have_mpeg2_pic_param;
     VAPictureParameterBufferMPEG2 mpeg2_pic_param;
     int have_mpeg2_iq_matrix;
     VAIQMatrixBufferMPEG2 mpeg2_iq_matrix;
-    /* temporal_reference 按提交序自增（模 1024）。MPEG-2 的这个字段只用于
-     * 显示序标识，解码器不靠它做参考帧管理，所以自增即可。 */
+    /* Temporal_reference increases itself in the submission order (model 1024). This field for MPEG-2 is only used
+     * Displays sequenced identification, which is not used for frame management, so self-increment is sufficient. */
     unsigned int mpeg2_temporal_ref;
-    /* sequence header 只在首帧与分辨率变化时送，与 param_sets_sent 同理。 */
+    /* The first frame and resolution changes only, as param_sets_sent. */
     int mpeg2_seq_sent;
 
-    /* AV1：合成 OBU 需要两样东西 ——
-     *   1) pic param 的结构化字段：序列头与帧头**只存在于这里**，
-     *      VASliceDataBuffer 里仅有 tile 载荷、不含任何 OBU 封装
-     *      （va_dec_av1.h:643-645 明确说明码流按 per-tile 粒度传入）
-     *   2) 每个 tile 在码流缓冲里的偏移与长度：tile_group 必须逐 tile 写
-     *      tile_size_minus_1，而 slice_data 是连成一片累积的。
+    /* AV1: Synthetic OBU requires two things --
+     *   1) Pic param 's Structured Fields: Sequence Header and Frame** only exists here**,
+     *      VASLiceDataBuffer only contains a Tile load, without any OBU envelope
+     *      (va_dec_av1.h: 643-645 with clear code currents per-tile particle level)
+     *   2) Offset and length of each tile in the code current buffer: tile_group must write by tile
+     *      The tile_size_minus_1, and slice_data is a cumulative one.
      *
-     * ⚠️ 边界来源必须是 VASliceParameterBufferAV1，**不能**数
-     * VASliceDataBuffer 的追加次数。实机实测：ffmpeg 每帧只调一次
-     * vaRenderPicture 送 slice data，却在同一帧声明 8 个 tile ——
-     * 即整帧 tile 打包在一个 buffer 里，靠追加次数只会得到 1。
-     * 正确来源是每 tile 一份的 slice param（va_dec_av1.h:635 "should be
-     * sent once per tile"），其 slice_data_size/slice_data_offset 分别是
-     * tile 字节数与在缓冲内的偏移（:649-658，注释明确说 slice_data_size
+     * ⁇  Boundary source must be VASLiceParameter BufferAV1,** not **
+     * Additional times for VASLiceDataBuffer. Actual: ffmpeg adjusted only once per frame
+     * vaRenderPicture sent slicice data, but declared 8 tile...
+     * That is, the whole frame tile is packed in a buffer, and only one is obtained by adding.
+     * The correct source is a slick param per tile (va_dec_av1.h:635 "should be)
+     * The slick_data_size/ slice_data_offset”)
+     * The byte number of tile is offset by buffer (649-658, note makes clear slick_data_size)
      * "actually means tile_data_size"）。
      *
-     * 512 项足以覆盖 8K/多 tile 场景（规范 MAX_TILE_COLS×MAX_TILE_ROWS
-     * 名义上 64×64，实际受 MAX_TILE_AREA 约束远小于此）。 */
+     * 512 sufficient to cover 8K/ multiple tile scenes (regulation MAX_TILE_COLSx_MAX_TILE_ROWS)
+     * 64 x 64 in nominal terms, which is much less bound by MAX_TILE_AREA). */
     int have_av1_pic_param;
-    /* 已向会话报过位深没有：0=还没报，1=报的 8bit，2=报的 10bit。
-     * CAPTURE 协商发生在首个单元送出的 SOURCE_CHANGE 里，而 vaCreateContext
-     * 阶段还拿不到位深，所以只能在首次 EndPicture 见到 PPB 时补告。 */
+    /* Has the session been overtaken by a long time: 0 = not yet reported, 1 = 8bit, 2 = 10bit reported.
+     * CAPTURE consultation occurred in SOURCE_CHANGE from the first module, and vCreateContext
+     * The stage is not ready for further processing, so only the first time EndPicture sees the PPP can be filled. */
     /* Effective output sample size, also preserved when HEVC sessions reopen. */
     int output_ten_bit;
     int av1_bd_reported;
@@ -446,129 +446,129 @@ struct dmd_context {
     VASliceParameterBufferAV1 av1_tile_param[512];
     int    av1_tile_count;
 
-    /* AV1 自洽 DPB：refresh_frame_flags 与 ref_frame_idx 都由我们写入码流，
-     * 而 VA-API 不提供前者（那是编码器的 GOP 决策，随源码流被丢弃）。
-     * 故自己维护一套槽位分配，保证写入码流的两者互相自洽。
-     * 详见 av1_bitstream.h 的 struct dmd_av1_dpb 说明。 */
+    /* The AV1 self-directed DPB: writes_frame_flags and ref_frame_idx are all written by us into the stream.
+     * VA-API does not provide the former (that's the GP decision of the encoder, discarded with the source stream).
+     * So, it maintains a slot allocation that guarantees that the two writing streams will be self-serving.
+     * See the explanation for av1_bitstream.hstruct dmd_av1_dpb for details. */
     struct dmd_av1_dpb av1_dpb;
 
-    /* AV1 延迟一帧送料所需的暂存。
+    /* AV1 Delays the storage of a frame for the delivery.
      *
-     * 为什么必须延迟：refresh_frame_flags 的正确值等于"下一帧的
-     * ref_frame_map 与本帧的差异位"（实测 4 帧全部命中源码流真实值），
-     * 所以本帧合成完还不能立刻送走 —— 要等下一帧到来、反算出正确值、
-     * 就地改写那 8 位之后才能送。
+     * Why delay: the correct value for refresh_frame_flags is equal to "the next frame"
+     * The & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & & &
+     * So this frame can't be sent out immediately after the completion of the synthesis -- until the next frame arrives, the correct value is calculated.
+     * Rewrite that eight bits just to be delivered.
      *
-     * av1_hold 持有已合成但尚未送出的上一帧字节（本模块 malloc，
-     * 送出后 free）。av1_hold_len 是其长度。 */
+     * v1_hold holds the last bytes that have been synthesized but not yet sent (this module Malloc, the first time the message is written in the first place.)
+     * Free after sending out. av1_hold_len is its length. */
     unsigned char *av1_hold;
     size_t         av1_hold_len;
-    /* 暂存帧的 refresh_frame_flags 位偏移。
-     * ⚠️ 不能复用 dpb.last_refresh_bitpos —— 那个字段会被**本帧**的
-     * build_frame 覆盖。实测踩过：日志显示 "bitpos=19 len=655"，
-     * 而 len=655 是新合成帧的长度，暂存帧长 2686，一眼即知拿错了帧。 */
+    /* Refresh_frame_flags offset.
+     * The dpb.last_refresh_bitpos -- that field will be ** the frame**
+     * . Checked: log shows "bitpos=19 len=655",
+     * And len=655 is the length of the new synthetic frame, the temporary frame 2686, and you know the wrong frame at first glance. */
     size_t         av1_hold_bitpos;
-    /* 暂存帧的 disable_frame_end_update_cdf 位偏移（同上，不能复用
-     * dpb 里的同名字段，会被本帧覆盖）。 */
+    /* Disable_frame_end_update_cdf offset from the temporary frame (ibid., cannot be reused)
+     * The same name segment in dpb will be covered by this frame. */
     size_t         av1_hold_endupd_bitpos;
-    /* AV1 延迟一帧送料，EndPicture 里送出的是**上一帧**的数据，
-     * 所以待配对队列必须登记那一帧的 surface 而不是当前 surface。
-     * 实测不这样做的后果：回传 unit_seq 在队列里找不到对应项
-     * （"unit_seq=6 无匹配项，回退顺序推断"），帧被配到错误的 surface，
-     * ffmpeg 等不到它要的那个 → 超时 → flush → 整段码流只出 1 帧。
-     *   av1_hold_surface：当前压在 av1_hold 里那一帧的 surface
-     *   av1_send_surface：build_unit 本次实际送出的那一帧的 surface */
+    /* AV1 Delays a frame delivery, EndPicture sends ** data from previous frame**,
+     * So the to pairing queue must register the frame of the framework instead of the current pattern.
+     * The consequences of not doing so are measured: echoes unit_seq not found in queues
+     * ("unit_seq=6 no match, rebuttal inference,"), frame is set to the wrong surface,
+     * ffmpeg cannot wait for the one it wants to get.
+     *   av1_hold_surface: currently presses the frame of av1_hold
+     *   Av1_send_surface: build_unit The frame that was actually delivered */
     VASurfaceID    av1_hold_surface;
     VASurfaceID    av1_send_surface;
-    /* 暂存帧在影子 DPB 里的帧号（frame_seq，见 av1_bitstream.h）。
-     * refresh 的影子登记发生在下一帧的 patch（那时才知道源码流把本帧
-     * 放进了哪个槽），登记时用这个号。 */
+    /* The frame number is in the shadow of the DPB (frame_seq, see av1_bitstream.h).
+     * Refresh's shadow registration occurred in the next frame of the past (that's when we knew the source stream was the frame)
+     * - What slot is it? - This is the number for the registration. */
     int            av1_hold_frame;
-    /* ---- flush 修复队列 ----
+    /* -flush fix queue -
      *
-     * 暂存帧被 sync 提前冲出（消费者等它的 surface 像素）时，refresh
-     * 尚未反算，按 0 送出（不占任何槽，绝不破坏 DPB），同时把字节留进
-     * 修复队列。下一帧 EndPicture 时 diff 已经能算出源码流的真实
-     * refresh，把修复缓冲就地改写后**重发一次**：硬件重新解码本帧
-     * （输出内容不变，surface 被再次写入同样的像素，无害），DPB 因此
-     * 补上正确的槽位。重发的输出用哨兵 pending（surface=0）丢弃，
-     * 不参与配对。 */
+     * When sync flushes the sync pre-emption, refresh
+     * Uncounted, press 0 to send (no slot, no DPB) while leaving the bytes in
+     * Fix Queue. The next frame diff can already calculate the true source stream
+     * Refresh, rewrite the fix buffers to the ground** re-reissued**: Hardware decoded the frame
+     * (Expires are still in order, sourface is again written into the same pixels, no harm), DPB therefore
+     * Fills the correct slots. Reissued output is discarded by sentry pending (surface=0).
+     * No matchmaking. */
     unsigned char *av1_repair_buf;
     size_t         av1_repair_len;
     size_t         av1_repair_bitpos;
     int            av1_repair_frame;
-    /* 修复趟要还原的 disable_frame_end_update_cdf：第一趟（flush 送出）
-     * 强制写 1 抑制帧上下文回写，真值存这里，修复趟写回真值完成
-     * 唯一一次回写。见 dmd_av1_dpb::last_endupd_bitpos。 */
+    /* Restored session_frame_end_update_cdf: First trip (flush delivery)
+     * Force 1 to inhibit frame reset, real value is stored here, rewriting the real value is completed
+     * The only answer is given. See dmd_av1_dpb::last_endupd_bitpos. */
     size_t         av1_repair_endupd_bitpos;
     int            av1_repair_endupd_val;
-    /* 双趟送料的交接槽：EndPicture 里 build_unit 先跑，它把**本帧**的像素趟
-     * 缓冲放这里；等上面的 DPB 趟把 av1_repair_buf（上一帧）送完，再整体搬进
-     * av1_repair_buf。不分开就会重发本帧自己 —— 实测过：帧 2 的合成 4422 字节
-     * 被当成"修复重发 4422 字节"送了两遍，紧接着 double free。 */
+    /* Double feed delivery slot: EndPicture builder_unit first, it runs the pixels **Figure**
+     * Buffer here; wait for the DPB above to deliver av1_repair_buf (upset) and move in as a whole.
+     * av1_repair_buf. The frame itself is re-reissued without separation -- measured: frame 2 synthesis 4422 bytes
+     * It was sent twice as "repair 4422 byte," followed by a double free. */
     unsigned char *av1_next_repair_buf;
     size_t         av1_next_repair_len;
     size_t         av1_next_repair_bitpos;
     int            av1_next_repair_frame;
     size_t         av1_next_repair_endupd_bitpos;
     int            av1_next_repair_endupd_val;
-    /* 最近一个拿到真实像素的 surface，供 show_frame=0 的空壳承接像素。 */
+    /* The last shell that gets real pixels is a surface for show_frame=0 to carry pixels. */
     VASurfaceID    av1_last_ready;
 
-    /* ---- show_existing_frame 补插 ----
-     * 硬件不输出 show_frame=0 的帧（符合规范），源码流靠 70 个 SEF 头
-     * 让它们各复显一次，凑满 150 帧。缺 SEF 头时实测只收 80 帧。
+    /* - Show_existing_frame plug-in
+     * Hardware does not export show_frame=0 frames (compliant), source flow is 70 SEF heads
+     * Let them reappear once and fill 150 frames. Only 80 frames are collected when SEF headouts are missing.
      *
-     * 位置规律（150 帧样本，100% 成立）：
-     *   全部 70 个 SEF 都紧跟在一个 show_frame=1 的帧之后
-     *   80 个 show=1 的帧里有 70 个带 SEF
-     * 引用规律：SEF 的 map_idx 指向的槽，正是某个 show_frame=0 帧
-     *   最后刷新的那个槽。
+     * Location pattern (150 frame sample, 100% established):
+     *   All 70 SEFs are closely behind a show_frame=1
+     *   80 show = 1 with 70 SEFs
+     * Reference Law: SEF's map_idx point slot, just some show_frame=0
+     *   Finally refresh that slot.
      *
-     * 于是驱动这样推导：show_frame=0 的帧进队（记下它占的 DPB 槽），
-     * 遇到 show_frame=1 的帧送出后，从队首取一个补一个 SEF 头。 */
-    /* 待复显帧所占的 DPB 槽，环形。容量取 64：实测 8 太小 ——
-     * 金字塔 B 结构下 show_frame=0 的帧会连续到来，
-     * 150 帧样本里队列长期处于满状态，入队被丢弃了 58 次
-     * （只入队 12 次，而 show=0 帧有 70 个）。 */
+     * The following is a video of the video that shows the number of people who are using the system:
+     * After the frame is sent out of show_frame=1, a SEF head is taken from the first team. */
+    /* The DPB slot to be re-recovered. Capacity extraction 64: 8 is too small --
+     * The frame of the pyramid B structure shows_frame=0 will continue to arrive.
+     * 150 frames were long-suffering, and 58 times were discarded.
+     * (12 times only in the team, and 70 times in show=0 frame). */
     unsigned       av1_sef_slot[64];
     int            av1_sef_head;
     int            av1_sef_count;
-    /* 无条件计数器。⚠️ 不要用日志行数推断执行次数 ——
-     * 本会话已两次因此误判（第 54 轮把 220 行当 220 次调用，
-     * 第 59 轮把 75 条日志当 75 次执行）。 */
-    unsigned long  av1_sef_visits;   /* 取槽点被执行的次数 */
-    unsigned long  av1_sef_show1;    /* 其中 send_show 为 1 的次数 */
-    unsigned long  av1_sef_enq;      /* 入队次数 */
-    unsigned long  av1_sef_drop;     /* 队列满而丢弃的次数 */
-    unsigned long  av1_sef_sent;     /* 实际追加的 SEF 单元数 */
-    unsigned long  av1_ep_enter;     /* EndPicture 进入次数 */
-    unsigned long  av1_ep_unit;      /* build_unit 返回非空的次数 */
-    unsigned long  av1_ep_null;      /* build_unit 返回 NULL（入暂存）次数 */
-    unsigned long  av1_hold_show1;   /* 入暂存时当前帧 show=1 的次数 */
-    unsigned long  av1_sendset1;     /* av1_send_show 被赋 1 的次数 */
-    unsigned long  av1_flushed;      /* sync flush 送出暂存帧的次数 */
-    unsigned long  av1_flush_show1;  /* flush 送出的帧里 show=1 的次数 */
-    unsigned long  av1_ep_show1;     /* EndPicture 送出的帧里 show=1 的次数 */
-    /* 参考帧全不在影子 DPB 而被丢掉的帧（拖到 GOP 中间起解、码流截断）。
-     * av1_ref_drop 是累计数，av1_ref_drop_now 只在**本次** EndPicture 内
-     * 有效：build_unit 用它告诉 EndPicture"这次 NULL 是丢帧，不是不支持
-     * 码流重建"，两者的收尾不同（前者要按空壳交付并返回成功）。 */
+    /* Unconditional counter. Do not extrapolate the number of times executed by log lines --
+     * The session was misjudged twice (round 54 calls 220 lines for 220 calls, and then the video is available on the page).
+     * In round 59, 75 logs are counted as 75 times executed). */
+    unsigned long  av1_sef_visits;   /* Number of slots executed */
+    unsigned long  av1_sef_show1;    /* Of which send_show is 1 */
+    unsigned long  av1_sef_enq;      /* Number of entries */
+    unsigned long  av1_sef_drop;     /* Number of times they've been thrown out of line */
+    unsigned long  av1_sef_sent;     /* Number of additional SEF units actually added */
+    unsigned long  av1_ep_enter;     /* EndPicture Entry */
+    unsigned long  av1_ep_unit;      /* Number of times build_unit returns non-empty */
+    unsigned long  av1_ep_null;      /* NULL (install) */
+    unsigned long  av1_hold_show1;   /* Number of current frames show=1 on suspense */
+    unsigned long  av1_sendset1;     /* av1_send_show was assigned 1 times */
+    unsigned long  av1_flushed;      /* sync flash sent to suspense */
+    unsigned long  av1_flush_show1;  /* Show =1 times from the frame sent by Flush */
+    unsigned long  av1_ep_show1;     /* Number of times that EndPicture sent show=1 */
+    /* The frame of reference is not the frame of the shadow DPB that was thrown out (to drag to the middle of the GOP, the stream cut).
+     * av1_ref_drop is cumulative, av1_ref_drop_now only in **EndPicture
+     * Valid: Build_unit uses it to tell EndPicture "This time NULL is missing frame, not unsupported
+     * The cipher flow is reconstructed" and the end of the two is different (the former is delivered by shell and returned to success). */
     unsigned long  av1_ref_drop;
     int            av1_ref_drop_now;
-    /* 配套记录 show_frame：show_frame=0 的帧不产生输出（解码器实测只对
-     * show_frame=1 的帧吐 CAPTURE 缓冲），不能为它登记待配对项，
-     * 否则队列里多出永远配不上的条目。 */
+    /* The frame with the accompanying log show_frame: show_frame=0 does not produce output (decoder only for actual measurements).
+     * Show_frame=1 frame vomiting CAPTURE buffer) cannot be registered for the pairing,
+     * Otherwise, there are more entries that never fit. */
     int            av1_hold_show;
     int            av1_send_show;
 
-    /* H.264：VA-API 从不传递参数集（SPS/PPS 被解析成字段后原始比特流就丢了），
-     * 所以要从 pic param 反向合成，并在首个 VCL 之前送入 OUTPUT 队列。 */
+    /* H.264: VA-API never transmits the set of parameters (the original bit stream is lost after the SPS/PPS has been deconstructed into fields).
+     * So you want to synthesize backwards from the pic param and send it to the OUTPUT queue before the first VCL. */
     int have_h264_pic_param;
     VAPictureParameterBufferH264 h264_pic_param;
-    /* HEVC 图像参数：合成 VPS/SPS/PPS 用。与 h264 那份互斥使用。 */
-    /* PPS 的 num_ref_idx 默认值推导：l0 取见过的最大、l1 取见过的最小。
-     * 见 decode.c 的说明 —— 直接照抄每帧生效值会写出错误的 PPS 默认值。 */
+    /* HEVC image parameter: Synthetic VPS/SPS/PPS. Use with h264. */
+    /* PPS's num_ref_idx default deduction: zero takes the maximum, l1 takes the smallest seen.
+     * See the description of decode.c - A direct copy of each frame entry value will write the wrong PPS default value. */
     unsigned int refidx_l0_max;
     unsigned int refidx_l1_min;
     int refidx_seen;
@@ -588,17 +588,17 @@ struct dmd_context {
     int param_sets_sent;
     unsigned int sent_mbs_wide;
     unsigned int sent_mbs_high;
-    /* 上次随 PPS 发出的 num_ref_idx 默认值。它必须跟随当前帧的生效值，
-     * 变化时要重发 PPS —— l1 偏大会改变 ref_idx_l1 的熵解码码长。 */
+    /* Last time a num_ref_idx default was sent with a PPS. It must follow the current frame entry value,
+     * Reissued PPS - l1 overselect ref_idx_l1 entropy decoding long. */
     unsigned int sent_l0;
     unsigned int sent_l1;
     unsigned int pending_l0;
     unsigned int pending_l1;
-    /* 已 shutdown(SHUT_WR)：不能再发送，也不必重复 flush */
+    /* SHUT_WR: no longer send, no need to repeat Flush */
     int input_finished;
 };
 
-/* 一个 VA-API config 对象：profile + entrypoint + 属性集合 */
+/* A VA-API config object: profile + entry + property collection */
 struct dmd_config {
     int in_use;
     VAConfigID id;
@@ -608,15 +608,15 @@ struct dmd_config {
     int num_attribs;
 };
 
-/* 驱动私有数据，挂在 ctx->pDriverData
+/* Driver private data, hang on ctx->pDriverData
  *
- * 锁策略：单把 lock 保护所有对象表。这不是性能瓶颈 —— 表操作都是 O(表长)
- * 的内存操作。**但阻塞 IO 绝不能持锁做**：与 daemon 的收发在放锁后进行，
- * 靠 context 的 busy 标志串行化同一 context 上的 IO。
+ * Lock policy: Keep all object sheets on lock. This is not a performance bottle -- the table is an O (table length) operation
+ * ** But blocking IOs must not be locked **: with the receipt and distribution of daemon after the locking, the IO must be locked.
+ * The collage of the same context on the IO by the context bary sign.
  */
 struct dmd_driver {
     pthread_mutex_t lock;
-    /* IO 完成时广播，等 context 的 busy 标志用 */
+    /* IO broadcast when finished, waiting for the confext busy tag */
     pthread_cond_t io_done;
 
     struct dmd_config configs[DMD_MAX_CONFIGS];
@@ -631,50 +631,50 @@ struct dmd_driver {
     unsigned int next_buffer_id;
     unsigned int next_image_id;
 
-    /* 某个 context 正在做 daemon IO（放锁期间的互斥标志）。
-     * 用数组下标而非 ID，查找更快。
-     * ⚠️ 语义是"有线程在锁外引用这个会话（包括它手里还没 release 的帧缓冲）"，
-     * 所以**必须撑到最后一次使用之后**才清；清了再拆会话就是拆别人在用的 fd。 */
+    /* Some context is doing daemon IO (the peer-over sign during locking).
+     * Index the array directly instead of looking up the ID.
+     * The semantic is "the lined quote from the session outside the lock (including the frame buffer it has not yet release), which is the most important part of the story.
+     * ** So it has to be done only after the last use**; clearing the session is just the fun of taking out the fd that is being used. */
     int io_busy[DMD_MAX_CONTEXTS];
 
-    /* 交还 io_busy 时发现有线程请求拆本槽位的会话，就先挂在这里，
-     * 由**最后一个用完的人**真正销毁（见 decode.c 的 io_release）。
-     * 直接拆不行：那时收帧线程可能正拿着同一个会话在 ioctl，close 掉它的 fd
-     * 之后 fd 号被宿主进程回收，再动一次动的就是 Chrome 自己的 fd。 */
+    /* I've got a line for the slot session when I return io_busy.
+     * By the last person to be used** that is actually destroyed (see io_release of decode.c).
+     * Not directly: the frame line might have been holding the same session at the octl, close to dropping its fd
+     * Then the fd is recycled by the host process and the move is chrome's own frd. */
     struct dmd_session *io_defer[DMD_MAX_CONTEXTS];
     struct dmd_encode *encode_defer[DMD_MAX_CONTEXTS];
 
-    /* 后台收帧线程：Chrome 只调 EndPicture，从不 vaSyncSurface。
+    /* Backstage frame closing thread: Chrome only epticure, never vSyncSurface.
      *
-     * 慢速播放实测（2fps 编号流 × 0.25 倍速 ≈ 每帧 2 秒）：硬件早已解完，
-     * 但两次 EndPicture 之间没有任何 VA 调用，帧就一直压在 V4L2 的
-     * CAPTURE 队列里 —— 驱动没有任何执行机会把像素写进 surface，
-     * Chrome 采样到的是空缓冲或上一轮内容，画面表现为前后帧跳跃。
+     * Slow playback actual 2fps number stream x 0.25 times the speed of  ⁇  2 seconds per frame: hardware is already solved, and the hardware is now available.
+     * But there's no VA call between EndPicture and the frame is always on V4L2.
+     * CAPTURE queue -- driver does not have any executive opportunity to write pixels into the surface,
+     * Chrome sampled either an empty buffer or a previous round of content, with a forward and forward frame leap.
      *
-     * 所以要有一条不依赖调用方节奏的收帧路径。线程惰性启动（第一次
-     * CreateContext 时），只做"取帧 → 按 unit_seq 配对 → 写 surface"，
-     * 与 EndPicture / SyncSurface 共用 io_busy 串行化，不改变配对逻辑。 */
+     * So there's a frame path that doesn't depend on the call-side rhythm. Linear inertia starts.
+     * "CreateContext" (when you're on)
+     * Shares io_busy stringing with EndPicture/ SyncSurface without changing the matchmaking logic. */
     pthread_t reaper;
     int reaper_started;
     int reaper_stop;
 
-    int drm_fd; /* 来自 ctx->drm_state，仅记录，当前不做 ioctl */
+    int drm_fd; /* From ctx->drm_state, record only, not currently octl */
     uint32_t encode_caps; /* DMD_ENC_CAP(profile), probed once per VA display. */
 };
 
-/* 启动后台收帧线程（惰性，重复调用无副作用）。调用方持锁。 */
+/* Starts the backstage collection (inertity, repeated calls without side effects). */
 void dmd_reaper_start_locked(struct dmd_driver *drv);
-/* 停止并回收后台收帧线程。调用方**不得**持锁。 */
+/* Stops and recovers the backstage collection. Callers** must not ** hold the lock. */
 void dmd_reaper_stop(struct dmd_driver *drv);
 
-/* 从 VADriverContext 取私有数据；ctx 或 pDriverData 为空时返回 NULL。 */
+/* Take private data from VADRIVCONT; ctx or pDriverData returns NULL when empty. */
 struct dmd_driver *dmd_get_driver(VADriverContextP ctx);
 
-/* 日志：默认静默，设 DMD_VA_LOG=1 后输出到 stderr。
- * 绝不写 stdout —— 那会污染宿主进程的输出。 */
+/* Log: Default silence, with DMD_VA_LOG=1 output to stderr.
+ * Never write stdout -- that's gonna pollute the output of the host process. */
 void dmd_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-/* ---- 已实现的 vtable 入口（其余在自动生成的 stubs.c 中） ---- */
+/* - a realized vtable entry (the rest in auto-generated stubs.c) */
 
 VAStatus dmd_Terminate(VADriverContextP ctx);
 
@@ -724,7 +724,7 @@ VAStatus dmd_SetDisplayAttributes(VADriverContextP ctx,
                                   VADisplayAttribute *attr_list,
                                   int num_attributes);
 
-/* ---- decode.c：解码数据路径 ---- */
+/* - decode.c: decoding data path - */
 
 VAStatus dmd_CreateSurfaces(VADriverContextP ctx, int width, int height,
                             int format, int num_surfaces,
@@ -803,29 +803,29 @@ VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image
                       unsigned int src_height, int dest_x, int dest_y,
                       unsigned int dest_width, unsigned int dest_height);
 
-/* ---- export.c：dmabuf 出口 ---- */
+/* - export.c: dmabuf export - */
 
-/* 把 surface 导出成 dmabuf（DRM_PRIME_2）。
+/* Export the surface to dmabuf (DRM_PRIME_2).
  *
- * Firefox 取帧只走这条路：CreateImageVAAPI 拿不到 DRM_PRIME_2 描述符就
- * 返回 DECODE_ERR，播放器随即回落软解，且没有拷贝回退路径。
- * ffmpeg 命令行不需要它（hwdownload 走 vaDeriveImage + vaMapBuffer）。 */
+ * Firefox takes the frame only this way: CreateImageVAAPI cannot get DRM_PRIE_2
+ * returns DECODE_ERR and the player then returns softly and has no copy of the retreat path.
+ * The ffmpeg command line does not need it (hwdownload walk vaDeriveImage + vamapBuffer). */
 VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
                                  uint32_t mem_type, uint32_t flags,
                                  void *descriptor);
 
-/* 等到 surface 像素真的就绪（内部自行加锁，调用方不得持锁）。
+/* Wait until the surface pixel is really ready (internal self-lock, caller is not allowed to hold the lock).
  *
- * SyncSurface 为避免与 MediaCodec 的流水线深度死锁，会对"已提交但未就绪"
- * 的 surface 直接报成功放行，真正的等待推迟到取像素时。所以 image.c 的
- * DeriveImage / GetImage 在读 surface 几何或拷像素之前必须先调用本函数。 */
+ * SyncSurface, to avoid locking up the water line with MediaCodec, will "had submitted but not ready"
+ * , the searchface is now released. The real wait is postponed until the pixels are taken.
+ * DeriveImage / GetImage must call this function before reading the geometry or copying of the surface. */
 VAStatus dmd_surface_wait(struct dmd_driver *drv, VASurfaceID surface);
 
 VAStatus dmd_QuerySurfaceStatus(VADriverContextP ctx,
                                 VASurfaceID render_target,
                                 VASurfaceStatus *status);
 
-/* ---- image.c：VAImage 出口 ---- */
+/* - image.c: VAImage Export - */
 
 VAStatus dmd_CreateImage(VADriverContextP ctx, VAImageFormat *format,
                          int width, int height, VAImage *image);
@@ -838,7 +838,7 @@ VAStatus dmd_DestroyImage(VADriverContextP ctx, VAImageID image);
 VAStatus dmd_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
                       unsigned int width, unsigned int height, VAImageID image);
 
-/* ---- 跨文件内部辅助（均要求调用方已持 drv->lock） ---- */
+/* - Cross-file internal support (all callers are required to hold drv->lock) */
 
 struct dmd_surface *dmd_find_surface_locked(struct dmd_driver *drv,
                                             VASurfaceID id);
@@ -848,45 +848,45 @@ struct dmd_buffer *dmd_find_buffer_locked(struct dmd_driver *drv,
                                           VABufferID id);
 struct dmd_image *dmd_find_image_locked(struct dmd_driver *drv, VAImageID id);
 
-/* 隐式同步一个 surface（GetImage 在 surface 未就绪时用）。
- * 要求调用方已持锁；内部会临时放锁做 IO，返回时仍持锁 ——
- * 调用方必须重新查找所有缓存的对象指针。 */
+/* Invisible sync a surface (GetImage in surface when not ready).
+ * Requires the caller to be locked; the internal lock will be used temporarily for IO, and the lock will remain on return --
+ * The caller must re-search all cached object points. */
 VAStatus dmd_surface_sync_locked(struct dmd_driver *drv, VASurfaceID surface,
                                  int timeout_ms);
 
-/* 释放一个 surface 槽位持有的资源（不加锁）。 */
+/* Release a resource (unlocked) held in a surface slot. */
 void dmd_surface_reset_locked(struct dmd_surface *s);
-/* 释放一个 context 槽位持有的资源，含 V4L2 会话（不加锁；会关闭设备 fd）。 */
+/* Releases a resource held in a context slot containing V4L2 sessions (unlocked; closes the device fd). */
 void dmd_context_reset_locked(struct dmd_context *c);
 
-/* 按 surface 几何填一个 VAImage 描述（不含 image_id/buf）。
- * 这是 1088-vs-1080 那处几何的唯一真源，derive 与 create 共用。
- * stride 传**字节**；ten_bit 决定 fourcc（P010 每样本 2 字节）。 */
+/* Enter a VAImage description by the surface geometry (excluding image_id/buf).
+ * This is the only real source of 1088-vs-1080 geometry that the direve shares with the new world.
+ * The stride fax** bytes;ten_bit decision is sourcecc (P010 bytes per sample). */
 void dmd_fill_image_geometry(VAImage *img, unsigned int disp_width,
                              unsigned int disp_height, unsigned int stride,
                              unsigned int slice_height, int ten_bit);
 
-/* 对齐辅助 */
+/* Alignment Auxiliary */
 unsigned int dmd_align_up(unsigned int v, unsigned int align);
 
-/* ---- profiles.c 内部辅助 ---- */
+/* - PROFES.c INTERNAL ADDITIONAL - */
 
-/* 该 profile 是否由本驱动支持（即 msm_vidc 有对应硬件解码器）。 */
+/* Whether this profile is supported by this driver (i. e. msm_vidc has a corresponding hardware decoder). */
 int dmd_profile_supported(VAProfile profile);
 
-/* profile → 协议 codec id（DMD_CODEC_*）。不支持的 profile 返回 -1。 */
+/* The profile  ⁇  protocol codec id (DMD_CODEC_*). Unsupported profile returns -1. */
 int dmd_profile_to_codec(VAProfile profile);
 
 /* ---- h264_bitstream.c ---- */
 
-/* 从 VA-API 的 pic param 反向合成带 4 字节起始码的 SPS / PPS NALU。
- * VA-API 从不传递参数集原始比特流，而 daemon 靠起始码识别 NAL 类型把它们
- * 累积成 codec-specific data，所以必须自己写出来。
- * 返回写入 out 的字节数，0 表示失败（含 out_cap 不足）。 */
-/* HEVC 参数集合成（hevc_bitstream.c）。
+/* SPS/ PPS NALU from the Pic Param inverted synthesis of 4 bytes from VA-API.
+ * VA-API never transmits the original bits stream of the argument set, and daemon recognizes them with the starting code nar type
+ * It's a codec-specific data, so you have to write it yourself.
+ * Returns the byte number of write out, 0 for failure (including out_cap insufficient). */
+/* The HEVC parameters are assembled (hevc_bitstream.c).
  *
- * dmd_hevc_can_build 返回 0 表示这个码流无法合成（VA-API 缺少必要信息），
- * 调用方应让上层回落软解，而不是产出坏画面。 */
+ * dmd_hevc_can_build returns 0 to the stream that cannot be synthesized (VA-API lacks the necessary information).
+ * The caller should allow the top down to be softened rather than produce bad images. */
 int    dmd_hevc_can_build(const VAPictureParameterBufferHEVC *pp);
 size_t dmd_hevc_build_vps_nalu(const VAPictureParameterBufferHEVC *pp,
                                VAProfile profile,

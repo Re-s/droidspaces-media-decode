@@ -1,7 +1,7 @@
-/* AV1 OBU 反向合成——变长编码、对齐与 OBU 头。
+/* AV1 OBU Inverted Synthesis - Longer Encoding, Alignment with OBU Head.
  *
- * 设计说明见 av1_bitstream.h 顶部。本文件只实现最底层的比特写入原语，
- * 序列头/帧头/tile group 的语法在后续提交里加。
+ * Design description at av1_bitstream.h. This document only allows for the bottom bit to be written in the original language, and then only the bottom bit to be written.
+ * The syntax of the sequence header/frame/tile group is submitted in Riga.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +33,7 @@ size_t dmd_av1_leb128(uint64_t v, unsigned char *out, size_t out_cap)
         unsigned char byte = (unsigned char)(v & 0x7f);
         v >>= 7;
         if (v)
-            byte |= 0x80;          /* 还有后续字节 */
+            byte |= 0x80;          /* And the following bytes. */
         out[n++] = byte;
     } while (v);
     return n;
@@ -43,8 +43,8 @@ size_t dmd_av1_leb128(uint64_t v, unsigned char *out, size_t out_cap)
 
 void dmd_av1_put_uvlc(struct dmd_bitwriter *bw, uint32_t v)
 {
-    /* AV1 规范 4.10.3：leadingZeros 个 0，一个 1，然后 leadingZeros 位尾数。
-     * 值 v 编码为 (1 << leadingZeros) - 1 + mantissa。 */
+    /* AV1 Standard 4.10.3: Leave Zeros 0, one, then leave Zeros bitile.
+     * Value v Encoded as (1 < leaving Zeros) - 1 + mantissa. */
     uint32_t leading_zeros = 0;
     uint64_t val = (uint64_t)v + 1;
 
@@ -56,7 +56,7 @@ void dmd_av1_put_uvlc(struct dmd_bitwriter *bw, uint32_t v)
         return;
     }
 
-    /* leading_zeros 个 0 位；put_bits 不接受 nbits=0，所以判空。 */
+    /* Left_zeros 0 bits; put_bits not accepted nbits=0, so empty. */
     if (leading_zeros > 0)
         dmd_bw_put_bits(bw, 0, (int)leading_zeros);
     dmd_bw_put_flag(bw, 1);
@@ -69,7 +69,7 @@ void dmd_av1_put_uvlc(struct dmd_bitwriter *bw, uint32_t v)
 
 void dmd_av1_put_le(struct dmd_bitwriter *bw, uint64_t v, int nbytes)
 {
-    /* AV1 规范 4.10.4：小端字节序，要求调用时已字节对齐。 */
+    /* AV1 Regulation 4.10.4: A small byte order requiring byte alignment at the time of the call. */
     if (nbytes <= 0 || nbytes > 8 || bw->bit_pos != 0) {
         bw->overflow = 1;
         return;
@@ -82,16 +82,16 @@ void dmd_av1_put_le(struct dmd_bitwriter *bw, uint64_t v, int nbytes)
 
 void dmd_av1_put_ns(struct dmd_bitwriter *bw, uint32_t v, uint32_t n)
 {
-    /* AV1 规范 4.10.7 ns(n)：非对称编码，小值省一位。
+    /* AV1 Code 4.10.7 ns (n): Asymmetric code, with one small value.
      *   w = FloorLog2(n) + 1
      *   m = (1 << w) - n
-     * v < m 时用 w-1 位直接写；否则写 (v + m) 的 w 位。 */
+     * v < m written directly with w-1 bit; otherwise the w bit written (v+m). */
     if (n == 0) {
         bw->overflow = 1;
         return;
     }
     if (n == 1)
-        return;                    /* 只有一个取值，不占位 */
+        return;                    /* Only one value, not in place */
 
     uint32_t w = 0, t = n;
     while (t) { w++; t >>= 1; }    /* w = FloorLog2(n) + 1 */
@@ -110,8 +110,8 @@ void dmd_av1_put_ns(struct dmd_bitwriter *bw, uint32_t v, uint32_t n)
 
 void dmd_av1_put_su(struct dmd_bitwriter *bw, int32_t v, int nbits)
 {
-    /* AV1 规范 4.10.6 su(n)：n 位补码。写入时取低 nbits 位即可，
-     * 解码侧按符号位扩展。 */
+    /* AV1 Regulation 4.10.6 su(n): n bit supplementation. Take a lower nbits bit when writing.
+     * Decoding side expands by sign bit. */
     if (nbits <= 0 || nbits > 32) {
         bw->overflow = 1;
         return;
@@ -120,28 +120,28 @@ void dmd_av1_put_su(struct dmd_bitwriter *bw, int32_t v, int nbits)
     dmd_bw_put_bits(bw, (uint32_t)v & mask, nbits);
 }
 
-/* ------------------------------------------------------------------ 对齐 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - Alignment */
 
 void dmd_av1_byte_align(struct dmd_bitwriter *bw)
 {
-    /* AV1 规范 5.3.5 byte_alignment()：纯补零，**不写 stop bit**。
-     * 这是与 H.264/HEVC rbsp_trailing_bits 的关键差别。 */
+    /* AV1 Regulation 5.3.5 byte_alignment(): Nothing but scratch, ** not to write stop bit**.
+     * This is the key difference with H.264/HEVC rbsp_trailing_bits. */
     while (bw->bit_pos != 0 && !bw->overflow)
         dmd_bw_put_flag(bw, 0);
 }
 
 void dmd_av1_trailing_bits(struct dmd_bitwriter *bw)
 {
-    /* AV1 规范 5.3.4 trailing_bits()：一个 1，然后补零到字节边界。
-     * 注意即使当前已对齐也要写这个 1 —— 它是 payload 结束标记。 */
+    /* AV1 Regulation 5.3.4 trailing_bits(): one and then complete zero to byte boundary.
+     * Note that this 1 -- it's Payload end mark -- even if it is now aligned. */
     dmd_bw_put_flag(bw, 1);
     while (bw->bit_pos != 0 && !bw->overflow)
         dmd_bw_put_flag(bw, 0);
 }
 
-/* ------------------------------------------------------- 序列头合成（2/4） */
+/* - - - - - - - - - - - - - - - - - - - Sequence head synthesis (2/4) */
 
-/* 位宽计算：AV1 规范用 FloorLog2(x)+1 表示"表达 x 需要几位"。 */
+/* Bit-wide calculation: AV1 is used to use the name "expression x takes several" in FloorLog2(x)+1. */
 static int bits_for(uint32_t v)
 {
     int n = 0;
@@ -149,7 +149,7 @@ static int bits_for(uint32_t v)
     return n ? n : 1;
 }
 
-/* color_config()，AV1 规范 5.5.2。 */
+/* Coll._config(), AV1 Reg. 5.5.2. */
 static void put_color_config(struct dmd_bitwriter *bw,
                              const VADecPictureParameterBufferAV1 *p)
 {
@@ -158,8 +158,8 @@ static void put_color_config(struct dmd_bitwriter *bw,
     const uint32_t sub_x      = p->seq_info_fields.fields.subsampling_x;
     const uint32_t sub_y      = p->seq_info_fields.fields.subsampling_y;
 
-    /* high_bitdepth / twelve_bit：bit_depth_idx 0/1/2 → 8/10/12 位
-     * （va_dec_av1.h:255-260）。只有 profile 2 能到 12 位。 */
+    /* high_bitdepth / twelve_bit: bit_depth_idx 0/1/2 represents 8/10/12 bits.
+     * (va_dec_av1.h:255-260). Only the profile 2 can reach 12 places. */
     const int high_bitdepth = (depth_idx != 0);
     dmd_bw_put_flag(bw, high_bitdepth);
     if (p->profile == 2 && high_bitdepth)
@@ -170,76 +170,76 @@ static void put_color_config(struct dmd_bitwriter *bw,
 
     /* color_description_present_flag = 0。
      *
-     * ⚠️ 曾置 1 并显式写三个描述符（想保住 VA-API 给的
-     * matrix_coefficients），实测与真实码流不符：libaom 置 0，
-     * 于是三者都取 UNSPECIFIED(2)。多写会让序列头长 3 字节。
+     * ⁇  used 1 and clearly wrote 3 descriptors (to save VA-API from)
+     * The results of the video are not consistent with the real stream: libaom 0, which is not a good idea.
+     * So all three take the UNSPECIFED(2). More writing makes the head of the sequence three bytes long.
      *
-     * 代价可接受：matrix_coefficients 只影响色彩转换矩阵的选择，
-     * 不影响能否解出帧；而本驱动输出 NV12 给上层，色彩解释由上层负责。 */
+     * The cost is acceptable: the choice of color conversion matrices is influenced only by the cost of the matrix_coefficients.
+     * Does not affect the ability to defox the frame; this driver produces NV12 for the upper layer, where colour interpretation is the responsibility. */
     dmd_bw_put_flag(bw, 0);
 
     if (mono) {
         dmd_bw_put_flag(bw, (int)p->seq_info_fields.fields.color_range);
-        return;                                    /* 单色分支到此结束 */
+        return;                                    /* Monochrome branch is over. */
     }
 
     dmd_bw_put_flag(bw, (int)p->seq_info_fields.fields.color_range);
 
-    /* subsampling 只在 profile 2 且 12 位时显式写入；profile 0 恒 4:2:0、
-     * profile 1 恒 4:4:4，由 profile 推导，不占码流位（规范 5.5.2）。 */
+    /* subsampling only writes when profile 2 and 12 bits; profile 0 is 4:2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+     * Profile 1 persistent 4:4 with no code currents (regulation 5.5.2). */
     if (p->profile == 2 && depth_idx == 2) {
         dmd_bw_put_flag(bw, (int)sub_x);
         if (sub_x)
             dmd_bw_put_flag(bw, (int)sub_y);
     }
 
-    /* chroma_sample_position 仅 4:2:0 时出现。VA-API 的同名字段已标
-     * va_deprecated（:285），故写 UNKNOWN(0)：它只影响色度插值相位假设，
-     * 不影响能否解出帧。 */
-    /* chroma_sample_position = 1（CSP_VERTICAL）。真实码流用 1；
-     * VA-API 的同名字段已标 va_deprecated（:285）故不可信。
-     * 该值只影响色度插值的相位假设，不影响能否解出帧。 */
+    /* The same name section of VA-API appears only at 4:2 :00.
+     * va_deprecaed(:285) and therefore wrote UNKNOWN(0): It only affects color-plug-in phase scenarios, but it is not a good idea.
+     * Without prejudice to the unwinding of the frame. */
+    /* The real code flow 1;
+     * The same name section of VA-API is marked va_deprecated (285).
+     * This value affects only the phase scenario of the colour plug value and does not affect the frame being untangled. */
     if (sub_x && sub_y)
         dmd_bw_put_bits(bw, 1, 2);
 
-    /* separate_uv_delta_q 写 **1**（不是源码流的值，但我们只能声明一次：
-     * 序列头随 KEY 帧发一次，而"本帧 U/V 的 delta 是否不同"是逐帧的。
-     * 声明 1 之后每帧用 diff_uv_delta 这一位如实表达：源里 V 继承 U 时
-     * 就写 0（解码器据此把 V 的 delta 取成 U 的，与源推断结果一致），
-     * V 与 U 不同（rav1e 常见）时写 1 并带上 V 的两个 delta。
-     * 声明 0 会把 V 的 delta 丢掉 —— 实测 rav1e 样本 luma 逐字节全对、
-     * 色度 50% 字节错，就是这个字段被吃掉了。 */
+    /* **1** (not the value of the source stream, but we can only state once:
+     * The head of the sequence is sent to the KEY frame once, and "Is the frame U/ V's delta different" is frame-by-frame.
+     * Declaration 1 After each frame is expressed as a true expression: when V in source inherits U
+     * Write 0 (the decoder that takes V delta into U, which corresponds to the source inference),
+     * V writes 1 when different from U (rav1e usually) and takes two deltas with V.
+     * Declares that V delta will be thrown out -- actual rav1e samples luma by byte,
+     * 50% color size bytes wrong, that field was eaten. */
     dmd_bw_put_flag(bw, 1);                        /* separate_uv_delta_q */
 }
 
-/* tile_info()，AV1 规范 5.9.15。
+/* Tile_info(), AV1 Regulator 5.9.15.
  *
- * ⚠️ tile_size_bytes_minus_1 按 max(tile_len) 动态计算（曾写死，见下），
- *    第 4 步的
- * tile_group 必须用同样宽度写 tile_size_minus_1 —— 两处不一致会让
- * 解码器按错误宽度读 tile 长度，从第二个 tile 起全部错位。 */
-/* tile_info()，AV1 规范 5.9.15。
+ * ⁇  tile_size_bytes_minus_1 by max(tile_len) dynamic (written dead, see below),
+ *    Step 4
+ * Tile_group must write the same width
+ * The decoder reads the length of tile in error width, all mispositions from the second tile. */
+/* Tile_info(), AV1 Regulator 5.9.15.
  *
- * ⚠️ 本函数的边界值算错过两次，最终以 ffmpeg 的 CBS 实现为准逐行校对
- * （libavcodec/cbs_av1_syntax_template.c 的 tile_info()）。两个坑：
+ * ⁇  The boundary value of this function was missed twice, and eventually line-by-line proofing based on the ffmpeg CBS achievement
+ * (tile_info(c) of libavcodec/cbs_av1_syntax_template.c) two pits:
  *
- *   1) 位移量是 sb_size = sb_shift + 2，**不是** sb_shift。CBS 原文：
+ *   1) The shift is sb_size = sb_shift + 2, **not **sb_shift. CBS Original:
  *        sb_size = sb_shift + 2;
  *        max_tile_width_sb = AV1_MAX_TILE_WIDTH >> sb_size;
- *      用 sb_shift 会让 max_tile_width_sb 大 4 倍 → min_log2_tile_cols
- *      偏小 → 一元码起点就错。
+ *      Using sb_shift makes max_tile_width_sb four times too large, affecting min_log2_tile_cols.
+ *      Small, one-yard starting point is wrong.
  *
- *   2) min_log2_tiles 要对 min_log2_tile_cols 取 max。CBS 原文：
+ *   2) Min_log2_tiles to take max from min_log2_tile_cols. CBS original text:
  *        min_log2_tiles = FFMAX(min_log2_tile_cols,
  *                    cbs_av1_tile_log2(max_tile_area_sb, sb_rows*sb_cols));
- *      漏掉会让 min_log2_tile_rows 偏小 → 行方向多写若干个 1。
+ *      The omission will leave the min_log2_tile_rows small enough to write several more 1 in the direction of the line.
  *
- * increment(v, min, max) 的编码规则（cbs_av1_write_increment）：
- *   v == max → 写 (max-min) 个 1，**不写停止位**
- *   否则     → 写 (v-min) 个 1，再写一个 0
+ * Code rules for increment(v, min, max) (cbs_av1_write_increment):
+ *   If v == max, write (max-min) one bits with no stop bit.
+ *   Otherwise, write (v-min) one bits followed by a zero.
  *
- * ⚠️ tile_size_bytes_minus_1 动态计算，第 4 步 tile_group 里写
- * tile_size_minus_1 必须用同样宽度 —— 两处不一致会从第二个 tile 起全错位。 */
+ * ⁇ tile_size_bytes_minus_1 Dynamic calculation, step 4
+ * The tile_size_minus_1 must be the same width -- two inconsistencies will be completely misplaced from the second tile. */
 static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
                           const VADecPictureParameterBufferAV1 *p,
                           uint32_t mi_cols, uint32_t mi_rows)
@@ -274,7 +274,7 @@ static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
     const uint32_t min_log2_tiles = (min_log2_tile_cols > min_log2_area)
                                   ? min_log2_tile_cols : min_log2_area;
 
-    /* VA-API 给的是 tile_cols/tile_rows（个数），先反推 log2。 */
+    /* VA-API gives tile_cols/tile_rows(number), then reverses log2. */
     uint32_t cols_log2 = 0;
     while ((1u << cols_log2) < p->tile_cols)
         cols_log2++;
@@ -287,7 +287,7 @@ static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
 
     if (p->pic_info_fields.bits.uniform_tile_spacing_flag) {
         /* increment(tile_cols_log2, min_log2_tile_cols, max_log2_tile_cols)
-         * 先夹到合法区间：CBS 的写入侧对越界直接报错拒绝。 */
+         * First, we'll get to the legal area: CBS's side of writing direct denial of cross-border reporting. */
         if (cols_log2 < min_log2_tile_cols) cols_log2 = min_log2_tile_cols;
         if (cols_log2 > max_log2_tile_cols) cols_log2 = max_log2_tile_cols;
         for (uint32_t i = min_log2_tile_cols; i < cols_log2; i++)
@@ -304,8 +304,8 @@ static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
         if (rows_log2 != max_log2_tile_rows)
             dmd_bw_put_flag(bw, 0);
     } else {
-        /* 非均匀：逐 tile 写 width_in_sbs_minus_1 / height_in_sbs_minus_1，
-         * 用 ns(n) 编码。上界是"剩余 sb 数"与 max_tile_*_sb 的较小者。 */
+        /* Uneven: write width_insbs_minus_1 / head_insbs_minus_1,
+         * Encoding with ns(n). The upper limit is the smaller "suspendable sb" with max_tile_*sb. */
         uint32_t start_sb = 0;
         for (int i = 0; i < p->tile_cols && start_sb < sb_cols; i++) {
             const uint32_t rest = sb_cols - start_sb;
@@ -322,26 +322,26 @@ static void put_tile_info(struct dmd_bitwriter *bw, int tile_size_bytes,
         }
     }
 
-    /* TileCols*TileRows > 1 时写 context_update_tile_id 与 tile_size_bytes。
-     * 位宽用**上面夹取修正后**的 log2 值，不能再按 tile_cols 重算。 */
+    /* TileCols*TileRows > 1 writes context_update_tile_id and tile_size_bytes.
+     * Bit wide** log2 values for the modified ** after the clip above can no longer be recalculated by tile_cols. */
     if (cols_log2 + rows_log2 > 0) {
         dmd_bw_put_bits(bw, p->context_update_tile_id,
                         (int)(cols_log2 + rows_log2));
-        /* tile_size_bytes_minus_1：按各 tile 的**实际长度**决定，不能写死。
+        /* tile_size_bytes_minus_1: ** actual length of tile** ** cannot be written dead.
          *
-         * ⚠️ 曾写死 1（2 字节），理由是"VA-API 给的 tile offset 之间恰好
-         * 各差 2 字节"。该推断是错的 —— 实测源码流 trace_headers 此处为 0
-         * （即 1 字节）。写死 2 字节会让每个 tile 间隙多 1 字节，
-         * 7 个间隙共多 6~7 字节，位流从此整体偏移，
-         * 解码器随后读到的字段全部错位（表现为 zero_bit out of range）。
+         * ⁇  wrote death by 1 (2 bytes) on the grounds that "VA-API gave tile offset just as well.
+         * The inference is wrong -- track_headers here are 0
+         * (i. e. 1 byte). Writing dead 2 byte will give each tile a gap of 1 byte,
+         * 7 gaps with 6-7 bytes, which are shifted from this overall,
+         * The decoder then reads all the fields in a misallocation (expressed as Zero_bit out of range).
          *
-         * 正确做法：取 max(tile_len) 所需的最小字节数。tile_group 里写
-         * tile_size_minus_1 时必须用同一宽度，故由调用方算好后传入。 */
+         * Correct approach: take the minimum byte number required for max(tile_len).
+         * The same width must be used for the time of the tile_size_minus_1, so the caller is counted and then passed on. */
         dmd_bw_put_bits(bw, (unsigned)(tile_size_bytes - 1), 2);
     }
 }
 
-/* quantization_params()，AV1 规范 5.9.12。 */
+/* Quantification_params(), AV1 Regulation 5.9.12. */
 static void put_quantization_params(struct dmd_bitwriter *bw,
                                     const VADecPictureParameterBufferAV1 *p)
 {
@@ -349,12 +349,12 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
 
     dmd_bw_put_bits(bw, p->base_qindex, 8);
 
-    /* delta_q：1 位 delta_coded 标志 + 7 位**二进制补码**有符号值。
-     * 曾按规范 4.10.6 的 su(n)="n-1 位幅值 + 1 位符号" 怀疑过这里的写法，
-     * 用 rav1e 样本 bat/rav_720 的原始位流实测定论：真实码流就是补码
-     * （y=10/u_dc=12/u_ac=2/v_dc=-9/v_ac=-15 五组值按补码+diff_uv_delta
-     * 排列能在 payload 第 25 位起逐位命中，按幅值+符号则一处都不命中）。
-     * CBS 的 read_signed 也是纯补码读法，两边一致。 */
+    /* delta_q: 1 bit delta_coded sign + 7 bit** binary supplement** has a symbol value.
+     * Su(n)="n-1 bit value +1 bit sign" has been used to check the writing here, as is the norm.
+     * Original bittology from rav1e samples bat/ rav_720: Real stream is a supplement
+     * (y=10/u_dc=12/u_ac=2/v_dc=-9/v_ac=15 by adding to the five sets of values + diff_uv_delta)
+     * The table is capable of being hit by the 25th position of the payload, and by the value + sign is not hit at any point.
+     * The CBS read_signed is also a purely coding reading that is consistent on both sides. */
     #define PUT_DELTA_Q(v) do {                        \
         if ((v) != 0) { dmd_bw_put_flag(bw, 1);        \
                         dmd_av1_put_su(bw, (v), 7); }  \
@@ -364,13 +364,13 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
     PUT_DELTA_Q(p->y_dc_delta_q);
 
     if (!mono) {
-        /* diff_uv_delta 的位置：紧跟 delta_q_y_dc **之后**、U 的两个 delta
-         * 之前（CBS quantization_params 原文顺序是 y_dc → diff_uv_delta →
-         * u_dc → u_ac → (v_dc, v_ac)）。曾把它写在 U 之后，序列头
-         * separate_uv_delta_q=0 时该位不存在所以没暴露；改成恒 1 后立刻
-         * 整体错位 1 位起，后续字段全乱。
-         * VA-API 的 v_dc/v_ac 是 CBS 的**生效值**（源里 diff_uv_delta=0 时
-         * 它已被推断成 U 的值），于是"V 与 U 是否不同"恰好还原源码流真值。 */
+        /* Diff_uv_delta: stay close to delta_q_y_dc**, U delta**
+         * Before (CBS Quantification_params in original order y_dc  ⁇  diff_uv_delta  ⁇
+         * ⁇ dc ⁇ u_ac ⁇  (v_dc, v_ac)  ⁇  wrote it after U, the sequence header
+         * This position was not exposed at the time of the separate_uv_delta_q=0; changed to constant1 immediately
+         * The overall error of 1 bits, the subsequent field is all messed up.
+         * VA-API v_dc/v_ac is CBS ** entry value** (diff_uv_delta=0 in source)
+         * It has been deduced as a U), so "V and U are different" just to restore the original source flow value. */
         const int diff_uv = p->v_dc_delta_q != p->u_dc_delta_q ||
                             p->v_ac_delta_q != p->u_ac_delta_q;
         dmd_bw_put_flag(bw, diff_uv);
@@ -393,7 +393,7 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
     }
 }
 
-/* segmentation_params()，AV1 规范 5.9.14。 */
+/* Regulation_params(), AV1 Reg. 5.9.14. */
 static void put_segmentation_params(struct dmd_bitwriter *bw,
                                     const VADecPictureParameterBufferAV1 *p,
                                     int primary_ref_none)
@@ -403,7 +403,7 @@ static void put_segmentation_params(struct dmd_bitwriter *bw,
     if (!enabled)
         return;
 
-    /* primary_ref_frame 为 NONE 时 update_map/update_data 恒 1、不写入码流。 */
+    /* Update_map/update_data is constant 1, without writing the bitstream when prism_ref_frame is NONE. */
     if (!primary_ref_none) {
         dmd_bw_put_flag(bw, (int)p->seg_info.segment_info_fields.bits.update_map);
         if (p->seg_info.segment_info_fields.bits.update_map)
@@ -413,9 +413,9 @@ static void put_segmentation_params(struct dmd_bitwriter *bw,
     }
 
     if (primary_ref_none || p->seg_info.segment_info_fields.bits.update_data) {
-        /* 逐段逐特征写。feature_mask 的位对应 SEG_LVL_* 特征是否启用，
-         * feature_data 是值。位宽与是否有符号由规范表
-         * Segmentation_Feature_Bits/Signed 决定。 */
+        /* Para-specific. The field matching SEG_LVL_* feature is enabled,
+         * The value is the value. The bit width is the standard table with the symbols.
+         * Decision on Security_Feature_Bits/Signed. */
         static const int seg_bits[8]   = { 8, 6, 6, 6, 6, 3, 0, 0 };
         static const int seg_signed[8] = { 1, 1, 1, 1, 1, 0, 0, 0 };
         for (int i = 0; i < 8; i++) {
@@ -425,7 +425,7 @@ static void put_segmentation_params(struct dmd_bitwriter *bw,
                 if (!on)
                     continue;
                 if (seg_bits[j] == 0)
-                    continue;            /* SEG_LVL_REF_FRAME 等无值特征 */
+                    continue;            /* SEG_LVL_RF_FRAME Equivalent feature */
                 if (seg_signed[j])
                     dmd_av1_put_su(bw, p->seg_info.feature_data[i][j],
                                    seg_bits[j] + 1);
@@ -437,12 +437,12 @@ static void put_segmentation_params(struct dmd_bitwriter *bw,
     }
 }
 
-/* loop_filter_params()，AV1 规范 5.9.11。 */
+/* Loop_filter_params(), AV1 Regulation 5.9.11. */
 static void put_loop_filter_params(struct dmd_bitwriter *bw,
                                    const VADecPictureParameterBufferAV1 *p,
                                    int coded_lossless, int allow_intrabc)
 {
-    /* lossless 或 allow_intrabc 时整段不写（规范里直接返回默认值）。 */
+    /* The userless or allow_intrabc time is left blank (the default is returned directly from the norm). */
     if (coded_lossless || allow_intrabc)
         return;
 
@@ -464,9 +464,9 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
         dmd_bw_put_flag(bw, delta_update);
         if (delta_update) {
             for (int i = 0; i < 8; i++) {
-                /* 逐项写 update 标志 + su(7)。这里对每个非零值写更新，
-                 * 零值写标志 0 —— VA-API 不区分"未更新"与"更新为 0"，
-                 * 保守地把非零视为需要更新。 */
+                /* Write update sign + su(7) by item. This is an update for each non-zero value.
+                 * Zero-value writing sign 0 - VA-API does not distinguish between "unupdated" and "updated to 0",
+                 * The non-zero is conservatively seen as requiring updating. */
                 if (p->ref_deltas[i] != 0) {
                     dmd_bw_put_flag(bw, 1);
                     dmd_av1_put_su(bw, p->ref_deltas[i], 7);
@@ -487,279 +487,279 @@ static void put_loop_filter_params(struct dmd_bitwriter *bw,
 }
 
 /*
- * ============ AV1 合成正确性的验证基线（实测，勿凭记忆改动） ============
+ * = = = = = = AV1 composite validity baseline (actual, not modified by memory) = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
  *
- * 源码流 av1_1080p.obu 的 temporal unit 结构并非一帧一 TU：
- *   150 个 TU，各含帧数 [1,5,0,1,0,2,0,1...] —— TU2 就含 5 帧。
- * 因此任何"取前 N 帧"的截断都会破坏 TU 完整性，实测源码流原始字节
- * 按帧截断到 5 帧后 dav1d 也只解出 1 帧。对照必须按 **TU 边界** 截断。
+ * The TU:
+ *   150 TUs, each containing frame numbers [1,5,0,1,2,0,1...] — TU2 contains 5 frames.
+ * So any cut in "pre-N" will destroy TU's integrity, and the source stream is actually original bytes.
+ * When the frame is cut to 5 frames, dav1d only removes 1 frame. The contrast must be **TU border** cut.
  *
- * 硬件 V4L2 基线（每帧一单元送料）：
- *   前 2 TU（ 6 帧）→ 送 6 收 2
- *   前 6 TU（ 9 帧）→ 送 9 收 6
- *   前16 TU（17 帧）→ 送17 收16
- * 解码器有约 1 帧固有延迟，序列越长越接近 N-1。
+ * Hardware V4L2 baseline (one module per frame):
+ *   Previous 2 TU(6 frames) Send 6 to collect 2
+ *   Previous 6 TU(9) Send 9 to collect 6
+ *   Top 16 TU(17) Send 17, charge 16
+ * The decoder has an inherent delay of about 1 frame, the longer the sequence, the closer it is to N-1.
  *
- * dav1d 侧同一基线：2/6/16 TU 分别出 2/6/16 帧。
+ * dav1d side-side same baseline: 2/6/16 TU separate 2/6/16 frames.
  *
- * ⚠️ 曾长期误用"送 6 收 6"作基线 —— 那是 6 个 TU 共 9 帧的结果，
- *    与"6 帧"不是同一量级，据此判断合成质量会得出错误结论。
+ * The "Send 6" for the baseline -- that's the result of six TUs of nine frames, and the result of the "Send 6" for the base line.
+ *    The mass of the synthesis is not of the same magnitude as the "Fix Frame", and the resulting synthetic quality will lead to the wrong conclusion.
  *
- * ---- 当前唯一已知缺陷：帧间帧帧头少 1 字节（已大幅收窄）----
+ * - The only known defect at present: 1 byte less between frames (substantially narrowed)
  *
- * 最新实测（6 帧样本，全部按"独立流 + trace_headers 字段序列 diff"核对）：
- *   帧2  源2683B 合成2683B  完全一致
- *   帧3  源 644B 合成 643B  少 1
- *   帧4  源 240B 合成 240B  完全一致
- *   帧5  源 178B 合成 178B  完全一致
- *   帧6  源  83B 合成  82B  少 1
- * 即 6 帧里 4 帧已逐字节正确，只有帧3、帧6 各少 1 字节。
+ * Latest actual measurements (6 frame samples, all check according to "Independent stream + trade_headers field series diff"):
+ *   Frame 2 Source 2683B. Synthetic 2683B.
+ *   Frame 3 Source 644B Synthesis 643B Less 1
+ *   Frame 4 Source 240B Synthesis 240B is identical
+ *   Frame 5 source 178B synthetic 178B identically
+ *   Frame 6 Source 83B Synthesis 82B Less 1
+ * That is, the 6 frames 4 are by bytes correct, with only 3 frames and 6 frames 1 bytes less each.
  *
- * 帧3 的字段序列比对结果（f3s.obu vs f3y.obu，各含 KEY 帧 + 该帧）：
- *   267 个字段**全部相同**，唯一差异是 obu_size 644 vs 643。
- * 字节层面：偏移 19 处源为 00 00 00 0a、合成为 00 00 0a —— 源多一个 0x00，
- * 其后内容完全相同（整体错开一字节）。
+ * Field sequence matching results for frame 3 (f3s.obu vs f3y.obu, each with KEY frames + the frame):
+ *   267 fields** all the same**, the only difference being obu_size 644 vs 643.
+ * Byte Level: Offset 19 with 000 00 0a, synthesized with 00 00 0a - one more 0x00,
+ * The following elements are identical (a staggered bytes).
  *
- * 布局核算（帧3）：8 个 tile 数据 619B + 7 个 tile_size(1B) = 626B
- *   源   obu_size 644 → 帧头 + tg头 = 18B
- *   合成 obu_size 643 → 帧头 + tg头 = 17B
+ * Layout accounting (frame 3): 8 tile data 619B + 7 tile_size (1B) = 626B
+ *   Source obu_size 644 + tg header = 18B
+ *   Synthetic obu_size 643 + tg header = 17B
  *
- * 已排除的候选：
- *   · tile 数据与 tile_size 序列 —— 两侧完全相同（[1,11,11,11,10,236,91] + 248B）
- *   · tile_size_bytes 宽度 —— 两侧都是 1 字节，动态计算已正确
- *   · tile_group 头 —— tile_total=8>1（实测 tile_cols=4 tile_rows=2），
- *     tile_start_and_end_present_flag 确实写了，byte_align 后正好 1 字节
- *   · byte_align 在已对齐时不补 —— 代码正确（规范 5.3.5 纯补零）
+ * Excluded candidates:
+ *   · Tile data is identical to the tile_size sequence - the same on both sides ([1,11,11,11,11,10,236,91] +248B)
+ *   . tile_size_bytes width -- 1 byte on both sides, dynamic calculations correct
+ *   . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+ *     Tile_start_and_end_present_flag did write, byte_align
+ *   • byte_align does not replace when aligned - code correct (code 5.3.5 for clean completion)
  *
- * 所以差的 1 字节在 uncompressed_header 内部，且**不改变字段序列**。
+ * The 1 byte is therefore not available inside the unpressed_header and** does not change the field sequence**.
  *
- * 本轮又排除了三项：
- *   · 字段位宽 —— 267 项逐项比对 length($3)，**零差异**
- *   · leb128 编码 —— 两侧 obu_size 都用 2 字节，644 vs 643 是结果非原因
- *   · film_grain / apply_grain —— 序列头 film_grain_params_present=0，
- *     两侧都不写该位，trace 各报 2 处一致
+ * Three more have been excluded from this round:
+ *   • Field wide - 267 item-by-item Length($3), **n difference**
+ *   . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+ *   . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+ *     Neither side, Trace. The two newspapers are identical.
  *
- * 精确定位（穷举插入法，比任何推断都可靠）：
- *   在合成帧的偏移 17/18/19 任一处插入一个 0x00，结果与源**逐字节完全相同**。
- *   源   [10:26] = 00000a179f00030000000a89774458bb
- *   合成 [10:26] = 00000a179f000300000a89774458bb44
- *   即源此处是 00 00 00（三个零），合成只有 00 00（两个零）。
- * 反推帧头长度：源 17B（136 位），合成 16B（128 位），差整 8 位。
+ * Precision (injection is more reliable than any extrapolation):
+ *   Inserts a 0x00 anywhere in the synthetic frame offset 17/18/19, with the result identical to the source** by bytes**.
+ *   Source [10:26] = 00000a179f000000a89774458bb
+ *   Synthetic [10:26] = 00000a1799f000000a89774458bb44
+ *   This is the source here at 000000 (three zeroes) and the synthesis at 0000 (two zeros).
+ * Inverse frame length: Source 17B (136 bit), synthetic 16B (128 bit), minus 8 bit.
  *
- * 注意 AV1 **不使用** EBSP 转义（那是 H.264/HEVC 的机制），
- * 所以这三个零不是防竞争字节，而是某个字段的真实内容。
- * 按该偏移位置，嫌疑落在 delta_q / segmentation 一带。
+ * Note that AV1 ** does not use the ** EBSP translator (which is the mechanism of H.264/HEVC)
+ * So the zero is not a anti-competitive by-by-blank, but the true content of a given field.
+ * By this deflection, the suspect is located in the area of delta_q/ distribution.
  *
- * 字节级对位（已确证，比任何位偏移推断可靠）：
- *   源   [10:26] = 00 00 0a 17 9f 00 03 00 | 00 00 0a 89 77 44 58 bb
- *   合成 [10:26] = 00 00 0a 17 9f 00 03    | 00 00 0a 89 77 44 58 bb
- * 已知 tile 层完全相同（第一个 tile_size=0x00 表示 size=1，其后 1 字节
- * tile 数据 0x00，再往后 0x0a 起是第二个 tile）。据此对齐可得：
- *   源   帧头 = [0..17]，末字节 [17]=0x00
- *   合成 帧头 = [0..16]，末字节 [16]=0x03
- * 且 **[0..16] 十七个字节两侧逐字节相同**。
+ * Byte pair (substantiated, more reliable than any deviation):
+ *   Source      [10:26] = 00 00 0a 17 9f 00 03 00 | 00 00 0a 89 77 44 58 bb
+ *   Synthesized [10:26] = 00 00 0a 17 9f 00 03    | 00 00 0a 89 77 44 58 bb
+ * Known tile layer is identical (first Tile_size=0x00 for size=1, followed by 1 byte)
+ * The tile data 0x00, followed by 0x0a starting with the second item.
+ *   Source Frame = [0.17], last byte [17] = 0x00
+ *   Synthetic Frame = [0.16], last bytes [16] = 0x03
+ * and **[0.16] Seventeen bytes are identical**.
  *
- * ★ 结论：合成写的每一位都是对的，只是在帧头**最末**少写了 1~8 位零，
- *   导致 byte_align 少补一整字节。要找的字段满足三个条件：
- *     (a) 值为 0   (b) 长度 1~8 位   (c) 位于 uncompressed_header 末尾
+ * * Conclusion: Each one is right, but one to eight bits is missing at the end of the frame**
+ *   This leads to a less than one byte_align byte. The field you are looking for meets three conditions:
+ *     (a) Value 0 (b) length 1-8 bit (c) at the end of uncompressed_header
  *
- * 本轮已逐行核对并确认正确的分支（不必再查）：
- *   · put_tile_info 全段，含 context_update_tile_id 与 tile_size_bytes_minus_1
- *   · put_quantization_params —— separate_uv_delta_q=0（实测），
- *     故不写 diff_uv_delta、U/V 共用一组 delta，代码处理正确
- *   · delta_q_params / delta_lf_params（1104-1120）—— 与规范 5.9.17/5.9.18 一致，
- *     实测 delta_q_present=1、delta_q_res=0
- *   · tx_mode（increment 编码）、reference_select、reduced_tx_set_used
+ * The correct branch has been verified and confirmed on a line-by-line basis in the current round (no further need to look):
+ *   * put_tile_info full paragraph with context_update_tile_id and tile_size_bytes_minus_1
+ *   * Put_quantisation_params — separate_uv_delta_q=0 (actual),
+ *     Do not write diff_uv_delta, U/V share a set of delta, code processed correctly
+ *   • delta_q_params / delta_lf_params (1104-1120) — consistent with normative regulation 5.9.17/5.9.18,
+ *     Actual Delta_q_present=1, delta_q_res=0
+ *   • tx_mode (inclement code), reference_select, reduced_tx_set_used
  *
- * ---- 补位实验结论（DMD_AV1_PAD_BITS，决定性）----
+ * - The conclusion of the post supplemental experiment (DMD_AV1_PAD_BITS, decisive) -
  *
- * 在 byte_align 之前额外补 N 位零，逐帧与源比对（6 帧样本）：
+ * Add N byte_align to the frame-to-source ratio (6 frames sample):
  *       pad=0  pad=1  pad=2  pad=3
- *   帧2   ·      ·      ·      ·
- *   帧3   ·      ✓      ✓      ✓
- *   帧4   ✓      ✓      ✓      ✓
- *   帧5   ✓      ✓      ✓      ✓
- *   帧6   ·      ·      ·      ·
- * （✓ = 与源**逐字节完全相同**）
+ *   Frame 2...
+ *   Frame 3 . . . . . . . . . . . . . . . .
+ *   Frame 4   ✓      ✓      ✓      ✓
+ *   Frame 5   ✓      ✓      ✓      ✓
+ *   Frame 6...
+ * ( ⁇  Same as source** by bytes**)
  *
- * 三点确证：
- * 1. 帧3 只要补 ≥1 位零就逐字节正确 —— 上一轮"帧头末尾少写 1~8 位零"
- *    的假设成立。位数不敏感是因为 byte_align 会吸收多余零位。
- * 2. 帧4、帧5 在任何 pad 值下都正确，说明它们本来就落在字节边界上，
- *    补零不影响 —— 所以这个补位不是"某帧特有"，而是**所有帧都该补**。
- * 3. 帧2、帧6 补零救不了：它们差的是**非零位**，属另一类缺陷。
+ * Three points confirm:
+ * Frame 3 is correct by by bytes if you fill 1 bit -- last round "Lite 1-8 bytes at the end of the frame."
+ *    The assumption is that the number of digits is not sensitive because the byte_align will absorb the extra zeros.
+ * 2. Frames 4, 5 are correct at any Pad value, which indicates that they are in fact located on the byte boundary,
+ *    Nothing is going to matter -- so this is not a frame-specific, but ** all frames should be filled**.
+ * Frame 2, frame 6 is not a rescue: they are poor** non-zero ** and they are another kind of defect.
  *
- * ---- 帧2 / 帧6 的残余缺陷（各只差 1 个字节，其余全同）----
- *   帧2 (2683B) 共同前缀 18B，仅 [18] 不同：
- *       源 0x70 = 01110000   合成 0x68 = 01101000
- *       XOR = 0x18 —— 相邻两位模式不同（源 11 0 / 合成 10 1）
- *   帧6 (83B) 共同前缀 2B，仅 [2] 不同：
- *       源 0x00 = 00000000   合成 0x04 = 00000100
- *       XOR = 0x04 —— 合成**多写**了 1 位
- * 方向相反（帧2 少、帧6 多），故不是同一个常量偏差。
- * 帧6 偏移 2 落在 refresh_frame_flags 一带（本会话修过该字段）；
- * 帧2 是第一个 inter 帧（order_hint=16），偏移 18 接近帧头末尾。
+ * - Residue defects of frame 2/ frame 6 (one byte each, all remaining)
+ *   Frame 2 (2683B) Common prefix 18B, only [18]:
+ *       Source 0x70 = 01110000
+ *       XOR = 0x18 - Two different modes in the adjacent (source 11 0/ synthetic 101)
+ *   Frame 6 (83B) Common prefix 2B, only [2] Different:
+ *       Source 0x00 = 000000000
+ *       XOR = 0x04 - Synthetic** 1 bit more
+ * The opposite direction (frame 2 and more) is not the same constant deviation.
+ * Frame 6 offset 2 landed along the recfresh_frame_flags (the field was fixed in this session);
+ * Frame 2 is the first interframe (order_hint=16), deflecting 18 close to the end of the frame.
  *
- * 注意：帧2 是链条上第一个 inter 帧，它错则后续全废 ——
- * 这解释了为什么补位让 3 帧变正确、硬件解码帧数却仍是 1。
- * 修复顺序应当是 帧2 → 帧6，而非先追帧数。
+ * Note: Frame 2 is the first interframe on the chain, and it is all gone by mistake.
+ * This explains why the replacement of three frames is correct, but the number of hardware decoding frames is still 1.
+ * The order of restoration should be frame 2  ⁇  frame 6 and not the number of frames to be pursued first.
  *
- * ---- 帧2 缺陷已定位：skip_mode_present（新增 DMD_AV1_BITS 开关测得）----
+ * - Frame 2 defect is located: skip_mode_present (new DMD_AV1_BITS switch detected)
  *
- * DMD_AV1_BITS=1 打印帧头各段起始位位置，帧2（第一个 inter 帧）实测：
+ * DMD_AV1_BITS=1 Print frame start-up for the sections, frame 2 (first interframe)
  *   tile_info@55 quant@66 seg@78 lf@83 cdef@111 lr@139
  *   txmode@145 refsel@146 skipmode@147 warp@148 redtx@149 header_end@157
- * 而字节比对给出的差异位正是 **147** —— 即 skip_mode_present。
+ * And the byte ratio gives the difference in the range **147** -- that is, skip_mode_present.
  *
- * 各帧的 VA-API 取值 vs 源码流实际写入（按上述位位置逐位反解源字节）：
- *   帧2  VA-API skip_mode_present=0   源=1   ← 不一致
- *   帧3  VA-API 1                     源=1
- *   帧4  VA-API 1                     源=1
- *   帧5  VA-API 1                     源=1
- *   帧6  VA-API 1                     源=1
- * 源码流全部 5 个 inter 帧都是 1，只有帧2 的 VA-API 值与源不符。
+ * VA-API extraction values vs flow from each frame are actually written (inverse source bytes by position above):
+ *   Frame 2 VA-API skip_mode_present=0 Source=1 ⁇  Unconforms
+ *   Frame 3 VA-API 1 Source = 1
+ *   Frame 4 VA-API 1 Source = 1
+ *   Frame 5 VA-API 1 Source = 1
+ *   Frame 6 VA-API 1 Source = 1
+ * The source stream is 1 for all 5 inter frames, except for the VA-API value of 2 frames which does not match the source.
  *
- * 也就是说：VA-API 的 mode_control_fields.bits.skip_mode_present 在本帧
- * **不可直接转写**。规范 5.9.22 的 skipModeAllowed 要比较参考帧 order hint
- * （需找出前向/后向最近的两个参考），VA-API 给的结论在此帧与 libaom 不符。
- * ---- 实测结论：skip_mode_present 与 allow_warped_motion **两个都要改** ----
+ * Namely: the mode_control_fields. bits.skip_mode_present of VA-API
+ * ** Not directly retransmitted**. The skipModeAllowed of 5.9.22 compares the frame of reference to the frame of reference
+ * (The two most recent references need to be identified forward/backward), the conclusions given by VA-API do not match libaom in this frame.
+ * - Test findings: skip_mode_present and allow_warped_motion**
  *
- * 加 DMD_AV1_SKIP / DMD_AV1_WARP 覆盖开关穷举组合，与源逐帧比对：
- *   skip=1 warp=0 → 帧2 ✓ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
- *   skip=1 warp=- → 帧2 ✗ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
- *   skip=- warp=0 → 帧2 ✗ 帧3 ✓ 帧4 ✓ 帧5 ✓ 帧6 ✗
- * （✓ = 与源逐字节完全相同；- = 用 VA-API 原值）
- * 单改任一个都不够，两个必须同时改，帧2 才逐字节正确。
+ * Add a combination of DMD_AV1_SKIP/ DSD_AV1_WarP overScopeless Switches, matching the source-to-source:
+ *   skip=1 warp=0: frame 2 ✓, frame 3 ✓, frame 4 ✓, frame 5 ✓, frame 6 ✗
+ *   skip=1 warp=-: frame 2 ✗, frame 3 ✓, frame 4 ✓, frame 5 ✓, frame 6 ✗
+ *   skip=-warp=0 = Frame 2 = Frame 3 = Frame 4 = Frame 5 = Frame 6
+ * ( ⁇  exactly the same as source bytes;-= original VA-API)
+ * One is not enough, two must be changed simultaneously, and frame 2 is correct by by bytes.
  *
- * 逐位实测（帧2 偏移18，144..152 位）：
- *   位147 源1 合成0  skip_mode_present
- *   位148 源0 合成1  allow_warped_motion
- * 两侧总位数相同（都到 header_end@157），所以**不是移位**，是两个值都反。
+ * Predictable (frame 2 shifting 18,144.152 bit):
+ *   Source 1 in 147. Synthetic 0skip_mode_present
+ *   148 bits source 0 composite1 allow_warped_motion
+ * The total number of places on both sides is the same (both to header_end@157), so** not to move**, but to both values.
  *
- * VA-API 侧的参考帧状况（DMD_AV1_BITS 实测）解释了 skip_mode_present：
- *   帧2 oh=16 idx=[2,2,2,2,2,2,2] ref_oh=[0,0,0,0,0,0,0]
- * 七个参考全指向同一 slot，只有一个可用参考 —— 按规范 5.9.22
- * skipModeAllowed 需要前向+后向两个不同参考，故 VA-API 报 0 是"讲道理"的，
- * 但 libaom 编码时写的是 1。所以此处不能照抄 VA-API 结论。
+ * The situation of the frame of reference on the side of VA-API (DMD_AV1_BITS) explains the skip_mode_present:
+ *   Frame 2 oh = 16 idx = [2,2,2,2,2,2] ref_oh = [0,0,0,0,0,0,0,0,0,0,0,0]
+ * All seven references point to the same slot, only one reference available -- by standard 5.9.22
+ * The skipModeAllowed needs to go forward and back two different references, so the VA-API 0 is "justifiably."
+ * But libaom code is written in 1. So this is not a copy of VA-API conclusions.
  *
- * ⚠️ 已确认**不是**位域读取错位：va_dec_av1.h:545-576 的
- * mode_control_fields 位域声明里 skip_mode_present 是独立字段，
- * 读取无误（曾怀疑此项，已排除）。
+ * ⁇  Confirmed**is not** field read error: va_dec_av1.h: 545-576
+ * The skip_mode_present is a separate field in the mod_control_fields domain statement.
+ * Read correctly (suspected and excluded).
  *
- * 待解决：这两个字段的正确取值规则是什么。当前只知道本码流
- * 全部 5 个 inter 帧的源值都是 skip=1，而 warp 需按帧判断
- * （帧2 源为 0）。不能直接写死常量 —— 那只是拟合这一条码流。
+ * To be resolved: What are the correct values for these two fields? Only the current flow is known.
+ * All 5 inter frames are source values skip=1, while the warp is judged by frame
+ * (Framework 2 Source 0). Not write the death constant -- that's just a bar flow.
  *
- * 下一步要么按规范自行推导 skipModeAllowed，要么找出 VA-API 该值的正确解释。
+ * The next step is either to deduce the skipMode Alllowed by standard or to find a correct interpretation of the value of VA-API.
  *
- * 附带纠正：1154 行用 reference_select 当门是对的（规范 5.9.22 里
- * skipModeAllowed 的前置就含 reference_select），上一轮把它列为嫌疑属误判。
+ * Side correction: 1154 line reference_select
+ * The prefix for skipModeAllowed includes reference_select), which was characterized as a suspect by error in the previous round.
  *
- * ---- 帧6 缺陷已定位：末帧的 refresh_frame_flags 从未被改写 ----
+ * - Frame 6 defect is located: the last frame refresh_frame_flags never rewrited -
  *
- * 位 21 落在 refresh_frame_flags（实测 @19，占 19..26 位）内。
- * 落盘流与源码流逐帧对比：
- *   帧2 源0x01 合成0x01 ✓   帧3 源0x08 合成0x08 ✓
- *   帧4 源0x20 合成0x20 ✓   帧5 源0x40 合成0x40 ✓
- *   帧6 源0x00 合成0x20 ✗
- * 前四帧完全正确 —— "延迟一帧就地改写"机制本身工作正常
- * （DMD_AV1_LOG 实测依次给出 refresh=0x01/0x08/0x20/0x40）。
+ * The first 21 landed in refresh_frame_flags (actually @19, 19.26 bit).
+ * The current is a frame-by-frame comparison between the falling stream and the source stream:
+ *   Frame 2 0x01 Synthetic 0x01
+ *   Frame 4: source 0x20, synthesized 0x20 ✓. Frame 5: source 0x40, synthesized 0x40 ✓.
+ *   Frame 6: source 0x00, synthesized 0x20 ✗.
+ * The first four frames are perfectly correct -- "Delaying a frame-on-the-spot" mechanism itself works properly.
+ * (DMD_AV1_LOG results in refresh=0x01/0x08/0x20/0x40).
  *
- * 帧6 是样本里的**最后一帧**，没有"下一帧"来触发改写，
- * 于是停在 `1 << slot` 的占位值 0x20，而源码流该帧真值是 0x00。
- * 这是本会话修过的"暂存末帧从不送出"的姊妹缺陷：
- * 那次漏的是数据发送，这次漏的是数值改写。
+ * Frame 6 is the last frame in the sample**, without the "Next frame" triggering the rewrite,
+ * The place value of the `1 < < slot ' is 0x20, while the frame value of the source stream is 0x00.
+ * This is the sister defect of the "silence frame never sent" that this session has fixed:
+ * The missing item was the data sent and the missing item was the numerical rewrite.
  *
- * 修法方向：sync_surface_locked 里 flush 暂存帧时，除了送出数据，
- * 还要给它一个 refresh 值。末帧无后继可比，但可用
- * "本帧之后没有任何帧会引用它" 推出 0 —— 需确认这是通用规则
- * 还是仅本码流如此（不能拿一条码流的末帧值当常量）。
+ * The law is modified by the fact that when the frush is stored in the sync_search_locked, except for the sending of data, the data is not available.
+ * And give it a refresh value. The last frame is comparable, but available.
+ * "No frame will ever quote from this frame." Launch 0 --and this is a universal rule.
+ * Or is it just a local stream (the last frame value of a stream cannot be taken as a constant).
  *
- * ⚠️ 注意 DMD_AV1_BITS 打印的 refresh_mask 是**改写前**的占位值
- * （0x01,0x02,0x04,0x08,0x10 的简单轮转），不是最终写入码流的值。
- * 判断 refresh 正确性必须看落盘流（DMD_AV1_DUMP），不要看这个探针。
+ * Note that the refresh_mask print from DMD_AV1_BITS is ** placeholder value before rewrite**
+ * (simple rotation of 0x010x02,0x04,0x08,0x10) is not the value that is ultimately written into the stream.
+ * The correctness of the refresh must be judged by looking at the stream (DMD_AV1_DUMP) and not at this probe.
  *
- * ---- 帧6 原始记录：位 21 ----
- * 帧6 差异在偏移 2（位 16..23），合成在位 21 多写 1 位。
- * 该位置在 tile_info(@55) 之前，属 uncompressed_header 开头段 ——
- * frame_type / show_frame / refresh_frame_flags / order_hint 一带，
- * 与 skip_mode_present 无关，需单独定位。
+ * - Frame 6 Original Record: Bit 21 -
+ * Frame 6 Differences are offset 2 (bit 16.23), synthesized in 21 overwritten 1 bit.
+ * This position is the opening paragraph of uncompressed_header before tile_info (@55) --
+ * The #saves #saves #saves #saves #saves #saves #saves #saves #saves #saves #saves #saves #saves #saves #s
+ * Not related to kip_mode_present, separate positioning is required.
  *
- * 剩余嫌疑（按位置从后往前）：
- *   · skip_mode_present 的**门条件**：代码用 `reference_select` 当门（1154 行），
- *     而规范 5.9.22 的 skipModeAllowed 推导并不含该项。实测
- *     reference_select=1 故本帧仍写了，但门条件本身仍需按规范复核。
- *   · allow_warped_motion 的 is_motion_mode_switchable 门
- *   · reduced_tx_set_used 之后是否还有规范要求、代码完全未写的字段
+ * Remaining suspicion (by location):
+ *   • skip_mode_present**: code used `reference_select` when door (1154 lines),
+ *     And the skipModeAllowed descriptor 5.9.22 does not contain this.
+ *     The framework is still written, but the conditions themselves need to be reviewed in accordance with the norms.
+ *   . that is_motion_mode_switchable
+ *   • Whether there are any standard requirements after which there are completely unwritten fields
  *
- * ⚠️ 方法教训（本轮再次踩到）：trace_headers 输出的位置是**流内累计位置**，
- * 不是帧内偏移；且输出里**没有** obu_forbidden_bit 行，
- * 所以"按 obu_forbidden_bit 分段取第 N 个 OBU"这种做法无效 ——
- * 本轮据此做的几组"两侧相同"比较全部作废。
- * 可靠判据只有两条：字节级穷举插入、以及单帧独立流的字段序列 diff。
+ * ⁇  (Trace_headers output is at ** accumulated position within stream**, and then the result is a change in the system.
+ * Not internal; and there is no obu_forbidden_bit line in the output**,
+ * So "Stick the N OBU by obu_forbidden_bit" is invalid...
+ * The groups of "the same side" made on this basis are all scrapped.
+ * There are only two reliable findings: bytes of insertion and field sequences of single-frame independent streams.
  *
- * ⚠️ 本轮一度又犯"跨帧比对"的老错：trace_headers 对含多帧的流会把各帧
- * 字段混在一起输出，我据此得出"位 168 是 tile_start_and_end_present_flag"，
- * 实际那行来自另一帧（同位置在本帧是 cdef_y_pri_strength[5]）。
- * 教训重申：必须把待测帧单独包成独立流再 trace。
+ * The current cycle is another time of "cross-frames versus right": the flow of multi-frames will take the frames.
+ * The field was mixed up for output, and I came up with a "168" for tile_start_and_end_present_flag."
+ * The line actually came from another frame (the same position in this frame is cdef_y_pri_stream[5]).
+ * The lessons reiterate that the framework to be measured must be isolated into an independent stream and then trace.
  *
 
- * 以帧 3（order_hint=4）为例，用"按声明宽度解 tile 长度、看余量是否合理"
- * 的方式反推帧头长度：
- *   源码流   帧头 18B → tiles=[1,11,11,11,10,236,91] 余 248B
- *   合成流   帧头 17B → tiles=[1,11,11,11,10,236,91] 余 248B
- * tile 数据逐字节相同、tile 长度序列相同（且 max=236 与 VA-API 给的
- * max_tile 吻合），差别只在帧头本身少 1 字节。
- * 具体是哪个字段少写/少了几位尚未定位 —— 下一步应逐字段核对帧 3 的
- * uncompressed_header，而非再依赖位偏移换算。
+ * Take frame 3 (order_hint=4) for example, "read the length of tile according to its stated width, see if the balance is reasonable."
+ * _Other Organiser
+ *   Source stream: 18-byte frame header, tiles=[1,11,11,11,10,236,91], 248 bytes remaining.
+ *   Synthesized: 17-byte frame header, tiles=[1,11,11,11,10,236,91], 248 bytes remaining.
+ * Tile data are bytes equal, style length sequences are identical (and max=236 from VA-API)
+ * The difference is only 1 byte less than the frame itself.
+ * Specifically which field is missing/ several are not yet located - the next field-by-field check box 3
+ * Unpressed_header, not re-dependent on the conversion of bits.
  *
- * ⚠️ tile_size_bytes_minus1 是**逐帧变化**的，不是流级常量：
- *   源码流首帧 = 1（2 字节，max_tile=4123）
- *   源码流帧 3 = 0（1 字节，max_tile=236）
- * 曾把首帧的值当成全流统一值，据此写死 2 字节，导致每个 tile 间隙多
- * 1 字节。现按 max(tile_len)-1 动态计算，实测与源码流逐帧一致
+ * ⁇ tile_size_bytes_minus1 is ** frame-by-frame **, not flow-level constant:
+ *   Source stream first frame = 1 (2 bytes, max_tile=4123)
+ *   Source flow frame 3 = 0 (1 byte, max_tile=236)
+ * The first frame value was considered a flat-rate value, which resulted in 2 bytes of death, resulting in a gap of each tile
+ * 1 byte. The measurements are consistent with the frame-by-frame of the source stream, based on the dynamic of max(tile_len)-1
  * （4123→2, 747→2, 236→1, 79→1, 38→1, 19→1）。
  *
- * ---- 金字塔 B 帧结构：多数帧 show_frame=0，不产生输出 ----
- * VA-API 提供 show_frame（va_dec_av1.h:425），但不提供 show_existing_frame。
- * 实测 ffmpeg 送来的前 6 帧：
- *   ft=0 show=1 oh=0    ← KEY，显示
- *   ft=1 show=0 oh=16   ← 参考帧，不显示
+ * - Pyramid B frame structure: most frames show_frame=0, no output produced -
+ * VA-API provides show_frame (va_dec_av1.h:425), but not show_existing_frame.
+ * Pre-detection 6 frames sent by ffmpeg:
+ *   ft=0 show=1 oh=0 ⁇ KEY, display
+ *   ft=1 show=0 oh=16  ⁇  Reference frame, not displayed
  *   ft=1 show=0 oh=8
  *   ft=1 show=0 oh=4
  *   ft=1 show=0 oh=2
- *   ft=1 show=1 oh=1    ← 显示
- * 只有首帧与末帧 show_frame=1。源码流 trace_headers 的 show_frame 序列
- * (1 | 0,0,0,0,1) 与 VA-API 给的完全一致，show_existing_frame 恒 0，
- * 且 TU2 内 5 个 OBU_FRAME 都带完整帧头 —— 故合成结构本身正确。
+ *   ft=1 show=1 oh=1 display
+ * Only the first and last frames show_frame=1. The source stream track_headers' show_frame sequence
+ * (1  ⁇ 0,0,0,0,1) Exactly consistent with VA-API, show_existing_frame0,
+ * And five OBU_FRAMEs in TU2 are all full frames -- so the synthetic structure itself is correct.
  *
- * ⚠️ 由此推翻"合成流比源码流少出帧"的结论。决定性对照：
- *   源码流 帧1+帧2 → dav1d 1 帧、硬件 送 2 收 1
- *   合成流 帧1+帧2 → dav1d 1 帧、硬件 送 2 收 1
- * 完全相同。帧 2 的 show_frame=0，本就不产生输出，
- * 拿"送 N 收 N-1"去要求它出帧是错的。
+ * The result is to overturn the conclusion that "synthetic currents are less than source flow" and then to reverse it.
+ *   Source Flow 1+Fram 2  ⁇  dav1d 1 Frame 2 Hardware Delivery 1
+ *   Synthetic stream 1+frame 2  ⁇  dav1d 1 frame, hardware 2 sent 1
+ * Exactly the same. The show_frame=0 of frame 2 does not produce output.
+ * Take "Send N take N-1" to ask it to come out of frame is wrong.
  *
- * ⚠️ trace_headers 不是多帧判据：它对源码流同样只解析首帧
- *    （-c copy 下 bsf 遇到后续 OBU 会停），实测源与合成的字段序列
- *    尾部完全相同。多帧正确性只能靠 dav1d 解出的帧数判断。
+ * ⁇ trace_headers is not a multi-framework decision: it also interprets the source stream only by parsing the first frame.
+ *    (-c copyy under bsf encounters follow-up OBU stops), field sequence of actual source and synthesis
+ *    The tail is identical. Multi-frame correctness is judged by the number of frames that dav1d untangles.
  *
- * ---- 两种 TU 分组各自触发不同报错（实测，用于区分症状来源）----
- * 把合成的 5 帧按不同方式分组喂给 dav1d：
- *   每帧独立一个 TU（驱动原本的输出方式）
+ * - - Each of the two TU clusters triggers a different reporting error (actually measured, used to distinguish the source of the symptoms) -
+ * Feed the five frames of the synthesis to dav1d in different ways:
+ *   One TU per frame (drilling original output)
  *     → "zero_bit out of range: 1, but must be in [0,0]"
- *   按源码流结构分组（TU1=1帧, TU2=其余4帧）
+ *   Grouping by source stream structure (TU1 = 1 frame, TU2 = 4 remaining frame)
  *     → "Invalid repeated frame header OBU"
- * 两者都停在第 2 帧。后一条说明：一个 TU 内出现多个完整帧头是非法的，
- * 源码流能这么做是因为其中多数帧带 show_existing_frame 或不显示。
- * 因此 zero_bit 那条并非独立缺陷，而是分组方式的副产物 ——
- * 追它会跑偏（本轮一度按它去查 CDEF 区）。
+ * Both are located in frame 2. The latter states that the presence of multiple complete frames in one TU is illegal.
+ * The source stream can do this because most of the frames show_existing_frame or are not shown.
+ * So the zero_bit is not a stand-alone defect, but a by-product of the grouping approach...
+ * The chase will run out of time (this round will be the one to check the CEDF area).
  *
- * 另：合成流与源码流的首个差异恒在第 2 帧载荷偏移 18（位 144，CDEF 区），
- * 源 0x70 / 合成 0x68。单独把该字节改回 0x70 无效（dav1d 仍 1 帧），
- * 证明它是上游某字段取值不同导致位流整体偏移的**结果**而非原因。
+ * In addition: The first difference between the synthetic and the source stream is constant in frame load offset 18 (by 144, CDEF area).
+ * Source 0x70/ Synthesis 0x68. Revert the byte back to 0x70 is invalid (dav1d still 1 frame),
+ * It is demonstrated that it is the result of a different field take-off from the upstream area ** which results in an overall deviation of the flow** rather than the cause.
  */
 
-/* cdef_params()，AV1 规范 5.9.19。 */
+/* cdef_params(), AV1 Reg. 5.9.19. */
 static void put_cdef_params(struct dmd_bitwriter *bw,
                             const VADecPictureParameterBufferAV1 *p,
                             int coded_lossless, int allow_intrabc)
@@ -773,8 +773,8 @@ static void put_cdef_params(struct dmd_bitwriter *bw,
 
     const int n = 1 << p->cdef_bits;
     for (int i = 0; i < n; i++) {
-        /* VA-API 把 y/uv strength 打包成 (pri << 2) | sec 的形式，
-         * 与码流里 4 位 pri + 2 位 sec 的布局一致，可直接拆写。 */
+        /* VA-API packs Y/UV strength as (pri << 2) | sec.
+         * The layout of the four-bit pr + 2-bit sec in the stream is identical and can be broken directly. */
         dmd_bw_put_bits(bw, p->cdef_y_strengths[i] >> 2, 4);
         dmd_bw_put_bits(bw, p->cdef_y_strengths[i] & 0x3, 2);
         if (!p->seq_info_fields.fields.mono_chrome) {
@@ -784,7 +784,7 @@ static void put_cdef_params(struct dmd_bitwriter *bw,
     }
 }
 
-/* lr_params()，AV1 规范 5.9.20。 */
+/* lr_params(), AV1 Regulator 5.9.20. */
 static void put_lr_params(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
                           int all_lossless, int allow_intrabc)
@@ -796,30 +796,30 @@ static void put_lr_params(struct dmd_bitwriter *bw,
     const uint32_t rcb = p->loop_restoration_fields.bits.cbframe_restoration_type;
     const uint32_t rcr = p->loop_restoration_fields.bits.crframe_restoration_type;
 
-    /* 序列头 enable_restoration 恒写 1，所以这一段**总要写**——
-     * 即使三个 lr_type 全为 0（那正是"本帧不做 restoration"的正规表达）。
-     * 早先这里按"全 0 就提前返回"，与序列头不一致，导致帧头短 6 位。 */
+    /* Sequence header persistently writes 1, so this paragraph** always writes**--
+     * Even three lr_types are all zero.
+     * Earlier, the "All Zeros" was used to return early, which did not match the head of the sequence, resulting in a short frame of six bits. */
 
-    /* lr_type 用 f(2)，取值顺序与 VA-API 的 restoration_type 枚举一致
+    /* lr_type with f(2), value order is the same as VA-API list of reference_type
      * （0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE）。 */
     if (getenv("DMD_AV1_BITS"))
         fprintf(stderr, "[lr] oh=%u ry=%u rcb=%u rcr=%u shift=%u uv=%u\n",
                 p->order_hint, ry, rcb, rcr,
                 p->loop_restoration_fields.bits.lr_unit_shift,
                 p->loop_restoration_fields.bits.lr_uv_shift);
-    /* ⚠️ lr_type 的码流编码与 VA-API 枚举**不是**同一套取值，必须映射。
+    /* ⁇ lr_type coding of the stream with the VA-API emits** is not the same set of extracts and must be mapd.
      *
-     * 规范 5.9.20 用 Remap_Lr_Type[4] = {NONE, SWITCHABLE, WIENER, SGRPROJ}
-     * 把码流里的 f(2) 映射成 FrameRestorationType；
-     * VA-API 直接给 FrameRestorationType 枚举
+     * Standard 5.9.20 Use Remap_Lr_Type[4] = NONE, SWITCHABLE, WIENER, SCRPROJ}
+     * (b) Map f(2) in the stream as FrameRestorationType;
+     * VA-API directs to FrameRestorationType
      * （0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE）。
-     * 写码流要做**反向**映射：
+     * Write stream to map backwards **
      *   NONE(0)→0   WIENER(1)→2   SGRPROJ(2)→3   SWITCHABLE(3)→1
      *
-     * 实测证据（帧26，oh=28）：VA-API 给 ry=1(WIENER)，
-     * 源码流该位写 2 —— 直接转写得到 1，正是差异位 115/116。
-     * 早先"put_lr_params 已验证正确"的结论来自 6 帧样本，
-     * 那些帧恰好 ry=rcb=rcr=0，映射前后都是 0，掩盖了这个缺陷。 */
+     * The evidence is measured (frame 26, oh = 28): VA-API to ry=1 (WIENER),
+     * Source stream 2 - 1 direct transliteration, 115/116.
+     * The earlier "put_lr_params have verified" conclusions were from a six-frame sample, which was found to be a very good one.
+     * The frames just happened to be ry=rcb=rcr=0, and the map was all 0, covering up the flaw. */
     static const unsigned char lr_to_bits[4] = { 0, 2, 3, 1 };
     dmd_bw_put_bits(bw, lr_to_bits[ry & 3], 2);
     if (!p->seq_info_fields.fields.mono_chrome) {
@@ -828,30 +828,30 @@ static void put_lr_params(struct dmd_bitwriter *bw,
     }
 
     if (ry || rcb || rcr) {
-        /* ⚠️ VA-API 的 lr_unit_shift 是**总位移量**（0..2），
-         * 而码流里分成两个各 1 位的字段（规范 5.9.20）：
-         *   use_128x128_superblock=1: lr_unit_shift 一位即表示 0 或 1
-         *   否则: lr_unit_shift(1) + 若为 1 再写 lr_unit_extra_shift(1)
-         *         总位移 = lr_unit_shift + lr_unit_extra_shift
-         * 所以 shift=2 要写成 1 再写 1。
+        /* VA-API lr_unit_shift is the total shift (0..2),
+         * The stream is divided into two 1-bit fields (regulation 5.9.20):
+         *   Use_128x128_subperblock=1 lr_unit_ship
+         *   Otherwise: lr_unit_ship (1) + if 1 is written lr_unit_extra_ship (1)
+         *         Total Offset = lr_unit_ship + lr_unit_extra_ship
+         * So the shift=2 is to write as one and write again as one.
          *
-         * 早先代码写 `lr_unit_shift` 的低 1 位、extra 恒填 0：
-         * shift=2 被写成 0，且不写 extra —— 实测帧26（shift=2）
-         * 差异位 121/122 正是此处。
-         * 6 帧样本里 ry=rcb=rcr=0，整个 if 块被跳过，掩盖了缺陷。 */
+         * The earlier code says `lr_unit_ship ` low 1 bit, exttra constant 0:
+         * Shift=2 written as 0 without extra -- realistic frame 26 (Shift=2)
+         * The difference is 121/122 here.
+         * 6 in the frame sample ry=rcb=rcr=0, the whole if block was skipped and the defects were masked. */
         const unsigned sh = p->loop_restoration_fields.bits.lr_unit_shift;
         if (p->seq_info_fields.fields.use_128x128_superblock) {
-            /* ⚠️ sbs128=1 时码流位是**有效位移减一**（规范 5.9.20：
+            /* ⁇  sbs128=1 time current is ** Effective Offset 1** (Regular 5.9.20:
              * "When use_128x128_superblock is equal to 1, lr_unit_shift is
-             * set equal to 1 + lr_unit_shift"），有效值只可能是 1 或 2。
-             * VA-API 给的是有效值，所以这里必须写 sh-1，而不是 sh 的非零判定。
+             * Set effective to 1 + lr_unit_ship"), only valid values of 1 or 2.
+             * VA-API gives a valid value, so it must be written sh-1, not sh non-zero.
              *
-             * 实测（testsrc 合成流 av1_probe.mp4，帧 oh=16，lr_type[2]=SGRPROJ，
-             * 源码流该位 0 ⇒ 有效位移 1）：旧写法把 0 写成 1 ⇒ 有效位移 2 ⇒
-             * restoration 单元从 64 变成 128 ⇒ **整条流每一帧都错**
-             * （framemd5 128/128 全不匹配，浏览器里表现为满屏坏帧）。
-             * 之所以此前 B 站 1800 帧真流逐字节一致，是它的 restoration 帧
-             * 恰好全是有效位移 2（写 1 蒙对）—— 这个缺陷被样本掩盖了。 */
+             * (tesrc composite stream av1_probe.mp4, frame oh=16, lr_type[2]=SCRPROJ,
+             * Source stream 0  ⁇  valid shift 1: old writing 0 to 1  ⁇  valid shift 2  ⁇
+             * Retention unit from 64 to 128  ⁇  ** Every single single single piece of the stream is wrong**
+             * (framemd 5,128/128 does not match at all, and the browser is full of screens.
+             * The reason B Station 1800 is really a byte-by-the-temperate frame is its framework of response
+             * And it's all just a valid shift -- it's a flaw that's covered up. */
             dmd_bw_put_bits(bw, sh > 1 ? 1 : 0, 1);
         } else {
             dmd_bw_put_bits(bw, sh ? 1 : 0, 1);
@@ -871,8 +871,8 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     if (!p || !out || out_cap < 8)
         return 0;
 
-    /* payload 先写临时缓冲：obu_size 用 leb128 编码，必须先知道 payload
-     * 长度才能写头部。序列头很小（实测 20 字节上下），栈上足够。 */
+    /* Payload writes a temporary buffer: obu_size with a leb128 encoding, you must know about payload
+     * The length is enough to write the head. The sequence head is small (live 20 bytes up and down) and there's enough on the pad. */
     unsigned char body[128];
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, sizeof(body));
@@ -880,35 +880,35 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     const uint32_t enable_order_hint =
         p->seq_info_fields.fields.enable_order_hint;
 
-    /* ---- sequence_header_obu()，AV1 规范 5.5.1 ---- */
+    /* - procedure_header_obu(), AV1 Regulation 5.5.1 - */
 
     dmd_bw_put_bits(&bw, p->profile, 3);                    /* seq_profile   */
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.still_picture);
     dmd_bw_put_flag(&bw, 0);   /* reduced_still_picture_header
-                                * 恒 0：置 1 会砍掉后面绝大多数字段，而帧头
-                                * 解析依赖其中的 enable_* 能力位。 */
+                                * Hen-0: set 1 will cut most of the back fields off and frame heads
+                                * Parsing the power bits that rely on it. */
 
     dmd_bw_put_flag(&bw, 0);   /* timing_info_present_flag
-                                * VA-API 不提供 timing_info。时序不影响解码，
-                                * 显示节奏由上层控制。 */
+                                * VA-API does not provide text_info. Time sequence does not affect decoding,
+                                * Shows the rhythm is controlled by the upper layers. */
     dmd_bw_put_flag(&bw, 0);   /* initial_display_delay_present_flag */
     dmd_bw_put_bits(&bw, 0, 5);/* operating_points_cnt_minus_1
-                                * 单一 operating point：本驱动不做可扩展层，
-                                * 与 OBU 头 extension_flag 恒 0 相一致。 */
+                                * Single operation point: This driver does not make scalable layers,
+                                * Consistency with OBU head extension_flag constant 0. */
     dmd_bw_put_bits(&bw, 0, 12);          /* operating_point_idc[0] */
     /* seq_level_idx[0] = 8（level 4.0）+ seq_tier[0] = 0。
      *
-     * ⚠️ 曾写 0（level 2.0），实测与真实码流不符：libaom 对 1080p 输出 8。
-     * 关键不只是数值 —— seq_level_idx > 7 时**必须紧跟 seq_tier**（f(1)），
-     * 写 0 会少这一位，导致序列头后续所有字段偏移 1 位。
-     * VA-API 不提供 level，取 8 跟随真实码流；MediaCodec 按实际分辨率
-     * 分配资源，不用这个字段校验。 */
+     * ⁇  wrote 0 (level 2.0) which does not match the real stream: libaom for 1080p output 8.
+     * The key is not just the number — seq_vel_idx > 7 ** must follow seq_tier**(f(1)),
+     * Writing 0 will be less than this, leading to a 1-bit shift in all fields following the sequence header.
+     * VA-API does not provide level, pick 8 with real stream; MediaCodec by actual resolution
+     * Allocate resources, without this field verification. */
     dmd_bw_put_bits(&bw, 8, 5);           /* seq_level_idx[0] */
-    dmd_bw_put_flag(&bw, 0);              /* seq_tier[0]（因 idx > 7） */
+    dmd_bw_put_flag(&bw, 0);              /* seq_tier [0] (because idx > 7) */
 
-    /* frame_width_bits 取实际所需位宽而不写死 16 位。
-     * frame_width_minus1 按 va_dec_av1.h:332-334 是**上采样后**分辨率，
-     * 正是 max_frame_width_minus_1 要的语义。 */
+    /* frame_width_bits takes the required bit wide without writing to death 16 bits.
+     * frame_width_minus1 press v_dec_av1.h:332-334 is ** the resolution after sampling**,
+     * It's the semantic meaning of max_frame_width_minus_1. */
     const uint32_t w_m1  = p->frame_width_minus1;
     const uint32_t h_m1  = p->frame_height_minus1;
     const int      wbits = bits_for(w_m1);
@@ -920,8 +920,8 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     dmd_bw_put_bits(&bw, h_m1, hbits);
 
     dmd_bw_put_flag(&bw, 0);   /* frame_id_numbers_present_flag
-                                * 置 0：VA-API 不提供 delta_frame_id，帧头里
-                                * 对应字段也就不写 —— 两处必须一致。 */
+                                * Set 0: VA-API does not provide delta_frame_id, frame
+                                * The corresponding field is not written -- the two places must be identical. */
 
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.use_128x128_superblock);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_filter_intra);
@@ -929,39 +929,39 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_interintra_compound);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_masked_compound);
 
-    /* ⚠️ enable_warped_motion 序列级字段 VA-API **不提供**（全文件 grep
-     * 确认）。取 1 是安全侧：它只是能力位，帧级 allow_warped_motion（:439）
-     * 才决定该帧是否真用。若这里置 0 而帧级为 1，解码器会拒绝该帧；
-     * 置 1 而帧级为 0 则无任何副作用。 */
+    /* ⁇ enable_warped_motion sequence field VA-API** not available (full file grep)
+     * Take one: a security side: it's a capability level, allow_warped_motion (:439)
+     * The frame is used. If you have 0 here and the frame is 1 and the decoder rejects the frame;
+     * Set 1 with 0 without any side effects. */
     dmd_bw_put_flag(&bw, 1);
 
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_dual_filter);
     dmd_bw_put_flag(&bw, (int)enable_order_hint);
     if (enable_order_hint) {
         dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_jnt_comp);
-        dmd_bw_put_flag(&bw, 1);   /* enable_ref_frame_mvs：同样不提供，
-                                    * 同理取安全侧 1（帧级 use_ref_frame_mvs
-                                    * 在 :435）。 */
+        dmd_bw_put_flag(&bw, 1);   /* The blog is also available on the Internet, and the Internet is available on the Internet.
+                                    * Same security side 1 (frame level)
+                                    * In: 435. */
     }
 
-    /* seq_choose_screen_content_tools = 1 时 seq_force_screen_content_tools
-     * 取 SELECT_SCREEN_CONTENT_TOOLS 且**不占码流位**，语义是"每帧在帧头
-     * 自行声明"。这正合需要：VA-API 只给帧级 allow_screen_content_tools
-     * （:429），在序列级猜一个固定值反而可能与帧冲突。
-     * seq_choose_integer_mv 同理（帧级 force_integer_mv 在 :430）。 */
+    /* The next time you're in the game, you're gonna have to be a good girl.
+     * SelECT_Streen_CONTEN_TOOLS ** does not occupy a bitstream** semantic is "each frame is in the frame"
+     * Declare yourself." This is what it takes: VA-API only gives frame levels
+     * (429) A fixed value is assumed at the sequence level that may conflict with the frame.
+     * Seq_choose_integer_mv (framework level force_integer_mv in:430). */
     dmd_bw_put_flag(&bw, 1);       /* seq_choose_screen_content_tools */
     dmd_bw_put_flag(&bw, 1);       /* seq_choose_integer_mv           */
 
     if (enable_order_hint)
         dmd_bw_put_bits(&bw, p->order_hint_bits_minus_1, 3);
 
-    /* enable_superres：VA-API 不提供序列级字段，用帧级 use_superres 反推。
-     * enable_restoration：VA-API 同样不提供，恒写 1 并在每帧 lr_params
-     * 里写 lr_type=0 —— 自洽且语义等价于"不用 restoration"。
-     * ⚠️ 代价：帧头比 enable_restoration=0 的源码流多 6 位，但这 6 位
-     * 写在我们自己的码流里，tile_group 位置自洽，不影响解码正确性。
-     * ⚠️ 真正使用 loop restoration（lr_type≠0）的码流不受支持 ——
-     * VA-API 完全不提供 LR 参数，像素会差一个滤波环节。 */
+    /* Eenable_suppreres: VA-API does not provide sequence field, using frame_subpres to reverse.
+     * Eenable_restoration: VA-API also does not provide, constant writing 1 and lr_params
+     * It says lr_type=0 -- self-serving and semantic equivalent to "no response".
+     * Cost: Frames 6 bits more than source stream of Eenable_restoration=0, but 6 bits
+     * In our own bitstream, the tile_group is self-configured and does not affect the correct decoding.
+     * ⁇  Real use of the log flow (lr_type ⁇ 0) is not supported —
+     * VA-API does not provide LR parameters at all, and pixels are missing a filtering link. */
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.use_superres);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_cdef);
     dmd_bw_put_flag(&bw, 1);
@@ -976,7 +976,7 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     if (bw.overflow)
         return 0;
 
-    /* 组装：OBU 头（内含 leb128 的 payload 长度）+ payload。 */
+    /* assembly: OBU head (including the payload length of the leb128) + payload. */
     const size_t body_len = dmd_bw_bytes(&bw);
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_SEQUENCE_HEADER,
                                          body_len, out, out_cap);
@@ -987,13 +987,13 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     return hdr + body_len;
 }
 
-/* ---- surface -> 帧号 的"最近拥有者"表 ----
+/* -Surface-> Frame Number's "Recent Owner" Table--
  *
- * ffmpeg 的 surface 池会回收复用 surface id：一帧显示完且不再被引用后，
- * 它的 surface 会被新的解码帧拿走（实测 160 帧样本里 oh1 与 oh7 先后
- * 同用 surface 6）。因此 surface 不能直接当帧身份用；但"最近拥有某
- * surface 的帧"总是唯一且还活着的。所有从 surface 出发的身份判断
- * 都经过这里。 */
+ * The ffmpeg surface pool will recover the surface id: once a frame is displayed and no longer quoted, the ffmpeg will be used to restore the surface id.
+ * Its surface will be removed by a new decoding frame (live 160 frames of the sample, oh1 and oh7
+ * So, it's not a frame identity; but "recently owned."
+ * The frame of the surface is always the only one alive. All the identities from the surface are always the ones that are left.
+ * It's all through here. */
 static int dmd_av1_frame_of(struct dmd_av1_dpb *dpb, VASurfaceID surf)
 {
     if (!dpb || surf == VA_INVALID_ID || surf == 0)
@@ -1021,7 +1021,7 @@ static void dmd_av1_remember_surface(struct dmd_av1_dpb *dpb,
         dpb->surf_hist[dpb->surf_hist_n].frame = frame;
         dpb->surf_hist_n++;
     } else {
-        /* 表满：覆盖最早一项（最老的拥有关系最不可能再被查询）。 */
+        /* Table full: Cover the first item (the oldest relationship is the last to be searched again). */
         for (int i = 1; i < dpb->surf_hist_n; i++)
             dpb->surf_hist[i - 1] = dpb->surf_hist[i];
         dpb->surf_hist[dpb->surf_hist_n - 1].surf = surf;
@@ -1029,21 +1029,21 @@ static void dmd_av1_remember_surface(struct dmd_av1_dpb *dpb,
     }
 }
 
-/* ------------------------------------------------- 全局运动（5.9.24） */
+/* - - - - - - - - - - - - - - - - - - - - - - Global campaigns (5.9.24) */
 
-/* 规范/参考实现的位宽常量（libavcodec/av1.h）。 */
-#define DMD_GM_ABS_ALPHA_BITS      12   /* alpha（idx 2..5 及各类型的斜切项）*/
+/* The bit-wide constant (libavcodec/av1.h) which is regulated/referenced. */
+#define DMD_GM_ABS_ALPHA_BITS      12   /* Alpha (idx 2.5 and slashed entries of various types)*/
 #define DMD_GM_ALPHA_PREC_BITS     15
-#define DMD_GM_ABS_TRANS_ONLY_BITS  9   /* 仅平移（TRANSLATION 的 idx 0/1）*/
+#define DMD_GM_ABS_TRANS_ONLY_BITS  9   /* idx 0.1 for TRAINSLATION only*/
 #define DMD_GM_TRANS_ONLY_PREC_BITS 3
-#define DMD_GM_ABS_TRANS_BITS      12   /* ROTZOOM/AFFINE 的 idx 0/1 */
+#define DMD_GM_ABS_TRANS_BITS      12   /* idx 0/1 of ROTZOOM/ AFFENE */
 #define DMD_GM_TRANS_PREC_BITS      6
 #define DMD_WARPEDMODEL_PREC_BITS  16
 
 enum dmd_gm_type { GM_IDENTITY = 0, GM_TRANSLATION = 1,
                    GM_ROTZOOM = 2, GM_AFFINE = 3 };
 
-/* av_log2()：floor(log2(v))，v=0 时为 0。 */
+/* v_log2: floor (log2(v)), v=0 is 0. */
 static int dmd_gm_ilog2(uint32_t v)
 {
     int n = 0;
@@ -1051,9 +1051,9 @@ static int dmd_gm_ilog2(uint32_t v)
     return n;
 }
 
-/* 算术右移（等价 floor(v / 2^n)）。这里必须自己写：解码器侧用的是
- * `prev >> prec_diff`，对负数是**向下取整**；C 的整数除法是向零取整，
- * 直接除会差一格，算出的符号与解码器重建的就不一致。 */
+/* Arithmetic right shift, equivalent to floor(v / 2^n). The decoder uses
+ * `prev > > prec_diff ' , negative is **down-diff**; integer C is divided by zero,
+ * The direct difference between the square and the coder is not consistent. */
 static int32_t dmd_gm_fdiv(int32_t v, int32_t d)
 {
     int32_t q = v / d;
@@ -1061,12 +1061,12 @@ static int32_t dmd_gm_fdiv(int32_t v, int32_t d)
     return q;
 }
 
-/* increment()（规范 4.10.5）：写 v，取值范围 [0,max]。
- * 位串是"v 个 1"，v<max 时再补一个 0 作终止符（共 v+1 位）；
- * v==max 时不补 0（共 max 位）—— 顶格值没有终止符，读侧靠数到 max 位收敛。
- * ⚠️ 这里曾写成"v+1 个 1 再补 0"，于是每个 subexp 符号前都多出一个 1：
- *   实测源符号 118 被读成 237（= 2v+1），且每个符号都各自错位又各自重新
- *   对齐（终止符仍在），所以只有 gm 的数值全错、帧头其余部分照常。 */
+/* Increment(, regulation 4.10.5): Write v, range value [0, max].
+ * The string is "v of 1", and an additional 0 is added to the end of v+1 bits when v<max;
+ * v = 0 (total max bit) when max is not added - the top value does not terminate, read side by count to max bit.
+ * ⁇  This used to be "v+1 1 plus 0", so every subext symbol has one more 1:
+ *   The actual source symbol 118 is read 237 (= 2v+1) and each symbol is scattered and re-set
+ *   Alignment (the termination is still in place), so only the value of gm is all wrong and the rest of the frame is as usual. */
 static void dmd_gm_put_increment(struct dmd_bitwriter *bw, uint32_t v,
                                  uint32_t max_len)
 {
@@ -1076,7 +1076,7 @@ static void dmd_gm_put_increment(struct dmd_bitwriter *bw, uint32_t v,
         dmd_bw_put_flag(bw, 0);
 }
 
-/* sub_exp()（规范 4.10.8）：逐位对齐 libavcodec/cbs_av1 的 write_subexp。 */
+/* Sub_exp() (regulation 4.10.8), biographically aligned libavcodec/cbs_av1 write_subext. */
 static void dmd_gm_put_subexp(struct dmd_bitwriter *bw, uint32_t value,
                               uint32_t range_max)
 {
@@ -1088,7 +1088,7 @@ static void dmd_gm_put_subexp(struct dmd_bitwriter *bw, uint32_t value,
     } else {
         range_bits = (uint32_t)dmd_gm_ilog2(value);
         len = range_bits - 2;
-        if (len > max_len) {          /* 顶格与下一档合并，改用 ns() */
+        if (len > max_len) {          /* Merge top with next, reusing ns() */
             range_bits--;
             len = max_len;
         }
@@ -1101,11 +1101,11 @@ static void dmd_gm_put_subexp(struct dmd_bitwriter *bw, uint32_t value,
         dmd_av1_put_ns(bw, value - range_offset, range_max - range_offset);
 }
 
-/* recentering 的逆运算。解码侧（规范 7.11.3.6 / inverse_recenter）是
+/* Recentering inverts. Decoding side (regulation 7.11.3.6 / invers_recenter) is
  *   if ((r<<1) <= mx) x = inverse_recenter(r, sub)
  *   else              x = mx-1-inverse_recenter(mx-1-r, sub)
- * 已知 x 与 r，反解 sub：先把越界的 r 镜像到前半区（连同 x），再按
- * inverse_recenter 的三段定义逐个求逆。 */
+ * Known x with r, counter-reconstruct sub: first click the cross-border r image to the first half (with x)
+ * Inversion_recenter's three-point definition is counterproductive. */
 static uint32_t dmd_gm_recenter_encode(uint32_t x, uint32_t r, uint32_t mx)
 {
     if ((int64_t)r * 2 > (int64_t)mx) {
@@ -1117,8 +1117,8 @@ static uint32_t dmd_gm_recenter_encode(uint32_t x, uint32_t r, uint32_t mx)
     return 2 * (x - r);
 }
 
-/* 规范里"重建后"的 gm_params 默认值（7.11.3.6 之前的初始化）：
- * idx%3==2 → 1<<16（恒等缩放的定点 1.0），其余 0。 */
+/* gm_params default value in the norm for "re-reconstruction" (initialization before 7.11.3.6):
+ * idx%3=2 < 1<16 (scaling point 1.0), remaining 0. */
 static void dmd_gm_default(int32_t p[7][6])
 {
     for (int i = 0; i < 7; i++)
@@ -1126,12 +1126,12 @@ static void dmd_gm_default(int32_t p[7][6])
             p[i][j] = (j % 3 == 2) ? (1 << DMD_WARPEDMODEL_PREC_BITS) : 0;
 }
 
-/* 算出一个 gm_params 符号（码流里 sub_exp 的整数值）。返回 0 成功；
- * -1 表示 VA 给的值无法由本语法表达，调用方须把该参考帧退回 IDENTITY。
+/* Calculates a gm_params symbol (integer value of sub_exp in the stream). Returns 0 successful;
+ * -1 indicates that the value given by VA cannot be expressed in this syntax, and the caller must return the reference frame to IDENTITY.
  *
- * 依据：解码侧 cur = (decoded << prec_diff) + round，故
- * decoded = (cur - round) >> prec_diff 必须整除；r 由 prev 同法算出，
- * 必须是**解码器当时那份** prev（见 dmd_av1_dpb.gm_slot）。 */
+ * Based on: decoded side cur = (decoded < prec_diff > round, therefore)
+ * The > prec_diff must be eliminated; r is calculated by the prev method,
+ * Must be the ** decoder at the time** prev (see dmd_av1_dpb.gm_slot). */
 static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
                                int hp, uint32_t *sym, uint32_t *range_max)
 {
@@ -1157,7 +1157,7 @@ static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
     const int32_t scale     = 1 << prec_diff;
     const int32_t delta     = cur - round;
 
-    if (delta % scale) return -1;              /* 不落在重建格点上 */
+    if (delta % scale) return -1;              /* It's not on the reconstruction. */
     const int32_t d = delta / scale;
     if (d < -mx || d > mx) return -1;
 
@@ -1165,7 +1165,7 @@ static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
     if (r < -mx) r = -mx;
     if (r >  mx) r =  mx;
 
-    /* 无符号域上的 recentering：x、r 各自平移 mx，mx 变成 2*mx+1 个取值。 */
+    /* Recentering on an unsigned domain: x, r moving mx on a par, mx on a 2*mx+1 value. */
     const uint32_t mxu = (uint32_t)mx * 2u + 1u;
     const uint32_t x  = (uint32_t)(d + mx);
     uint32_t ru = (uint32_t)(r + mx);
@@ -1175,16 +1175,16 @@ static int dmd_gm_encode_param(int type, int idx, int32_t cur, int32_t prev,
     return 0;
 }
 
-/* 把 uncompressed_header() 写进 bw，不含结尾的 trailing_bits /
- * byte_alignment —— 由调用方按封装形式决定：
- *   OBU_FRAME_HEADER(3) 用 trailing_bits（规范 5.9.1）
- *   OBU_FRAME(6)        用 byte_alignment（规范 5.10.1）
- * 这个区别是实测踩出来的：用错会让 tile_group 起始位置偏移，
- * dav1d 报 "Failed to read unit"。 */
-/* 把 VA 的第 i 个参考翻成本合成流的槽号。返回 0 表示**解析不出来**：
- * 消费者给的 ref_frame_map 项是 VA_INVALID_ID（该槽没有帧），或它指向的帧
- * 早已被踢出影子 DPB。slot_out 仍会给一个可用的槽号（透传源槽号），
- * 便于调用方在"照样要送"的路径上保持原有行为。 */
+/* Write uncompressed_header() in bw, without endings of traiding_bits/
+ * Byte_alignment - The caller determines in sealed form:
+ *   OBU_FRAME_HEADER(3) with traiding_bits (regulation 5.9.1)
+ *   OBU_FRAME(6) byte_alignment (regulation 5.10.1)
+ * The difference is measured by the fact that using error will deflect the tile_group from the beginning.
+ * The dav1d newspaper "Failed to read unit". */
+/* The slot number for the VA 's first reference flip cost synthesis stream. returns 0 to mean **is unable to resolve**:
+ * The consumer gives ref_frame_map to VA_INVALID_ID (the slot does not have a frame), or the frame it points to
+ * It has already been evicted from the shadow DPB. slot_out still passes through the source slot as a usable slot number,
+ * To keep the caller on the "send" path. */
 static int resolve_ref(struct dmd_av1_dpb *dpb,
                        const VADecPictureParameterBufferAV1 *p,
                        int i, unsigned *slot_out)
@@ -1211,16 +1211,16 @@ int dmd_av1_refs_resolvable(const void *pic_v, struct dmd_av1_dpb *dpb)
     if (!p)
         return 1;
     const uint32_t ft = p->pic_info_fields.bits.frame_type;
-    /* KEY / INTRA_ONLY / SWITCH 都不读参考帧内容（SWITCH 全刷），
-     * allow_intrabc 的帧整帧 intra（规范里直接跳过帧间预测），也不读。
-     * ⚠️ 不要拿 reference_select 当放行条件：规范 5.9.2 里它为 0 只是
-     * "不显式给出 7 个槽号"，帧照样引用 LAST（ref_frame_idx[0]）。 */
+    /* KEY/ INTRA_ONLY/ SWITCH does not read the frame contents (SWITCH full brush), but the text is not available.
+     * Allow_intrabc's frame intra (a direct skipping of the frame forecast in the norm) is not read.
+     * ⁇  Do not take reference_select as release conditions: Standard 5.9.2 in which it is 0, just
+     * "No visible presentation of 7 slots", with frame quotes from LAST (ref_frame_idx[0]). */
     if (ft != 1 /* INTER_FRAME */ || p->pic_info_fields.bits.allow_intrabc)
         return 1;
-    /* 真正会被解码器取用的槽位：LAST 恒用；复合参考/skip_mode 再用 ALTREF
-     * （规范 5.9.2 的 ref_alternate_frame = ref_frame_map[ref_frame_idx[3]]）。
-     * VA-API 的 PPB 里没有 reference_mode（它在 slice 参数里），所以这里
-     * 保守地把 3 也算进"用到的参考"。 */
+    /* The slot that will really be taken from the decoder: LAST for long-term use; composite reference/skip_mode for ALTREF
+     * (ref_alternate_frame = ref_frame_map [ref_frame_idx[3], regulating 5.9.2).
+     * The PPB of VA-API does not have reference_mode, so here
+     * And conservatively, count three into "use reference." */
     unsigned unused_slot;
     if (!resolve_ref(dpb, p, 0, &unused_slot))
         return 0;
@@ -1233,30 +1233,30 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     struct dmd_av1_dpb *dpb,
                                     const VADecPictureParameterBufferAV1 *p, int tile_size_bytes)
 {
-    /* struct dmd_bitwriter 是纯值结构：buf 指向调用方的缓冲，其余成员
-     * 都是计数器。所以"拷入 → 写 → 拷回"是安全的，函数体内得以保留
-     * 已与真实码流逐字段对齐过的 `&bw` 写法，不必逐行改动引入笔误。 */
+    /* Struck dmd_bitwriter is a pure value structure: buff points to the buffer of the caller, the rest of the members
+     * It's all counting. So "Cuffing & Write & Cuff Back" is safe and the function is preserved.
+     * The `&bw ' formula, aligned with the real stream by field, does not require line-by-line changes to introduce a clerical error. */
     struct dmd_bitwriter bw = *bwp;
 
-    /* ---- show_frame 强制置 1（方向 A 的落地，见本文件 SEF 长注释）----
+    /* - show_frame forced 1 (landfall of Direction A, see long comment for this document)
      *
-     * 硬件只对 show_frame=1 的帧吐 CAPTURE 缓冲，而 ffmpeg 的 VA-API 后端
-     * 会为**每个**提交帧的 surface 要像素（show_frame=0 的帧日后靠 SEF
-     * 复显，复显就是重用同一个 surface）。之前这些帧拿不到硬件像素，
-     * 任何"从别的 surface 拷像素"的承接都被实测否证（信息根本不存在）。
+     * Hardware only for frame vomiting of show_frame=1 CAPTURE buffer, while ffmpeg VA-API backend
+     * The frame frame that will be used to use the frame (show_frame=0) for **s**shows
+     * The first time these frames were not able to get hardware pixels, they were used again.
+     * Any "from other surface pixels" is verified.
      *
-     * 修法：合成头里把 show_frame 写成 1，让硬件为每个提交帧都出一帧
-     * （OUTPUT_ORDER=1 下按解码序输出，与 pending 登记顺序一致），
-     * 每张 surface 拿到**自己那一帧**的真实像素。SEF 复显由 ffmpeg
-     * 重用 surface 完成，驱动无需合成任何 SEF 头。
+     * Reverse: Write show_frame in the synthetic head as 1 to allow hardware to frame each submission frame
+     * (OUTPUT_ORDER=1 output in decoding order, in the order of registration with pending),
+     * Every surface gets a real pixel ** of its own. SEF repeats ffmpeg
+     * Reuse the surface to complete the drive without the need to synthesize any SEF header.
      *
-     * show_frame 只控制"是否输出"，不影响 DPB/参考语义
-     * （槽位刷新由 refresh_frame_flags 决定，与本位无关）。
-     * 头内所有依赖它的语法分支（showable 位、error_resilient 推断、
-     * KEY 帧的 refresh 推断、film_grain 出现条件）都统一用这个生效值，
-     * 保证码流自身自洽。影子 DPB（decode.c）仍按原始值记账。
+     * Show_frame only controls "Is output" without prejudice to DPB/Semantics
+     * (Staff refresher decided by refresh_frame_flags, unrelated to this position).
+     * All the syntax branches in the head that rely on it (showable bits, error_resilient inference,
+     * The KEY frame refresh inference, the file_grain conditions are present) is used to apply this entry value uniformly, but the value is not the same as the value.
+     * The guarantee numbers flow into the system. Shadow (decode.c) still keeps the accounts at the original values.
      *
-     * DMD_AV1_NO_SHOWFORCE=1 恢复旧行为，供 A/B 对照。 */
+     * DMD_AV1_NO_SHOWORCE=1 Restoration of old behaviour for A/B comparison. */
     const int no_showforce = getenv("DMD_AV1_NO_SHOWFORCE")
                              && getenv("DMD_AV1_NO_SHOWFORCE")[0] == '1';
     const int show_frame_eff = no_showforce
@@ -1272,62 +1272,62 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     const int order_hint_bits = enable_order_hint
         ? (int)p->order_hint_bits_minus_1 + 1 : 0;
 
-    /* CodedLossless 的判定（规范 7.12.1）：所有段的 qindex 与四个 delta_q
-     * 全为 0。VA-API 不直接给这个量，按定义算 —— 它决定 loop_filter /
-     * cdef / lr 三段是否出现在码流里，算错会让帧头结构错位。 */
+    /* CodedLossless Decision (Regulation 7.12.1): qindex with four delta_q for all paragraphs
+     * All zero. VA-API does not give this amount directly, as defined -- it decides to drop_filter/
+     * Cdef/lr Whether the three segments appear in the stream is miscalculated to cause the frame structure to be mispositioned. */
     const int coded_lossless =
         (p->base_qindex == 0 && p->y_dc_delta_q == 0 &&
          p->u_dc_delta_q == 0 && p->u_ac_delta_q == 0 &&
          p->v_dc_delta_q == 0 && p->v_ac_delta_q == 0);
-    /* AllLossless 还要求无 superres 上采样（规范 7.12.1）。 */
+    /* AllLossless also requires no sampling on the superres (regulation 7.121). */
     const int all_lossless =
         coded_lossless && !p->pic_info_fields.bits.use_superres;
 
-    /* --- uncompressed_header()，AV1 规范 5.9.2 --- */
+    /* -- uncompressed_header(), AV1 Regulation 5.9.2 -- */
 
-    /* show_existing_frame：本驱动逐帧转发真实帧，不复用已解码帧，恒 0。
+    /* Show_existing_frame: This driver forwards the real frame by frame, without using decoded frames, constant 0.
      *
-     * ---- 这正是像素帧数差距的根源（本轮测定）----
-     * 源码流 av1_1080p.obu 的 OBU 构成：
-     *     TD 150、OBU_FRAME 150、独立 FRAME_HEADER 70、SEQ_HDR 5
-     *     150 个 OBU_FRAME 里 show_frame=1 的只有 80 个
-     *     70 个独立 FRAME_HEADER **全部**是 show_existing_frame=1
-     *     80 真实显示 + 70 复显 = 150 = 软解输出帧数
+     * - This is the root cause of the difference in the number of pixel frames (this round)
+     * OBU composition of the source stream av1_1080p.obu:
+     *     TD 150, OBU_FRAME 150, independent FRAME_HEADER 70, SEQ_HDR 5
+     *     Only 80 out of 150 of the 150 OBU_FRAME show_frame=1
+     *     70 independent Frame_HEADER** all ** is show_existing_frame=1
+     *     80 Real display + 70 regress = 150 = number of soft output frames
      *
-     * 而硬件侧：送入 150 单元、收到 80 帧 —— 与 show_frame=1 的数量
-     * 精确吻合，硬件行为完全正确，一帧不少。
-     * 缺的 70 帧是 SEF 复显帧，本驱动从未合成。
+     * Hardware side: number of units sent into 150, 80 frames received - and show_frame=1
+     * Accurate match, perfect hardware behavior, a lot of frames.
+     * The missing 70 frame is the SEF frame, which has never been synthesized.
      *
-     * 但 SEF 帧无法在此合成：实测 BeginPicture 恰好被调 150 次
-     * （= OBU_FRAME 数），SEF 帧**不经过** VA-API 解码路径
-     * （探针显示 150 次调用全是真实帧，anchor == target）。
-     * 解码侧 VA-API 也没有 show_existing_frame 字段
-     * （只有 va_enc_av1.h 提到它，属编码侧）。
-     * 结论：SEF 复显由 ffmpeg 在 VA-API 之上自行完成，
-     * 驱动只需保证被引用的 surface 里有正确像素即可。
-     * 所以 md5 对不上软解的原因要往"surface 内容"方向找，
-     * 不是"少合成了 70 个 SEF 帧"。
+     * But the SEF frame cannot be synthesized here: it's measured that the baginpicture is just 150 times adjusted
+     * (= OBU_FRAME), SEF frame** unexacted ** VA-API decoding path
+     * (The probe shows 150 calls made all in real frames, ancchor = target).
+     * Decoded VA-API no show_existing_frame fields
+     * (only va_enc_av1.h mentions it, which is code side).
+     * Conclusion: SEF repeats that it was done by ffmpeg on VA-API itself, and that the ffmpeg is not a good idea.
+     * Drivers only ensure that the quoted surface contains the correct pixels.
+     * So the reason why md5 is not so soft is in the direction of "surface content."
+     * Not "Less Synthesis 70 SEF Frames."
      *
-     * ---- 上面这段结论错了一半，本轮用隔离测试推翻 ----
-     * 把源码流原封不动喂硬件（/tmp/sess3 绕过整个驱动）：
-     *     session API: 送 150 单元, 收 150 帧
-     * 硬件能吐满 150 帧！而驱动合成流只能收 80 帧。
-     * 两条流的 OBU 构成差异只有一项：
-     *     源码流   SEQ_HDR 5  TD 150  FRAME 150  FRAME_HDR 70（全是 SEF）
-     *     合成流   SEQ_HDR 5  TD 150  FRAME 150  FRAME_HDR  0
-     * 所以"硬件不吐 show_frame=0 的帧"是对的，
-     * 但"因此拿不到那 70 帧"是错的 —— 硬件会为每个 SEF 头
-     * 复显一次，只要码流里有那个头。缺的正是这 70 个 SEF 头。
+     * - The above conclusion is half wrong, and this round is overridden by isolation tests.
+     * Feed the source stream to hardware (/tmp/sis3 bypassing the entire drive):
+     *     Session API: Send 150 units, take 150 frames
+     * Hardware can fill 150 frames! And the synthetic stream can only take 80 frames.
+     * The two streams of OBU make up only one difference:
+     *     Source stream SEQ_HDR 5 TD 150 FRAME 150 FRAME_HDR 70 (all SEF)
+     *     Synthetic stream SEQ_HDR 5 TD 150 FRAME 150 FRAME_HDR 0
+     * So "hardware doesn't vomit show_frame=0" is right.
+     * But "so you can't get the 70 frames" is wrong -- hardware will be for every SEF head.
+     * Once again, if there is that head in the stream. The missing 70 SEF heads.
      *
-     * ---- 驱动能否推导出 SEF ----
-     * 驱动收不到 SEF（150 次 BeginPicture 全是真实帧），
-     * 但可以推导：show_frame=0 && showable=1 的帧日后必被 SEF 引用，
-     * 插入时机由 order_hint（显示序）决定。实测这两个字段齐备：
-     *     oh=16 show=0 showable=1   ← 将被 SEF 复显
-     *     oh=1  show=1 showable=1   ← 自身即显示
-     * 下一步：在合成流里按显示序补插 SEF FRAME_HEADER。
+     * - Whether the driver can export SEF -
+     * The driver never receives an SEF (all 150 BeginPicture calls are real frames),
+     * But it can be deduced that the frame of the show_frame=0 & & showable=1 will be quoted later by the SEF, which will be used to create a new one.
+     * Inserts the time determined by the order_hint (show order). The two fields are measured as ready:
+     *     oh=16 show=0 showable=1   (displayed later by SEF)
+     *     oh=1  show=1 showable=1   (displayed immediately)
+     * Next: Insert SEF FRAME_HEADER in the synthetic stream in the display order.
      *
-     * （frame_id_numbers_present=0 时该字段仍存在，只是后续不读 frame_id。） */
+     * (fame_id_numbers_present=0; only follow-up non-readable frame_id. */
     dmd_bw_put_flag(&bw, 0);
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "frame_type", bw.byte_pos*8+bw.bit_pos);
@@ -1336,11 +1336,11 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!show_frame_eff)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.showable_frame);
 
-    /* error_resilient_mode：KEY_FRAME 且 show_frame 时恒 1、不写入。 */
-    /* error_resilient_mode（CBS 原文）：
+    /* The ERROOR_resilient_mode: KEY_FRAME and show_frame1 non-writing. */
+    /* ERROOR_resilient_mode (CBS original):
      *   frame_type == SWITCH || (frame_type == KEY && show_frame)
-     *     → infer 1（不写入码流）
-     *   否则 flag(error_resilient_mode) */
+     *     ~Infer 1 (No writing stream)
+     *   Otherwise, the flag (error_resilient_mode) */
     const int er_inferred = (frame_type == 3) ||
                             (is_key && show_frame_eff);
     if (!er_inferred) {
@@ -1352,34 +1352,34 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.disable_cdf_update);
 
-    /* allow_screen_content_tools：序列头里 seq_choose_screen_content_tools=1
-     * → seq_force = SELECT_SCREEN_CONTENT_TOOLS(2)，故此处写 f(1)。 */
+    /* Allow_screw_content_tools: seq_choose_screen_content_tools=1
+     * * Seq_force = SELECT_SCREEN_CONTENT_TOOLS (2), so write f(1) here. */
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_screen_content_tools);
     if (p->pic_info_fields.bits.allow_screen_content_tools) {
-        /* seq_choose_integer_mv=1 → seq_force_integer_mv = SELECT，写 f(1)。 */
+        /* See  ⁇  seq_choose_integer_mv=1  ⁇  seq_force_integer_mv = SELECT, writing f(1). */
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.force_integer_mv);
     }
 
-    /* frame_id_numbers_present=0（序列头如此写），跳过 current_frame_id。 */
+    /* The frame_id_numbers_present=0 (sequence header) skips the current_frame_id. */
 
-    /* frame_size_override_flag：恒 0，表示帧尺寸等于序列头里的
-     * max_frame_size —— 我们把 max 就写成本帧尺寸，二者一致。
-     * KEY_FRAME 之外的帧若尺寸变化，本驱动会重建会话，所以恒等成立。 */
-    if (frame_type != 3 /* SWITCH_FRAME 时该标志恒 1 */)
+    /* frame_size_override_flag: persistent 0, which means that frame size is equal to that in the head of the sequence
+     * Max_frame_size -- we put max on the cost frame size, which is the same.
+     * If the frame outside KEY_FRAME changes size, the driver will recreate the session, so the constant is established. */
+    if (frame_type != 3 /* SWITCH_FRAME should be constant1 */)
         dmd_bw_put_flag(&bw, 0);
 
-    /* order_hint（规范 5.9.2）：条件是 enable_order_hint 且**并非**
-     * "frame_is_intra 同时 refresh_frame_flags == allFrames"。
+    /* order_hint (norm 5.9.2): provided that the means_order_hint and** not**
+     * "frame_is_intra and refresh_frame_flags == allFrames".
      *
-     * ⚠️ 这里踩过两次坑，最后靠解析真实码流定论：
-     * libaom 生成的 1080p KEY_FRAME（show_frame=1）**确实写了** order_hint
-     * （值 0，位于 frame_size_override_flag 之后）。所以不能简化成
-     * "帧内帧一律不写" —— 那样会少写 order_hint_bits 位。
+     * The pits were stepped on twice, and finally the real bitstream was solved:
+     * 1080p KEY_FRAME (show_frame=1)**the order_hint
+     * (value 0, after frame_size_override_flag). So not simplified to
+     * "No frame is written" -- that would lower the order_hint_bits bit.
      *
-     * 原因：KEY+show 帧的 refresh_frame_flags 字段不出现在码流里，但规范
-     * 7.20 说此时 RefreshFrameFlags 取 allFrames 只是**解码器侧的推导值**，
-     * 而 5.9.2 的判据针对的是**语法变量**。实测 libaom 的行为表明该判据
-     * 在此不成立，即照写 order_hint。 */
+     * Reason: The refresh_frame_flags field of the KEY+show frame does not appear in the bitstream, but the norm
+     * 7.20 Says that at this point, RefreshFrame Flags takes all Flames only ** decoder side decoder decomposing values**,
+     * The decision in 5.9.2 is directed at the **grammatical variable**. The actual behaviour of libaom indicates that the decision was based on the evidence.
+     * Not here, that's the order of the order. */
     if (enable_order_hint) {
         if (getenv("DMD_AV1_BITS"))
             fprintf(stderr, "[bits] order_hint @ %zu\n",
@@ -1387,10 +1387,10 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         dmd_bw_put_bits(&bw, p->order_hint, order_hint_bits);
     }
 
-    /* primary_ref_frame：帧内帧或 error_resilient 时不写。 */
-    /* err_res 是**生效值**：被 infer 的场合恒 1，否则取 VA-API 给的。
-     * 后续 primary_ref_frame / use_ref_frame_mvs / allow_warped_motion
-     * 的条件都要用这个生效值，用原始字段会判错。 */
+    /* Primariy_ref_frame: Do not write when frame or error_resilient. */
+    /* The err_res is ** Valid Value**: Always Infer Inver Place 1, otherwise VA-API gives.
+     * Follow-up Primariy_ref_frame/use_ref_frame_mvs/ allow_warped_motion
+     * The condition is to use this entry value, which is wrong in the original field. */
     const int err_res = er_inferred
                       ? 1 : (int)p->pic_info_fields.bits.error_resilient_mode;
     const int primary_ref_none = intra_only || err_res ||
@@ -1398,78 +1398,78 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!intra_only && !err_res)
         dmd_bw_put_bits(&bw, p->primary_ref_frame, 3);
 
-    /* refresh_frame_flags：KEY_FRAME + show_frame 时恒 0xFF、不写入码流。
+    /* Refresh_frame_flags: KEY_FRAME + show_frame with constant 0xFF, without writing the bitstream.
      *
-     * ⚠️ VA-API **不提供**这个字段（全文件 grep 确认：只在 va_dec_av1.h:421
-     * 的注释里被提及，结构体里没有）。它是"本帧要刷新哪些参考槽位"的位掩码。
+     * VA-API** does not provide the field** (full file grep confirms: only va_dec_av1.h:421).
+     * The notes are mentioned, not in the structure. It's a bit mask for "what slots this frame is to refresh."
      *
-     * ⚠️ 历史错误（V4L2 直通后暴露）：这里原先恒写 0xFF，理由是
-     * "MediaCodec 内部自行管理参考帧生命周期，不依赖码流里的这个掩码"。
-     * 那个假设对 MediaCodec 成立，对 V4L2 **不成立** —— msm_vidc 按码流
-     * 管理参考帧，0xFF 意味着每个帧间帧都刷掉全部 8 个槽，参考帧链立刻崩。
-     * 实测后果：合成流交 dav1d 软解，第 2 帧起报 Invalid data，只解出 1 帧；
-     * 走硬件时表现为送 6 单元只回 2 帧后解码器停摆。
-     * trace_headers 逐字段比对显示 refresh_frame_flags 源码流为 1、合成为 255。
+     * ⁇  History error (V4L2 exposed): this is the original case of 0xFF, which is the reason why
+     * "MediaCodec runs the frame life cycle itself, without relying on this mask in the stream."
+     * The hypothesis was created for MediaCodec, v4L2 ** not created ** — msm_vidc by stream
+     * Manage the frame, 0xFF means that each frame has been erased from all eight slots and the reference chain immediately collapses.
+     * (b) Actual effects: synthetic flow flow dav1d softened, 2nd frame startup Invalid Data, delineating only 1 frame;
+     * The hardware is shown as sending 6 units back to 2 frames and then the decoder stops.
+     * The field_headers field-by-field matching displays refresh_frame_flags source stream of 1 and synthesizes to 255.
      *
-     * 正确做法：从 DPB 快照 ref_frame_map[8] 推导。本帧解码后会占用某些槽，
-     * 而 VA-API 在每帧给出当帧的 ref_frame_map —— 凡是槽里存的 surface id
-     * 等于本帧的 current_frame，该槽就是本帧要刷新的目标。
+     * Correct approach: From DPB snapshot ref_frame_map[8]. This frame decodes and uses some slots,
+     * VA-API gives frame ref_frame_map -- the surface id stored in every slot
+     * The same as this frame's crrent_frame, which is the target of the frame to be refreshed.
      *
-     * 找不到任何匹配槽时退回 0（不刷新任何槽）：那是 show_existing_frame
-     * 或不作为参考的帧的正常情形，比 0xFF 安全得多 —— 宁可少声明刷新，
-     * 也不要谎称刷新了全部而让解码器丢弃仍在使用的参考帧。 */
+     * returns 0 when no match slot is found (no slot is refreshed): that's show_existing_frame
+     * The normal situation of the frame that is not the reference is much safer than 0xFF - less declaration to refresh,
+     * And don't lie about refreshing all the frames that the decoder has dropped. */
     const int refresh_all = (frame_type == 3) ||
                             (is_key && show_frame_eff);
 
-    /* ===================== 自洽 DPB（影子参考帧管理）=====================
+    /* Maintain a consistent shadow DPB for reference frames
      *
-     * 问题：refresh_frame_flags（本帧解码后写入哪些参考槽的 8 位掩码）
-     * VA-API 完全不提供 —— 它随源码流被 ffmpeg 解析后丢弃，因为那是
-     * 编码器的 GOP 决策。源码流实测序列 1,8,32,64,0,0,64,0,0,32,64,0
-     * （三分之一是 0），无法从单帧信息还原。
+     * Question: refresh_frame_flags (8 bit mask for which reference slots to write after this frame decoding)
+     * VA-API is not provided at all -- it is discarded by ffmpeg as it is in the source stream
+     * GOP decision for encoder. Source flow real-time sequence 1,8,32,64,0,0,0,64,0,0,32,64,0
+     * (one third is 0) cannot be restored from single frame information.
      *
-     * 关键洞察：**我不需要还原它。**
-     * ref_frame_idx[] 同样由本函数写入码流。解码器只要求这两者
-     * **互相自洽**：我说本帧存进槽 k，之后引用它时就报槽 k。
-     * 至于原编码器把它放在哪个槽，与解码结果无关。
+     * Key insight:** I don't need to restore it.**
+     * Ref_frame_idx[] also writes the stream by this function. The decoder only requires these two.
+     * ** **: I said this frame is in k, and then I'll take k when I quote it.
+     * As to which slot the original encoder placed in, it has nothing to do with the decoding result.
      *
-     * 于是自己管一份影子 DPB：
-     *   · 每个非 KEY 帧占用一个槽，8 槽轮转（refresh = 1 << slot）
-     *   · 记录 shadow[slot] = 该槽存的 surface id
-     *   · 写 ref_frame_idx 时，把 VA-API 给的"槽号"先经它的 ref_frame_map
-     *     翻成 surface id，再在影子 DPB 里查出**我的**槽号
+     * So you're taking care of a shadow yourself.
+     *   • Each non-KEY frame occupies one slot, 8 slot rotation (refresh = 1 < slot)
+     *   • Recording shadow[lot] = the archive id stored in the slot
+     *   • When writing ref_frame_idx, give the "swart" to VA-API by its ref_frame_map
+     *     Turn it into a surface id and find my ** slot in the shadow of the DPB.
      *
-     * 已用实测数据模拟验证：连续 5 帧的全部引用都能在影子 DPB 中解析到。
+     * The simulation of the live data has been verified: all references to the 5 consecutive frames can be interpreted in the shadow DPB.
      *
-     * 历史错误（本轮修复的根因）：原先恒写 0xFF，理由是"MediaCodec 自行
-     * 管理参考帧，不看码流里这个掩码"。该假设对 MediaCodec 成立，对 V4L2
-     * 不成立 —— msm_vidc 按码流管理参考帧，0xFF 让每个帧间帧刷掉全部 8 槽，
-     * 参考帧链立刻崩：合成流交 dav1d 软解第 2 帧起 Invalid data。
+     * Historical error (cause of this round of restoration): original constant 0xFF, on the grounds that "MediaCodec is self-dependant
+     * Manages the frame of reference, without looking at this mask in the stream." This hypothesis is for MediaCodec, V4L2.
+     * Not created - msm_vidc manages the frame by stream, 0xFF allows each frame to brush out all 8 slots,
+     * The reference chain immediately collapses: synthetic flow flow dav1d softly delineate 2nd frame Invalid data.
      *
-     * 已否决的三种"还原编码器决策"的推导（均实测失败）：
-     *  1. 在 ref_frame_map[] 里找 current_frame —— 该数组是本帧解码**前**的
-     *     快照，current 尚未写入，恒不匹配
-     *  2. 相邻两帧 ref_frame_map 差分 —— 给出的是上一帧刷新的槽，
-     *     且无法表达"本帧不刷新"（值 0）
-     *  3. 取第一个未被引用/仍为初值的空槽 —— 实测 5 帧里只有首帧碰对
+     * The three rejected "reverted encoder decision" (all failed):
+     *  Find the current_frame -- the array is pre-coded** in ref_frame_map[]
+     *     The snapshot, the current is not written yet. It's not the same.
+     *  The two adjacent frames ref_frame_map difference - given as a new slot,
+     *     And cannot express "This frame is not updated" (value 0)
+     *  The first empty slot that was not quoted/is still primary - actual 5 frames only match the first
      * ==================================================================== */
     if (getenv("DMD_AV1_LOG"))
-        fprintf(stderr, "[av1] ft=%u oh=%u refresh_all=%d err_res(生效)=%d "
-                        "er_inferred=%d 原始er=%u\n",
+        fprintf(stderr, "[av1] ft=%u oh=%u refresh_all=%d err_res(Entry into force)=%d "
+                        "er_inferred=%d Original er=%u\n",
                 frame_type, p->order_hint, refresh_all, err_res, er_inferred,
                 p->pic_info_fields.bits.error_resilient_mode);
     unsigned refresh_mask = 0;
     int my_slot = -1;
     if (!refresh_all) {
-        /* 占位 refresh：轮转槽。真实值要等下一帧的 map 差分反算
-         * （dmd_av1_patch_prev_refresh），届时就地改写这 8 位；
-         * 若帧被 sync 提前冲出（flush），改写为 0 并进修复队列。
-         * 影子登记也不在这里 —— 等真实值出来才登记（见 patch）。 */
+        /* Places are occupied. The real value is set to the next map score.
+         * (dmd_av1_watch_prev_refresh) and then rewrite the eight places in place;
+         * If frame sync is flushed out early, rewrite to 0 and enter the repair queue.
+         * Shadow registration is not here either -- it's only registered when the real value comes out. */
         my_slot = dpb ? (int)(dpb->dpb_next_slot & 7u) : 0;
         refresh_mask = 1u << my_slot;
         if (dpb) {
-            /* 帧号与 surface 归属此刻登记（后续帧的引用翻译要用），
-             * 槽位放置则等 patch 反算出真实 refresh 后再做。 */
+            /* The frame number and the surface belong to the registration at this point (the quotes from the frame follow) and the other part of the frame are used to register the situation.
+             * The slots are placed until the patch is calculated for the real refresh. */
             const int me = ++dpb->frame_seq;
             dmd_av1_remember_surface(dpb, p->current_frame, me);
         }
@@ -1480,8 +1480,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                     refresh_mask, bw.byte_pos * 8 + bw.bit_pos);
         dmd_bw_put_bits(&bw, refresh_mask, 8);
     } else if (dpb) {
-        /* KEY / SWITCH 帧全刷：refresh 不写入码流（规范 7.20 推断），
-         * 影子表立即登记 —— KEY 帧直送、无延迟，本帧 placement 即最终值。 */
+        /* KEY/ SWITCH frames are fully brushed: refresh does not write the stream (regulation 7.20 extrapolation),
+         * The shadow sheet is immediately registered - the frame is sent straight, without delay, and the frame is the final value. */
         const int me = ++dpb->frame_seq;
         dmd_av1_remember_surface(dpb, p->current_frame, me);
         for (int k2 = 0; k2 < 8; k2++) {
@@ -1498,57 +1498,57 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         fprintf(stderr, "\n");
     }
 
-    /* ref_order_hint[i]（规范 5.9.2）：条件是
+    /* ref_order_hint[i] (norm 5.9.2):
      *   !refresh_all && error_resilient_mode && enable_order_hint
      *
-     * 本码流实测不触发（DMD_AV1_LOG 采得）：
-     *   ft=0 refresh_all=1 err_res=1   ← KEY 帧，refresh_all 已排除
-     *   ft=1 refresh_all=0 err_res=0   ← 帧间帧，err_res 为 0
-     * 即 KEY 帧被 refresh_all 挡住、帧间帧 err_res 为假，一个字节都不写。
+     * The HID does not trigger (DMD_AV1_LOG pick):
+     *   & ft=0 refresh_all=1 err_res=1  ⁇ KEY frames, exclude
+     *   ft=1 refresh_all=0 err_res=0  ⁇  framework, err_res 0
+     * The KEY frame is blocked by refresh_all, the frame frame err_res is fake, and no bytes are written.
      *
-     * 故此处不实现。若将来遇到 error_resilient 的帧间码流需要补上，
-     * 注意两点：(1) 必须带 !refresh_all 条件，否则给 KEY 帧多写
-     * 8*order_hint_bits 位会让整个帧头错位（实测 dav1d 把 8 tile 读成
-     * 2x17 后报 zero_bit out of range）；(2) VA-API 不提供各槽的 order
-     * hint，需从自洽 DPB 的 dpb_order_hint[] 取。 */
+     * So this is not happening here. If you encounter a error_resilient inter-framework stream, you need to fill it up.
+     * Note two points: (1) must be brought with: < http_all > , otherwise write more to KEY frames
+     * 8*order_hint_bits will cause the entire frame to be mispositioned (actual dav1d reads 8 tile)
+     * 2x17 after reporting zero_bit out of range; (2) VA-API does not provide for slots or for
+     * Hint, to be taken from dpb_order_hint[] of DPB. */
 
-    /* 参考帧索引：帧间帧才有。 */
-    unsigned my_idx[7] = { 0, 0, 0, 0, 0, 0, 0 };  /* 翻译后写入码流的槽号 */
+    /* Reference Frame Index: Only in the frame. */
+    unsigned my_idx[7] = { 0, 0, 0, 0, 0, 0, 0 };  /* Enter a slot number for the stream after translation */
     if (!intra_only) {
-        /* frame_refs_short_signaling 需要 enable_order_hint；置 0 表示
-         * 显式给出全部 7 个 ref_frame_idx（VA-API 提供的正是这个数组）。 */
+        /* frame_refs_shot_signaling requires enable_order_hint; state 0
+         * A display of all seven ref_frame_idx (the array is provided by VA-API). */
         if (enable_order_hint)
             dmd_bw_put_flag(&bw, 0);
-        /* 把 VA-API 的槽号经影子 DPB 翻译成**本合成流**的槽号。
+        /* Translating VA-API slot numbers by Shadow DPB into slot numbers ** for this synthetic stream**.
          *
-         * 本合成流的 DPB 槽位分配与源码流无关（KEY/全刷帧占全部 8 槽，
-         * 其余帧按 dpb_next_slot 轮转，见 build_frame 末尾的影子登记），
-         * 而 VA-API 的 ref_frame_idx[i] 是 ffmpeg 按源码流维护的槽号。
-         * 翻译规则：源槽 s → ref_frame_map[s]（surface id，即"想要哪一帧
-         * 的内容"）→ 在影子 DPB 里查该 surface 现在占本流的哪个槽。
+         * The DPB slot allocation for this stream is not related to the source stream (KEY/All-Filter 8 slots).
+         * The rest of the frame is on dpb_next_slot and is registered at the end of the build_frame)
+         * And VA-API's ref_frame_idx[i] is the slot number that ffmpeg maintains by source stream.
+         * Translation rules: s  ⁇  ref_frame_map[s] (source id, "What frame do you want?")
+         * "Content" is the shadow of which slot the shadow has now taken.
          *
-         * 为什么必须翻译而不是透传：透传只在合成流的槽位分配与源码流
-         * 逐帧一致时才成立，那要求 refresh_frame_flags 也逐帧等于源真值
-         * —— 而真值要等下一帧的 map 差分才能算出，导致每帧必须延迟一帧
-         * 送料；ffmpeg 又会在 EndPicture 后立刻 Sync 叶帧的 surface，
-         * 暂存帧被 flush 提前送出、带着错误的 refresh，参考链全断
-         * （实测 160 帧样本 147 帧像素错误，KEY 帧全对、帧间帧全错）。
-         * 翻译之后合成流自身自洽，每帧可立即送出，整个延迟/反算/flush
-         * 机制都不再需要。
+         * Why must it be translated instead of overflowing: tectonics only distribute slots and source streams in synthetic streams
+         * It's built when the frame is consistent. It requires refresh_frame_flags to be set to the frame equals the source value.
+         * - And the true value is to be calculated by waiting for the next map score, which means that each frame must be delayed.
+         * The ffmpeg will be in place soon after EndPicture's Sync leaf frame.
+         * The temporary frame is sent out early with the wrong refresh, the reference chain is broken
+         * (Survey 160 frame samples 147 frame pixel error, KEY frames all right, frames all wrong).
+         * The translation is done and the flow is self-directed, and each frame is ready to be sent out immediately, with the whole delay/caution/flush
+         * The mechanisms are no longer needed.
          *
-         * CDF 继承也跟着对：解码器从 ref_frame_idx[primary_ref_frame]
-         * 指向的槽加载 CDF，翻译保证那仍是"同一帧内容"，于是 CDF 演化
-         * 链与源码流逐帧相同，源码流的 tile 数据可原样解码。
+         * CDF succession is also right: the decoder from ref_frame_idx [primariy_ref_frame]
+         * Load the pointed slots with the CDF, the translation guarantees that it is still the same frame, so the CDF evolves.
+         * Chains are the same as the source stream through the frame, and the source stream tile data can be decoded as it is.
          *
-         * 影子 DPB 里同一 surface 可能占多个槽（KEY/全刷帧刷新 8 槽），
-         * 取哪个都等价（内容与 CDF 相同），取扫描到的第一个。 */
+         * The same shadow mode in the DPB may take over multiple slots (KEY/ Full-Frusher 8 slots), but the same system can be used to create a new system of filters.
+         * Take the same price for any item (the same content as the CDF), take the first one that you have scanned. */
         for (int i = 0; i < 7; i++) {
             unsigned my = 0;
             const int ok = resolve_ref(dpb, p, i, &my);
             if (getenv("DMD_AV1_DBG"))
                 fprintf(stderr, "[dbg] ref[%d]: va_slot=%u -> my_slot=%u %s\n",
                         i, (unsigned)p->ref_frame_idx[i], my,
-                        ok ? "" : "未解析");
+                        ok ? "" : "Not parsed");
             if (getenv("DMD_AV1_REFDBG"))
                 fprintf(stderr, "[refdbg] f=%d t=%u ref[%d]: surf=%u va_slot=%u"
                                 " -> my=%u%s\n",
@@ -1557,69 +1557,69 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                                ? p->ref_frame_map[p->ref_frame_idx[i]]
                                                : 0),
                                 (unsigned)p->ref_frame_idx[i], my,
-                                ok ? "" : "  <-- 未解析");
+                                ok ? "" : "  <-- Not parsed");
             my_idx[i] = my;
             dmd_bw_put_bits(&bw, my, 3);
         }
-        /* frame_id_numbers_present=0，不写 delta_frame_id。 */
+        /* The frame_id_numbers_present=0, not delta_frame_id. */
     }
 
-    /* frame_size() / render_size()：frame_size_override=0 时帧尺寸由序列头
-     * 给出，这里只写 superres 与 render_size（规范 5.9.5/5.9.6/5.9.8）。 */
-    /* superres_params()（规范 5.9.8）：**仅当序列头 enable_superres=1 时**
-     * 码流里才有 use_superres 这一位。
+    /* frame_size() / render_size(): frame_size_override=0 by sequence head
+     * Here only the supres and render_size (regulation 5.9.5/5.9.6. 5.9.8). */
+    /* Superres_params((regulation 5.9.8):** Only when the head of the sequence is enable_supres=1**
+     * The stream has only one of these.
      *
-     * ⚠️ 曾在此多写一位：序列头按 use_superres 写 enable_superres（本帧为 0），
-     * 解码器于是不来读这个标志，而实现却无条件写了 —— 帧头从此错位 1 位，
-     * dav1d 报 "trailing_one_bit out of range: 0"。教训：凡"序列头某位决定
-     * 帧头是否有此字段"的地方，两处条件必须写成同一个表达式。 */
+     * The first post was written here by a new user: "The first time I wrote this post is that I wrote the following:
+     * The decoder came to read the sign, and the realization was written unconditionally -- the frame was misplaced by 1 bit from here.
+     * Dav1d reports "Trailing_one_bit out of range:0". Lessons: Van's head is somewhere.
+     * There is no place for this field in the frame, and both conditions must be written in the same expression. */
     if (p->pic_info_fields.bits.use_superres) {
         dmd_bw_put_flag(&bw, 1);
-        /* coded_denom：SUPERRES_DENOM_MIN=9，占 SUPERRES_DENOM_BITS=3 位。 */
+        /* @dord_denom: SUPERRES_DENOM_MIN=9, in SUPERRES_DENOM_BITS=3 places. */
         const uint32_t denom = p->superres_scale_denominator;
         dmd_bw_put_bits(&bw, (denom >= 9 ? denom - 9 : 0), 3);
     }
-    /* render_and_frame_size_different = 0：显示尺寸等于帧尺寸。
-     * VA-API 不提供 render_size，且它只影响显示裁剪、不影响解码。 */
+    /* Render_and_frame_size_different = 0: display size equals frame size.
+     * VA-API does not provide render_size and it only affects displaying cropping and not decoding. */
     dmd_bw_put_flag(&bw, 0);
 
-    /* allow_intrabc（规范 5.9.2）：条件是 allow_screen_content_tools &&
-     * UpscaledWidth == FrameWidth。以 ffmpeg CBS 的原文为准：
+    /* Allow_intrabc (regulation 5.9.2): condition of allow_screen_content_tools & & &
+     * UPCALEDWIdth = FlameWidth. By ffmpeg CBS:
      *   if (allow_screen_content_tools && upscaled_width == frame_width)
      *       flag(allow_intrabc);
      *   else
      *       infer(allow_intrabc, 0);
      *
-     * upscaled_width == frame_width 等价于"无 superres 上采样"——
-     * superres_params 里只有 use_superres 时才把 frame_width 按 denom 缩小。
+     * Upscaled_width = frame_width equal to "no sample on superres" --
+     * The frame_width button is narrowed only when the user_papers are used.
      *
-     * ⚠️ 这个条件错过两次：先漏 upscaled 判据，后又把
-     * allow_screen_content_tools 整个去掉（误读真实码流某一位所致）。
-     * 两个条件**都要**，缺一个就多写或少写 1 位。 */
-    /* ⚠️ 这里 CBS 源码与 libaom 的实际输出不一致，以**真实码流**为准。
+     * ⁇  This condition was missed twice: first leaked the evidence, then took it.
+     * Allow_screen_content_tools completely removed (cause of a misread of the real stream somewhere).
+     * Both conditions**, with one missing, write more than one bit less. */
+    /* ⁇  Here the CBS source code does not match the actual output of libaom, whichever is ** the real stream**.
      *
-     * CBS（cbs_av1_syntax_template.c）写的是条件读：
+     * CBS (cbs_av1_syntax_temlate.c) writes about readable conditions:
      *   if (allow_screen_content_tools && upscaled_width == frame_width)
      *       flag(allow_intrabc); else infer 0
      *
-     * 但用位级解析器逐字段核对 libaom 生成的 1080p KEY_FRAME：该帧
-     * allow_screen_content_tools=0，若按 CBS 的条件跳过这一位，整个帧头
-     * 会错位、读到末尾 trailing_one_bit=0；无条件读这一位才能得到
-     * trailing_one_bit=1（位数精确闭合）。
+     * But field-by-field reconciliation of libaom generated by bits parser 1080p KEY_FRAME:
+     * Allow_screen_content_tools=0. If you skip this position under CBS conditions, the entire frame is set to be a bit more than a few minutes away.
+     * Trailing_one_bit=0 at the end; read this one unconditionally to get
+     * Trailing_one_bit=1 (precision closing).
      *
-     * 结论：实际编码器无条件写该位。判据是"能否让真实码流闭合"，
-     * 而不是源码怎么写 —— 我们要喂的是真实解码器，不是 CBS。 */
-    /* allow_intrabc：以 ffmpeg trace_headers 对真实码流的逐位输出为准。
-     * 实测 libaom 生成的 1080p KEY_FRAME（allow_screen_content_tools=0）：
-     *   位 46  render_and_frame_size_different
-     *   位 47  disable_frame_end_update_cdf     ← allow_intrabc **不存在**
-     *   位 48  uniform_tile_spacing_flag
-     * 即 CBS 的条件读成立：asct=0 时该位不写入码流。
+     * Conclusion: The actual encoder wrote the position unconditionally. The verdict is "can the real code close?"
+     * And not how the source code says -- we're feeding the real codec, not the CBS. */
+    /* Allow_intrabc: Depends on the ffmpeg trade_headers' in-situ output of the real stream.
+     * 1080p KEY_FRAME (allow_screen_content_tools=0) from the actual libaom:
+     *   The first of the 46 renders and frame_size_disferent
+     *   47 places_frame_end_update_cdf ⁇  allow_intrabc** does not exist**
+     *   48 places uniform_tile_spacing_flag
+     * That is, CBS conditions are read in: this is not written into the stream when asct=0.
      *
-     * ⚠️ 曾据自己写的解析器"位数闭合"推断成无条件写，那是错的 ——
-     * 解析器本身在此处有偏差，两个错误互相抵消才显得闭合。
-     * 教训：验证工具必须先用 trace_headers 这类权威输出校准，
-     * 不能拿未校准的自制解析器当基准。 */
+     * The  ⁇  was assumed to be unconditional based on the self-written parser "digit closing," which is wrong...
+     * The parser itself is biased here, and two errors offset each other to appear closed.
+     * Lessons: Validation tools must first be calibrated with an authoritative output like trade_headers, which is a very important tool for the development of the new technology.
+     * Uncalibrated home-made solver cannot be used as a baseline. */
     if (intra_only && p->pic_info_fields.bits.allow_screen_content_tools &&
         !p->pic_info_fields.bits.use_superres)
         dmd_bw_put_flag(&bw, (int)allow_intrabc);
@@ -1627,7 +1627,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!intra_only) {
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_high_precision_mv);
         /* read_interpolation_filter()：is_filter_switchable f(1)，
-         * 为 0 时再写 2 位 interp_filter。VA-API 的 interp_filter 取值
+         * Write 2 bits of interp_filter for 0 hours. The interp_filter for VA-API
          * 4 = SWITCHABLE。 */
         if (p->interp_filter == 4) {
             dmd_bw_put_flag(&bw, 1);
@@ -1637,27 +1637,27 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         }
         dmd_bw_put_flag(&bw,
             (int)p->pic_info_fields.bits.is_motion_mode_switchable);
-        /* use_ref_frame_mvs 需 enable_ref_frame_mvs（序列头写 1）、
-         * 非 error_resilient、且 enable_order_hint。 */
+        /* Use_ref_frame_mvs to apply_ref_frame_mvs (Sequence header 1),
+         * Not error_resilient and available_order_hint. */
         if (!err_res && enable_order_hint)
             dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.use_ref_frame_mvs);
     }
 
-    /* disable_frame_end_update_cdf：reduced_still_picture_header=0 且
-     * disable_cdf_update=0 时出现。 */
+    /* Disable_frame_end_update_cdf:reduced_still_picture_header=0 and
+     * appears when Disable_cdf_update=0. */
     if (dpb)
         dpb->last_endupd_bitpos = (size_t)-1;
     if (!p->pic_info_fields.bits.disable_cdf_update) {
-        /* 记下位偏移：双趟解码要靠它把第一趟的回写关掉，见
-         * dmd_av1_dpb::last_endupd_bitpos 的说明。 */
+        /* Write down the offset: Double decoding is done by turning off the first rewrite. See.
+         * dmd_av1_dpb::last_endupd_bitpos */
         if (dpb)
             dpb->last_endupd_bitpos = bw.byte_pos * 8 + (size_t)bw.bit_pos;
         dmd_bw_put_flag(&bw,
             (int)p->pic_info_fields.bits.disable_frame_end_update_cdf);
     }
 
-    /* MiCols/MiRows：以 4x4 单元计的画面尺寸（规范 5.9.5 的推导）。
-     * 2*((width+7)>>3) 等价于向上取整到 8 像素再折半。 */
+    /* MiCols/MiRows: image size in 4x4 units (guiding by 5.9.5).
+     * 2*(width+7)>3 equals up to 8 pixels equal to half a point. */
     const uint32_t width  = (uint32_t)p->frame_width_minus1 + 1;
     const uint32_t height = (uint32_t)p->frame_height_minus1 + 1;
     const uint32_t mi_cols = 2 * ((width  + 7) >> 3);
@@ -1670,13 +1670,13 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "seg", bw.byte_pos*8+bw.bit_pos);
     put_segmentation_params(&bw, p, primary_ref_none);
 
-    /* delta_q_params()（5.9.17）：base_qindex > 0 时才有 delta_q_present。 */
+    /* Delta_q_params(5.9.17): delta_q_present at base_qindex > 0. */
     if (p->base_qindex > 0)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.delta_q_present_flag);
     if (p->mode_control_fields.bits.delta_q_present_flag) {
         dmd_bw_put_bits(&bw, p->mode_control_fields.bits.log2_delta_q_res, 2);
 
-        /* delta_lf_params()（5.9.18）：仅在 delta_q_present 时出现。 */
+        /* Delta_lf_params(5.9.18): only occurs when delta_q_present(s). */
         if (!allow_intrabc) {
             dmd_bw_put_flag(&bw,
                 (int)p->mode_control_fields.bits.delta_lf_present_flag);
@@ -1696,56 +1696,56 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "lr", bw.byte_pos*8+bw.bit_pos);
     put_lr_params(&bw, p, all_lossless, (int)allow_intrabc);
 
-    /* read_tx_mode()（5.9.21）：CodedLossless 时 tx_mode 恒 ONLY_4X4、
-     * 不写入；否则写 tx_mode_select f(1)。VA-API 的 tx_mode 取值
+    /* Read_tx_mode((5.9.21): tx_mode_only_04x4, tx_mod_mod_mode_losses
+     * Do not write; otherwise write tx_mode_secondf(1). VA-API tx_mode
      * 2 = TX_MODE_LARGEST, 3 = TX_MODE_SELECT。 */
-    /* read_tx_mode（CBS 原文）：
-     *   coded_lossless → infer(tx_mode, ONLY_4X4)，不写入
-     *   否则 increment(tx_mode, TX_MODE_LARGEST=1, TX_MODE_SELECT=2)
+    /* Read_tx_mode (original CBS):
+     *   ⁇  infer (tx_mode, ONLY_4X4), do not write
+     *   Otherwise (tx_mode, TX_MODE_LARGEST=1, TX_MODE_SELECT=2)
      *
-     * ⚠️ 曾误当成 f(1) 标志写 `tx_mode == 3`，两处都错：
-     *   - 编码方式不是单个标志位，而是 increment（range [1,2]）
-     *   - VA-API 的 tx_mode 值域是 [0..2]（va_dec_av1.h:560-563），
-     *     直接就是规范枚举值，不存在 3
-     * increment 在 range_max 时写 (max-min)=1 个 1 且无停止位，
-     * 在 range_min 时只写一个 0。 */
+     * ⁇  used as f(1) sign `tx_mode==3 ' , both wrong:
+     *   - Encoding is not a single signpost, but rather an incretion (range [1])
+     *   - The tx_mode domain of VA-API is [0.2] (va_dec_av1.h:560/563),
+     *     Directly the norm enumerator, does not exist.
+     * Inclement writes (max-min)=1 with no stop slot, and then you can't stop.
+     * Write only one 0 when the range_min is in. */
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "txmode", bw.byte_pos*8+bw.bit_pos);
     if (!coded_lossless) {
         const uint32_t tm = p->mode_control_fields.bits.tx_mode;
         if (tm >= 2)
-            dmd_bw_put_flag(&bw, 1);   /* TX_MODE_SELECT：写 1，无停止位 */
+            dmd_bw_put_flag(&bw, 1);   /* TX_MODE_SELECT: Write 1, no stop slot */
         else
-            dmd_bw_put_flag(&bw, 0);   /* TX_MODE_LARGEST：停止位 */
+            dmd_bw_put_flag(&bw, 0);   /* TX_MODE_LARGEST: Stop bit */
     }
 
-    /* frame_reference_mode()（5.9.23）：帧间帧写 reference_select。 */
+    /* (5.9.23): frame frame frame writing */
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "refsel", bw.byte_pos*8+bw.bit_pos);
     if (!intra_only)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reference_select);
 
-    /* skip_mode_params()（5.9.22）：skipModeAllowed 必须按**本合成流**的状态
-     * 推导 —— 解码器也是这么算的。两边结论不一致就会多写或少写 1 位，
-     * 帧头从此错位（实测：源码流 oh=16 那帧 skipModeAllowed=0、码流里没有
-     * skip 位，而我们无条件写 0，整帧后移 1 位，CBS 把我们的 warp 位读成
-     * reduced_tx_set，dav1d 直接 Invalid data）。
+    /* skip_mode_params((5.9.22)): skipModeAllowed must follow the status of ** this synthetic stream**
+     * The decoder is the same. If you do not agree, you write more or less one bit.
+     * The frame is misallocated from this point on.
+     * Skip bit, and we write zero, shift the whole frame back to one bit, CBS reads our warp bit as
+     * The blog is a part of the blog, which is a part of the blog of the Global Voices community.
      *
-     * 判据（CBS uncompressed_header 原文）：
-     *   帧内 || !reference_select || !enable_order_hint → allowed = 0
-     *   否则在 7 个参考里找前向（dist<0 里最接近当前的）与后向（dist>0 里
-     *   最远离的）；有后向 → 1；无后向但存在比 forward 更早的"第二前向" → 1；
-     *   否则 → 0。dist = get_relative_dist(ref_hint, 本帧 hint)。
+     * The decision (CBS unpressed_header):
+     *   The frame is full of  ⁇  [speaks Spanish]!
+     *   Otherwise, search forwards and backwards in seven references.
+     *   Most remote; backward  ⁇ 1; no backward but longer present than forward  ⁇ 1;
+     *   ⁇ .dist = get_relative_dist (ref_hint, this frame hit).
      *
-     * 参考帧的 order hint 取影子 DPB（我们自己的槽位分配），不是源码流的槽号，
-     * 因为解码器看到的正是我们写进码流的 my_idx。 */
+     * The frame order hit takes the shadow DPB (our own slot allocation), not the number of the slots in the source stream,
+     * Because the decoder saw exactly what we wrote into the stream of my_idx. */
     int skip_allowed = 0;
     if (!intra_only && p->mode_control_fields.bits.reference_select &&
         enable_order_hint && order_hint_bits > 0 && dpb) {
         const unsigned ohm = 1u << order_hint_bits;
-        /* 规范 get_relative_dist（5.9.x）：v = (a-b) & (ohm-1)；仅当 v **大于**
-         * ohm/2 才减 ohm。ties（v == ohm/2）保留正值。
-         * 之前写成 `v - (v & ohm)`，等于用 bit order_hint_bits 判符号：只有差值
-         * 恰好 = 3*ohm/4 时才为负，回绕处（如 hint=0 参考 hint=96，ohm=128）
-         * 本应 -32 却算成 +96，skipModeAllowed 少 1 位，帧头整体错位 1 位。 */
+        /* Standard get_relative_dist( 5.9.x): v = (a-b) & (ohm-1); should v ** be greater than**
+         * ohm/2 only reduces the ohm. ties(v = ohm/2) keep the positive value.
+         * previously written `v - (v & ohm) ' equals the bit order_hint_bits: only margin
+         * Only negative = 3*ohm/4 is negative and rounded back (e. g. Hint=0 reference Hint=96, ohm=128)
+         * It should have been -32 but calculated to be +96, skipModeAllowed 1 bit less, and the overall frame was 1 bit different. */
 #define RELD(x, y) ((((x) - (y)) & (ohm - 1u)) > (ohm >> 1)                         \
                     ? (int)((((x) - (y)) & (ohm - 1u)) - ohm)                       \
                     : (int)(((x) - (y)) & (ohm - 1u)))
@@ -1786,65 +1786,65 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                     dpb->dpb_order_hint[my_idx[6] & 7u]);
     }
     if (skip_allowed) {
-        /* 值取 VA-API 的 skip_mode_present：ffmpeg 的 mode_control_fields
-         * 是 CBS 从源码流解析出来的，忠实于源码流。 */
+        /* Mode_control_fields of the value VA-API_mode_present:ffmpeg
+         * CBS deciphers from the source stream, faithful to the source stream. */
         dmd_bw_put_flag(&bw,
             (int)p->mode_control_fields.bits.skip_mode_present);
     }
 
-    /* allow_warped_motion（5.9.22，紧接 skip_mode_params 之后）：
-     * 权威条件见 CBS cbs_av1_syntax_template.c 的 uncompressed_header：
+    /* Allow_warped_motion (5.9.22, immediately after kip_mode_params):
+     * For authority conditions, see CBS cbs_av1_syntax_templace.c, uncompressed_header:
      *   if (frame_is_intra || error_resilient_mode || !seq->enable_warped_motion)
-     *       infer(allow_warped_motion, 0);      // 不占码流位
+     *       infer (allow_warped_motion, 0); / / do not take the code current
      *   else
      *       flag(allow_warped_motion);
-     * 与 is_motion_mode_switchable **无关** —— 那个字段只决定块级的
-     * motion mode 是否需要解析，早在本函数上方 read_mv_mode 处就用掉了。
-     * 旧实现把它加进守卫，于是 mms=0 的帧少写 1 位，其后
-     * reduced_tx_set / is_global[7] / film_grain / tile_group 全体前移，
-     * 软解报 Invalid data、硬解吐垃圾。
-     * 序列级 enable_warped_motion 我们恒写 1（见 :902），故此处不必再判。 */
+     * Not related to the fact that the field only determines the size of the block
+     * Whether the motion mode needs to be interpreted is used long before the read_mv_mode is found above this function.
+     * The old realization added it to the guard, so the mms=0 frame was less than 1 bit, then
+     * The whole of the group is now in the front line of the #MultiBlackBlackBlackBlackBlackBlackBlack.
+     * Softly reporting Invalid Data, hard-disposal garbage.
+     * Sequence level is achievable_warped_motion We write consistently 1 (see: 902), so there is no need to sentence here. */
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu va_warp=%u va_redtx=%u va_mms=%u cf=%u oh=%u\n", "warp", bw.byte_pos*8+bw.bit_pos,
             (unsigned)p->pic_info_fields.bits.allow_warped_motion,
             (unsigned)p->mode_control_fields.bits.reduced_tx_set_used,
             (unsigned)p->pic_info_fields.bits.is_motion_mode_switchable,
             (unsigned)p->current_frame, (unsigned)p->order_hint);
     if (!intra_only && !err_res)
-        /* 直接转写 VA-API 的 allow_warped_motion（理由同上：
-         * ffmpeg CBS 解析值忠实于源码流，旧"uniform_ref 置 0"规则是
-         * 对抗位错位时拟合出来的，换码流即错）。 */
+        /* Allow_warped_motion for direct transliteration of VA-API (see ibid.:
+         * The ffmpeg CBS parsing value is faithful to the source stream, the old rule "uniform_ref set 0" is
+         * The switch flow is wrong. */
         dmd_bw_put_flag(&bw,
             (int)p->pic_info_fields.bits.allow_warped_motion);
 
     if (getenv("DMD_AV1_BITS")) fprintf(stderr,"[bits] %s @ %zu\n", "redtx", bw.byte_pos*8+bw.bit_pos);
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
 
-    /* global_motion_params()（规范 5.9.24）：帧间帧逐参考帧写
-     *   is_global[i] | is_rot_zoom[i] | is_translation[i] | 参数们
+    /* Global_motion_params((NOR 5.9.24): Frame-to-frame frame
+     *   ⁇  is_global[i] is_rot_zoom[i]  ⁇  is_translation[i]  ⁇  arguments
      *
-     * VA-API 的 wm[i] 给的是**重建后**的参数（ffmpeg libavcodec/vaapi_av1.c
-     * 直接抄 AV1Frame.gm_params），要还原码流里的符号必须做 recentering
-     * 的逆运算 + subexp 写位，见上面 dmd_gm_put_param。
+     * Wm[i] of VA-API for ** after reconstruction (ffmpeg libavcodec/vaapi_av1.c)
+     * AV1Frame.gm_params) to restore the symbol in the original stream must be recentering
+     * , for the counter-counting +subtext bit, see dmd_gm_put_param above.
      *
-     * ⚠️ 差分的基准 prev 必须是**解码器当时那份**：规范里它取自
-     *   ref_frame_idx[primary_ref_frame] 那个槽。我们用 my_idx[]（已翻译成
-     *   本合成流的槽号）去查按槽备份 gm_slot[]，与硬件读到同一个值。
-     *   primary_ref_frame 为 NONE（帧内帧/err_res/源码流本就不引用任何帧）
-     *   时用默认值，与规范 7.11.3.6 的 setup_past_independence 一致。
+     * The base for the difference must be ** the decoder at the time**: in the norm it was taken from
+     *   We use my_idx[, translated]
+     *   The slot number of this synthetic stream is checked for backup gm_slot[] in the slot, which is read to the same value as hardware.
+     *   Primariy_ref_frame to NONE (the frame/err_res/source stream does not quote any frame)
+     *   , using the default value, is consistent with the setup_past_indexence that regulates 7.11.3.6.
      *
-     * 顺序：ROTZOOM 在码流里是 [2][3][0][1]，AFFINE 是 [2][3][4][5][0][1]，
-     * TRANSLATION 只有 [0][1] —— 不是下标升序，写错顺序整帧头就错位。
+     * Order: ROTZOOM in the stream is [2][3] [0][1], AFFFINE is [2][3] [4] [5][0][1],
+     * TRANSLATION only [0][1] - not below the ascending order, misorders the entire frame.
      *
-     * 任一个参数编不出来（VA 给的值不落在重建格点上、或越出该档的
-     * [-mx,mx]）就**整参考帧退回 IDENTITY**：先算后写，绝不写半截。
-     * 退回后本帧存的就是默认参数，后续帧的 prev 跟着一起退回默认，
-     * 合成流仍然自洽，只是丢掉该参考帧的全局运动补偿（与旧行为相同）。 */
+     * Any parameter that doesn't work out is worth anything to rebuild the grid or get out of the class.
+     * [-mx, mx] Return to IDENTITY**: Count it first, never half.
+     * The default parameters are the defaults that are stored in the back frame, and the following prev returns the defaults together.
+     * The synthetic stream remains self-serving, but only the global movement compensation (the same as the old behaviour) that has been lost from the frame. */
     struct dmd_av1_gm cur_gm;
     dmd_gm_default(cur_gm.p);
     if (!intra_only) {
-        /* 码流里的下标顺序（不是升序！）：见 5.9.24 的调用次序。 */
+        /* The order of the lower mark in the stream (not ascending!): see the order of call in 5.9.24. */
         static const int gm_order[4][6] = {
-            { -1, -1, -1, -1, -1, -1 },   /* IDENTITY：不写参数 */
+            { -1, -1, -1, -1, -1, -1 },   /* IDENTITY: No parameter written */
             {  0,  1, -1, -1, -1, -1 },   /* TRANSLATION */
             {  2,  3,  0,  1, -1, -1 },   /* ROTZOOM */
             {  2,  3,  4,  5,  0,  1 },   /* AFFINE */
@@ -1893,9 +1893,9 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                         i, type, sym[0], sym[1], sym[2], sym[3], sym[4], sym[5],
                         cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]);
 
-            /* 本帧存进槽的参数 = 解码器重建的那份。VA 的 wmmat[0..5] 正是
-             * AV1Frame.gm_params[0..5]（ffmpeg 逐项照抄，含未传输下标的
-             * 默认值与 ROTZOOM 的 4/5 推导），所以直接取六个值即可。 */
+            /* Arguments for depositing this frame into the slot = the decoder that is reconstructed. VA wmmat[0.5] is exactly
+             * AV1Frame.gm_params [0.5] (ffmpeg) item by item, including untransmitted subscripts
+             * The default value is 4/5 extrapolated by ROTZOOM, so just six values are taken. */
             for (int j = 0; j < 6; j++) cur_gm.p[i][j] = cm[j];
         }
     }
@@ -1903,27 +1903,27 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
         dpb->gm_pending = cur_gm;
         dpb->gm_pending_frame = dpb->frame_seq;
         if (refresh_all) {
-            /* KEY/SWITCH 全刷：8 个槽都是本帧（与上面 dpb_shadow 的登记
-             * 同一处、同一条件）。帧内帧的 gm 恒为默认值。 */
+            /* KEY/SWITCH Full brush: 8 slots are this frame (registration with dpb_shadow above)
+             * Same place, same condition. The gm of the frame is always the default. */
             for (int k = 0; k < 8; k++) dpb->gm_slot[k] = cur_gm;
         }
     }
 
-    /* film_grain_params()（5.9.30）：序列头里 film_grain_params_present
-     * 为 0 时整段不出现。我们如实转写该标志，故此处同样条件。 */
+    /* film_grain_params() (5.9.30): file_grain_params_present
+     * The entire time is 0. We rewrite the sign, so the same conditions apply here. */
     if (p->seq_info_fields.fields.film_grain_params_present &&
         (show_frame_eff || p->pic_info_fields.bits.showable_frame))
         dmd_bw_put_flag(&bw, 0);         /* apply_grain = 0 */
 
-    /* 结尾不写 trailing_bits / byte_alignment —— 交给调用方按封装形式决定。 */
+    /* Do not end with trailing_bits / byte_alignment - to the caller in sealed form. */
     *bwp = bw;
 }
 
-/* 把帧头 payload 装进指定类型的 OBU。obu_type 决定结尾用哪种对齐：
- *   DMD_OBU_FRAME_HEADER → trailing_bits（规范 5.9.1）
- *   DMD_OBU_FRAME        → byte_alignment（规范 5.10.1），之后紧跟 tile_group
- * 返回写入 out 的字节数（含 OBU 头），失败返回 0。
- * tail_out 回传 payload 的位长度，供 OBU_FRAME 继续拼 tile_group。 */
+/* Load the frame payload into the specified type of OBU. OBU_type determines which alignment to follow at the end:
+ *   DMD_OBU_FRAME_HEADER  ⁇  trailing_bits (Regular 5.9.1)
+ *   DMD_OBU_FRAME  ⁇  byte_alignment (regulation 5.10), followed by Tile_group
+ * Returns the bytes (including the header of the OBU) that write out, failed to return 0.
+ * Tail_out returns the payload bit length to continue the spell tile_group for OBU_FRAME. */
 static size_t build_frame_header_obu(int tile_size_bytes,
                                     const VADecPictureParameterBufferAV1 *p,
                                      int obu_type,
@@ -1940,15 +1940,15 @@ static size_t build_frame_header_obu(int tile_size_bytes,
         fprintf(stderr, "[bits] header_end @ %zu\n",
                 bw.byte_pos * 8 + bw.bit_pos);
 
-    /* 此处曾有一个"身份不明的补位"（无条件写 1 个 0  bit）。它不存在于
-     * 规范里，且在帧头真实长度 ≡ 0 (mod 8) 的帧上会把 byte_alignment 撑成
-     * 一整个 0x00 字节 —— tile 数据整体后移 1 字节，熵解码从第一 byte 起
-     * 就是错的（实测 640x360 第 7 帧起 dav1d 直接报 Invalid data）。
-     * 帧头字段现已与源码流逐位对齐，不需要任何补位。 */
+    /* There was an "unidentified replacement" here. It does not exist in
+     * In the norm, and on the frame of the frame, the true length of the frame is 0 (mod 8) to be held up byte_alignment
+     * A whole 0x00 bytes --tile data body moves 1 bytes, entropy decoding from first byte
+     * It is wrong (actually 640x360 7th frame dav1d direct report Invalid Data).
+     * The frame field is now aligned to the source stream in step, and no replacement is required. */
     if (obu_type == DMD_OBU_FRAME)
-        dmd_av1_byte_align(&bw);      /* 纯补零，不写标记位 */
+        dmd_av1_byte_align(&bw);      /* Zero clean, no tags. */
     else
-        dmd_av1_trailing_bits(&bw);   /* 写 1 再补零 */
+        dmd_av1_trailing_bits(&bw);   /* Write 1 and make zero. */
 
     if (bw.overflow)
         return 0;
@@ -1966,7 +1966,7 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
 
     unsigned char body[512];
     size_t body_len = 0;
-    /* 独立 FRAME_HEADER OBU 不带 tile 数据，宽度取最小值 1。 */
+    /* Independent Frame_HEADER OBU without tile data, with a minimum width of 1. */
     if (build_frame_header_obu(1, p, DMD_OBU_FRAME_HEADER,
                               body, sizeof(body), &body_len, dpb) == 0)
         return 0;
@@ -1989,10 +1989,10 @@ size_t dmd_av1_build_frame(const void *pic_v,
     if (!p || !out || !tiles || num_tiles <= 0 || out_cap < 16)
         return 0;
 
-    /* tile_size_bytes：取最大 tile 长度所需的最小字节数。
-     * 帧头的 tile_size_bytes_minus_1 与 tile_group 里 tile_size_minus_1
-     * 的宽度必须一致，故先算出来再合成帧头。
-     * 注意写入的是 len-1（tile_size_minus_1），故按 max_len-1 取位宽。 */
+    /* Tile_size_bytes: the minimum bytes required to take the maximum length of tile.
+     * Tile_size_bytes_minus_1 and tile_group
+     * The width must be consistent, so we can calculate the frame first and then synthesize it.
+     * Note that this is written at len-1 (tile_size_minus_1), so press max_len-1 for width. */
     size_t max_tile = 0;
     for (int i = 0; i + 1 < num_tiles; i++)
         if (tiles[i].len > max_tile) max_tile = tiles[i].len;
@@ -2003,22 +2003,22 @@ size_t dmd_av1_build_frame(const void *pic_v,
     }
     if (tile_size_bytes > 4) tile_size_bytes = 4;
 
-    /* 帧头（结尾 byte_alignment，不是 trailing_bits）。 */
+    /* Frame (end byte_alignment, not trading_bits). */
     unsigned char fh[512];
     size_t fh_len = 0;
     if (build_frame_header_obu(tile_size_bytes, p, DMD_OBU_FRAME,
                               fh, sizeof(fh), &fh_len, dpb) == 0)
         return 0;
 
-    /* tile_group_obu()（规范 5.11.1）的 payload：
-     *   NumTiles > 1 时先写 tile_start_and_end_present_flag
-     *   置 0 表示本 group 覆盖全部 tile（tg_start=0, tg_end=NumTiles-1）
-     *   随后 byte_alignment，再逐 tile 写 tile_size_minus_1 + 数据
-     *   最后一个 tile 不写长度（由 OBU 剩余长度隐含）
+    /* The payload of tile_group_obu((regulation 5.111):
+     *   NumTiles > 1 writes tile_start_and_end_present_flag
+     *   Make 0 for this group to overwrite all tile (tg_start=0, tg_end=NumTiles-1)
+     *   Next_alignment, write tile_size_minus_1+ data byte_alignment
+     *   Last Tile No Length (insured by the remaining length of OBU)
      *
-     * tile_size_minus_1 用 le(4)，宽度必须与帧头 tile_info 里写的
-     * tile_size_bytes_minus_1 = 1（即 2 字节）一致 ——
-     * 两处不符会从第二个 tile 起全错位。 */
+     * Tile_size_minus_1 with le(4), width must be written in the frame tile_info
+     * Tile_size_bytes_minus_1=1 (i. e. 2 bytes) is consistent --
+     * The two discrepancies will be completely misallocated from the second Tile. */
     const uint32_t tile_total =
         (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
 
@@ -2032,7 +2032,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
         return 0;
     const size_t tg_hdr_len = dmd_bw_bytes(&tgw);
 
-    /* 先算 OBU payload 总长，才能写 leb128 的 obu_size。 */
+    /* Count OBU payload first to write the obu_size of the leb128. */
     size_t payload_len = fh_len + tg_hdr_len;
     for (int i = 0; i < num_tiles; i++) {
         if (!tiles[i].data && tiles[i].len)
@@ -2047,16 +2047,16 @@ size_t dmd_av1_build_frame(const void *pic_v,
     if (hdr == 0 || hdr + payload_len > out_cap)
         return 0;
 
-    /* ⚠️ 把 last_refresh_bitpos 由"帧头内偏移"换算为"本 OBU 内偏移"。
+    /* ⁇  Convert the last_refresh_bitpos from "deficit in frame" to "intra-OBU offset".
      *
-     * put_uncompressed_header 里的 bitwriter 基于局部 body 缓冲，
-     * 记下的是帧头内的位偏移（实测 19）。但上层改写时拿到的是含
-     * OBU 头的完整缓冲，直接用会打偏 hdr*8 位。
-     * 实测后果：OBU 头首字节由 0x32 被改成 0x20，
-     * type 6(FRAME) 变成 4(TILE_GROUP) 且 has_size 被清零，
-     * 整条流从该处结构崩塌 —— dav1d 只认出 5 个 OBU 就报 Invalid data。
+     * The bitwriter in put_uncompressed_header writes to a local body buffer,
+     * The frame is inverse (actual 19). But the upper layer is changed to contain
+     * The full buffer of the head of the OBU will be missed by direct hit of hdr*8 bit.
+     * The first byte of OBU is 0x32 and is changed to 0x20.
+     * The frame 6 became 4(TILE_GROUP) and has_size was cleared, and the #MultiDanananDownDownSives are not allowed to use the #Murvey4 — the frame — but the #Murvey4 — is not a good idea.
+     * The whole stream collapsed from the structure of the place — dav1d recognized only five OBUs and reported invalid Data.
      *
-     * 调用方（decode.c）再叠加 TD 等更外层前缀的长度。 */
+     * Caller (decode.c) adds the length of the more outer prefix, such as TD. */
     if (dpb && dpb->last_refresh_bitpos != (size_t)-1)
         dpb->last_refresh_bitpos += hdr * 8;
     if (dpb && dpb->last_endupd_bitpos != (size_t)-1)
@@ -2069,10 +2069,10 @@ size_t dmd_av1_build_frame(const void *pic_v,
         *q++ = tg_hdr[i];
     for (int i = 0; i < num_tiles; i++) {
         if (i + 1 < num_tiles) {
-            /* le(tile_size_bytes)：宽度必须与帧头写的
-             * tile_size_bytes_minus_1 + 1 一致，否则从第二个 tile 起全错位。
-             * 该宽度由上面按 max(tile_len) 算出，不再写死 —— 曾写死 2 字节，
-             * 而源码流实际用 1 字节，每个间隙多 1 字节导致位流整体偏移。 */
+            /* le (tile_size_bytes): width must be written on the frame
+             * Tile_size_bytes_minus_1+1 is consistent, otherwise the second Tile is completely misplaced.
+             * The width is calculated by pressing max(tile_len) above and writing no more deaths - 2 bytes written dead,
+             * The source stream actually uses one byte, with one byte more than one byte per gap, leading to an overall offset of the flow. */
             const uint32_t v = (uint32_t)(tiles[i].len - 1);
             for (int b = 0; b < tile_size_bytes; b++)
                 *q++ = (unsigned char)((v >> (8 * b)) & 0xFF);
@@ -2080,12 +2080,12 @@ size_t dmd_av1_build_frame(const void *pic_v,
         for (size_t k = 0; k < tiles[i].len; k++)
             *q++ = tiles[i].data[k];
     }
-    /* 帧已合成成功 —— 把本帧登记进影子 DPB，供后续帧的 ref_frame_idx 查询。
-     * 必须在成功路径的末尾做：合成失败时不能污染 DPB 状态，
-     * 否则后续帧会引用一个从未真正写入解码器的槽。 */
-    /* 影子 DPB 登记已移入 put_uncompressed_header 的 refresh 写入处：
-     * 全刷帧（KEY/SWITCH）在那里清空 8 槽，其余帧在那里占一个
-     * "确定已死"的受害者槽。此处不再登记，避免同帧双重写入。 */
+    /* Frame successfully synthesized - register this frame into Shadow DPB for ref_frame_idx queries for the follow frame.
+     * Must be done at the end of the successful path: do not pollute the DPB state when the synthesis fails,
+     * Otherwise, the frame will quote a slot that has never really been written into the decoder. */
+    /* Shadow DPB registered moved into refresh in put_unpressed_head:
+     * The whole frame is empty there. The 8th slot is empty. The rest is taken there.
+     * The victim slot "Determination confirmed". This is no longer registered, and double-entry is avoided. */
 
     return hdr + payload_len;
 }
@@ -2096,9 +2096,9 @@ size_t dmd_av1_build_show_existing(unsigned char *buf, size_t cap,
     if (!buf || cap < 4)
         return 0;
 
-    /* 载荷：show_existing_frame(1)=1、frame_to_show_map_idx(3)，
-     * 随后 trailing_bits（规范 5.3.4：先写一个 1，再零填充到字节边界）。
-     * 4 位有效数据 + 停止位 1 + 3 个 0 = 恰好 1 字节。 */
+    /* Load: show_existing_frame(1)=1, frame_to_show_map_idx(3),
+     * Then the trailing_bits (regulation 5.3.4: write a 1 first and then fill the byte boundary with zero).
+     * 4-bit valid data + stop bit 1 + 3 0 = just 1 byte. */
     struct dmd_bitwriter bw;
     unsigned char payload[2];
     dmd_bw_init(&bw, payload, sizeof(payload));
@@ -2110,11 +2110,11 @@ size_t dmd_av1_build_show_existing(unsigned char *buf, size_t cap,
 
     const size_t plen = bw.byte_pos + (bw.bit_pos ? 1 : 0);
 
-    /* OBU 头：forbidden(1)=0 type(4)=3 extension(1)=0 has_size(1)=1
-     * reserved(1)=0 → (3 << 3) | 0x02 = 0x1a，与源码流实测一致。 */
+    /* OBU Head: Forbidden (1) = 0 type (4) = 3 interpretation (1) = 0 has_size (1) = 1
+     * Reserved (1) = 0  ⁇  (3 < 3) ⁇ 0x02 = 0x1a, consistent with the source flow. */
     size_t n = 0;
     buf[n++] = (unsigned char)((DMD_OBU_FRAME_HEADER << 3) | 0x02);
-    /* leb128 的 obu_size；plen 恒为 1，单字节足够。 */
+    /* The bou_size of the leb128; the square is consistently 1 and the word bytes are sufficient. */
     if (plen >= 0x80)
         return 0;
     buf[n++] = (unsigned char)plen;
@@ -2130,13 +2130,13 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                                 size_t prev_bitpos,
                                 int prev_frame)
 {
-    /* ⚠️ 不能因 prev_frame_bytes 为空就提前返回。
+    /* The pav_frame_bytes cannot return early because they are empty.
      *
-     * 那样 KEY 帧与第一个帧间帧（此时还没有暂存帧）都会跳过末尾的
-     * map 快照，使 prev_valid 迟一拍置位。实测后果：算出的序列是
-     * —,8,32,64 而真值为 1,8,32,64 —— 首个值 1 丢失，其余整体错位
-     * 赋给了前一帧，改写因此全部落在错误的帧上。
-     * 无论本次是否有帧可改写，都必须保存 map 作为下一次差分的基准。 */
+     * So that KEY and the first frame (there is no temporary frame) will all jump through the end.
+     * Map snapshot, make prev_valid late. Actual consequence: calculated sequence
+     * - 8, 32, 64 and real value 1, 8, 32, 64 - First value 1 lost, remaining overall error
+     * The previous frame was given, and all the rewrites fell on the wrong frame.
+     * Whether or not there is a frame to rewrite this time, it is important to keep the map as the benchmark for the next score difference. */
     if (!dpb || !cur_pic) return;
     const VADecPictureParameterBufferAV1 *p = cur_pic;
     if (getenv("DMD_AV1_DBG"))
@@ -2145,14 +2145,14 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                 prev_frame_bytes ? "yes" : "NO",
                 prev_bitpos == (size_t)-1 ? -1 : (ssize_t)prev_bitpos);
 
-    /* ---- 计算源 DPB 上一帧踢出的帧 E（供本帧的槽位分配）----
+    /* - Calculate Source Frame E from previous DPB frame (for slot allocation of this frame)
      *
-     * 本帧的 map 与上一帧的 map 的差异 = 上一帧解码时对 DPB 的改动：
-     * 被改的槽里，旧内容就是源编码器踢出的帧（E）。源编码器保证被踢出的
-     * 帧不再被任何后续帧引用 —— 它是当前时刻唯一"确定已死"的帧，
-     * 让本帧占它的槽永远不会覆盖活引用（滞后一帧淘汰）。
-     * 差分为 0（上一帧 refresh=0，没动 DPB）或多槽（KEY 全刷）时置
-     * evict_valid=0，由 put_uncompressed_header 的兜底规则选槽。 */
+     * The difference between the map of this frame and the previous map = changes to the DPB when the previous frame is decoded:
+     * The old slot is the frame (E) that the source encoder kicked. The source encoder guarantees that the kick is made.
+     * The frame is no longer quoted by any successor frame -- it's the only "death-sure" frame at this moment.
+     * Let this frame take its slots never cover living references (a later one phaseout).
+     * Disparities 0 (previous frame refresh=0, no DBB) or multi-hull (all KEY)
+     * ivic_valid=0, selected by put_unpressed_header. */
     dpb->evict_valid = 0;
     for (int i = 0; i < 8; i++) {
         if (p->ref_frame_map[i] != dpb->prev_ref_map[i]) {
@@ -2168,50 +2168,50 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
         fprintf(stderr, "[dbg] patch: evict_valid=%d frame=%d\n",
                 dpb->evict_valid, dpb->evict_frame);
 
-    /* ⚠️ prev_valid 必须在 KEY 帧那次调用就置位。
+    /* ⁇  prev_valid must be called in position at the KEY frame.
      *
-     * 差分需要"上一帧的 map"，而 KEY 帧本身不写 refresh（无需改写），
-     * 但它的 map 是后续第一个帧间帧做差分的基准。若只在真正执行改写时
-     * 才置位，整个序列会晚一拍：实测算出 —,8,32,64 而真值是 1,8,32,64，
-     * 首个值 1 丢失，且 8/32/64 被错位赋给了前一帧。
-     * 所以本函数无论是否改写，末尾都保存 map 并置 prev_valid。 */
+     * The difference takes "the last frame" and the KEY frame does not write refresh (no rewrite),
+     * But its map is the baseline for the first time that the frame is missing. If only the rewrite is actually implemented,
+     * The whole sequence will be shot later: the actual number is 1, 8, 32, 64, and the real value is 1, 8, 32, 64.
+     * The first value 1 was lost and the first one was misplaced to the previous frame.
+     * So, whether or not this function is rewritten, saves the Map at the end and prev_valid. */
     if (dpb->prev_valid && prev_frame_bytes &&
         prev_bitpos != (size_t)-1 && prev_len > 0) {
-        /* 本帧 map 与上帧 map 的差异位 = 上一帧实际写入的槽。
-         * 实测 4 帧全部命中源码流真实值（1/8/32/64）。
+        /* The difference between this frame Map and the upper frame Map bit = the slot actually written in the previous frame.
+         * Actual 4 frames hit the real source stream (1/8/32/64).
          *
-         * ⚠️ 但**本帧是 KEY/INTRA_ONLY 全刷帧时不能做这个差分**（第 94 轮实机定位）。
-         * 规范 7.20：帧内帧的 RefreshFrameFlags 取 allFrames 是**解码器侧的
-         * 推导值**，不写入码流。全刷会把 ref_frame_map 八个槽一次性换掉，
-         * 于是差分算出 0xff —— 而这个 0xff 会被赋给**上一个帧间帧**，
-         * 覆盖它真正的 refresh 值。
+         * ⁇  But this frame is KEY/INTRA_ONLY not able to do this difference when the whole frame is painted** (No. 94 live positioning).
+         * Regulation 7.20: RefreshFrame Flags for allFrames is ** on the side of the decoder
+         * The index **, without writing the stream. The brush will replace the ref_frame_map eight slots once and for all.
+         * The difference is 0xff -- and this 0xff is assigned to the last frame**, which is the first time that the  ⁇  is used to create a new structure.
+         * Cover it for the real refresh value.
          *
-         * 实机症状（150 帧样本，oh=30 处是 KEY 帧）：
-         *     反算序列 ... 0x00 0xff 0xff 0x01 0x08 ...
-         *     源码流真值 ... 0x00 0x08 0x01 0x08 0x20 ...
-         * 前 28 项完全一致，第 28 项起插入两个 0xff，导致其后整体错位一项，
-         * 全序列 104 项里 49 项不符。而 refresh 错位会让参考帧全盘错，
-         * 表现为"帧数对、画面数对，但从第 1 帧起像素就不一致"。
+         * Real-time symptoms (150 frame samples, oh=30 at KEY frames):
+         *     Counter-sequence 0x00 0xff 0xff 0x01 0x08...
+         *     Source current real value 0x00 0x08 0x01 0x08 0x20...
+         * The first 28 items were identical, and the first 28 items were inserted into two 0xffs, which resulted in the entire misposition of one.
+         * 49 out of the full sequence 104 do not match. Refresh is misplaced by the full reference frame.
+         * It is expressed as "frame pair, screen count, but pixels are inconsistent from frame 1. "
          *
-         * 正确做法：全刷帧不参与差分，直接跳到末尾更新基准 map。
-         * 上一个帧间帧的 refresh 保持它自己合成时的轮转占位值 —— 那个值
-         * 未必等于源真值，但至少不会被 0xff 污染，也不会造成序列错位。
+         * Correct approach: The whole frame does not involve differentials, jumps straight to the end to update the baseline map.
+         * Refresh of the previous frame keeps the rotation value when it synthesizes itself -- that value.
+         * Not necessarily equal to the source true, but at least not contaminated by 0xff, nor did it cause a sequence error.
          *
-         * ⚠️ 只挡住全刷帧本身还不够（这是第一版修复漏掉的一半）。
-         * 全刷帧把基准 map 整体换掉之后，**紧跟它的那一帧**拿这份新基准
-         * 做差分，照样会算出接近满位的 mask。实测第一版把不一致从 49 降到
-         * 29，但第 28 项仍是 0xff —— 正是全刷帧的后继帧。
-         * 所以全刷帧除了跳过差分，还必须让基准失效一拍（prev_valid=0），
-         * 让后继帧也跳过一次，从它之后重新建立差分基准。 */
-        /* ⚠️ 判据必须与 dmd_av1_build_frame 里的 refresh_all 完全一致
-         * （规范 7.20 / 5.9.2）：SWITCH 帧，或 show_frame=1 的 KEY 帧。
+         * The whole brush is not enough in itself (this is half of the first version of the repair).
+         * After the whole map has been replaced, ** the frame that followed it ** takes this new benchmark.
+         * The difference will be calculated as near-full mask. The first version of the index will reduce the inconsistency from 49 to 49.
+         * 29, but item 28 is still 0xff -- that is the frame that is the back of the whole frame.
+         * So, in addition to skipping the score, the whole frame must be disabled by the baseline (prev_valid=0), which is a very good thing.
+         * Let the back frame also skip once and then re-establish the differential benchmark. */
+        /* The evidence must be identical to the refresh_all in dmd_av1_build_frame
+         * (Code 7.20/ 5.9.2): SWITCH frame, or KEY frame show_frame=1.
          *
-         * 第一版我写成 `frame_type==0 || frame_type==2` —— 两处都错：
-         *   · 漏了 show_frame：KEY 帧只在 show_frame=1 时才全刷
-         *   · 多算了 INTRA_ONLY(2)：它不全刷，照常写 refresh_frame_flags
-         * 单元测试当场抓住（用例以 memset 构造 pic，frame_type 落在 0，
-         * 被误判成全刷而跳过差分，两项断言归零）。
-         * 教训：同一个语义在两处实现就一定会走偏，这里直接抄 refresh_all 的式子。 */
+         * I wrote the first version of `frame_type=0 ⁇   ⁇  frame_type=2 ' -- both wrong:
+         *   • Missing show_frame: The KEY frame is only painted when show_frame=1
+         *   ..don't worry. INTRA_ONLY(2): Not all of it, as usual.
+         * Unit testing for spot-on-the-spot capture (for example, memset construction of pic, frame_type
+         * The two claims were zero).
+         * Lessons: The same semantic approach is always one way or another, and here we can just copy the refresh_all formula. */
         const unsigned cur_ft = p->pic_info_fields.bits.frame_type;
         int cur_is_intra = (cur_ft == 3) ||
                            (cur_ft == 0 && p->pic_info_fields.bits.show_frame);
@@ -2222,21 +2222,21 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
         }
         if (cur_is_intra) {
             if (getenv("DMD_AV1_LOG"))
-                fprintf(stderr, "[av1] 本帧是全刷帧(ft=%u show=%u)，跳过差分"
-                                "（否则会算出 0x%02x 污染上一帧）\n",
+                fprintf(stderr, "[av1] This is a whole painting.(ft=%u show=%u),Skipping score"
+                                "(Otherwise, we’ll figure it out. 0x%02x Contamination past the frame.)\n",
                         cur_ft, p->pic_info_fields.bits.show_frame, mask);
             mask = 0;
-            /* 保存新基准，但标记为"不可用于差分" —— 后继帧跳过一次，
-             * 由它自己的 map 重新建立基准。 */
+            /* Saves a new baseline, but marked as "not usable for difference" -- one skipping from the frame.
+             * By its own Map re-created the baseline. */
             for (int i = 0; i < 8; i++) dpb->prev_ref_map[i] = p->ref_frame_map[i];
             dpb->prev_valid = 0;
             return;
         }
 
-        /* 就地改写上一帧帧头里那 8 位。
-         * refresh_frame_flags 未必字节对齐，须按位写，MSB first。 */
+        /* Rewrite the eight places in the top of the top.
+         * Not necessarily bytes, then, in the first place, MSB. */
         if (getenv("DMD_AV1_LOG"))
-            fprintf(stderr, "[av1] 反算上帧 refresh=0x%02x (bitpos=%zu len=%zu)\n",
+            fprintf(stderr, "[av1] It’s a frame. refresh=0x%02x (bitpos=%zu len=%zu)\n",
                     mask, prev_bitpos, prev_len);
         if (getenv("DMD_AV1_DBG"))
             fprintf(stderr, "[dbg] patch: cur_oh=%u mask=0x%02x %s\n",
@@ -2252,19 +2252,19 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
                 else   prev_frame_bytes[byi] &= (unsigned char)~(1u << bii);
             }
         }
-        /* 影子登记：源码流把上一帧放进了 mask 的那些槽，我们的槽位
-         * 与源一致（合成流的 refresh 已改写为源真值），影子表照抄。
-         * 之后的引用翻译据此进行。 */
+        /* Shadow registration: The source stream puts the frame into those slots in the mask, our slots.
+         * Consistent with source (the synthetic stream refresh has been recast to source true), shadowed.
+         * The subsequent citation translation is done accordingly. */
         if (prev_frame > 0) {
             for (int k = 0; k < 8; k++)
                 if (mask >> k & 1u) {
                     dpb->dpb_shadow[k] = prev_frame;
                     dpb->dpb_order_hint[k] = dpb->last_oh;
-                    /* 全局运动的按槽备份必须与影子表同步：下一帧算
-                     * 差分符号时查的就是这里登记的这一帧的参数。
-                     * gm_pending 是"最近合成帧"的参数，只有它确实属于
-                     * prev_frame 时才可用（否则宁可用默认值 —— 与解码器
-                     * 那份不一致时最多丢一次运动补偿，不会写坏码流）。 */
+                    /* Global motion backups must be synchronized with shadow tables: next frame counts
+                     * The difference sign is the parameter of this frame that is registered here.
+                     * gm_pending is the parameter for "Recent Synthetic Frame," only it does belong to it.
+                     * Prev_frame only available (otherwise default values - with codecs
+                     * If you don't agree, you can throw up your motion compensation at most once, and you don't write bad-ass flows. */
                     if (dpb->gm_pending_frame == prev_frame)
                         dpb->gm_slot[k] = dpb->gm_pending;
                 }
@@ -2276,7 +2276,7 @@ void dmd_av1_patch_prev_refresh(struct dmd_av1_dpb *dpb,
 }
 
 
-/* ---------------------------------------------------------------- OBU 头 */
+/* - - - - - - - - - - - - - - - - - - - - Head of the OBU */
 
 size_t dmd_av1_obu_header(int obu_type, size_t payload_len,
                           unsigned char *out, size_t out_cap)
@@ -2286,12 +2286,12 @@ size_t dmd_av1_obu_header(int obu_type, size_t payload_len,
 
     /* forbidden(1)=0 | type(4) | extension(1)=0 | has_size(1)=1 | reserved(1)=0
      *
-     * 即 0x00 | (type << 3) | 0x00 | 0x02 | 0x00 —— has_size 位是 bit1。
-     * 举例：SEQUENCE_HEADER(1) → 0x0a，FRAME_HEADER(3) → 0x1a，
+     * This means 0x00  ⁇ (type< < 3) ⁇ 0x00 ⁇ 0x00  ⁇  has_size is bit1.
+     * Examples: SEQUENCE_HEADER(1)  ⁇ Ox0a, FRAME_HEADER(3)  ⁇ x1a,
      *       TILE_GROUP(4) → 0x22，TEMPORAL_DELIMITER(2) → 0x12。
      *
-     * 对照实测的非法值 0xd0 = 1101_0000：forbidden=1（必须 0）、
-     * type=10（保留值）—— 一眼就能看出那不是 OBU 头而是裸载荷。 */
+     * The actual illegal value is 0xd0 = 1101_000:forbidden=1 (must 0),
+     * Type = 10 -- one can see that it's not an OBU head but a naked load. */
     out[0] = (unsigned char)(((obu_type & 0x0f) << 3) | 0x02);
 
     size_t n = dmd_av1_leb128((uint64_t)payload_len, out + 1, out_cap - 1);

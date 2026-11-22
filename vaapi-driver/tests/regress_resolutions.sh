@@ -1,22 +1,22 @@
 #!/bin/sh
-# 多分辨率硬解回归：硬解结果必须与软解逐字节一致。
+# Multi-resolution hard resolution regression: hard resolution results must match soft resolution by bytes.
 #
-# 为什么需要它：原有回归流全是 1920x1080，恰好等于 msm_vidc 的
-# G_FMT(CAPTURE) 默认几何，因此永远不触发"用 OUTPUT 协商值覆盖 CAPTURE
-# 残留"那条分支。真实缺陷（残留 stride=1920 被用于 1280x720，导致每行
-# 错位 640 字节并把 slice_height 从 736 压成 492）就藏在这个盲区里，
-# 表现为 Firefox 绿屏，而 1080p 回归全绿。
+# Why it is needed: all the original returns are 1920x1080, which is exactly the same as msm_vidc
+# G_FMT(CAPTURE) Default geometry, so never triggers"Use OUTPUT Consultation value overwrite CAPTURE
+# The "residual" branch. The real defect.
+# The stale stride shifts each row by 640 bytes and reduces slice_height from 736 to 492.
+# Shows the Firefox green screen, and 1080p returns green.
 #
-# 覆盖点：
-#   1280x720   常见非 1080p
-#   854x480    宽度非 128 倍数（stride 需对齐到 896）
-#   640x360    小分辨率
-#   720x1280   竖屏（高 > 宽）
-#   分辨率切换 同一 fd 上依次解 1080p→720p→480p
+# Overwrite point:
+#   1280x720   Common Unlike 1080p
+#   854x480    Width non- 128 Multiplier（stride We need to align. 896）
+#   640x360    Small Resolution
+#   720x1280   Stand up (high) > Width）
+#   Resolution Switch Same fd Top-in-Speech 1080p ~720p ~480p
 #
-# 用法:
-#   FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh [源码流]
-# 依赖 ffmpeg 具备 libx265 与 vaapi 支持。
+# Usage:
+#   FFMPEG=/path/to/ffmpeg DRIVER_DIR=../build ./regress_resolutions.sh [Source Flow]
+# Reliance on ffmpeg with libx265 with vaapi support.
 
 set -e
 
@@ -27,7 +27,7 @@ WORK=${WORK:-$(mktemp -d)}
 KEEP=${KEEP:-0}
 
 if [ ! -f "$SRC" ]; then
-    echo "跳过: 找不到源码流 $SRC" >&2
+    echo "skip: Source stream not found $SRC" >&2
     exit 77
 fi
 
@@ -39,7 +39,7 @@ trap cleanup EXIT
 fail=0
 pass=0
 
-# 逐个分辨率：编码 -> 软解 md5 -> 硬解 md5 -> 比对
+# One resolution by resolution: code----- softened md5-- hardened md5--
 for spec in 1280x720 854x480 640x360 720x1280; do
     w=${spec%x*}
     h=${spec#*x}
@@ -48,7 +48,7 @@ for spec in 1280x720 854x480 640x360 720x1280; do
     if ! "$FFMPEG" -hide_banner -loglevel error -i "$SRC" \
             -vf "scale=$w:$h" -c:v libx265 -x265-params log-level=0 \
             -frames:v 24 -f hevc "$clip" -y 2>/dev/null; then
-        printf '  %-10s 跳过（编码失败，缺 libx265?）\n' "$spec"
+        printf '  %-10s Skip (code failed, missing) libx265?）\n' "$spec"
         continue
     fi
 
@@ -58,7 +58,7 @@ for spec in 1280x720 854x480 640x360 720x1280; do
     if ! LIBVA_DRIVERS_PATH="$DRIVER_DIR" "$FFMPEG" -hide_banner -loglevel error \
             -hwaccel vaapi -i "$clip" -pix_fmt yuv420p \
             -f rawvideo "$WORK/hw.yuv" -y 2>/dev/null; then
-        printf '  %-10s ✗ 硬解失败\n' "$spec"
+        printf '  %-10s ✗ Hard resolution failed\n' "$spec"
         fail=$((fail + 1))
         continue
     fi
@@ -66,16 +66,16 @@ for spec in 1280x720 854x480 640x360 720x1280; do
     rm -f "$WORK/hw.yuv"
 
     if [ "$sw" = "$hw" ]; then
-        printf '  %-10s ✓ 字节一致\n' "$spec"
+        printf '  %-10s ✓ Bytes Same\n' "$spec"
         pass=$((pass + 1))
     else
-        printf '  %-10s ✗ 不一致 软解=%.12s 硬解=%.12s\n' "$spec" "$sw" "$hw"
+        printf '  %-10s ✗ Inconsistent Soft=%.12s hardware decode=%.12s\n' "$spec" "$sw" "$hw"
         fail=$((fail + 1))
     fi
 done
 
-# 分辨率切换：同一解码器 fd 上连续处理三种几何。
-# 这是最接近浏览器自适应码率的场景，也是残留几何最容易暴露的地方。
+# Resolution switch: Three geometry processes continuously on the same decoder fd.
+# This is the scene of the closest browser self-adaptation rate and the most exposed location for residual geometry.
 sw_ok=1
 : > "$WORK/switch.hevc"
 for spec in 1920x1080 1280x720 854x480; do
@@ -91,7 +91,7 @@ for spec in 1920x1080 1280x720 854x480; do
 done
 
 if [ "$sw_ok" = "1" ]; then
-    # 逐段比对：拼接流整体解码后帧尺寸会变，单段比对更严格。
+    # Parameter by Parameter: The frame size changes after the overall spooling has been decoded and the single segment is more stringent than the pair.
     seg_fail=0
     for spec in 1920x1080 1280x720 854x480; do
         seg="$WORK/seg_$spec.hevc"
@@ -104,7 +104,7 @@ if [ "$sw_ok" = "1" ]; then
         rm -f "$WORK/s.yuv"
         [ "$sw" = "$hw" ] || seg_fail=1
     done
-    # 再跑一次拼接流，确认同一会话内切换不报错、不截断。
+    # Run the spool again to confirm that the same session is open and closed.
     if LIBVA_DRIVERS_PATH="$DRIVER_DIR" "$FFMPEG" -hide_banner -loglevel error \
             -hwaccel vaapi -i "$WORK/switch.hevc" -f null - 2>/dev/null; then
         :
@@ -112,13 +112,13 @@ if [ "$sw_ok" = "1" ]; then
         seg_fail=1
     fi
     if [ "$seg_fail" = "0" ]; then
-        printf '  %-10s ✓ 各段字节一致\n' '切换流'
+        printf '  %-10s ✓ Bytes of the field are consistent\n' 'Switch Stream'
         pass=$((pass + 1))
     else
-        printf '  %-10s ✗ 切换后像素或解码异常\n' '切换流'
+        printf '  %-10s ✗ Toggle Pixels or Decoding Unusual\n' 'Switch Stream'
         fail=$((fail + 1))
     fi
 fi
 
-echo "多分辨率回归: 通过 $pass，失败 $fail"
+echo "Multi-resolution regression: Pass. $pass，failed $fail"
 [ "$fail" = "0" ]

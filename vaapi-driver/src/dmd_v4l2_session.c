@@ -1,28 +1,28 @@
 /*
- * dmd_v4l2_session —— dmd_client.h 接口的 V4L2 直通实现。
+ * dmd_v4l2_session — dmd_clit.h interface V4L2 is implemented directly.
  *
- * 取代原先的 socket + decode-daemon 链路：驱动进程自己打开
- * /dev/video32（msm_vidc_driver）解码，不再需要跨进程通信。
+ * Replace the original socket+de-deaemon link: the driver opens itself
+ * /dev/video32 (msm_vidc_driver) decodes and no longer requires cross-process communication.
  *
- * 为什么能这么做（实测推翻了早先的判断）：容器内 /dev/video32 与
- * /dev/dma_heap/system 都属 droidspaces-gpu 组，容器用户在该组内，
- * **无需 root** 即可直接解码。实测容器内无 root 解 AV1 得 10 帧，
- * 四个 codec 全部可用，三个并发实例互不干扰。
+ * Why do you do this? (Specify overturning earlier judgment): inside /dev/ video32 with
+ * /dev/dma_head/systems belong to the droidspaces-gpu group, where the container user is,
+ * ** The decoding is done without root**. No root decoding of AV1 inside the container is done by 10 frames,
+ * All four codecs are available, and three examples are available without interference.
  *
- * 于是 daemon 存在的唯一理由（跨进程访问 Android MediaCodec）消失了。
- * 去掉它省下：socket 往返、每帧一次全画面 memcpy（1080p 是 3MB）、
- * SHM 槽位池与归还协议、握手与版本协商、daemon 进程与 watchdog。
+ * The only reason why daemon exists (inter-processed interview with Android MediaCodec) disappeared.
+ * Remove it: Socket, go round, go round, go round, and get a full picture of memcpy (1080p is 3MB),
+ * The SHM slot is for restitution agreements, handshake and version negotiation, the daemon process and watchdog.
  *
- * 刻意保持 dmd_client.h 的接口不变 —— decode.c 一行都不用改，
- * 它看到的仍是 create/send_unit/next_frame/release_frame/drain/destroy。
- * 这样这次改造对上层是透明的，也便于对照排查。
+ * The dmd_client.h interface is maintained -- decode.c without changing the line, and the & & & & & & & & ;
+ * It still sees the record of the creation/send_unit/text_frame/release_frame/drain/destroy.
+ * This modification is thus transparent for the upper layers and allows for cross-checking.
  *
- * 与 daemon 版的语义差异（已在各函数处注明）：
- * - dmd_frame.data 直接指向 V4L2 的 dmabuf 映射，不再是 socket 收进来的
- *   拷贝。release_frame 之前不能覆写，release 之后立刻失效。
- * - shm_slot 字段复用为 CAPTURE 缓冲索引（>=0），语义仍是"归还凭据"。
- * - unit_seq 由本实现通过 V4L2 timestamp 透传，规则与 daemon 版一致
- *   （送料时写 seq*1000 微秒，收帧时除回来）。
+ * Semantic differences with the daemon version (semantics specified at each function):
+ * - dmd_frame.data directs dmabuf map to V4L2 and is no longer received by the socket
+ *   Copy. Release_frame cannot be overwritten before release lapses immediately after.
+ * - Shm_slot field is re-used as CAPTURE buffer index (> = 0), and semantically still "refundable documents".
+ * - unit_seq from Ben achieved through V4L2 timestamp, the rules are consistent with the daemon version
+ *   (Seq*1,000 microseconds in feed, removes when frame is collected)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -37,21 +37,21 @@
 #include <string.h>
 #include <time.h>
 
-/* 与 dmd_client.c 保持一致的日志开关：只有字面 "1" 打开。 */
+/* Log switch that is consistent with dmd_client.c: only "1" is opened literally. */
 static int v4l2_log_wanted(void)
 {
     const char *e = getenv("DMD_VA_LOG");
     return e && e[0] == '1';
 }
 
-/* ---------------------------------------------------------------- 配置 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - configuration */
 
 void dmd_session_config_init(struct dmd_session_config *cfg)
 {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
-    /* port / sock_path / want_shm 在 V4L2 直通下已无意义，保留字段是为了
-     * 不破坏 dmd_client.h 的 ABI 与调用方代码；本实现一律忽略它们。 */
+    /* Port / lock_path / want_shm with direct V4L2 is meaningless and the field is reserved for
+     * ABI and caller codes are not destroyed at dmd_client.h; this is done without them. */
     cfg->codec = DMD_CODEC_H264;
     cfg->connect_timeout_ms = 2000;
     cfg->io_timeout_ms = 5000;
@@ -72,14 +72,14 @@ int dmd_format_display_height(const struct dmd_format *fmt){
     return fmt->buf_height;
 }
 
-/* ------------------------------------------------------------ 会话生命周期 */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - The life cycle of the conversation */
 
 void dmd_session_set_ten_bit(struct dmd_session *s, int ten_bit)
 {
     if (!s)
         return;
-    /* 只在 CAPTURE 还没配好时有效：配好之后再改几何就没人重协商了，
-     * 那种情况（同一会话内位深变化）本驱动不支持，宁可留个日志。 */
+    /* Only when CAPTURE is not ready: no one will be able to negotiate again after the geometry is done.
+     * That situation (the deep change in the inside of the same session) was not supported by the fact that it would be preferable to leave a log. */
     if (s->dec.cap_size && !!ten_bit != !!s->dec.ten_bit) {
         dmd_session_log(s, "ignore bit-depth change (%d to %d) after CAPTURE setup",
                  s->dec.ten_bit, ten_bit);
@@ -93,23 +93,23 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
 {
     if (!cfg) {
         if (err) { err->code = DMD_ERR_INVAL; snprintf(err->msg, sizeof(err->msg),
-                                                "配置为空"); }
+                                                "Missing session configuration"); }
         return NULL;
     }
 
     struct dmd_session *s = calloc(1, sizeof(*s));
     if (!s) {
         if (err) { err->code = DMD_ERR_NOMEM; snprintf(err->msg, sizeof(err->msg),
-                                                "内存不足"); }
+                                                "Out of memory"); }
         return NULL;
     }
     s->log = v4l2_log_wanted();
     s->codec = cfg->codec;
     s->io_timeout_ms = cfg->io_timeout_ms > 0 ? cfg->io_timeout_ms : 5000;
 
-    /* VP8 未实现：驱动侧缺码流重建。
-     * ⚠️ 硬件支持 VP80（第 80 轮实测枚举确认），此前注释说"没有 VP80 格式"是错的。
-     * 这里给出明确错误而不是静默失败，便于上层定位。 */
+    /* VP8 Not achieved: Driver-driven default stream re-established.
+     * Hardware support VP80 (80th round of actual count confirmed), following an earlier note that "no VP80 format" was wrong.
+     * This gives clear errors, not silent failures, which allow for upward positioning. */
     if (!dmd_v4l2_probe(cfg->codec)) {
         dmd_session_set_error(s, DMD_ERR_REJECTED, "V4L2 decoder does not support this codec");
         if (err) *err = s->err;
@@ -124,7 +124,7 @@ struct dmd_session *dmd_session_create(const struct dmd_session_config *cfg,
         free(s);
         return NULL;
     }
-    /* open 里 memset 过 d，位深必须在它之后落。 */
+    /* Open memset over d, the depth must fall behind it. */
     s->dec.ten_bit = cfg->ten_bit ? 1 : 0;
 
     dmd_session_log(s, "session opened: codec=%d %dx%d (direct V4L2)",
@@ -151,43 +151,43 @@ void dmd_session_destroy(struct dmd_session *s)
     free(s);
 }
 
-/* 判断一个 Annex-B 单元是否只含参数集（VPS/SPS/PPS 及 H.264 的 SPS/PPS）。
+/* Determines whether an Annex-B module contains only a set of parameters (SPS/PPS and H.264).
  *
- * 为什么必须区分：配对依赖"驱动登记的序号"与"V4L2 回传的 timestamp"用同一套
- * 编号。驱动侧在 EndPicture 里每**帧**加一号（参数集不经过 EndPicture），
- * 而这里若对每个 send_unit 都加号，参数集就会白占编号，两侧从此错开。
+ * Why must we distinguish between relying on the serial number of the "drive registration" and "V4L2 return timestamp" in the same way?
+ * No. The driver is added to each ** frame** in EndPicture (parameter set without EndPicture),
+ * And if you add a number to each of the send_units, the argument set will be empty numbered and the two sides will be staggered from this.
  *
- * 实测后果（HEVC 1920x1080 12 帧）：ffmpeg 调 12 次 EndPicture 登记 1..12，
- * 而 session 层送出 15 个单元编号 1..15。配对按值相等匹配，于是系统性错帧 ——
- * 帧数看着完全正确（12/12），画面却张冠李戴：标称 POC 0 的 surface
- * 实际装的是显示序第 7 帧（逐帧匹配平均差 0.000）。
+ * The results are measured (HEVC 1920x108012 frame): ffmpeg mod 12 EndPicture registrations 1.12,
+ * The session layer sends out 15 cell numbers 1.15. Matching equals the values, and then systematically error frames --
+ * Frame numbers are exactly correct (12/12), but the picture is a very good one: the surface called POC 0
+ * The actual display order 7 frames (the average difference of 0.000 by frame).
  *
- * 这个 bug 只在动态画面下暴露：测试素材上半 797 行恰好是静态图案，
- * 与真帧逐字节相同，只有下半的动态渐变带露馅。 */
+ * This bug is exposed only in dynamic images: the first half of the test material 797 is a static pattern, and the first half of the test material is exposed to the same kind of material.
+ * As with the frame by bytes, only the second half of the dynamic gradient is visible. */
 static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
 {
-    /* AV1：show_existing_frame 单元不推进单元序号。
+    /* The AV1:show_existing_frame module does not advance the unit number.
      *
-     * 这类单元是 TD + 一个 SEF 帧头（共 3~4 字节），不含任何 tile 数据，
-     * 硬件会为它复显一个已解码帧。驱动侧的 pending 队列只为真实帧登记，
-     * 所以它**不能**占用一个 unit_seq —— 否则其后所有真实帧的 PTS
-     * 都偏移一位，配对全部落到回退路径上。
+     * This is a TD+SEF frame (of 3-4 bytes) that does not contain any tile data,
+     * Hardware will re-enact a decoded frame. The drive-driven pending queue is registered only as the real frame.
+     * So it** cannot ** take a unit_seq -- otherwise all the real PTSs that follow.
+     * All of them are shifted and the pairs are all on the retreat path.
      *
-     * 这与 HEVC 参数集是同一类问题：第 b86ab9f 次提交修的就是
-     * "units_submitted 按帧递增、units_sent 按 send_unit 递增"导致的错位。
+     * This is the same as the HEVC Parameter Set: b86ab9f is the one that was submitted for repair
+     * The place of error caused by "units_submitted by frame, unit_sent by send_unit"
      *
-     * 判据：长度 <= 8，且首个 OBU 是 TD、第二个是 FRAME_HEADER，
-     * 或首个直接就是 FRAME_HEADER。
+     * The decision is: length < = 8 and the first OBU is TD and the second is FRAME_HEADER, and the second is the `FRAME_HEADER'.
+     * Or first, the FRAME_HEADER.
      *
-     * ⚠️ 范围说明：这个修复是必要的（不修则 SEF 之后所有真实帧的
-     * PTS 偏移一位、配对全部落到回退路径），但它**不是**
-     * "SEF 数量超过 20 就崩"的原因 —— 修完再测 SEF_MAX=40 仍然超时。
-     * 那个上限另有成因，尚未定位。 */
+     * ⁇  Scope: This repair is necessary (without fixing all the real frames after SEF)
+     * PTS offset one pair to retreat path)
+     * "SEF number over 20, and then crash" -- after completing the test SEF_MAX=40 is still time-consuming.
+     * That ceiling is for other reasons and has not yet been established. */
     if (codec == DMD_CODEC_AV1) {
         if (len > 8 || len < 2)
             return 0;
         size_t i = 0;
-        /* 可选的 TD（type=2, obu_size=0） */
+        /* optional TD(type=2, obu_size=0) */
         if (((d[i] >> 3) & 0xF) == 2) {
             if ((d[i] >> 1) & 1) {
                 if (i + 1 >= len || d[i + 1] != 0)
@@ -199,12 +199,12 @@ static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
         }
         if (i >= len)
             return 0;
-        /* 随后必须是 FRAME_HEADER（type=3），且载荷首位 show_existing_frame=1 */
+        /* Then must FRAME_HEADER(type=3) with the first load show_existing_frame=1 */
         if (((d[i] >> 3) & 0xF) != 3)
             return 0;
         size_t pl = i + 1;
         if ((d[i] >> 1) & 1)
-            pl = i + 2;             /* 跳过 leb128 obu_size（此处恒 1 字节） */
+            pl = i + 2;             /* Skip lib128 obu_size (Hing 1 byte) */
         if (pl >= len)
             return 0;
         return (d[pl] >> 7) & 1;    /* show_existing_frame */
@@ -215,7 +215,7 @@ static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
     size_t i = 0;
     int saw_vcl = 0, saw_any = 0;
     while (i + 4 <= len) {
-        /* 定位起始码（3 或 4 字节） */
+        /* Positioning Starts (3 or 4 bytes) */
         size_t sc = 0;
         if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1)
             sc = 3;
@@ -227,42 +227,42 @@ static int unit_is_param_set_only(int codec, const unsigned char *d, size_t len)
         if (h >= len) break;
         saw_any = 1;
         if (codec == DMD_CODEC_HEVC) {
-            /* HEVC NAL 头 2 字节，type = (byte0 >> 1) & 0x3F。
-             * VCL NAL 是 0..31；VPS=32 SPS=33 PPS=34 AUD=35 EOS/EOB/FD/SEI=36..40。 */
+            /* HEVC NAL Head 2 bytes, type = (byte0 > > 1) & 0x3F.
+             * VCL NAL is 0.31; VPS=32 SPS=33 PPS=34 AUD=35 EOS/EOB/ FD/SEI=36.40. */
             unsigned t = (unsigned)((d[h] >> 1) & 0x3F);
             if (t < 32) saw_vcl = 1;
         } else {
-            /* H.264 NAL 头 1 字节，type = byte0 & 0x1F。
-             * VCL 是 1(非IDR)/5(IDR)；SPS=7 PPS=8 SEI=6 AUD=9。 */
+            /* H.264 NAL Head 1 byte, type = byte0 & 0x1F.
+             * VCL is 1 (non-IDR)/5 (IDR); SPS=7 PPS=8 SEI=6 AUD=9. */
             unsigned t = (unsigned)(d[h] & 0x1F);
             if (t == 1 || t == 5 || (t >= 2 && t <= 4)) saw_vcl = 1;
         }
         i = h + 1;
     }
-    /* 只有确实解析到了 NAL 且其中没有任何 VCL，才算纯参数集单元。 */
+    /* Only when nal is actually parsed and there is no VCL in it is a pure argument set cell. */
     return saw_any && !saw_vcl;
 }
 
-/* -------------------------------------------------------------------- 送料 */
+/* - - - - - - - - - - - - - - - - - - - - - - - Delivery */
 
 int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
 {
     if (!s || !data || len == 0) return DMD_ERR_INVAL;
 
-    /* 背压处理：后端返回 1 表示当前无空闲输入缓冲。这不是错误 ——
-     * 收帧后缓冲会被回收。必须重试而不能丢单元：丢任何一个访问单元
-     * 都会毁掉后续的参考帧链，画面必然坏掉。
+    /* Back pressure processing: Backend returns 1 for currently free input buffer. This is not an error...
+     * The buffer is recycled after the frame is collected. You must try again without dropping the unit: drop any access module
+     * And it's gonna destroy the following frame of reference, and the picture's gonna be broken.
      *
-     * 与 daemon 版的差异：那边是靠 output 线程并发回收，这边是单线程，
-     * 所以要主动调 recv 推进流水线。 */
-    /* 纯参数集单元不占编号：驱动侧在 EndPicture 里每帧加一号，
-     * 参数集不经过 EndPicture，这里也必须跳过，否则两侧编号错开。 */
+     * Difference from the daemon version: that's a one-line line over there with the output and recycling.
+     * So you have to start recv pushing the current line. */
+    /* Pure Parameter Set Unit does not number: The driver adds one number to each frame in EndPicture.
+     * The argument set does not pass EndPicture, and it must be skipped here, otherwise the two side numbers are staggered. */
     const int ps_only = unit_is_param_set_only(s->codec,
                                                (const unsigned char *)data, len);
 
     int spins = 0;
     for (;;) {
-        /* 参数集沿用当前编号（不预占下一号），VCL 单元才推进。 */
+        /* The argument set follows the current number (not to take next number), and the VCL module is advanced. */
         int r = dmd_v4l2_send(&s->dec, data, len,
                               (uint64_t)(s->units_sent + (ps_only ? 0 : 1))
                                   * 1000ULL);
@@ -298,7 +298,7 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
                     continue;
                 }
                 if (pr == 2) { s->eos = 1; break; }
-                break;                    /* 0 = 暂无就绪帧，正常 */
+                break;                    /* 0 = not available, normal */
             }
             return 0;
         }
@@ -307,35 +307,35 @@ int dmd_session_send_unit(struct dmd_session *s, const void *data, size_t len)
             return DMD_ERR_IO;
         }
 
-        /* r == 1：输入缓冲满。推一次收帧循环让驱动回收缓冲。
-         * 这里不能把帧丢掉 —— 若真收到帧，说明调用方还没取，
-         * 属于调用序列问题，报错比静默丢帧好。 */
+        /* r = = 1: Enter a buffer. Push a frame loop to allow the driver to recover the buffer.
+         * You can't throw the frame away here -- if you really get the frame, you don't get the caller.
+         * It's a question of calling the sequence. It's better to mistreat than to drop the frame. */
         uint8_t *fd = NULL; size_t fl = 0; uint64_t fp = 0; int fi = -1;
         int rr = dmd_v4l2_recv(&s->dec, &fd, &fl, &fp, &fi, 20);
         if (rr == 1) {
-            /* 收到帧但调用方还没来取 —— 存进待取队列，绝不丢弃。
-             * 丢任何一帧都会毁掉后续的参考帧链。 */
+            /* The frame is received but the caller has not yet come to pick it up -- deposit into the to-do queue and never drop it.
+             * The next frame of reference will be destroyed by the loss of any frame. */
             if (dmd_session_pending_push(s, fd, fl, fp, fi) < 0) {
-                /* 队列容量等于 CAPTURE 缓冲数，理论上到不了这里。
-                 * 真到了说明缓冲计数有问题，归还该帧避免泄漏。 */
+                /* The queue capacity equals the CAPTURE buffer number, which is theoretically not available.
+                 * It was true that the buffer count was flawed and that the frame was returned to avoid leakage. */
                 dmd_v4l2_release(&s->dec, fi);
                 dmd_session_set_error(s, DMD_ERR_STATE, "pending-frame queue overflow");
                 return DMD_ERR_STATE;
             }
             dmd_session_publish_format_if_needed(s);
-            continue;      /* 队列腾出了缓冲，立刻重试送料 */
+            continue;      /* The queue has released a buffer. */
         }
         if (rr == 2) {
-            s->eos = 1;    /* 排空中；余下的帧仍会从队列/recv 取出 */
+            s->eos = 1;    /* Line up; the remaining frame will still be removed from the queue/ recv */
         }
         if (rr < 0) {
             dmd_session_set_error(s, DMD_ERR_IO, "receive failed while relieving input backpressure");
             return DMD_ERR_IO;
         }
         if (++spins > 500) {          /* 500 × 20ms = 10s */
-            /* 诊断这类死锁时，这三个计数是关键：pend_count 满而
-             * OUTPUT 全在驱动手里，说明消费者不取帧、CAPTURE 没归还、
-             * 固件停摆。DMD_VA_LOG=1 时打印。 */
+            /* When these locks are diagnosed, the three counts are key: pend_count full.
+             * The OOTPUT is all in the driver's hands, which means the consumer doesn't take the frame, the CAPTURE doesn't return, the consumer doesn't take the frame.
+             * Solids are stopped. Print when DMD_VA_LOG=1. */
             int qout = 0, qcap = 0;
             for (int i = 0; i < s->dec.n_out; i++)
                 if (s->dec.out[i].queued) qout++;
@@ -356,7 +356,7 @@ int dmd_session_finish_input(struct dmd_session *s)
     if (!s) return DMD_ERR_INVAL;
     if (s->input_finished) return 0;
     s->input_finished = 1;
-    /* 告知驱动没有更多数据，逼出流水线里剩余的帧。 */
+    /* The notification driver did not have more data to push out the remaining frames in the stream. */
     if (dmd_v4l2_drain(&s->dec) < 0) {
         dmd_session_set_error(s, DMD_ERR_IO, "failed to request decoder drain");
         return DMD_ERR_IO;
@@ -369,39 +369,39 @@ int dmd_session_drain(struct dmd_session *s)
 {
     if (!s) return DMD_ERR_INVAL;
 
-    /* 语义说明：上层（decode.c 的 SyncSurface）在等帧超时时调本函数，
-     * 想要"催出积压帧但会话仍可用"。它按返回值分流：
-     *   DMD_OK   → 认为可逆，置 drained_once，继续送料
-     *   非 DMD_OK → 退回不可逆的 finish_input，会话就此收尾
+    /* semantic description: the upper level (SyncSurface of decode.c) is calling the function while the frame is timed out,
+     * Wants to "cat out the backlog frame but the session is still available". It divides the value by return:
+     *   DMD_OK — Reversed, drawn_once, continue the feed
+     *   DMD_OK — Return to irreversible finish_input, end of session
      *
-     * msm_vidc 上这两条路都不能走真正的 DECODER_CMD：
-     *   · STOP 会把会话推进 DRAIN 子状态，之后 CMD_START 被拒
+     * Neither of these roads can be really travelled.
+     *   . STOP will push the session forward to the DRAIN substate, and the CMD_START is rejected.
      *     （dmesg: "av1D: msm_vidc_streaming_state: (CMD_START) not allowed,
-     *      sub_state (DRAIN)"），此后**永久不再出帧**
-     *   · 故 V4L2 规范的 drain-and-resume（STOP+START）在本平台不可用，
-     *     实测 START 返回 EBUSY
+     *      Sub_state (DRAIN) ** Since then, no more frames have been removed**
+     *   • The V4L2 norm, which is therefore not available on this platform, is not available in the country.
+     *     Actual START returns EBUSY
      *
-     * 而返回失败同样有害：上层会立刻 finish_input 终结流。
+     * The failure to return is also harmful: the upper level immediately finishes the stream.
      *
-     * 所以这里返回成功的 no-op —— 不动解码器，让上层以为"已排空、可继续"。
-     * 这是安全的：本实现的 send_unit 每次送料都顺手 DQBUF 收帧
-     * （msm_vidc 要求及时归还 CAPTURE 缓冲才继续解码），积压帧本来就会
-     * 被及时取走，不需要额外的排空动作来催。
+     * So here's the successful no-op -- do not move the codec so the upper level thinks "defended and can continue."
+     * This is safe: Ben's end_unit gets the DQBUF collection every time the feed comes in.
+     * (msm_vidc demanding timely return of CAPTURE buffer until decoded)
+     * They were removed in time and no additional emptiness was required to rush.
      *
-     * 真正结束时走 finish_input，那里才发不可逆的 STOP。
+     * When it's really over, it's the end of the story that comes out of the STOP.
      *
-     * ⚠️ 但返回 DMD_OK 会让上层置 drained_once 后**再也不会**触发真正的排空，
-     * 而解码器确实会攥住尾部帧不放 —— 那几帧只有 EOS 才吐得出来。
+     * But returning to DMD_OK will allow the upper layers to be drawn after ** never to trigger a real drain.
+     * And the decoder does hold the tail frame -- those frames are only eOS.
      *
-     * 实测（H.264 300 帧）：drain 返回 OK 时，surface 7 等满 5000ms 超时、
-     * ffmpeg 放弃该帧，之后尾部帧才在 DestroyContext 的"排空补齐"里到达，
-     * 但那时上游已不再收货，结果硬解 298 帧 / 软解 300 帧。
-     * 解码器本身一帧不少（日志：送入 300 单元，收到 300 帧），
-     * 丢帧发生在驱动与 ffmpeg 之间。
+     * Actual (H.264,300 frames): Draw returns OK when the sunface 7 is 5,000 ms full of time,
+     * ffmpeg abandoned the frame and the tail came in "filled and filled" at DestroyContext.
+     * But at that time, the upstream delivery was no longer in order to harden the 298/ soften the 300 frame.
+     * The decoder itself is a very large set (log: sent 300 units, received 300 frames),
+     * Drop frame occurs between the driver and the ffmpeg.
      *
-     * 所以这里返回"不可用"，让上层退回 finish_input 去发真正的 EOS。
-     * 代价是会话此后不可再送料 —— 但上层只在等帧超时（默认 2000ms）
-     * 且输入尚未结束时才走到这里，那时流实际上已经到尾了。 */
+     * So here goes back "not available", and let the upper level go back to finish_input to send the real EOS.
+     * The price is that the session is not ready to be delivered after the session - but the upper layer is only waiting for the frame to pass.
+     * And the input is not yet finished and the stream is actually over. */
     (void)s;
     dmd_session_log(s, "reversible V4L2 drain unavailable; caller must finish input to receive tail frames");
     return DMD_ERR_STATE;

@@ -1,31 +1,25 @@
 # DroidSpaces V4L2 VA-API driver (decode and encode)
 #
-# 产物名不可更改：libva 从 msm render node 推导出的驱动名就是 msm_drm，
-# 只会尝试打开 <dridir>/msm_drm_drv_video.so 这一个文件（无 fallback）。
-# 详见 README.md 的"无感发现机制"。
-#
-# 必须在容器内（aarch64）编译：本机 x86_64 交叉工具链缺 aarch64 glibc。
+# libva derives msm_drm from the render node and looks only for
+# msm_drm_drv_video.so in its driver directory. Preserve this filename.
+# Build inside the AArch64 container when the host toolchain lacks an AArch64 sysroot.
 
 TARGET  := msm_drm_drv_video.so
 SRCDIR  := src
 BUILD   := build
 
-# libva 只取头文件路径；driver 是被 libva dlopen 的插件，
-# 符号由宿主进程提供，不要链接 libva 本体。
+# The libva loader opens this module and provides its VA-API entry points.
+# Use the headers without linking libva into the driver.
 VA_CFLAGS := $(shell pkg-config --cflags libva 2>/dev/null)
 
-# libdrm 头：surface 用 msm_drm 的 dumb buffer 分配，才能导出 dmabuf
-# （Firefox 取帧的唯一途径）。只用头文件里的 ioctl 定义与 fourcc 常量，
-# 不链接 libdrm 本体 —— ioctl 直接走 syscall。
+# Use libdrm headers for dumb-buffer allocation and DMA-BUF export.
+# The driver sends ioctls directly and does not link libdrm.
 DRM_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-# -MMD -MP：生成 .d 依赖文件，让改动头文件也能触发重编译。
-# 没有这两个选项时，规则只依赖 .c —— 改了 driver.h 后 make 会认为
-# 目标是最新的，产物里仍是旧值（v0.3.7 改 DMD_DRIVER_VERSION 时实测踩到：
-# 版本串没进 .so，必须 make clean 才生效）。
-# 构建 ID：git hash (8位) + dirty 标记，编译进版本串便于判断实际加载的版本
+# Track header dependencies so changing driver.h rebuilds affected objects.
+# Embed the abbreviated Git hash and dirty marker in the driver version.
 GITDESC := $(shell cd $(dir $(lastword $(MAKEFILE_LIST))) && \
                    git rev-parse --short=8 HEAD 2>/dev/null || echo "nogit")
 GITDIRTY := $(shell cd $(dir $(lastword $(MAKEFILE_LIST))) && \
@@ -36,17 +30,9 @@ CFLAGS  += -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter \
            -fvisibility=hidden -D_GNU_SOURCE $(VA_CFLAGS) $(DRM_CFLAGS) \
            -I$(SRCDIR) -MMD -MP -DDMD_BUILD_ID=\"$(BUILD_ID)\"
 
-# AV1=1 声明 AV1 profile（开发/调试用）。发布版默认不声明 —— 像素校验未通过时
-# 声明它就是虚报，见 src/profiles.c 的说明。
-#
-# ⚠️ 必须走这个变量，不要在命令行覆盖 CFLAGS：
-#   make CFLAGS=-DDMD_ENABLE_AV1     ← 错，会丢掉 -fPIC（链接期报
-#                                      "relocation R_AARCH64_ADR_PREL_PG_HI21
-#                                      ... recompile with -fPIC"）
-#   make CPPFLAGS=-DDMD_ENABLE_AV1   ← 无效，编译规则只用 $(CFLAGS)，
-#                                      宏静默不生效（表现为 ffmpeg 报
-#                                      "No support for codec av1 profile 0"）
-# 两个坑都实际踩过，所以在这里提供一个正确的入口。
+# Enable the experimental AV1 profile with AV1=1. The default build hides it.
+# Use this option instead of overriding CFLAGS to preserve the shared-library
+# options, including -fPIC. CPPFLAGS is not used by these compilation rules.
 ifeq ($(AV1),1)
 CFLAGS  += -DDMD_ENABLE_AV1
 endif
@@ -71,11 +57,8 @@ SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDI
 OBJECTS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 DEPS    := $(OBJECTS:.o=.d)
 
-# 单元测试：纯函数、不碰硬件、不需要 daemon。
-#
-# 旧的 test_dmd_client / probe_shm_fallback 两个目标已随 socket 架构一起废弃：
-# 前者要连 daemon 的 TCP 20003，后者验证 daemon 的 SHM 降级行为，
-# V4L2 直通下都无对应物，且是 `make tests` 长期 exit 2 的原因。
+# These unit tests run without hardware or a daemon. The old socket client
+# and shared-memory fallback tests were removed with the daemon architecture.
 TESTDIR   := tests
 TESTBIN   := $(BUILD)/test_av1_bitstream
 TEST_SRCS := $(TESTDIR)/test_av1_bitstream.c $(SRCDIR)/av1_bitstream.c \
@@ -94,7 +77,7 @@ RECEIVE_TEST_SRCS := $(TESTDIR)/test_v4l2_receive.c \
                     $(SRCDIR)/dmd_v4l2_receive.c $(SRCDIR)/dmd_v4l2_session_state.c \
                     $(SRCDIR)/video_stats.c
 
-# 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
+# Install in the driver directory used by libva in the container.
 PREFIX  ?= /usr
 LIBDIR  ?= $(PREFIX)/lib/aarch64-linux-gnu
 DRIDIR  ?= $(LIBDIR)/dri
@@ -142,17 +125,15 @@ $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 $(BUILD)/$(TARGET): $(OBJECTS)
 	$(CC) $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $@
 
-# 确认入口符号确实导出（-fvisibility=hidden 下靠 VA_DRIVER_INIT_FUNC 的
-# 可见性属性导出，漏了就会被 libva 报 "has no function __vaDriverInit_*"）
+# libva must be able to find the visible entry point in the shared object.
 check: $(BUILD)/$(TARGET)
-	@echo "== 导出的 driver 入口 =="
+	@echo "== Exported driver entry points =="
 	@nm -D --defined-only $(BUILD)/$(TARGET) | grep vaDriverInit || \
-		{ echo "错误：未导出 __vaDriverInit_* 符号"; exit 1; }
+		{ echo "Error: __vaDriverInit_* symbol not exported"; exit 1; }
 
-# 单元测试：编译并**直接运行**。
-# 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
+# Build and run the unit tests using the driver's warning settings.
 tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN) $(PROFILE_TESTBINS) $(CAPTURE_TESTBIN) $(RECEIVE_TESTBIN)
-	@echo "== 运行单元测试 =="
+	@echo "== Running unit tests =="
 	@$(TESTBIN)
 	@$(ENCODE_TESTBIN)
 	@$(ENCODE_HEVC10_TESTBIN)
@@ -169,9 +150,7 @@ tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TEST
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
-# 必须带 $(VA_CFLAGS)：被测的 av1_bitstream.c 等都 #include <va/va.h>。
-# libva 头不在默认搜索路径时（例如只装在 sysroot 里），不传这个变量会
-# fatal error。既有问题，v0.4.4 及更早同样失败。
+# Pass the libva header path for installations outside the compiler's default search path.
 $(TESTBIN): $(TEST_SRCS) | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(TEST_SRCS) -lpthread -o $@
 
@@ -214,7 +193,7 @@ $(RECEIVE_TESTBIN): $(RECEIVE_TEST_SRCS) $(SRCDIR)/dmd_v4l2_session_private.h \
                     $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h | $(BUILD)
 	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(RECEIVE_TEST_SRCS) -lpthread -o $@
 
-# 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
+# Regenerate the stubs and vtable bindings after changing libva versions.
 gen:
 	python3 tools/gen_vtable.py /usr/include/va/va_backend.h > $(BUILD)/vtable.json
 	cd $(BUILD) && mkdir -p out && python3 ../tools/gen_stubs.py vtable.json
@@ -223,14 +202,14 @@ gen:
 install: $(BUILD)/$(TARGET)
 	install -d $(DESTDIR)$(DRIDIR)
 	install -m 0644 $(BUILD)/$(TARGET) $(DESTDIR)$(DRIDIR)/$(TARGET)
-	@echo "已安装到 $(DESTDIR)$(DRIDIR)/$(TARGET)"
+	@echo "Installed at $(DESTDIR)$(DRIDIR)/$(TARGET)"
 
 uninstall:
 	rm -f $(DESTDIR)$(DRIDIR)/$(TARGET)
-	@echo "已移除 $(DESTDIR)$(DRIDIR)/$(TARGET)"
+	@echo "Removed $(DESTDIR)$(DRIDIR)/$(TARGET)"
 
 clean:
 	rm -rf $(BUILD)
 
-# 头文件依赖（-MMD 生成）。放在末尾，且用 - 前缀忽略首次构建时的缺失。
+# Include generated header dependencies if they exist.
 -include $(DEPS)

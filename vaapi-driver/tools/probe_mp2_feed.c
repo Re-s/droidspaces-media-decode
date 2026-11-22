@@ -1,26 +1,26 @@
 /*
- * probe_mp2_feed —— 把 MPEG-2 基本流按不同粒度直送 /dev/video32，绕过 VA-API 驱动
+ * Probe_mp2_feed - Send MPEG-2 base flow to /dev/ video32 at different particle levels, bypassing VA-API drive
  *
- * 用途：定位 MPEG-2 "固件 SYS_ERROR" 是送料粒度问题还是固件能力缺失。
- * 背景见 profiles.c 的 MPEG-2 注释与 mpeg2_bitstream.c：
- * 合成码流已与 ffmpeg 原始流逐字节一致，但送入后固件在第 2 个单元报
- * SYS_ERROR、一帧不吐。本探针用**原始 ES**（不经合成）对拍不同送料方式，
- * 若某种粒度能出帧，就把驱动的送料改成同样的粒度。
+ * Use: Positioning MPEG-2 "Sys_ERROR" is a matter of particle size or lack of solid capacity.
+ * See MPEG-2 notes and mpeg2_bitstream.c for background:
+ * Synthetic stream is aligned with the ffmpeg original stream bytes, but send solids in 2 units
+ * SYS_ERROR, no vomiting. This probe uses ** original ES** (without synthesis) to shoot different delivery methods.
+ * If a particle size can be drawn from a frame, the driven delivery is changed to the same particle size.
  *
- * 内存模式：本机（内核 6.6 新 msm_vidc）REQBUFS 只接受 MMAP/DMABUF，
- * 探针用 MMAP（REQBUFS + QUERYBUF + mmap），OUTPUT/CAPTURE 都是。
+ * Memory mode: This machine (kernel 6.6 new msm_vidc) REQBUFS only accepts MMAP/DMABUF,
+ * The probe MMAP (REQBUFS + QUEYBUF + mmap), both of which are available in the OTPUT/ CAPTURE.
  *
- * 模式（argv[2]）：
- *   pic      每个单元 = 一幅图像（GOP 头并入其后的图像单元），
- *            首单元前置文件开头的 sequence 头区（驱动当前行为）
- *   seqevery 同 pic，但每个图像单元都前置 sequence 头区
- *   gop      每个单元 = 一个 GOP（sequence 头区并入首单元）
- *   whole    整个文件作为一个单元（要求放得进 OUTPUT sizeimage）
+ * Mode (argv [2]):
+ *   pic Each unit = one image (GOP header incorporated into the image unit that follows),
+ *            First module for the first file header (drivers current behaviour)
+ *   Seqery with pic, but each image unit is pre-set for the first section
+ *   Gop Each unit = one GOP (sequience header merged with first unit)
+ *   whole file as a unit (request to put in OPPUT sizeimage)
  *
- * 用法：
+ * Usage:
  *   cc -O2 -o probe_mp2_feed probe_mp2_feed.c
- *   ./probe_mp2_feed <file.mpg> [pic|seqevery|gop|whole] [单元数上限]
- *   DMP_DUMP=1 时把前几帧 CAPTURE 内容落盘到 /tmp/dmdwork/mp2_cap_*.yuv
+ *   ./probe_mp2_feed<file.mpg> [pic ⁇ seqevery ⁇ gop ⁇ whole] [unit ceiling]
+ *   Drop previous CAPTURE contents on /tmp/dmdwork/mp2_cap_*.youv
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -46,7 +46,7 @@ static unsigned char *slurp(const char *p, size_t *n)
     return b;
 }
 
-/* 在 [pos,n) 内找下一个会改变送料边界的起始码（0x00 图像 / 0xB8 GOP）。 */
+/* Find the next starting number (0x00 image) within [pos,n) that changes the boundary of the feed. / 0xB8 GOP. */
 static size_t next_boundary(const unsigned char *d, size_t n, size_t pos)
 {
     for (size_t p = pos; p + 3 <= n; p++)
@@ -56,7 +56,7 @@ static size_t next_boundary(const unsigned char *d, size_t n, size_t pos)
     return n;
 }
 
-/* QBUF 一个 OUTPUT 缓冲（MMAP）。队列满则回收一个再试；失败返回 -1。 */
+/* QBUF A UTPUT buffer (MMAP). The full queues recover one retry; failed to return -1. */
 static int qbuf_out(int fd, unsigned type, int idx, size_t bytesused)
 {
     struct v4l2_buffer b; struct v4l2_plane pl[1];
@@ -79,7 +79,7 @@ static int qbuf_out(int fd, unsigned type, int idx, size_t bytesused)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "用法: %s <file.mpg> [pic|seqevery|gop|whole] [单元数上限]\n",
+        fprintf(stderr, "Usage: %s <file.mpg> [pic|seqevery|gop|whole] [Unit ceiling]\n",
                 argv[0]);
         return 2;
     }
@@ -90,10 +90,10 @@ int main(int argc, char **argv)
 
     size_t flen = 0;
     unsigned char *data = slurp(argv[1], &flen);
-    if (!data) { fprintf(stderr, "读不到 %s\n", argv[1]); return 1; }
+    if (!data) { fprintf(stderr, "Can’t read. %s\n", argv[1]); return 1; }
 
     size_t first_pic = next_boundary(data, flen, 0);
-    printf("  输入 %s，%zu 字节，首个图像/GOP 边界在 %zu，模式 %s\n",
+    printf("  Enter %s,%zu Bytes, first image/GOP The border is on. %zu,Mode %s\n",
            argv[1], flen, first_pic, mode);
 
     int fd = open("/dev/video32", O_RDWR | O_CLOEXEC);
@@ -102,24 +102,24 @@ int main(int argc, char **argv)
     struct v4l2_format f;
     memset(&f, 0, sizeof(f));
     f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    f.fmt.pix_mp.width = 716;      /* matrixbench；内核会按宏块对齐改写 */
+    f.fmt.pix_mp.width = 716;      /* matrixbench;kernels are rewrited to macros */
     f.fmt.pix_mp.height = 236;
     f.fmt.pix_mp.pixelformat = v4l2_fourcc('M', 'P', 'G', '2');
     f.fmt.pix_mp.num_planes = 1;
     f.fmt.pix_mp.plane_fmt[0].sizeimage = 16 << 20;
     if (ioctl(fd, VIDIOC_S_FMT, &f) < 0) {
-        printf("  S_FMT(MPG2) 失败: %s\n", strerror(errno));
+        printf("  S_FMT(MPG2) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     const size_t isz = f.fmt.pix_mp.plane_fmt[0].sizeimage;
-    printf("  S_FMT(OUTPUT/MPG2) ok，sizeimage=%zu，核准确认 %ux%u\n",
+    printf("  S_FMT(OUTPUT/MPG2) ok,sizeimage=%zu,Confirmed confirmation %ux%u\n",
            isz, f.fmt.pix_mp.width, f.fmt.pix_mp.height);
 
     struct v4l2_requestbuffers rb;
     memset(&rb, 0, sizeof(rb));
     rb.count = 8; rb.type = f.type; rb.memory = V4L2_MEMORY_MMAP;
     if (ioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
-        printf("  REQBUFS(OUTPUT/MMAP) 失败: %s\n", strerror(errno));
+        printf("  REQBUFS(OUTPUT/MMAP) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     void *bufs[8];
@@ -130,14 +130,14 @@ int main(int argc, char **argv)
         b.type = f.type; b.memory = V4L2_MEMORY_MMAP; b.index = i;
         b.m.planes = pl; b.length = 1;
         if (ioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
-            printf("  QUERYBUF(OUTPUT %d) 失败: %s\n", i, strerror(errno));
+            printf("  QUERYBUF(OUTPUT %d) failed: %s\n", i, strerror(errno));
             close(fd); free(data); return 1;
         }
         bufsz[i] = pl[0].length;
         bufs[i] = mmap(NULL, pl[0].length, PROT_READ | PROT_WRITE,
                        MAP_SHARED, fd, pl[0].m.mem_offset);
         if (bufs[i] == MAP_FAILED) {
-            printf("  mmap(OUTPUT %d) 失败: %s\n", i, strerror(errno));
+            printf("  mmap(OUTPUT %d) failed: %s\n", i, strerror(errno));
             close(fd); free(data); return 1;
         }
     }
@@ -149,19 +149,19 @@ int main(int argc, char **argv)
 
     unsigned t = f.type;
     if (ioctl(fd, VIDIOC_STREAMON, &t) < 0) {
-        printf("  STREAMON(OUTPUT) 失败: %s\n", strerror(errno));
+        printf("  STREAMON(OUTPUT) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
 
-    /* 构造单元列表：按图像/GOP 边界切。units[0] 若是纯 sequence 头区
-     * （off=0、len=first_pic），按模式并入下一单元（pic/gop）或剔除
-     * （seqevery，喂料时统一前置）。 */
+    /* Construct a list of units: cut by image/GOP boundary. Units [0] if it is a plain section header
+     * (off=0, len=first_pic) incorporated in mode into the next module (pic/gop) or removed
+     * (seqevery, uniform feed prefix). */
     struct { size_t off, len; } units[8192];
     size_t nunits = 0;
     if (whole) {
         units[0].off = 0; units[0].len = flen; nunits = 1;
         if (flen > isz) {
-            printf("  整文件 %zu 字节放不进 sizeimage %zu\n", flen, isz);
+            printf("  Whole %zu Bytes can’t fit. sizeimage %zu\n", flen, isz);
             close(fd); free(data); return 1;
         }
     } else {
@@ -185,7 +185,7 @@ int main(int argc, char **argv)
             }
         }
     }
-    printf("  切出 %zu 个单元（首单元 len=%zu）\n", nunits,
+    printf("  Cut %zu Modules (first module) len=%zu)\n", nunits,
            nunits ? units[0].len : 0);
 
     size_t sent = 0;
@@ -196,33 +196,33 @@ int main(int argc, char **argv)
         int idx = (int)(sent % 8);
 
         if (seqevery && off >= first_pic && first_pic > 0) {
-            /* 图像单元前置 seq 头区，借用当前轮转槽。 */
-            if (first_pic + len > isz) { printf("  单元超 sizeimage\n"); break; }
+            /* Image unit prefixes the seq header by borrowing the current rotor. */
+            if (first_pic + len > isz) { printf("  Unit Super sizeimage\n"); break; }
             memcpy(bufs[idx], data, first_pic);
             memcpy((char*)bufs[idx] + first_pic, data + off, len);
             len += first_pic;
         } else {
-            if (len > isz) { printf("  单元 %zu 长 %zu 超 sizeimage\n",
+            if (len > isz) { printf("  Module %zu Long %zu Super sizeimage\n",
                                     u, len); break; }
             memcpy(bufs[idx], data + off, len);
         }
         if (qbuf_out(fd, f.type, idx, len) < 0) {
-            printf("  第 %zu 单元 QBUF 失败: %s\n", sent, strerror(errno));
+            printf("  number %zu Module QBUF failed: %s\n", sent, strerror(errno));
             break;
         }
         sent++;
-        /* 每 4 个单元看一眼 SOURCE_CHANGE。 */
+        /* A glance at SOURCE_CHANGE per 4 units. */
         struct pollfd pf = { .fd = fd, .events = POLLPRI };
         if (poll(&pf, 1, 0) > 0 && (pf.revents & POLLPRI)) {
             struct v4l2_event ev; memset(&ev, 0, sizeof(ev));
             if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0 &&
                 ev.type == V4L2_EVENT_SOURCE_CHANGE && !got_sc) {
                 got_sc = 1;
-                printf("  ✓ SOURCE_CHANGE 在第 %zu 单元后到达\n", sent);
+                printf("  ✓ SOURCE_CHANGE At %zu Unit is arriving.\n", sent);
             }
         }
     }
-    printf("  送入 %zu 个单元\n", sent);
+    printf("  Send In %zu Units\n", sent);
 
     if (!got_sc) {
         struct pollfd pf = { .fd = fd, .events = POLLPRI };
@@ -231,14 +231,14 @@ int main(int argc, char **argv)
             if (ioctl(fd, VIDIOC_DQEVENT, &ev) == 0 &&
                 ev.type == V4L2_EVENT_SOURCE_CHANGE) {
                 got_sc = 1;
-                printf("  ✓ SOURCE_CHANGE 在灌完后到达\n");
+                printf("  ✓ SOURCE_CHANGE We’re here after the irrigation.\n");
             }
         }
     }
     if (!got_sc)
-        printf("  ✗ 始终没有 SOURCE_CHANGE —— 固件没解析出流参数（看 dmesg）\n");
+        printf("  ✗ Never. SOURCE_CHANGE —— Solid does not parse outflow parameters (see dmesg)\n");
 
-    /* CAPTURE 侧协商并收帧。 */
+    /* CAPTURE side-view consultation and collection. */
     struct v4l2_format cf;
     memset(&cf, 0, sizeof(cf));
     cf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -249,7 +249,7 @@ int main(int argc, char **argv)
     if (!got_sc) { close(fd); free(data); return 1; }
     cf.fmt.pix_mp.pixelformat = v4l2_fourcc('N', 'V', '1', '2');
     if (ioctl(fd, VIDIOC_S_FMT, &cf) < 0) {
-        printf("  S_FMT(CAPTURE/NV12) 失败: %s\n", strerror(errno));
+        printf("  S_FMT(CAPTURE/NV12) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     const size_t csz = cf.fmt.pix_mp.plane_fmt[0].sizeimage;
@@ -258,7 +258,7 @@ int main(int argc, char **argv)
     memset(&crb, 0, sizeof(crb));
     crb.count = 16; crb.type = cf.type; crb.memory = V4L2_MEMORY_MMAP;
     if (ioctl(fd, VIDIOC_REQBUFS, &crb) < 0) {
-        printf("  REQBUFS(CAPTURE/MMAP) 失败: %s\n", strerror(errno));
+        printf("  REQBUFS(CAPTURE/MMAP) failed: %s\n", strerror(errno));
         close(fd); free(data); return 1;
     }
     void *cb[16];
@@ -297,8 +297,8 @@ int main(int argc, char **argv)
         ioctl(fd, VIDIOC_QBUF, &d);
     }
 
-    printf("\n  ===== 结果（模式 %s）=====\n", mode);
-    printf("  送入 %zu 单元，收到 %zu 帧\n", sent, frames);
+    printf("\n  ===== Outcome (mode) %s)=====\n", mode);
+    printf("  Send In %zu Unit, copy. %zu frame\n", sent, frames);
     close(fd); free(data);
     return 0;
 }

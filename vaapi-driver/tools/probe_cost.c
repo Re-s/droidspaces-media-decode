@@ -1,15 +1,15 @@
-/* 量一次"会话重建"到底多贵。
+/* How expensive is "communiqué re-establishment" once?
  *
- * 背景：浏览器路径下每帧触发一次 flush + 重建（147 帧 ≈ 147 次）。
- * 功能是对的、速度也够（Firefox 自报平均 7.4ms/帧，帧间隔 33.3ms），
- * 但在动 daemon 之前得先知道这笔开销的实际大小 ——
- * 如果重建只占单帧预算的很小一部分，那改 daemon 的收益就很有限。
+ * Background: Each frame triggers a flash + reconstruction under the browser path (147 frames x 147).
+ * The function is correct and fast enough (Firefox self-reported average 7.4ms/frames, frames intervals 33.3ms),
+ * But before you move the daemon, you need to know the actual amount of the expenses...
+ * If reconstruction is only a small part of the single-frame budget, then the gains from the change are limited.
  *
- * 直连 daemon 测三段耗时：
- *   1) 建会话（connect + 握手 + configure + start）
- *   2) 送参数集
- *   3) flush（finish_input）到拿到帧
- * 与"稳态下送一个 VCL 拿一帧"的耗时对比。
+ * Directly lined daemon to measure three periods of time:
+ *   1) build Session (cont + handshake + confuture + start)
+ *   2) Send Parameter Set
+ *   3) Flush (finish_input) to get the frame
+ * It's timed out with "Step a VCL to get a frame down."
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -34,7 +34,7 @@ static int load(const char *p)
     return 0;
 }
 
-/* 找下一个 start code，返回 NALU 起点，*len 为长度（不含下一个 start code） */
+/* Find next start code, returns the NALU starting point,*len is length (excluding next start code) */
 static long next_nalu(long from, long *len)
 {
     long i = from;
@@ -65,9 +65,9 @@ static double ms_since(struct timespec *t0)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/root/decode-test/test1080.h264";
-    if (load(path) < 0) { fprintf(stderr, "读不了 %s\n", path); return 1; }
+    if (load(path) < 0) { fprintf(stderr, "I can’t read it. %s\n", path); return 1; }
 
-    /* 收集 SPS/PPS 与前若干 VCL */
+    /* Collecting SPS/PPS and previous VCLs */
     unsigned char *sps = NULL, *pps = NULL;
     long sps_len = 0, pps_len = 0;
     long off = 0, len;
@@ -77,18 +77,18 @@ int main(int argc, char **argv)
 
     while ((off = next_nalu(off, &len)) >= 0 && nvcl < 64) {
         int nut = data[off] & 0x1f;
-        /* 送料必须带 Annex B 起始码（dmd_client.h 明确要求），
-         * next_nalu 返回的是 payload 起点，所以回退 3 字节、长度 +3。 */
+        /* The delivery must be with the Annex B starting code (dmd_clit.h explicitly requested), which is a very important part of the story.
+         * Next_nulu returns the payload starting point, so returns 3 bytes, length +3. */
         if (nut == 7 && !sps) { sps = data + off - 3; sps_len = len + 3; }
         else if (nut == 8 && !pps) { pps = data + off - 3; pps_len = len + 3; }
         else if (nut == 1 || nut == 5) { vcl_off[nvcl] = off - 3; vcl_len[nvcl] = len + 3; nvcl++; }
         off += len;
     }
     if (!sps || !pps || nvcl < 8) {
-        fprintf(stderr, "码流不含足够的 SPS/PPS/VCL\n");
+        fprintf(stderr, "The stream is not enough. SPS/PPS/VCL\n");
         return 1;
     }
-    printf("码流: SPS %ld 字节, PPS %ld 字节, 收集 %d 个 VCL\n\n",
+    printf("bitstream: SPS %ld bytes, PPS %ld bytes, Collection %d  VCL\n\n",
            sps_len, pps_len, nvcl);
 
     struct dmd_error e;
@@ -96,7 +96,7 @@ int main(int argc, char **argv)
     double t_open = 0, t_param = 0, t_flush = 0;
     struct dmd_frame fr;
 
-    /* ---- 第一段：建会话 ---- */
+    /* - First paragraph: construction session - */
     clock_gettime(CLOCK_MONOTONIC, &t0);
     struct dmd_session_config cfg;
     dmd_session_config_init(&cfg);
@@ -105,17 +105,17 @@ int main(int argc, char **argv)
     cfg.height = 1088;
     struct dmd_session *s = dmd_session_create(&cfg, &e);
     t_open = ms_since(&t0);
-    if (!s) { fprintf(stderr, "建会话失败 code=%d %s\n", e.code, e.msg); return 1; }
-    printf("① 建会话（connect+握手+configure+start）: %.1f ms\n", t_open);
+    if (!s) { fprintf(stderr, "Create session failed code=%d %s\n", e.code, e.msg); return 1; }
+    printf("① Build Session(connect+Shake hands.+configure+start): %.1f ms\n", t_open);
 
-    /* ---- 第二段：送参数集 ---- */
+    /* - Second paragraph: send the argument set - */
     clock_gettime(CLOCK_MONOTONIC, &t0);
     dmd_session_send_unit(s, sps, sps_len);
     dmd_session_send_unit(s, pps, pps_len);
     t_param = ms_since(&t0);
-    printf("② 送 SPS+PPS: %.1f ms\n", t_param);
+    printf("② Send SPS+PPS: %.1f ms\n", t_param);
 
-    /* ---- 模拟浏览器：只送 3 个 VCL，然后 flush 取帧 ---- */
+    /* - Simulate browser: only 3 VCLs sent, then Flush takes frames - */
     for (int i = 0; i < 3; i++)
         dmd_session_send_unit(s, data + vcl_off[i], vcl_len[i]);
 
@@ -124,27 +124,27 @@ int main(int argc, char **argv)
     int got = 0;
     double t_first = -1.0;
     while (dmd_session_next_frame(s, &fr, 3000) == DMD_OK) {
-        if (got == 0) t_first = ms_since(&t0);   /* 只有首帧才影响播放延迟 */
+        if (got == 0) t_first = ms_since(&t0);   /* Only the frame affects the delay. */
         got++;
         dmd_session_release_frame(s, &fr);
     }
     t_flush = ms_since(&t0);
-    printf("③ flush → 首帧: %.1f ms；取完全部 %d 帧（含等 EOS）: %.1f ms\n",
+    printf("③ flush → Homeframe: %.1f ms;Take the full piece. %d Frame (Equal) EOS): %.1f ms\n",
            t_first, got, t_flush);
-    /* 关键：重建路径下一次 flush 能拿到多帧，成本被这几帧摊薄。
-     * 影响播放流畅度的是"每帧摊到多少"，不是一次 flush 的总耗时。 */
-    printf("   → 摊到每帧: %.1f ms\n", got ? t_flush / got : 0.0);
-    t_flush = t_first;   /* 后续汇总用首帧延迟，避免把等 EOS 算进单帧成本 */
+    /* Key: Next time you re-establish the path, Flush, you get multiple frames, the costs are all set up.
+     * The flow rate is "How much per frame" and not the total time of a flash. */
+    printf("   → I’ll put it all in the frame.: %.1f ms\n", got ? t_flush / got : 0.0);
+    t_flush = t_first;   /* Follow up the aggregation with a lead frame delay, avoid waiting for EOS to be charged to single frame costs */
     dmd_session_destroy(s);
 
-    printf("\n单次重建总成本 ≈ %.1f ms（①+②+③）\n", t_open + t_param + t_flush);
+    printf("\n Total cost of single reconstruction ≈ %.1f ms(①+②+③)\n", t_open + t_param + t_flush);
 
-    /* ---- 对照：一个会话内连续送料的稳态耗时 ---- */
+    /* - Contrast: The steady state of successive deliveries in a session takes time - */
     s = dmd_session_create(&cfg, &e);
-    if (!s) { fprintf(stderr, "第二次建会话失败\n"); return 1; }
+    if (!s) { fprintf(stderr, "The second session failed.\n"); return 1; }
     dmd_session_send_unit(s, sps, sps_len);
     dmd_session_send_unit(s, pps, pps_len);
-    /* 先填满流水线 */
+    /* Fill the water line first. */
     for (int i = 0; i < 4; i++)
         dmd_session_send_unit(s, data + vcl_off[i], vcl_len[i]);
     int warm = 0;
@@ -157,18 +157,18 @@ int main(int argc, char **argv)
         if (dmd_session_next_frame(s, &fr, 3000) == DMD_OK) { steady++; dmd_session_release_frame(s, &fr); }
     }
     double t_steady = ms_since(&t0);
-    printf("对照：稳态下送 %d 个 VCL 各取 1 帧: %.1f ms（%.1f ms/帧）\n",
+    printf("Contrast: Stable down %d  VCL Every one. 1 frame: %.1f ms(%.1f ms/frame)\n",
            steady, t_steady, steady ? t_steady / steady : 0.0);
     dmd_session_destroy(s);
 
-    printf("\n=== 判断 ===\n");
-    printf("建会话+参数集 = %.1f ms，flush→首帧 = %.1f ms\n",
+    printf("\n=== Judgement ===\n");
+    printf("Build Session+Set of parameters = %.1f ms,flush→Homeframe = %.1f ms\n",
            t_open + t_param, t_flush);
-    printf("对照稳态 %.1f ms/帧；帧预算 33.3 ms（30fps）\n",
+    printf("Comparison to Steady %.1f ms/frames,frame budgets 33.3 ms(30fps)\n",
            steady ? t_steady / steady : 0.0);
-    printf("\n注意：一次 flush 能取到多帧，重建成本被摊薄。\n");
-    printf("是否值得改 daemon，要看实测帧率是否已经够用 ——\n");
-    printf("浏览器实测 143 帧按正常速度播完、Firefox 自报 7.4 ms/帧，\n");
-    printf("说明当前路径的吞吐已经满足 30fps。\n");
+    printf("\n Note: Once. flush We can get multiple frames, and the cost of rebuilding is spread out..\n");
+    printf("Is it worth changing? daemon,Depends on whether the frame rate is enough. ——\n");
+    printf("Browser Actual 143 The frame is finished at normal speed.,Firefox Self-reporting 7.4 ms/frame,\n");
+    printf("The current path is filled with vomit. 30fps.\n");
     return 0;
 }

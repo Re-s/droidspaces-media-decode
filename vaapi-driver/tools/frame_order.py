@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""判定硬解输出帧序与软解（显示序）的对应关系。
+"""Determines the correspondence between hard-line output and soft-squeak (show sequence)。
 
-用 Y 平面的 md5 做帧指纹，把每个硬解帧映射回它在软解输出里的位置。
-- 若映射是 0,1,2,3,... → 输出即显示序，正确
-- 若映射是乱的 → 帧序错乱（B 帧重排未按 PTS 归位）
-- 若某帧"未找到" → 该帧内容在软解结果里不存在，是真解错而非顺序问题
+Use Y The plane. md5 Make frame prints and map every hard frame back to its position in the soft modem output.。
+- If the map is... 0,1,2,3,... → Output is display order, correct
+- If the map is messy, the frame is in a disorderly order.（B Frame rehearsing failed PTS Return to your posts.）
+- An unmatched frame is absent from the software-decoded output, indicating a pixel error rather than reordering.
 
-用法：frame_order.py <软解yuv> <硬解帧前缀> [帧数] [显示WxH]
+Usage：frame_order.py <software decode yuv> <Hard frame prefix> [Frames] [Display WxH]
 """
 import glob
 import hashlib
@@ -34,13 +34,13 @@ def main():
                 break
             sw.setdefault(hashlib.md5(d[:y]).hexdigest(), idx)
             idx += 1
-    print(f"软解帧数 {idx}（唯一指纹 {len(sw)}）")
+    print(f"Soft Frames {idx}（The only fingerprints. {len(sw)}）")
 
     files = sorted(glob.glob(f"{prefix}-*.nv12"))
     if n:
         files = files[:n]
     if not files:
-        sys.exit(f"找不到硬解帧 {prefix}-*.nv12")
+        sys.exit(f"Hard frame not found {prefix}-*.nv12")
 
     mapping = []
     missing = 0
@@ -52,19 +52,19 @@ def main():
         mapping.append(pos)
         if pos is None:
             missing += 1
-        print(f"  hw[{i:3d}] -> sw[{pos if pos is not None else '未找到'}]")
+        print(f"  hw[{i:3d}] -> sw[{pos if pos is not None else 'Not found'}]")
 
     found = [m for m in mapping if m is not None]
     ordered = found == sorted(found)
     print()
-    print(f"硬解帧数 {len(files)}，未在软解中找到 {missing} 帧")
-    print(f"已找到的帧是否单调递增: {'是' if ordered else '否（帧序错乱）'}")
+    print(f"Hard frame number {len(files)}，Not found in soft resolution {missing} frame")
+    print(f"Whether the found frame is single-transit increment: {'Yes.' if ordered else 'No (frames are in a disorder)）'}")
     if found and ordered and found == list(range(len(found))):
-        print("结论: 输出即显示序，完全正确")
+        print("Conclusions: Output is display order, exactly correct")
     elif missing:
-        print("结论: 存在真解错的帧（内容在软解结果中不存在）")
+        print("Conclusions: A true frame to solve the problem (the content does not exist in the soluble result)）")
     else:
-        print("结论: 内容都对但顺序错 —— 典型的 B 帧重排未按 PTS 归位")
+        print("Conclusions: Everything is right, but in the wrong order -- typical. B Frame rehearsing failed PTS Return to your posts.")
 
 
 if __name__ == "__main__":
