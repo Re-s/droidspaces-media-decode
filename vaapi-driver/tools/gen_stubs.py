@@ -145,7 +145,12 @@ vl = [
     "",
 ]
 for f in funcs:
-    vl.append(f"    vtable->{f['name']} = {impl_name(f['name'])};")
+    name = f["name"]
+    if name == "vaMapBuffer2":
+        vl.append("#if VA_CHECK_VERSION(1, 22, 0)")
+    vl.append(f"    vtable->{name} = {impl_name(name)};")
+    if name == "vaMapBuffer2":
+        vl.append("#endif")
 vl.append("")
 with open("out/vtable.inc", "w", encoding="utf-8") as fh:
     fh.write("\n".join(vl))

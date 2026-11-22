@@ -11,7 +11,7 @@ make probe-hevc-lag
 ./build/probe_hevc_lag --selftest
 ```
 
-工具仅依赖 C 标准库、Linux V4L2 头与 pthread，链接真实的 `dmd_v4l2_session.c`、`v4l2_backend.c`、`video_stats.c`，无需 libva/EGL/GLES。`all` 和 `tests` 不依赖此目标，也不会执行硬件探针。`--selftest` 只检查 AU 解析，覆盖三/四字节起始码、首个 AUD 之前的参数集、截取 AU 上限、缺 AUD、多图像 AU 与 EOS/EOB 拒绝。
+工具仅依赖 C 标准库、Linux V4L2 头与 pthread，链接真实的 `dmd_v4l2_session.c`、`dmd_v4l2_session_state.c`、`dmd_v4l2_receive.c`、`v4l2_backend.c`、`video_stats.c`，无需 libva/EGL/GLES。`all` 和 `tests` 不依赖此目标，也不会执行硬件探针。`--selftest` 只检查 AU 解析，覆盖三/四字节起始码、首个 AUD 之前的参数集、截取 AU 上限、缺 AUD、多图像 AU 与 EOS/EOB 拒绝。
 
 ## 生成输入与运行
 

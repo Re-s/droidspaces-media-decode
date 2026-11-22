@@ -2,7 +2,8 @@
 /* HEVC AU / V4L2 completion-order diagnostic. No VA frontend or software decode.
  * From vaapi-driver/: make probe-hevc-lag
  * Or: cc -O2 -g -std=c11 -Wall -Wextra -Werror -Isrc tools/probe_hevc_lag.c \
- *   src/dmd_v4l2_session.c src/v4l2_backend.c src/video_stats.c -lpthread -o probe_hevc_lag
+ *   src/dmd_v4l2_session.c src/dmd_v4l2_session_state.c src/dmd_v4l2_receive.c \
+ *   src/v4l2_backend.c src/video_stats.c -lpthread -o probe_hevc_lag
  * Input: ffmpeg -i input -map 0:v:0 -frames:v 16 -an -sn -c:v copy \
  *   -bsf:v 'hevc_mp4toannexb,hevc_metadata=aud=insert' -f hevc sample.hevc
  * JSONL stdout; backend diagnostics stderr. Observation NEVER calls EOS/drain.

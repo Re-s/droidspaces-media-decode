@@ -59,8 +59,11 @@ endif
 LDFLAGS += -shared -Wl,--no-undefined -Wl,-z,defs
 LDLIBS  += -lpthread
 
+SESSION_SRCS := $(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/dmd_v4l2_session_state.c \
+                $(SRCDIR)/dmd_v4l2_receive.c
+
 SOURCES := $(SRCDIR)/bitstream.c $(SRCDIR)/driver.c $(SRCDIR)/profiles.c $(SRCDIR)/stubs.c \
-           $(SRCDIR)/dmd_v4l2_session.c \
+           $(SESSION_SRCS) \
           $(SRCDIR)/v4l2_backend.c $(SRCDIR)/decode.c $(SRCDIR)/image.c \
            $(SRCDIR)/h264_bitstream.c $(SRCDIR)/hevc_bitstream.c $(SRCDIR)/hevc_slice.c $(SRCDIR)/export.c \
            $(SRCDIR)/av1_bitstream.c $(SRCDIR)/mpeg2_bitstream.c \
@@ -86,6 +89,10 @@ HEVC_TESTBIN := $(BUILD)/test_hevc_slice
 IMAGE_INTEROP_TESTBIN := $(BUILD)/test_image_interop
 PROFILE_TESTBINS := $(BUILD)/test_profiles_default $(BUILD)/test_profiles_hevc10 $(BUILD)/test_profiles_hevc10_av1
 CAPTURE_TESTBIN := $(BUILD)/test_v4l2_capture
+RECEIVE_TESTBIN := $(BUILD)/test_v4l2_receive
+RECEIVE_TEST_SRCS := $(TESTDIR)/test_v4l2_receive.c \
+                    $(SRCDIR)/dmd_v4l2_receive.c $(SRCDIR)/dmd_v4l2_session_state.c \
+                    $(SRCDIR)/video_stats.c
 
 # 安装目录：libva 编译进去的 driver 目录（容器实测硬编码此路径）
 PREFIX  ?= /usr
@@ -119,9 +126,9 @@ $(BUILD)/probe_p010_egl: tools/probe_p010_egl.c | $(BUILD)
 # Explicit hardware diagnostic. Neither all nor tests runs/depends on this tool.
 probe-hevc-lag: $(BUILD)/probe_hevc_lag
 
-$(BUILD)/probe_hevc_lag: tools/probe_hevc_lag.c $(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h $(SRCDIR)/sandbox_heap.h $(SRCDIR)/video_stats.h | $(BUILD)
+$(BUILD)/probe_hevc_lag: tools/probe_hevc_lag.c $(SESSION_SRCS) $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h $(SRCDIR)/sandbox_heap.h $(SRCDIR)/video_stats.h | $(BUILD)
 	$(CC) $(TESTCFLAGS) -I$(SRCDIR) tools/probe_hevc_lag.c \
-		$(SRCDIR)/dmd_v4l2_session.c $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c -lpthread -o $@
+		$(SESSION_SRCS) $(SRCDIR)/v4l2_backend.c $(SRCDIR)/video_stats.c -lpthread -o $@
 
 $(BUILD)/probe_va_encode: tools/probe_va_encode.c $(OBJECTS)
 	$(CC) $(CFLAGS) $< $(OBJECTS) $(LDLIBS) -o $@
@@ -144,7 +151,7 @@ check: $(BUILD)/$(TARGET)
 
 # 单元测试：编译并**直接运行**。
 # 不走 -fvisibility=hidden / -fPIC 那套 .so 专用选项，但保持同样的告警标准。
-tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN) $(PROFILE_TESTBINS) $(CAPTURE_TESTBIN)
+tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TESTBIN) $(ENCODE_BACK_TESTBIN) $(STATS_TESTBIN) $(HEVC_TESTBIN) $(IMAGE_INTEROP_TESTBIN) $(PROFILE_TESTBINS) $(CAPTURE_TESTBIN) $(RECEIVE_TESTBIN)
 	@echo "== 运行单元测试 =="
 	@$(TESTBIN)
 	@$(ENCODE_TESTBIN)
@@ -158,6 +165,7 @@ tests: $(TESTBIN) $(ENCODE_TESTBIN) $(ENCODE_HEVC10_TESTBIN) $(ENCODE_FRONT_TEST
 	@$(BUILD)/test_profiles_hevc10
 	@$(BUILD)/test_profiles_hevc10_av1
 	@$(CAPTURE_TESTBIN)
+	@$(RECEIVE_TESTBIN)
 
 TESTCFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 
@@ -201,6 +209,10 @@ $(CAPTURE_TESTBIN): $(TESTDIR)/test_v4l2_capture.c $(SRCDIR)/v4l2_backend.c $(SR
 
 $(ENCODE_BACK_TESTBIN): $(TESTDIR)/test_v4l2_encoder.c $(SRCDIR)/v4l2_encoder.c $(SRCDIR)/v4l2_encoder.h | $(BUILD)
 	$(CC) $(TESTCFLAGS) -I$(SRCDIR) $(TESTDIR)/test_v4l2_encoder.c -o $@
+
+$(RECEIVE_TESTBIN): $(RECEIVE_TEST_SRCS) $(SRCDIR)/dmd_v4l2_session_private.h \
+                    $(SRCDIR)/dmd_client.h $(SRCDIR)/v4l2_backend.h | $(BUILD)
+	$(CC) $(TESTCFLAGS) $(VA_CFLAGS) -I$(SRCDIR) $(RECEIVE_TEST_SRCS) -lpthread -o $@
 
 # 重新生成 vtable 桩与装配代码（改动 libva 版本后才需要）
 gen:
