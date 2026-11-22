@@ -168,10 +168,10 @@ LIBVA_DRIVER_NAME=msm_drm ffmpeg -hwaccel vaapi \
 | 项 | 状态 |
 |---|---|
 | **设备兼容性** | 并非所有设备的 `/dev/video32` 都能用。已实测一台设备（小米平板 5 / nabu，内核 4.14）解码会话起不来：两段式协商每步都返回成功，但 `V4L2_EVENT_SOURCE_CHANGE` 永不到达、输入缓冲有去无回（`DQBUF` 恒 `EAGAIN`）、msm_vidc IRQ 净增与空闲无差别。同一设备的**编码器** `/dev/video33` 正常（`screenrecord` 可用，IRQ 净增 753）。已排除：缓冲类型、ION heap、物理连续性、容器权限、喂料切分、控制项、STREAMON 时序。属该设备解码路径问题，非平台配置问题。平台可用 `vaapi-driver/tools/probe_device_support.c` 判定：能收到 `SOURCE_CHANGE` 即可用 |
-| AV1 | **尚未达到像素一致**，因此发布版不声明该 profile（声明会让浏览器/ffmpeg 把工作交过来然后失败）。当前状态见 `doc/av1-v4l2-status.md`。开发版可用 `make AV1=1` 打开 |
+| AV1 | 默认不声明；`make AV1=1` 的独立构建已在 SM8750P 通过 8/10 位像素回归。近期范围见 [`app-playback-fixes.md`](app-playback-fixes.md)，早期问题记录保留在 `doc/av1-v4l2-status.md`；浏览器/EGL 不由 CPU 回读结果推定 |
 | VP8 | **不支持**。`/dev/video32` 的 `ENUM_FMT` 确实列出 `VP80`，但驱动缺少 RFC 6386 §9.1 未压缩块的重建逻辑，故不声明 |
-| 编解码覆盖 | H.264 / HEVC / VP9 已真机端到端逐字节验证。**未验证**：高位深与非 4:2:0（HEVC Main10、VP9 Profile2、H.264 High 10 / 4:2:2）—— 驱动不声明这些能力 |
-| HEVC 例外 | SPS 里 `num_short_term_ref_pic_sets > 0` 的码流无法重建参数集，驱动返回 `VA_STATUS_ERROR_UNIMPLEMENTED`，上层干净回落软解 |
+| 编解码覆盖 | H.264 / HEVC Main / VP9 Profile0 已真机端到端逐字节验证。HEVC Main10 的 NV12/P010 支持以独立 `HEVC10=1` 开启；SM8750P 上五组 Main10 profile 的 P010/NV12 共 300 帧像素一致，mpv 直接 VAAPI、Firefox 160 和 Chrome 154 ANGLE OpenGL 对照画面正常。本机 tmp 已安装 `HEVC10=1 AV1=0`，无驱动路径/DD 覆盖；Chrome 默认 ANGLE Vulkan 虽硬解成功，P010 图像导入仍黑屏，需临时 GL 参数或 ANGLE 修复。源码默认仍不声明，保留跨平台及 Chrome Vulkan 显示边界；仅验证约 10 秒片段，其它硬件与长片仍未验证。VP9 Profile2、H.264 High10 / 4:2:2 仍不声明；编码仍为 8 位 NV12。见 [`hevc-main10-p010-validation.md`](hevc-main10-p010-validation.md) |
+| HEVC 例外 | 受支持的 Main/Main10 4:2:0 流可从 VA DPB/POC 重建切片内短期参考集；SPS 长期参考表、自定义缩放表和缺失的 long-format slice 边界仍明确拒绝，不能通过移除检查扩大支持声明 |
 | seek | 驱动尚未实现会话重建式 seek（当前没有消费者在同一 context 上 seek）；ffmpeg 层面的 seek 已验证一致 |
 | 鉴权 | 0.4.0 没有跨进程通道，也就没有通道鉴权问题；访问控制完全由设备节点的文件权限决定。**若把节点开成 0666，容器内任何进程都能用硬件解码器** —— 多租户或运行不可信 App 的环境应按 §2.2 用组权限而非 0666 |
 | 并发上限 | 硬件支持 16 路会话，**驱动侧尚未测到上限行为**。多个 context 各自持有独立的 `/dev/video32` fd，超限时表现为 `open()` 或协商失败 |

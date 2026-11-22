@@ -46,23 +46,6 @@ VAStatus dmd_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned cha
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height)
-{
-    (void)ctx;
-    (void)surface;
-    (void)image;
-    (void)src_x;
-    (void)src_y;
-    (void)src_width;
-    (void)src_height;
-    (void)dest_x;
-    (void)dest_y;
-    (void)dest_width;
-    (void)dest_height;
-    dmd_log("未实现入口被调用: vaPutImage\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_CreateSubpicture(VADriverContextP ctx, VAImageID image, VASubpictureID *subpicture)
 {
     (void)ctx;
@@ -173,23 +156,6 @@ VAStatus dmd_GetSurfaceAttributes(VADriverContextP dpy, VAConfigID config, VASur
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus dmd_AcquireBufferHandle(VADriverContextP ctx, VABufferID buf_id, VABufferInfo *buf_info)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)buf_info;
-    dmd_log("未实现入口被调用: vaAcquireBufferHandle\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_ReleaseBufferHandle(VADriverContextP ctx, VABufferID buf_id)
-{
-    (void)ctx;
-    (void)buf_id;
-    dmd_log("未实现入口被调用: vaReleaseBufferHandle\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
 VAStatus dmd_CreateMFContext(VADriverContextP ctx, VAMFContextID *mfe_context)
 {
     (void)ctx;
@@ -247,15 +213,6 @@ VAStatus dmd_QueryProcessingRate(VADriverContextP ctx, VAConfigID config_id, VAP
     (void)proc_buf;
     (void)processing_rate;
     dmd_log("未实现入口被调用: vaQueryProcessingRate\n");
-    return VA_STATUS_ERROR_UNIMPLEMENTED;
-}
-
-VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
-{
-    (void)ctx;
-    (void)buf_id;
-    (void)timeout_ns;
-    dmd_log("未实现入口被调用: vaSyncBuffer\n");
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 

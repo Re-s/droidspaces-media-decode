@@ -79,20 +79,36 @@ Chrome 硬解时画面前后帧跳跃，开头几帧顺序错乱、之后恢复�
 0.4.6 修复。完整的 A-B 验证数据、被排除的误判原因、以及三条验证方法上的
 教训见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 v0.4.6。
 
-## 编解码器层面的固有限制
+## 当前编解码支持边界
 
-不随版本变化，属能力边界而非缺陷。
+以下描述当前发布配置及已验证的范围；历史探测失败不能直接证明硬件物理上不支持。
 
-**HEVC 带 `st_ref_pic_set` 的码流无法支持**（SPS 里
-`num_short_term_ref_pic_sets > 0`）。VA-API 只给个数不给内容，驱动无法复现，
-此时 `vaEndPicture` 返回 `UNIMPLEMENTED` 让上层回落软解。
-实测 x265 默认输出 0，常见码流不受影响。
+**HEVC 的 SPS 参考集已部分支持。** 对受支持的 Main 8 位、Main10 8/10 位 4:2:0 流，
+驱动根据 VA DPB/POC 重建显式切片内参考集；实际 RPS=4 文件已在三个位置
+共验证 360 帧像素。SPS 长期参考表、自定义缩放表、未知切片边界等仍会拒绝。
+具体限制见 [`app-playback-fixes.md`](app-playback-fixes.md)。
 
-**HEVC Main10 / VP9 Profile2 不出帧。** 固件能识别 10bit 但持续报
-`INSUFFICIENT`，属固件限制。
+**HEVC Main10 已在本机 tmp 安装启用，源码默认仍不声明。** `make HEVC10=1` 仅开启
+Main10 的 NV12/P010 解码，首份合法 PPB 锁定位深。2026-11-15，SM8750P 上四组
+P010 共 240 帧及 Main10 profile/NV12 的 60 帧均与软件像素一致、错误 0；
+小 surface 和 REQBUFS 前解码序初始化修复后，
+mpv 直接 VAAPI、Firefox 160 和 Chrome 154 ANGLE OpenGL 对照的实际画面已通过，
+未覆盖驱动/DD 环境变量。Chrome 默认 ANGLE Vulkan 虽有硬件完成计数且到达 ended，
+P010 导入却失败并显示黑屏；临时加 `--use-gl=angle --use-angle=gl` 的约 10 秒
+对照片段画面正常，未修改全局 launcher。源码 opt-in 保留跨平台及 Chrome Vulkan
+显示边界；其它设备、长片及 HDR 未验证，编码仍是 8 位 NV12。安装后 mpv 原 VAAPI
+的合成/实际片段也已复测，错误与解码/显示丢帧均为 0。三处驱动根因、独立 ANGLE
+限制、系统驱动 SHA、浏览器帧数与显示丢帧见
+[`hevc-main10-p010-validation.md`](hevc-main10-p010-validation.md)。
 
-**AV1 像素未通过。** 帧数与 dav1d 一致但像素不对，默认不声明，
-需 `-DDMD_ENABLE_AV1` 才编入。完整测绘见
+**VP9 Profile2 仍未开放。** 它不随 `HEVC10=1` 开启。早期 10bit 探测中的
+`INSUFFICIENT` / `SYS_ERROR` 同时受当时不完整的 CAPTURE 重配流程影响，
+不能再将该记录解释为 Main10 的必然固件限制，也不能据此推定 VP9 Profile2 已可用。
+
+**AV1 默认仍不声明，独立测试构建已有通过记录。** 使用 `make AV1=1`
+可启用现有代码；2026-11-15 的三组 8 位/10 位短样片共 180 帧已通过像素对比，
+mpv 显示仍经过 CPU 帧下载。验证范围见
+[`app-playback-fixes.md`](app-playback-fixes.md)；早期问题测绘保留在
 [`av1-v4l2-status.md`](av1-v4l2-status.md)。
 
 **MPEG-2 固件 `SYS_ERROR`。** 合成的比特流与原始流逐字节一致，但固件拒绝，

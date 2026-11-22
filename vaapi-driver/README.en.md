@@ -2,33 +2,64 @@
 
 > 🌐 **中文版（原文）：[README.md](README.md)** — the Chinese version is authoritative; if the two disagree, follow it.
 
-Exposes the MediaCodec hardware decoding capability of the Android host to the
-consumers inside a DroidSpaces container (`vainfo` / ffmpeg / Firefox / Chrome) through
-standard VA-API, **without requiring any environment variable**.
+Provides VA-API video decoding and encoding by accessing Qualcomm msm_vidc through
+V4L2 inside the container process, without an Android daemon or MediaCodec.
+Browsers require their corresponding launch and sandbox compatibility setup.
 
 Artifact: `msm_drm_drv_video.so`, installed into `/usr/lib/aarch64-linux-gnu/dri/`.
 
 ## Current capability boundary
 
-**Implemented: capability query + H.264 / HEVC / VP9 / VP8 decode data path.** `vainfo`
-lists the profiles and config attributes; all four have been taken end to end on real
-hardware and produce a picture, and the hardware-decoded output is **byte-for-byte
-identical** to software decode.
+**Decode:** capability query + H.264 / HEVC / VP9 / VP8 data paths, all verified on
+real hardware and byte-for-byte identical to software decode.
+
+**Encode:** `VAEntrypointEncSlice` accepts NV12 and returns encoded data through
+`VACodedBufferSegment`. H.264, HEVC Main and VP9 Profile 0 are probed on the
+selected encoder node (`/dev/video33` by default). See
+[hardware encoding](../doc/hardware-encoding.md) for encoder limits.
+
+For H.264 and HEVC Main, a VA-API CQP request selects VBR with the requested QP
+(26 if unspecified). HEVC devices without the fixed-QP controls use VBR alone.
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg \
+  -init_hw_device vaapi=va:/dev/dri/renderD128 \
+  -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi \
+  -i in.mp4 -vf 'scale_vaapi=format=nv12' \
+  -c:v h264_vaapi -b:v 2M -an out.mp4
+```
+
+The driver's VAAPI video-processing path also handles clockwise quarter-turn
+rotation through `transpose_vaapi`. For inputs whose container stores a 90°
+display transform, `-noautorotate` leaves the decoded pixels sideways; request
+the rotation explicitly and swap the scale dimensions, for example:
+
+```sh
+-vf 'scale_vaapi=w=960:h=540:format=nv12,transpose_vaapi=dir=clock'
+```
+
+Scaling and rotation currently run on CPU-backed NV12 surfaces in this driver's
+VPP implementation.
 
 Actual status per codec:
 
-| Profile | daemon codec | Capability query | Decodes to picture | Verification result |
+| Profile | codec id | Capability query | Decodes to picture | Verification result |
 |---------|-------------|---------|-----------|---------|
 | `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0 (H.264) | OK | **Pass** | 1080p 150 frames + 4K 90 frames + long stream 3000 frames, `cmp` byte-for-byte identical to software decode |
 | `VAProfileHEVCMain` | 1 (HEVC) | OK | **Pass** | 1080p / 4K / 720p / no reference frames / long stream 1500 frames, `cmp` byte-for-byte identical to software decode |
+| `VAProfileHEVCMain10` | 1 (HEVC) | Advertised only with `HEVC10=1` | **Opt-in build passes** | SM8750P, 2026-11-15: 300 Main10-profile P010/NV12 frames match software with zero errors; direct mpv VAAPI, Firefox 160 and a Chrome 154 ANGLE OpenGL comparison show correct images; Chrome’s default ANGLE Vulkan still fails P010 import with a black picture; testing covers a real ~10-second excerpt, not a full video or other hardware |
 | `VAProfileVP9Profile0` | 2 (VP9) | OK | **Pass** | 720p 120 frames + 1080p 60 frames, `cmp` byte-for-byte identical to software decode |
 | `VAProfileVP8Version0_3` | 3 (VP8) | OK | **Pass** | 720p 120 frames, `cmp` byte-for-byte identical to software decode |
 
-There is one class of HEVC bitstream we do not support: when the SPS has
-`num_short_term_ref_pic_sets > 0` the parameter sets cannot be rebuilt (VA-API only
-gives the count, not the content), `dmd_hevc_can_build` returns 0, and the driver
-returns `VA_STATUS_ERROR_UNIMPLEMENTED` so the layer above falls back to software
-decode cleanly. x265 does not produce this kind of bitstream by default.
+HEVC SPS short-term reference sets are reconstructed as explicit slice-local sets
+using VA DPB/POC data. The restricted path supports Main 8-bit and Main10 8/10-bit
+4:2:0 with complete long-format slice parameters. Missing SPS long-term reference
+tables, custom scaling lists and unknown slice boundaries still fail explicitly.
+Main10 locks NV12/P010 output to its first valid PPB and target surface; later depth
+changes are rejected. It requires the independent `HEVC10=1` option and is installed
+and enabled in the tested tmp container. Source defaults remain off pending wider
+hardware validation. Encoding remains 8-bit NV12 and VP9 Profile2 is not enabled.
+See [`../doc/hevc-main10-p010-validation.md`](../doc/hevc-main10-p010-validation.md).
 
 > **History**: the HEVC profile declaration was withdrawn for a while — back then
 > bitstream forwarding was not implemented yet, and declaring it made things worse
@@ -58,6 +89,12 @@ The difficulty differences between the codecs come from exactly one source —
   parameter sets (VPS/SPS/PPS), fewer usable fields in `profile_tier_level`, and
   `conf_win_*` does not exist at all in `va_dec_hevc.h` while most clients fill
   `slice_data_num_emu_prevn_bytes` with 0
+
+## Historical implementation notes
+
+The MediaCodec/daemon/socket details below describe older paths such as 0.3.x.
+For the current V4L2 architecture and capabilities, use the opening section,
+the repository-root README and CHANGELOG.
 
 ### Two H.264 pitfalls (both corrupt the picture instead of raising an error)
 
@@ -142,9 +179,11 @@ the session afterwards does not affect later reads.
 `switch.h264` (720p→480p) and `grow.h264` (480p→720p) are now both byte-for-byte
 identical to software decode.
 
-**No high bit depth is declared** (HEVC Main10, VP9 Profile2, H.264 High10): the hardware
-may support it, but it has not been verified. Lying about capabilities makes a consumer
-select us and then fail, which is worse than not reporting at all.
+**High bit depth was not advertised then** (HEVC Main10, VP9 Profile2, H.264 High10),
+because it had not been verified. Main10 now has SM8750P/P010 pixel validation in an
+opt-in `HEVC10=1` build, installed and enabled in the tested tmp system; source defaults
+remain off. This does not enable other
+high-bit-depth profiles or 10-bit encoding.
 
 ### Output path: the CPU path (VAImage) + dmabuf export (not zero-copy)
 

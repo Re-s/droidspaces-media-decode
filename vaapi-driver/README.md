@@ -2,8 +2,8 @@
 
 > 🌐 **English version: [README.en.md](README.en.md)**
 
-把 Android 宿主的 MediaCodec 硬件解码能力，通过标准 VA-API 暴露给 DroidSpaces
-容器内的消费者（`vainfo` / ffmpeg / Firefox / Chrome），**不需要任何环境变量**。
+在容器进程内通过 V4L2 直连高通 msm_vidc，以标准 VA-API 提供视频解码与编码；
+不需要 Android daemon 或 MediaCodec。浏览器需要对应的启动和沙箱兼容配置。
 
 产物：`msm_drm_drv_video.so`，安装到 `/usr/lib/aarch64-linux-gnu/dri/`。
 
@@ -14,16 +14,20 @@ profiles 与配置属性；四者都已真机端到端出画面，硬解输出�
 
 各 codec 实际状态：
 
-| Profile | daemon codec | 能力查询 | 解码出画面 | 验证结果 |
+| Profile | codec id | 能力查询 | 解码出画面 | 验证结果 |
 |---------|-------------|---------|-----------|---------|
 | `VAProfileH264ConstrainedBaseline` / `Main` / `High` | 0（H.264） | 正常 | **通过** | 1080p 150 帧 + 4K 90 帧 + 长流 3000 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileHEVCMain` | 1（HEVC） | 正常 | **通过** | 1080p / 4K / 720p / 无参考帧 / 长流 1500 帧，`cmp` 与软解逐字节一致 |
+| `VAProfileHEVCMain10` | 1（HEVC） | `HEVC10=1` 才声明 | **独立构建通过** | 2026-11-15，SM8750P：Main10 profile 的 P010/NV12 五组共 300 帧像素一致、错误 0；mpv 直接 VAAPI、Firefox 160 与 Chrome 154 ANGLE OpenGL 对照画面正常；Chrome 默认 ANGLE Vulkan 的 P010 导入仍黑屏；真实约 10 秒片段，非全片验证，其它硬件未验证 |
 | `VAProfileVP9Profile0` | 2（VP9） | 正常 | **通过** | 720p 120 帧 + 1080p 60 帧，`cmp` 与软解逐字节一致 |
 | `VAProfileVP8Version0_3` | 3（VP8） | 正常 | **通过** | 720p 120 帧，`cmp` 与软解逐字节一致 |
 
-HEVC 有一类码流不支持：SPS 里 `num_short_term_ref_pic_sets > 0` 时无法重建
-参数集（VA-API 只给数量、不给内容），`dmd_hevc_can_build` 返回 0，驱动回
-`VA_STATUS_ERROR_UNIMPLEMENTED` 让上层干净回落软解。x265 默认不产生这类码流。
+HEVC 的 SPS 短期参考集通过 VA DPB/POC 重建为切片内显式集，支持受限的
+Main 8 位和 Main10 8/10 位 4:2:0、完整 long-format slice。SPS 长期参考表、
+自定义缩放表、未知切片边界等仍拒绝。Main10 以独立 `HEVC10=1` 开启，本机 tmp 已正式安装启用；
+根据首份合法 PPB 与目标 surface 锁定 NV12/P010 输出，后续禁止动态切换位深；
+源码默认构建仍不声明，保留跨硬件验证边界；编码仍为 8 位 NV12，VP9 Profile2 未开放。
+构建与实测见 [`../doc/hevc-main10-p010-validation.md`](../doc/hevc-main10-p010-validation.md)。
 
 > **历史**：HEVC 的 profile 声明曾被撤销过一段时间 —— 那时码流转发还没实现，
 > 声明了反而更糟（消费者会选中我们然后失败，而它本可以直接走软解），
@@ -45,6 +49,11 @@ HEVC 有一类码流不支持：SPS 里 `num_short_term_ref_pic_sets > 0` 时无
 - HEVC：同为完整 NALU 只缺起始码，但参数集是三个（VPS/SPS/PPS），
   `profile_tier_level` 可用字段更少，且 `conf_win_*` 在 `va_dec_hevc.h` 里
   根本没有、`slice_data_num_emu_prevn_bytes` 多数客户端填 0
+
+## 历史实现记录
+
+以下 MediaCodec / daemon / socket 的实现细节属于 0.3.x 等早期路径；
+当前 V4L2 架构与能力以本页开头、仓库根 README 和 CHANGELOG 为准。
 
 ### H.264 的两个坑（都会导致画面错而不是报错）
 
@@ -109,8 +118,9 @@ ffmpeg 就会收到 `VA_STATUS_ERROR_OPERATION_FAILED`，整条流解不下去
 
 `switch.h264`（720p→480p）与 `grow.h264`（480p→720p）现均与软解逐字节一致。
 
-**不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10）：硬件可能支持，
-但未验证。谎报能力会让消费者选中我们然后失败，比不报更糟。
+**当时不声明高位深**（HEVC Main10、VP9 Profile2、H.264 High10），因为未经验证。
+当前 Main10 已有 `HEVC10=1` 的 SM8750P/P010 像素验证且本机 tmp 已安装启用；源码默认仍不声明，
+不能据此开放其它高位深 profile 或 10 位编码。
 
 ### 出口：CPU 路径（VAImage）+ dmabuf 导出（非零拷贝）
 

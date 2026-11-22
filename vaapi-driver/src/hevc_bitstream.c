@@ -1,26 +1,21 @@
 /* 从 VA-API 的 HEVC 参数缓冲合成 VPS/SPS/PPS NALU。
  *
- * 为什么要合成：MediaCodec 要的是标准 Annex B 码流，而 ffmpeg 通过 VA-API
+ * 为什么要合成：V4L2 有状态解码器要的是标准 Annex B 码流，而 ffmpeg 通过 VA-API
  * 交给我们的是**已解析成结构体**的参数集。原始 SPS/PPS 字节流不会传下来，
  * 只能按 H.265 语法重新写出来。
  *
- * ── slice 不需要重建 ─────────────────────────────────────
- * 和 H.264 一样，VASliceParameterBufferHEVC 里有 slice_data_byte_offset，
- * 它是 slice header 结束的位置 —— 这个字段能存在就说明 slice header
- * 原样在 slice data buffer 里。所以转发 slice 只需前置起始码，
- * 不必反推参考列表重排序（那是欠定问题）。
+ * 原始 slice header 和 CABAC 载荷仍在 slice data buffer 中。源 SPS 没有
+ * 短期参考集表时保留原转发路径；有表时 hevc_slice.c 从本帧 VA DPB 的 POC
+ * 与 RPS 标记重建等价内联集，只替换相应 header 位段及 PPS id，保留其它
+ * header 字段和 CABAC 载荷，并重做字节对齐、emulation prevention。
  *
  * ── VA-API 缺失、必须推导的字段 ───────────────────────────
  * profile_tier_level 的大部分、conformance window、VUI、
  * 以及 st_ref_pic_set 的内容都不在 VA-API 里。处理见下面各处注释。
  *
- * ⚠️ 最关键的约束是 num_short_term_ref_pic_sets：VA-API 只给个数、不给内容。
- * 若原码流在 SPS 里放了参考集（个数 > 0），我们无法复现，
- * 而 slice header 中 short_term_ref_pic_set_sps_flag=1 的引用会指向
- * 不存在的集合 —— 那会解出坏画面。所以个数 > 0 时**直接拒绝**，
- * 让上层回落软解，而不是产出错误图像。
- * 实测 x265 默认输出该字段为 0（slice header 内联自己的参考集），
- * 所以常见码流不受影响（tools/probe_hevc_sps.c）。
+ * VA-API 只给 SPS 短期参考集个数，不给表内容，因此新 SPS 的表设为空，
+ * 不能直接照抄旧 slice 的 SPS 索引。新路径需要完整 long-format slice 参数；
+ * 对缺失的长期 SPS 表、自定义缩放矩阵等仍明确拒绝，不推测必要参数。
  */
 
 #include <string.h>
@@ -32,15 +27,16 @@
 /* ---------------------------------------------------------------- 字段推导 */
 
 /* general_profile_idc：VA-API 不提供，从 VAProfile 映射。
- * 只声明了 VAProfileHEVCMain（见 profiles.c），所以固定为 Main=1。 */
+ * 入口会核对 profile/位深，不能把未知 profile 静默声明成 Main。 */
 static unsigned int hevc_profile_idc(VAProfile profile)
 {
     switch (profile) {
     case VAProfileHEVCMain10:
         return 2;   /* Main 10 */
     case VAProfileHEVCMain:
-    default:
         return 1;   /* Main */
+    default:
+        return 0;
     }
 }
 
@@ -224,9 +220,10 @@ static size_t build_sps_rbsp(const VAPictureParameterBufferHEVC *pp,
         dmd_bw_put_flag(&bw, pp->pic_fields.bits.pcm_loop_filter_disabled_flag);
     }
 
-    /* num_short_term_ref_pic_sets：VA-API 只给个数不给内容。
-     * 个数 > 0 的码流已在 dmd_hevc_can_build 里被拒，所以这里必然是 0。 */
-    dmd_bw_put_ue(&bw, pp->num_short_term_ref_pic_sets);
+    /* VA-API 不提供原始 SPS 参考集定义；hevc_slice.c 将受支持的
+     * Main/Main10 8/10 位码流改写为显式切片内参考集，因此这里声明 0 个 SPS 集合。
+     * 保留旧集合个数而不提供定义会破坏后续语法解析。 */
+    dmd_bw_put_ue(&bw, 0);
 
     dmd_bw_put_flag(&bw, pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag);
     if (pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag)
@@ -326,18 +323,54 @@ static size_t build_pps_rbsp(const VAPictureParameterBufferHEVC *pp,
 
 /* ---------------------------------------------------------------- 对外接口 */
 
-/* 能否为这个码流合成参数集？不能则应回落软解，而不是产出坏画面。
- *
- * 唯一的硬性拒绝条件是 num_short_term_ref_pic_sets > 0：
- * VA-API 只给个数不给内容，无法复现，而 slice header 会引用它们。
- * 返回 0 = 不支持，非 0 = 可以。 */
+/* 参数集层面的支持检查；有源 SPS 短期参考表时，slice 重写还会独立验证
+ * long-format 参数与 DPB。无法证明等价的字段不猜测。返回 0 = 不支持。 */
 int dmd_hevc_can_build(const VAPictureParameterBufferHEVC *pp)
 {
     if (!pp)
         return 0;
-    if (pp->num_short_term_ref_pic_sets > 0)
+    /* The pixel path represents only 4:2:0 with matched 8- or 10-bit planes.
+     * In particular, a Main10 profile does not make 9/12-bit or mixed-depth
+     * syntax safe. PCM samples, when present, cannot exceed the SPS depth.
+     * Syntax checked against FFmpeg n8.0 hevc/ps.c ff_hevc_parse_sps(). */
+    if (pp->pic_fields.bits.chroma_format_idc != 1 ||
+        pp->pic_fields.bits.separate_colour_plane_flag ||
+        pp->bit_depth_luma_minus8 != pp->bit_depth_chroma_minus8 ||
+        (pp->bit_depth_luma_minus8 != 0 && pp->bit_depth_luma_minus8 != 2) ||
+        (pp->pic_fields.bits.pcm_enabled_flag &&
+         (pp->pcm_sample_bit_depth_luma_minus1 >= 8u + pp->bit_depth_luma_minus8 ||
+          pp->pcm_sample_bit_depth_chroma_minus1 >= 8u + pp->bit_depth_chroma_minus8)))
         return 0;
+    if (pp->num_short_term_ref_pic_sets > 0) {
+        /* No original LT SPS table or custom scaling-list bytes are exposed
+         * here. The new path handles matched 8/10-bit full long-format slices and
+         * LT syntax whose source SPS table is empty; do not invent the rest. */
+        if (pp->num_short_term_ref_pic_sets > 64 || pp->num_long_term_ref_pic_sps ||
+            pp->pic_fields.bits.chroma_format_idc != 1 ||
+            pp->pic_fields.bits.separate_colour_plane_flag ||
+            pp->pic_fields.bits.scaling_list_enabled_flag ||
+            (pp->CurrPic.flags & (VA_PICTURE_HEVC_FIELD_PIC | VA_PICTURE_HEVC_BOTTOM_FIELD)))
+            return 0;
+    }
     return 1;
+}
+
+static int hevc_profile_matches_picture(const VAPictureParameterBufferHEVC *pp,
+                                        VAProfile profile)
+{
+    if (!dmd_hevc_can_build(pp))
+        return 0;
+    /* Main10 PTL also permits 8-bit pictures. Keep the SPS sample depth from
+     * the matched luma/chroma parameters rather than deriving it from PTL;
+     * the decode frontend separately selects NV12 or P010 for that depth. */
+    switch (profile) {
+    case VAProfileHEVCMain:
+        return pp->bit_depth_luma_minus8 == 0;
+    case VAProfileHEVCMain10:
+        return pp->bit_depth_luma_minus8 == 0 || pp->bit_depth_luma_minus8 == 2;
+    default:
+        return 0;
+    }
 }
 
 /* 把 RBSP 包成带起始码的 NALU：
@@ -364,6 +397,8 @@ size_t dmd_hevc_build_vps_nalu(const VAPictureParameterBufferHEVC *pp,
                                VAProfile profile,
                                unsigned char *out, size_t cap)
 {
+    if (!hevc_profile_matches_picture(pp, profile))
+        return 0;
     unsigned char rbsp[256];
     size_t n = build_vps_rbsp(pp, profile, rbsp, sizeof(rbsp));
     return emit_nalu(32, rbsp, n, out, cap);
@@ -373,6 +408,8 @@ size_t dmd_hevc_build_sps_nalu(const VAPictureParameterBufferHEVC *pp,
                                VAProfile profile,
                                unsigned char *out, size_t cap)
 {
+    if (!hevc_profile_matches_picture(pp, profile))
+        return 0;
     unsigned char rbsp[512];
     size_t n = build_sps_rbsp(pp, profile, rbsp, sizeof(rbsp));
     return emit_nalu(33, rbsp, n, out, cap);
@@ -381,6 +418,8 @@ size_t dmd_hevc_build_sps_nalu(const VAPictureParameterBufferHEVC *pp,
 size_t dmd_hevc_build_pps_nalu(const VAPictureParameterBufferHEVC *pp,
                                unsigned char *out, size_t cap)
 {
+    if (!dmd_hevc_can_build(pp))
+        return 0;
     unsigned char rbsp[512];
     size_t n = build_pps_rbsp(pp, rbsp, sizeof(rbsp));
     return emit_nalu(34, rbsp, n, out, cap);

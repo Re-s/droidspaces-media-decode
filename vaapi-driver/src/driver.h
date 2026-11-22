@@ -17,11 +17,23 @@
 #include <va/va_dec_vp9.h>
 /* struct drm_state 定义在这里，va_backend.h 只做前向声明。 */
 #include <va/va_drmcommon.h>
+#include <va/va_vpp.h>
+#include <va/va_backend_vpp.h>
+
+/* Keep vaMapBuffer's internal access flags available with older libva headers. */
+#ifndef VA_MAPBUFFER_FLAG_DEFAULT
+#define VA_MAPBUFFER_FLAG_DEFAULT 0
+#define VA_MAPBUFFER_FLAG_READ    1
+#define VA_MAPBUFFER_FLAG_WRITE   2
+#endif
 
 #include "dmd_client.h"
+#include "video_stats.h"
 #include "stubs.h"
 
 #include "av1_bitstream.h"
+
+struct dmd_encode;
 
 /* 驱动版本，随 vendor 串一起被消费者看到。
  * 注意 ffmpeg 按 vendor 串匹配 vaapi_driver_quirks 名单；我们不在名单内，
@@ -55,7 +67,7 @@
  * 帧号记账以适配消费者的 surface 复用。真流（B 站 1080p60，1800 帧）与软解
  * 逐字节一致，吞吐 120~190fps。另按固件能力运行时门控 VP8/MPEG-2（本机不支持，
  * 此前虚报 profile）。详见 CHANGELOG。 */
-#define DMD_DRIVER_VERSION "0.4.7"
+#define DMD_DRIVER_VERSION "0.5.0-dev"
 /* Makefile 每次构建注入：git 短 hash，工作区有未提交改动时带 -dirty。
  * 例：0.4.3+60534cf2 / 0.4.3+60534cf2-dirty。这样 vainfo 能明确报告
  * Firefox 实际 dlopen 的是哪一版 .so，排查浏览器问题不再靠文件时间猜。 */
@@ -176,12 +188,16 @@
  * 数据流：EndPicture 把 slice data 送给 daemon 并把 surface 挂进 context 的
  * 待解码队列；SyncSurface 从 daemon 取帧、按 FIFO 顺序填进队首 surface 的缓冲。
  */
+struct dmd_import;
 struct dmd_surface {
     int in_use;
     VASurfaceID id;
     /* 请求尺寸（显示尺寸，ffmpeg 传 1920x1080）。VAImage 以此为准。 */
     unsigned int width;
     unsigned int height;
+    /* Decoded display rectangle may be smaller than the application's pool
+     * dimensions (e.g. an FFmpeg 1088-row pool carrying 1080 visible rows). */
+    unsigned int visible_width, visible_height, visible_x, visible_y;
     /* 缓冲几何：宽对齐 128、高对齐 32 后的值，data 按此分配。 */
     unsigned int buf_width;
     unsigned int buf_height;
@@ -190,6 +206,9 @@ struct dmd_surface {
     unsigned int format; /* VA_RT_FORMAT_* */
     unsigned char *data;
     size_t data_size;
+    /* Read-only, externally owned NV12 input. The import owns duplicated
+     * descriptors/mappings; an in-flight snapshot retains it independently. */
+    struct dmd_import *imported;
     /* dumb buffer 后备存储：exportable 非 0 表示 data 是 mmap 出来的可导出
      * 内存，可通过 DRM_IOCTL_PRIME_HANDLE_TO_FD 导出 dmabuf fd。
      * Firefox 取帧走 vaExportSurfaceHandle，没有它就整条流回落软解；
@@ -218,6 +237,11 @@ struct dmd_surface {
      * 不需要在 EndPicture 里同步 memcpy —— 而那次 memcpy 会让吞吐减半
      * （实测 jinjie 300 帧：76.8 → 34.8 fps）。 */
     int exported;
+    /* A successful WRITE_ONLY/READ_WRITE PRIME export permits the application
+     * to supply encoder input directly through this local NV12 allocation.
+     * This grants no decode readiness: the producer must complete GPU writes
+     * before BeginPicture, and ordinary pixel-read APIs retain IDLE checks. */
+    int external_write_exported;
     /* 解码状态：0=空闲（VASurfaceReady），1=已提交待解码（VASurfaceRendering），
      * 2=帧已就绪（VASurfaceReady 且 data 有效）。 */
     int state;
@@ -241,6 +265,10 @@ struct dmd_buffer {
     size_t size; /* element_size * num_elements */
     void *data;
     int mapped;
+    /* EncCodedBuffer maps to this segment, not directly to the byte storage. */
+    VACodedBufferSegment coded_segment;
+    VAStatus coded_status;
+    int coded_pending;
 };
 
 /* 一个 image：VAImage 的后备存储。data 是普通 heap 内存
@@ -255,6 +283,10 @@ struct dmd_image {
     int mapped;
     /* derive 出来的 image 绑定在某个 surface 上；CreateImage 的为 VA_INVALID_ID */
     VASurfaceID derived_from;
+    int acquired_fd;
+    int handle_acquired;
+    unsigned int map_flags;
+    int map_sync_started;
 };
 
 /* 一个 context：config + render target 集合 + 一条 V4L2 解码会话。
@@ -281,6 +313,16 @@ struct dmd_context {
     VAContextID id;
     VAConfigID config_id;
     VAProfile profile;
+    VAEntrypoint entrypoint;
+    VASurfaceID vpp_source;
+    VARectangle vpp_source_region;
+    VARectangle vpp_output_region;
+    uint32_t vpp_rotation;
+    int vpp_has_source_region;
+    int vpp_has_output_region;
+    int vpp_have_params;
+    struct dmd_encode *encoder;
+    struct dmd_video_stats *video_stats;
     int codec; /* DMD_CODEC_* */
     unsigned int picture_width;
     unsigned int picture_height;
@@ -394,6 +436,8 @@ struct dmd_context {
     /* 已向会话报过位深没有：0=还没报，1=报的 8bit，2=报的 10bit。
      * CAPTURE 协商发生在首个单元送出的 SOURCE_CHANGE 里，而 vaCreateContext
      * 阶段还拿不到位深，所以只能在首次 EndPicture 见到 PPB 时补告。 */
+    /* Effective output sample size, also preserved when HEVC sessions reopen. */
+    int output_ten_bit;
     int av1_bd_reported;
     VADecPictureParameterBufferAV1 av1_pic_param;
     VASliceParameterBufferAV1 av1_tile_param[512];
@@ -528,6 +572,12 @@ struct dmd_context {
 
     VAPictureParameterBufferHEVC hevc_pic_param;
     int hevc_pic_param_valid;
+    /* Long-format slice boundaries. Parameters describe the next data buffer;
+     * offsets below become absolute in slice_data when that buffer arrives. */
+    VASliceParameterBufferHEVC hevc_slice_param[128];
+    size_t hevc_slice_offset[128];
+    unsigned hevc_slice_count, hevc_slices_bound;
+    int hevc_slice_error;
     int have_h264_slice_param;
     VASliceParameterBufferH264 h264_slice_param;
     int have_h264_iq_matrix;
@@ -589,6 +639,7 @@ struct dmd_driver {
      * 直接拆不行：那时收帧线程可能正拿着同一个会话在 ioctl，close 掉它的 fd
      * 之后 fd 号被宿主进程回收，再动一次动的就是 Chrome 自己的 fd。 */
     struct dmd_session *io_defer[DMD_MAX_CONTEXTS];
+    struct dmd_encode *encode_defer[DMD_MAX_CONTEXTS];
 
     /* 后台收帧线程：Chrome 只调 EndPicture，从不 vaSyncSurface。
      *
@@ -605,6 +656,7 @@ struct dmd_driver {
     int reaper_stop;
 
     int drm_fd; /* 来自 ctx->drm_state，仅记录，当前不做 ioctl */
+    uint32_t encode_caps; /* DMD_ENC_CAP(profile), probed once per VA display. */
 };
 
 /* 启动后台收帧线程（惰性，重复调用无副作用）。调用方持锁。 */
@@ -720,10 +772,33 @@ VAStatus dmd_RenderPicture(VADriverContextP ctx, VAContextID context,
 
 VAStatus dmd_EndPicture(VADriverContextP ctx, VAContextID context);
 
+VAStatus dmd_vpp_end(VADriverContextP ctx, VAContextID context);
+VAStatus dmd_vpp_render(VADriverContextP ctx, VAContextID context,
+                        VABufferID *buffers, int num_buffers);
+VAStatus dmd_vpp_query_filters(VADriverContextP ctx, VAContextID context,
+                               VAProcFilterType *filters,
+                               unsigned int *num_filters);
+VAStatus dmd_vpp_query_filter_caps(VADriverContextP ctx, VAContextID context,
+                                   VAProcFilterType type, void *filter_caps,
+                                   unsigned int *num_filter_caps);
+VAStatus dmd_vpp_query_pipeline_caps(VADriverContextP ctx,
+                                     VAContextID context,
+                                     VABufferID *filters,
+                                     unsigned int num_filters,
+                                     VAProcPipelineCaps *pipeline_caps);
+
 VAStatus dmd_SyncSurface(VADriverContextP ctx, VASurfaceID render_target);
 
 VAStatus dmd_SyncSurface2(VADriverContextP ctx, VASurfaceID surface,
                           uint64_t timeout_ns);
+
+VAStatus dmd_SyncBuffer(VADriverContextP ctx, VABufferID buf_id,
+                        uint64_t timeout_ns);
+
+VAStatus dmd_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image,
+                      int src_x, int src_y, unsigned int src_width,
+                      unsigned int src_height, int dest_x, int dest_y,
+                      unsigned int dest_width, unsigned int dest_height);
 
 /* ---- export.c：dmabuf 出口 ---- */
 
@@ -829,5 +904,14 @@ size_t dmd_h264_build_pps_nalu(const VAPictureParameterBufferH264 *pp,
                                unsigned int def_l0_minus1,
                                unsigned int def_l1_minus1,
                                unsigned char *out, size_t out_cap);
+
+/* External linear NV12 surfaces are encoder inputs. No caller FD is adopted. */
+VAStatus dmd_import_surface_init(struct dmd_surface *surface, unsigned width,
+                                  unsigned height, unsigned memory_type,
+                                  const void *descriptor);
+void dmd_import_ref(struct dmd_import *imported);
+void dmd_import_unref(struct dmd_import *imported);
+VAStatus dmd_import_copy(const struct dmd_surface *surface, unsigned char *data,
+                          size_t capacity);
 
 #endif /* DMD_DRIVER_H */

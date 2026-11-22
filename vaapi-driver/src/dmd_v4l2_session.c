@@ -30,6 +30,7 @@
 
 #include "dmd_client.h"
 #include "v4l2_backend.h"
+#include "video_stats.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -151,6 +152,14 @@ static void set_err(struct dmd_session *s, int code, const char *msg)
     if (!s) return;
     s->err.code = code;
     snprintf(s->err.msg, sizeof(s->err.msg), "%s", msg ? msg : "");
+    dmd_video_stats_error(s->dec.video_stats);
+}
+
+void dmd_session_set_video_stats(struct dmd_session *s, struct dmd_video_stats *stats)
+{
+    if (!s || s->dec.video_stats == stats) return;
+    dmd_video_stats_unref(s->dec.video_stats);
+    s->dec.video_stats = dmd_video_stats_ref(stats);
 }
 
 /* ---------------------------------------------------------------- 配置 */
@@ -249,6 +258,7 @@ void dmd_session_destroy(struct dmd_session *s)
              (unsigned long long)s->units_sent,
              (unsigned long long)s->frames_recv);
     dmd_v4l2_close(&s->dec);
+    dmd_video_stats_unref(s->dec.video_stats);
     free(s);
 }
 
@@ -538,6 +548,7 @@ static void publish_format(struct dmd_session *s)
     s->fmt.crop_bottom  = ch - 1;
     if (!s->fmt.valid) s->fmt.changes++;
     s->fmt.valid = 1;
+    dmd_video_stats_config(s->dec.video_stats, (unsigned)cw, (unsigned)ch, 0, 0);
 
     sess_log(s, "格式: 缓冲 %dx%d 有效 %dx%d stride=%d slice=%d",
              d->w, d->h, cw, ch, d->stride, d->slice_height);
@@ -564,6 +575,10 @@ static void fill_frame(struct dmd_session *s, struct dmd_frame *out,
     /* shm_slot 复用为 CAPTURE 缓冲索引：语义仍是"归还凭据"。 */
     out->shm_slot = index;
     out->seq = s->frame_seq++;
+    /* Queued frames retain their CAPTURE slot until release, so this flag
+     * survives send_unit's pending queue without being overwritten. */
+    out->hardware_error = index >= 0 && index < s->dec.n_cap
+                        ? s->dec.cap[index].hardware_error : 0;
 
     if (index >= 0 && index < DMD_V4L2_MAX_CAP) s->held[index] = 1;
     s->frames_recv++;

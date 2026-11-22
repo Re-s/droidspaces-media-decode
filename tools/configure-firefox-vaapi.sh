@@ -1,427 +1,294 @@
 #!/bin/sh
-# Configure per-user Firefox VA-API integration for msm_drm.
-#
-# Usage: configure-firefox-vaapi.sh [--verify|--uninstall]
-# Environment: DMD_DRIVER_DIR overrides automatic driver-directory selection.
+# Current-user launcher/desktop integration and one explicit root-owned policy.
+# No profile rewrites, daemon checks, or sandbox-disabling defaults.
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 - "$script_dir/../vaapi-driver/tools/firefox-hwdec" "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import sys
+import tempfile
 
-set -u
+TEMPLATE = Path(sys.argv.pop(1))
+PREF = 'dom.ipc.forkserver.enable'
+VALUE = {'Value': False, 'Status': 'locked'}
+TAG = '# Managed by configure-firefox-vaapi.sh (explicit RDD KGSL compatibility policy)'
 
-BEGIN_MARKER='// BEGIN DMD MSM VA-API MANAGED PREFS'
-END_MARKER='// END DMD MSM VA-API MANAGED PREFS'
-# Firefox profile 根目录不能写死 —— 不同安装方式放在不同地方，
-# 而且同一台机器上可能同时存在多处（本机实测 ~/.config/mozilla/firefox
-# 与 ~/.mozilla/firefox 都有真实 profile 和 prefs.js）：
-#
-#   ~/.mozilla/firefox                              apt / tarball（传统位置）
-#   ~/.config/mozilla/firefox                       较新版本遵循 XDG 后的新位置
-#   ~/snap/firefox/common/.mozilla/firefox          snap
-#   ~/.var/app/org.mozilla.firefox/.mozilla/firefox flatpak
-#
-# 策略：对每个存在 profiles.ini 的根目录都写一遍。宁可多写也不能漏
-# —— 写错位置的后果是"配了但没生效"，而这种失败最难排查（页面能播、
-# 统计看着正常，实际静默走软解）。
-# FIREFOX_HOME 环境变量可覆盖，只处理指定的那一个。
-firefox_homes() {
-    if [ -n "${FIREFOX_HOME:-}" ]; then
-        [ -f "$FIREFOX_HOME/profiles.ini" ] && printf '%s\n' "$FIREFOX_HOME"
-        return 0
-    fi
-    for h in \
-        "$HOME/.mozilla/firefox" \
-        "$HOME/.config/mozilla/firefox" \
-        "$HOME/snap/firefox/common/.mozilla/firefox" \
-        "$HOME/.var/app/org.mozilla.firefox/.mozilla/firefox"
-    do
-        [ -f "$h/profiles.ini" ] && printf '%s\n' "$h"
-    done
-}
-LOCAL_BIN="$HOME/.local/bin"
-WRAPPER="$LOCAL_BIN/firefox-msm-vaapi"
-APPLICATIONS="$HOME/.local/share/applications"
-DESKTOP="$APPLICATIONS/firefox.desktop"
-DESKTOP_BACKUP="$APPLICATIONS/firefox.desktop.dsh-msm-vaapi.backup"
+def fail(message):
+    raise RuntimeError(message)
 
-say() { printf '%s\n' "$*"; }
-err() { printf '%s\n' "error: $*" >&2; }
+def load_json(path, default=None):
+    if path.is_symlink():
+        fail(f'Refusing symlink: {path}')
+    if not path.exists():
+        return default
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        fail(f'Expected a JSON object: {path}')
+    return value
 
-usage() {
-    cat <<'EOF'
-Usage: configure-firefox-vaapi.sh [--verify|--uninstall]
+def atomic(path, data, mode=0o644):
+    if path.is_symlink():
+        fail(f'Refusing symlink: {path}')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = path.stat() if path.exists() else None
+    fd, temp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        os.fchmod(fd, stat.S_IMODE(old.st_mode) if old else mode)
+        if old and os.geteuid() == 0:
+            os.fchown(fd, old.st_uid, old.st_gid)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
-Install is the default. DMD_DRIVER_DIR can select the directory containing
-msm_drm_drv_video.so; otherwise the highest-versioned
-~/Documents/DSHWK/release-v* directory that contains the driver is used,
-falling back to /usr/lib/aarch64-linux-gnu/dri.
-EOF
-}
+def encoded(value):
+    return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
 
-firefox_running() {
-    command -v pgrep >/dev/null 2>&1 || return 1
-    pgrep -x firefox >/dev/null 2>&1 || pgrep -x firefox-esr >/dev/null 2>&1
-}
+def policy_parts(data):
+    policies = data.setdefault('policies', {})
+    if not isinstance(policies, dict):
+        fail('policies must be an object')
+    prefs = policies.setdefault('Preferences', {})
+    if not isinstance(prefs, dict):
+        fail('policies.Preferences must be an object')
+    return policies, prefs
 
-select_driver_dir() {
-    if [ -n "${DMD_DRIVER_DIR:-}" ]; then
-        DRIVER_DIR=$DMD_DRIVER_DIR
-    else
-        # 优先系统 dri 目录 —— 那是 `make install` 的正式落点，也是 libva
-        # 默认加载的位置。此前反过来先挑 release-v* 目录，结果用户装了
-        # 0.4.6 到系统目录，脚本却把 LIBVA_DRIVERS_PATH 指向遗留的
-        # release-v0.4.4，配完仍跑旧驱动（实测踩过）。
-        DRIVER_DIR=/usr/lib/aarch64-linux-gnu/dri
-        if [ ! -f "$DRIVER_DIR/msm_drm_drv_video.so" ]; then
-            # 系统目录没装，才退而找版本号最大的 release-v*（sort -V 版本序）。
-            for d in $(ls -d "$HOME"/Documents/DSHWK/release-v* 2>/dev/null | sort -V); do
-                [ -f "$d/msm_drm_drv_video.so" ] && DRIVER_DIR=$d
-            done
-        fi
-    fi
+def policy_ok(path):
+    data = load_json(path, {})
+    policies = data.get('policies', {})
+    prefs = policies.get('Preferences', {}) if isinstance(policies, dict) else {}
+    return isinstance(prefs, dict) and prefs.get(PREF) == VALUE
 
-    if [ ! -f "$DRIVER_DIR/msm_drm_drv_video.so" ]; then
-        err "msm_drm_drv_video.so not found in $DRIVER_DIR"
-        return 1
-    fi
-    return 0
-}
+def manage_policy(path, remove):
+    if os.geteuid() != 0:
+        fail('System policy changes require root. Use --install-system-policy as root.')
+    state_path = path.with_name(path.name + '.dmd-firefox-state.json')
+    backup = path.with_name(path.name + '.dmd-firefox.bak')
+    state = load_json(state_path)
+    data = load_json(path, {})
+    if remove:
+        if state is None:
+            print(f'No managed policy state; preserving {path}')
+            return
+        policies, prefs = policy_parts(data)
+        if prefs.get(PREF) != VALUE:
+            fail('Managed preference changed elsewhere; preserving the current policy and backup.')
+        if state['had_pref']:
+            prefs[PREF] = state['previous_pref']
+        else:
+            prefs.pop(PREF, None)
+        if not prefs and not state['had_preferences']:
+            policies.pop('Preferences', None)
+        if not policies and not state['had_policies']:
+            data.pop('policies', None)
+        original = load_json(backup) if state['had_file'] else None
+        if original is not None and data == original:
+            atomic(path, backup.read_bytes())
+        elif not state['had_file'] and not data:
+            path.unlink(missing_ok=True)
+        else:
+            atomic(path, encoded(data))
+        state_path.unlink()
+        print(f'Removed only managed {PREF}; other policies preserved: {path}')
+        return
+    if state is not None:
+        if not policy_ok(path):
+            fail('Managed preference changed elsewhere; reconcile it before reinstalling.')
+        print(f'Policy already installed: {path}')
+        return
+    had_policies = 'policies' in data
+    had_preferences = isinstance(data.get('policies'), dict) and 'Preferences' in data['policies']
+    policies, prefs = policy_parts(data)
+    state = {'had_file': path.exists(), 'had_policies': had_policies,
+             'had_preferences': had_preferences, 'had_pref': PREF in prefs,
+             'previous_pref': prefs.get(PREF)}
+    if path.exists():
+        if backup.exists() or backup.is_symlink():
+            fail(f'Archive the existing recovery backup before a new policy install: {backup}')
+        atomic(backup, path.read_bytes(), 0o600)
+    prefs[PREF] = VALUE
+    atomic(state_path, encoded(state), 0o600)
+    atomic(path, encoded(data))
+    print(f'Installed locked {PREF}=false: {path}')
 
-# Print each profile directory. profiles.ini paths can be absolute or relative
-# to ~/.mozilla/firefox and may contain spaces, so do not split the output.
-profile_dirs() {
-    _home="$1"
-    [ -f "$_home/profiles.ini" ] || return 1
-    awk -v root="$_home" '
-        function emit() {
-            if (in_profile && path != "") {
-                if (relative == "0" || path ~ /^\//) print path
-                else print root "/" path
-            }
-        }
-        /^\[/ { emit(); in_profile = ($0 ~ /^\[Profile[^]]*\]$/); path=""; relative="1"; next }
-        in_profile && /^Path=/ { path=substr($0, 6); next }
-        in_profile && /^IsRelative=/ { relative=substr($0, 12); next }
-        END { emit() }
-    ' "$_home/profiles.ini"
-}
+def desktop_quote(path):
+    # Desktop Entry Exec quoting is not shell quoting.
+    value = str(path).replace('%', '%%')
+    return '"' + re.sub(r'([\\"`$])', r'\\\1', value) + '"'
 
-# 另一套已知的管理块标记（DroidSpaces 集成器写的）。它管的 pref 与本脚本
-# 高度重叠，两套并存会让同一个 pref 被重复定义 —— Firefox 取最后一次赋值，
-# 行为未必错，但 user.js 变得没法读，改一处不生效很难查。
-# 检测到它就跳过该 profile，把选择权留给用户。
-FOREIGN_BEGIN='// >>> DroidSpaces Firefox VA-API integration >>>'
+def patch_desktop(data, wrapper):
+    changed = 0
+    names = {'firefox', 'firefox-esr', 'firefox-bin', 'firefox-hwdec', 'firefox-msm-vaapi'}
+    token_re = re.compile(r'''(?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+''')
+    def rewrite(line):
+        nonlocal changed
+        if not line.startswith('Exec='):
+            return line
+        command = line[5:]
+        tokens = list(token_re.finditer(command))
+        if not tokens:
+            return line
+        values = [shlex.split(token.group())[0] for token in tokens]
+        index = 0
+        if Path(values[0]).name == 'env':
+            index = 1
+            while index < len(values):
+                value = values[index]
+                if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', value):
+                    index += 1
+                elif value == '--':
+                    index += 1
+                    break
+                else:
+                    break
+        if index < len(tokens) and Path(values[index]).name in names:
+            token = tokens[index]
+            changed += 1
+            return 'Exec=' + command[:token.start()] + desktop_quote(wrapper) + command[token.end():]
+        return line
+    output = ''.join(rewrite(line) for line in data.splitlines(keepends=True))
+    if not changed:
+        fail('Desktop has no direct Firefox executable; refusing an unsafe rewrite.')
+    return output.encode()
 
-rewrite_user_js() {
-    userjs=$1
+def file_hash(data):
+    return hashlib.sha256(data).hexdigest()
 
-    # 已有另一套管理块 → 跳过，不叠加
-    if [ -f "$userjs" ] && grep -qF "$FOREIGN_BEGIN" "$userjs" 2>/dev/null; then
-        say "跳过（已由 DroidSpaces 集成器管理）: $userjs"
-        say "  两套配置的 pref 重叠，叠加会导致重复定义。"
-        say "  要改用本脚本，请先删掉 user.js 里 '>>> DroidSpaces ... >>>' 到"
-        say "  '<<< ... <<<' 之间的整段，再重新执行。"
-        # 但仍补一条对方不管的关键 pref：关掉硬解看门狗。
-        # 缺了它 B 站 1080p 会播几秒卡在加载（见 README）。
-        k='user_pref("media.ffmpeg.disable-software-fallback", true);'
-        if grep -qxF "$k" "$userjs" 2>/dev/null; then
-            say "  disable-software-fallback 已存在"
-        else
-            printf '%s\n' "$k" >> "$userjs" && say "  已补 $k"
-        fi
-        return 2          # 2 = 有意跳过，区别于 0 成功 / 1 失败
-    fi
+def user_paths():
+    if os.geteuid() == 0:
+        fail('Run user integration as the desktop user. Root only uses --install-system-policy/--uninstall-system-policy.')
+    home = Path.home()
+    return home / '.local/bin/firefox-hwdec', home / '.local/share/applications', home / '.local/state/droidspaces-firefox/integration.json'
 
-    tmp="$userjs.dsh-vaapi.$$"
-    mkdir -p "$(dirname "$userjs")" || return 1
-    [ -f "$userjs" ] || : > "$userjs" || return 1
+def install_user(args):
+    wrapper, apps, state_path = user_paths()
+    lib = Path(args.compat_lib)
+    if not lib.is_absolute() or re.search(r'[\s:]', str(lib)) or not lib.is_file() or not os.access(lib, os.R_OK):
+        fail('--compat-lib must be a readable absolute library path without whitespace/colons')
+    if not policy_ok(args.policy_file):
+        fail('Locked forkserver policy missing. First use --install-system-policy as root; RDD/content/GPU sandboxes stay enabled.')
+    if not TEMPLATE.is_file():
+        fail(f'Launcher template missing: {TEMPLATE}')
+    body = TEMPLATE.read_text()
+    launcher = ('#!/bin/sh\n' + TAG + '\nDMD_FIREFOX_HEAP_LIB=${DMD_FIREFOX_HEAP_LIB:-' + shlex.quote(str(lib)) + '}\n' + body.split('\n', 1)[1]).encode()
+    plans = {wrapper: launcher}
+    directories = [Path(x) for x in args.desktop_dir] if args.desktop_dir else [Path('/usr/share/applications'), Path('/usr/local/share/applications')]
+    candidates = {}
+    for directory in directories:
+        for pattern in ('firefox*.desktop', 'org.mozilla.firefox*.desktop'):
+            for source in sorted(directory.glob(pattern)):
+                candidates.setdefault(source.name, source)
+    for pattern in ('firefox*.desktop', 'org.mozilla.firefox*.desktop'):
+        for source in sorted(apps.glob(pattern)):
+            candidates[source.name] = source
+    if not candidates:
+        fail('No Firefox vendor .desktop found; specify --desktop-dir.')
+    for name, source in candidates.items():
+        plans[apps / name] = patch_desktop(source.read_text(), wrapper)
+    state = load_json(state_path, {'files': {}})
+    for dest, content in plans.items():
+        key = str(dest)
+        previous = state['files'].get(key)
+        if previous and dest.exists() and file_hash(dest.read_bytes()) != previous['installed_sha256']:
+            fail(f'Managed file changed elsewhere; preserving it: {dest}')
+        if not previous:
+            backup = dest.with_name(dest.name + '.dmd-firefox.bak')
+            if backup.exists() or backup.is_symlink():
+                fail(f'Archive the existing recovery backup first: {backup}')
+            previous = {'had_file': dest.exists(), 'backup': str(backup)}
+            if dest.exists():
+                atomic(backup, dest.read_bytes(), stat.S_IMODE(dest.stat().st_mode))
+            state['files'][key] = previous
+        previous['installed_sha256'] = file_hash(content)
+    state['compat_lib'] = str(lib)
+    atomic(state_path, encoded(state), 0o600)
+    for dest, content in plans.items():
+        atomic(dest, content, 0o755 if dest == wrapper else 0o644)
+        if dest == wrapper:
+            dest.chmod(0o755)
+        print(f'Installed: {dest}')
+    print('Close all Firefox processes before launching. Existing profiles were not rewritten.')
 
-    # Delete precisely our prior managed range, preserving all user-owned lines.
-    awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
-        $0 == begin { skipping=1; next }
-        skipping && $0 == end { skipping=0; next }
-        !skipping { print }
-    ' "$userjs" > "$tmp" || { rm -f "$tmp"; return 1; }
-    cat >> "$tmp" <<EOF
-$BEGIN_MARKER
-// Managed by configure-firefox-vaapi.sh. Do not edit inside this block.
-user_pref("media.hardware-video-decoding.enabled", true);
-// 绕过 gfxInfo 黑名单。不关看门狗（见下一项）。
-user_pref("media.hardware-video-decoding.force-enabled", true);
-user_pref("media.ffmpeg.vaapi.enabled", true);
-user_pref("media.hevc.enabled", true);
-user_pref("media.ffmpeg.vaapi.force-surface-zero-copy", 2);
-// ⚠️ 唯一能关掉硬解性能看门狗的开关。FFmpegVideoDecoder 累计 16 帧
-// decodeTime > frameDuration 就走
-//   "HW decoding is slow, switching back to SW decode"
-// → disable HW acceleration → 换新解码器 → FATAL_ERR。
-// 此前误把 force-enabled 当成这个开关；154 源码里看门狗条件只有
-// IsDecodingSlow() && !media.ffmpeg.disable-software-fallback，
-// force-enabled 只在 gfxPlatform 绕过黑名单，完全不参与判定。
-// B 站 1080p 每个解码器建立后 2 行内必走 PORT_SETTINGS(INSUFFICIENT)
-// 重配（固件报显示高度 vs 对齐高度），固件首帧再滞后 4 个输入单元，
-// 看门狗在解码器初期最敏感，于是进入
-// 杀解码器 → Seek 回同一 PTS → 重建 → 再重配 → 再误判 的死循环。
-// 实测（同一视频 100s / 3min）：加上后 HW slow、disable HW、FATAL、
-// Seek(43s) 全 0；3min 配对 4645 帧、送入 3099 收到 3099。
-// 代价：真正硬解损坏时 Firefox 不再自动退回软解。对本机（驱动侧
-// 送入=收到、零丢帧）可接受。
-user_pref("media.ffmpeg.disable-software-fallback", true);
-// 播放队列深度：不是可选项。Venus 固件的解码流水线滞后 4 个输入单元才吐首帧
-// （无 B 帧码流同样如此），Firefox 默认队列太浅，吸收不了这个滞后带来的交付
-// 抖动。1080p30 27Mbps 实测：不加丢帧 14.25%、顺序回退 20.75%；加上降到
-// 0.89% / 4.04%（软解基线 0.5% / 1.85%，即与软解同量级）。
-user_pref("media.video-queue.hw-accel-size", 10);
-user_pref("media.video-queue.default-size", 10);
-user_pref("media.video-queue.send-to-compositor-size", 6);
-$END_MARKER
-EOF
-    mv "$tmp" "$userjs"
-}
+def uninstall_user():
+    wrapper, apps, state_path = user_paths()
+    state = load_json(state_path)
+    if state is None:
+        print('No managed user integration; existing files preserved.')
+        return
+    records = sorted(state['files'].items(), key=lambda item: item[0] == str(wrapper))
+    for name, record in records:
+        path = Path(name)
+        if path.exists() and file_hash(path.read_bytes()) != record['installed_sha256']:
+            fail(f'Managed file changed elsewhere; preserving current file and backup: {path}')
+    for name, record in records:
+        path = Path(name)
+        backup = Path(record['backup'])
+        if record['had_file']:
+            atomic(path, backup.read_bytes(), stat.S_IMODE(backup.stat().st_mode))
+            path.chmod(stat.S_IMODE(backup.stat().st_mode))
+        else:
+            path.unlink(missing_ok=True)
+        print(f'Restored/removed: {path}')
+    state_path.unlink()
+    print('System policy is separate: root may use --uninstall-system-policy.')
 
-remove_user_js_block() {
-    userjs=$1
-    [ -f "$userjs" ] || return 0
-    tmp="$userjs.dsh-vaapi.$$"
-    awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
-        $0 == begin { skipping=1; next }
-        skipping && $0 == end { skipping=0; next }
-        !skipping { print }
-    ' "$userjs" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv "$tmp" "$userjs"
-}
+def verify(args):
+    wrapper, apps, state_path = user_paths()
+    state = load_json(state_path, {})
+    ok = policy_ok(args.policy_file)
+    print(f'Locked forkserver policy: {"OK" if ok else "MISSING"}: {args.policy_file}')
+    files = state.get('files', {})
+    ok = bool(files) and ok
+    for name, record in files.items():
+        path = Path(name)
+        valid = path.is_file() and file_hash(path.read_bytes()) == record['installed_sha256']
+        if path == wrapper:
+            valid = valid and os.access(path, os.X_OK)
+        ok = valid and ok
+        print(f'{"OK" if valid else "CHANGED/MISSING"}: {path}')
+    lib = Path(state.get('compat_lib', args.compat_lib))
+    readable = lib.is_file() and os.access(lib, os.R_OK)
+    print(f'RDD compatibility preload: {"OK" if readable else "MISSING"}: {lib}')
+    if not (ok and readable):
+        raise SystemExit(1)
 
-write_wrapper() {
-    mkdir -p "$LOCAL_BIN" || return 1
-    cat > "$WRAPPER" <<EOF
-#!/bin/sh
-# Generated by configure-firefox-vaapi.sh.
-export MOZ_DISABLE_RDD_SANDBOX=1
-export LIBVA_DRIVER_NAME=msm_drm
-export LIBVA_DRIVERS_PATH='$DRIVER_DIR'
-exec firefox "\$@"
-EOF
-    chmod 755 "$WRAPPER"
-}
+def main():
+    parser = argparse.ArgumentParser(description='Firefox 160 GNU/Linux AArch64: explicit RDD KGSL ioctl policy; Mozilla sandboxes are not disabled.')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--install', action='store_true', help='current-user launcher/desktops (default)')
+    group.add_argument('--uninstall', action='store_true', help='restore only managed user files')
+    group.add_argument('--verify', action='store_true')
+    group.add_argument('--install-system-policy', action='store_true', help='root: merge the single locked forkserver preference')
+    group.add_argument('--uninstall-system-policy', action='store_true', help='root: restore only that preference')
+    parser.add_argument('--compat-lib', default=os.environ.get('DMD_FIREFOX_HEAP_LIB', '/usr/local/lib/droidspaces-firefox/libdmd-firefox-compat.so'))
+    parser.add_argument('--policy-file', type=Path, default=Path('/usr/lib/firefox/distribution/policies.json'), help='policy path in this native Firefox installation')
+    parser.add_argument('--desktop-dir', action='append', help='vendor applications directory (repeatable)')
+    args = parser.parse_args()
+    if not args.policy_file.is_absolute():
+        fail('--policy-file must be absolute')
+    if args.install_system_policy or args.uninstall_system_policy:
+        manage_policy(args.policy_file, args.uninstall_system_policy)
+    elif args.uninstall:
+        uninstall_user()
+    elif args.verify:
+        verify(args)
+    else:
+        install_user(args)
 
-write_desktop() {
-    mkdir -p "$APPLICATIONS" || return 1
-    # 自愈：上一次卸载可能留下指向已删启动器的孤儿 .desktop（那会让图标报
-    # "无法找到程序"）。它不算用户数据，别把它备份成"用户的启动器"。
-    if [ -f "$DESKTOP" ] && grep -q '^Exec=' "$DESKTOP" 2>/dev/null; then
-        _exec=$(sed -n 's/^Exec=//p' "$DESKTOP" | head -1 | awk '{print $1}')
-        case "$_exec" in
-            "$LOCAL_BIN"/*)
-                if [ ! -x "$_exec" ]; then
-                    say "清理失效的启动器条目（Exec 不存在）: $DESKTOP"
-                    rm -f "$DESKTOP"
-                fi
-                ;;
-        esac
-    fi
-    # Preserve the user's launcher exactly once. A re-install must not back up
-    # our generated launcher as though it were user data.
-    if [ -f "$DESKTOP" ] && [ ! -f "$DESKTOP_BACKUP" ]; then
-        cp "$DESKTOP" "$DESKTOP_BACKUP" || return 1
-    fi
-    cat > "$DESKTOP" <<EOF
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Firefox
-Comment=Web Browser (msm VA-API)
-Exec=$WRAPPER %u
-Terminal=false
-Icon=firefox
-Categories=Network;WebBrowser;
-MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/rss+xml;application/x-xpinstall;application/pdf;x-scheme-handler/http;x-scheme-handler/https;
-StartupNotify=true
-EOF
-}
-
-install() {
-    if firefox_running; then
-        err "Firefox is running; close Firefox before changing its profiles"
-        return 1
-    fi
-    select_driver_dir || return 1
-
-    homes=$(firefox_homes)
-    if [ -z "$homes" ]; then
-        err "找不到任何 Firefox profile（已查 ~/.mozilla、~/.config/mozilla、snap、flatpak）"
-        err "可用 FIREFOX_HOME 指定包含 profiles.ini 的目录"
-        return 1
-    fi
-
-    # ⚠️ 不要写成 `... | while ...`：管道让循环跑在子 shell 里，
-    # 循环内的 exit/return 只终止子 shell，写失败会被静默吞掉并照常报
-    # "installed"（实测过）。改用重定向喂 while，循环就在当前 shell 里。
-    failed=0
-    any=0
-    skipped=0
-    while IFS= read -r home; do
-        [ -n "$home" ] || continue
-        profile_list=$(profile_dirs "$home") || continue
-        [ -n "$profile_list" ] || { say "跳过（无 [Profile*] 条目）: $home"; continue; }
-        while IFS= read -r profile; do
-            [ -n "$profile" ] || continue
-            # profiles.ini 可能列出已删除的 profile。目录不存在就跳过，
-            # 否则会凭空造出一个只有我们 pref 的目录，Firefox 根本不读。
-            if [ ! -d "$profile" ]; then
-                say "跳过（目录不存在）: $profile"
-                continue
-            fi
-            rewrite_user_js "$profile/user.js"
-            case $? in
-                0) any=1; say "configured: $profile/user.js" ;;
-                2) skipped=$((skipped + 1)) ;;   # 有意跳过，不算失败也不算成功
-                *) err "failed to write $profile/user.js"; failed=1 ;;
-            esac
-        done <<INNER
-$profile_list
-INNER
-    done <<OUTER
-$homes
-OUTER
-    if [ "$any" -eq 0 ]; then
-        if [ "$skipped" -gt 0 ]; then
-            err "所有 profile 都已由 DroidSpaces 集成器管理，未做改动"
-            err "沿用现有配置即可；要换成本脚本管理，按上面提示先清掉那一段"
-        else
-            err "没有可配置的 profile"
-        fi
-        return 1
-    fi
-    [ "$failed" -eq 0 ] || return 1
-    write_wrapper || return 1
-    write_desktop || return 1
-    say "installed Firefox VA-API integration (driver: $DRIVER_DIR)"
-}
-
-uninstall() {
-    if firefox_running; then
-        err "Firefox is running; close Firefox before changing its profiles"
-        return 1
-    fi
-    failed=0
-    # 同 install()：遍历所有 profile 根目录，且不用管道（避免子 shell 吞失败）。
-    homes=$(firefox_homes)
-    while IFS= read -r home; do
-        [ -n "$home" ] || continue
-        profile_list=$(profile_dirs "$home") || continue
-        while IFS= read -r profile; do
-            [ -n "$profile" ] || continue
-            if remove_user_js_block "$profile/user.js"; then
-                say "removed managed prefs: $profile/user.js"
-            else
-                err "failed to rewrite $profile/user.js"
-                failed=1
-            fi
-        done <<INNER
-$profile_list
-INNER
-    done <<OUTER
-$homes
-OUTER
-    # ⚠️ 顺序要紧：先处理 .desktop，再删启动器。
-    # 反过来的话，一旦 .desktop 这步失败（或被中断），桌面图标就指向一个
-    # 已被删除的 Exec，点击报"无法找到程序" —— 实测踩过，比不卸载更糟，
-    # 因为用户失去的是能用的 Firefox 图标。
-    if [ -f "$DESKTOP_BACKUP" ]; then
-        mv "$DESKTOP_BACKUP" "$DESKTOP"
-        say "restored: $DESKTOP"
-    elif [ -f "$DESKTOP" ]; then
-        # 只删我们生成的那个（Exec 指向本脚本的启动器）；用户自己的不动。
-        if grep -qF "Exec=$WRAPPER" "$DESKTOP" 2>/dev/null; then
-            rm -f "$DESKTOP"
-            say "removed: $DESKTOP"
-        else
-            say "保留（不是本脚本生成的）: $DESKTOP"
-        fi
-    fi
-    rm -f "$WRAPPER"
-    [ "$failed" -eq 0 ] || return 1
-    say "uninstalled Firefox VA-API integration"
-}
-
-report() { printf '%-28s %s\n' "$1" "$2"; }
-read_one_line() { [ -r "$1" ] && sed -n '1p' "$1" || printf 'unavailable'; }
-
-verify_devfreq() {
-    found=0
-    for d in /sys/class/devfreq/*; do
-        [ -d "$d" ] || continue
-        name=$(read_one_line "$d/name")
-        case "$name" in
-            *mvs0*|*mvs1*|*mvsc*|*venus*|*Venus*)
-                found=1
-                gov=$(read_one_line "$d/governor")
-                cur=$(read_one_line "$d/cur_freq")
-                report "Venus $name" "governor=$gov cur_freq=$cur"
-                ;;
-            *bus*|*Bus*|*bw*|*BW*)
-                found=1
-                cur=$(read_one_line "$d/cur_freq")
-                report "bus frequency $name" "$cur"
-                ;;
-        esac
-    done
-    [ "$found" -eq 1 ] || report "Venus/bus devfreq" "unavailable under /sys/class/devfreq"
-}
-
-verify() {
-    if select_driver_dir; then
-        report "driver" "OK: $DRIVER_DIR/msm_drm_drv_video.so"
-    else
-        report "driver" "MISSING (set DMD_DRIVER_DIR if needed)"
-    fi
-    [ -x "$WRAPPER" ] && report "launcher" "OK: $WRAPPER" || report "launcher" "MISSING: $WRAPPER"
-    if [ -f "$DESKTOP" ]; then
-        _e=$(sed -n 's/^Exec=//p' "$DESKTOP" | head -1 | awk '{print $1}')
-        if [ -n "$_e" ] && [ ! -x "$_e" ] && ! command -v "$_e" >/dev/null 2>&1; then
-            report "desktop override" "BROKEN: Exec 不存在（$_e）—— 图标会报"无法找到程序"，重新执行安装或手动删除 $DESKTOP"
-        else
-            report "desktop override" "OK: $DESKTOP"
-        fi
-    else
-        report "desktop override" "MISSING: $DESKTOP"
-    fi
-
-    # 找真正在解码的进程。⚠️ 不要用 `pgrep -f 'rdd$'`：RDD 的命令行末尾是
-    # -sandboxReporter 之类的参数，不是 "rdd"，实测匹配不到任何进程并误报
-    # "not running"。可靠判据是"加载了本驱动"或"持有 /dev/video32"。
-    rdds=''
-    if command -v pgrep >/dev/null 2>&1; then
-        for pid in $(pgrep -f '/firefox' 2>/dev/null || :); do
-            [ -r "/proc/$pid/maps" ] || continue
-            if grep -q 'msm_drm_drv_video\.so' "/proc/$pid/maps" 2>/dev/null ||
-               ls -l "/proc/$pid/fd" 2>/dev/null | grep -q 'video32'; then
-                rdds="$rdds $pid"
-            fi
-        done
-    fi
-    if [ -n "$rdds" ]; then
-        for pid in $rdds; do
-            envs=$(tr '\000' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n '/^MOZ_DISABLE_RDD_SANDBOX=/p;/^LIBVA_DRIVER_NAME=/p;/^LIBVA_DRIVERS_PATH=/p')
-            maps=$(grep -c 'msm_drm_drv_video\.so' "/proc/$pid/maps" 2>/dev/null || :)
-            fds=$(ls -l "/proc/$pid/fd" 2>/dev/null | grep -c 'video32' || :)
-            report "decoder $pid environment" "${envs:-missing}"
-            report "decoder $pid driver maps" "$maps"
-            report "decoder $pid /dev/video32 fds" "$fds"
-        done
-    else
-        report "decoder process" "none loaded this driver (play a video first)"
-    fi
-
-    if [ -e /dev/video32 ]; then
-        report "/dev/video32" "present (readable=$([ -r /dev/video32 ] && printf yes || printf no), writable=$([ -w /dev/video32 ] && printf yes || printf no))"
-    else
-        report "/dev/video32" "missing"
-    fi
-    verify_devfreq
-}
-
-case "${1:-}" in
-    '') install ;;
-    --verify) verify ;;
-    --uninstall) uninstall ;;
-    -h|--help) usage ;;
-    *) err "unknown option: $1"; usage >&2; exit 2 ;;
-esac
+try:
+    main()
+except (RuntimeError, OSError, ValueError) as exc:
+    print(f'error: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY

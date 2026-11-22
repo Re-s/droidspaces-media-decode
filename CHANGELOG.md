@@ -1,4 +1,54 @@
-# 更新日志（v0.4.7 · 分支 fix/vaapi-io-fd-race）
+# 更新日志
+
+## v0.5.0-dev
+
+- 2026-11-15：新增独立 `make HEVC10=1` Main10 解码开关，源码默认仍不声明，不同时开启
+  AV1/VP9 Profile2，也不增加 10 位编码。Main10 真正接受 8 位 NV12 和 10 位 P010：
+  首份合法 PPB 锁定匹配的 luma/chroma 位深与目标 surface，后续禁止动态切换；
+  HEVC Main 仍限 8 位。标准 P010 被内核替换为其它格式时明确失败，QP10/Q12A 不冒充
+  线性 P010。受限 SPS-RPS 重写保留 CABAC，缺失的长期参考表、自定义缩放表等仍拒绝。
+- 修复三处显示互操作根因：允许 mpv 的独立 16×16 surface 上传/导出探测而不降低解码
+  context 最小尺寸；把 Display Delay 组合放到首次 OUTPUT REQBUFS 前，使现代 msm_vidc
+  实际计算出解码序输出；为 Chrome 154 的 Main10 RT8 能力查询真实实现 NV12 路径。
+  现代 ABI 通过精确 QUERYCTRL 识别后才自动配置，跳过与新 metadata 撞号的旧控制；
+  环境变量 `DMD_V4L2_DISPLAY_DELAY=0/1` 分别禁用/强制诊断。无 EOS 逐 AU A/B 与自动
+  路径均证实新设置为 16 输入、16 输出、严格 unit1..16，旧位置为 16/14 且重排。
+- 同日 SM8750P / Adreno 830 的 tmp 容器中，640×360 与 1920×1080 真 10 位低位扰动
+  样片各 60 帧，实际 Main10 文件起点和 60 秒处各 60 帧，共 240 帧与软件 `framemd5`
+  逐帧一致，硬件完成计数增长、错误 0；新增 Main10 profile/NV12 60 帧，以及 H.264、
+  HEVC Main 8 位、AV1 8/10 位各 60 帧回归，最终九组共 540 帧像素全部一致、错误 0。
+  生产构建选择 `HEVC10=1 AV1=0`，不连带启用 AV1。P010 R16/GR1616 导出的真实
+  EGL 探针为 6528 样本零差异。
+- 已正式安装到 tmp 的系统驱动（`HEVC10=1 AV1=0`，旧库已备份），Gold 无驱动名称、
+  路径或 DD 环境覆盖即可自动加载；Main10 VLD 与原 H.264/HEVC 编码入口保留。
+  安装后 mpv 原 `vaapi` 的合成 60 帧、真实视频 60 秒处约 6 秒均正常退出，输入/
+  输出均为 P010，错误和两类丢帧均为 0。浏览器使用实际视频从 60 秒起 remux 的
+  约 10.194 秒 `hvc1` 片段：Chrome 154 默认 ANGLE Vulkan 虽硬件完成/输出 276、
+  错误 0 且 ended，P010 图像导入却失败、实际黑屏，不能计为显示通过。临时追加
+  `--use-gl=angle --use-angle=gl` 的对照画面正常，总帧 242、显示丢帧/损坏 0、
+  硬件完成 276、错误 0；未改全局 launcher。Firefox 160 画面正常，总帧 243、显示
+  丢帧 3、硬件完成采样最高 275（不是最终总数）、错误 0。负时间预滚使硬件帧数
+  多于视频总帧数，不能据此判为错配。两者保留既有沙箱；仅为短片段验证，不外推
+  至其它硬件、长片全程、HDR 或 10 位编码。源码 opt-in 仍保留跨平台与 Chrome
+  Vulkan 显示边界。安装 SHA、根因和完整判据见
+  [`doc/hevc-main10-p010-validation.md`](doc/hevc-main10-p010-validation.md)。
+
+- 新增 Firefox 160 GNU/Linux AArch64 的可选 RDD 兼容库：预开 system heap，
+  对固定 KGSL 描述符增加精确 ioctl 规则，保护其关闭/覆盖并拒绝 exec/io_uring。
+  保留 Mozilla 沙箱与 V4L2 直通；附用户启动入口、策略合并/回滚和内核负向测试。
+
+- 新增容器进程内的 V4L2 编码后端，默认 `/dev/video33`，不引入 daemon、
+  MediaCodec、Socket 或 Mesa 桥接依赖；现有 V4L2 解码保留。
+- 按设备实际格式/profile 探测 H.264 Constrained Baseline/Main/High、HEVC Main、
+  VP9 Profile 0 编码入口。支持 NV12、CBR/VBR、分数帧率、GOP 与强制关键帧。
+- 补齐 VA 编码参数、NV12 PutImage 上传、VACodedBufferSegment 与 SyncBuffer。
+  硬件 IO 在对象表锁外执行；输入与输出快照保护并发销毁，超时/坏包/溢出明确失败。
+- 新增前端、V4L2 模拟后端及完整 VA vtable 合约测试，以及真机编码探针。
+  当前范围和实机验证详见 `doc/hardware-encoding.md`。
+- 容器安装复测中修复既有解码错误路径：拒绝不支持的 HEVC 参数集时归还 IO
+  所有权，明确码流缓冲区所有权，避免后续等待超时及重复释放崩溃。
+
+## v0.4.7
 
 > 以下内容属 **v0.4.7**。它建立在 `v0.4.7-rc1` 之上：rc1 之后又修了两处
 > Chrome 侧的问题（`--enable-features=Vulkan` 的文档错误、以及本文件第一节
@@ -949,7 +999,13 @@ md5 与软解逐字节一致**。
 缺的只是三道闸门：`profiles.c` 的声明与映射、`codec_to_fourcc` 的 VP80 一项。
 `DMD_V4L2_CODEC_VP8 = 3` 就是它原本的编号，不是新占号。
 
-### 🔍 10bit（HEVC Main10 / VP9 Profile2）：固件限制，不声明
+### 🔍 v0.4.2 的历史 10bit 探测（HEVC Main10 / VP9 Profile2）
+
+> 以下保留当时的失败现象和判断，不是当前能力结论。当时重配缺少
+> `FLUSH_CAPTURE`，后续已更正 `STREAMOFF` 必然拆会话的归因；因此
+> `INSUFFICIENT` / `SYS_ERROR` 不能证明固件必然不支持 Main10。
+> 2026-11-15 的 SM8750P Main10/P010 已在独立 `HEVC10=1` 构建通过 240 帧
+> 像素验证，见本文件 v0.5.0-dev。VP9 Profile2 仍未开放。
 
 固件 **能识别** Main10（`PORT_SETTINGS` 上报 `bitdepth=1`），也接受
 QP10 / Q12A 格式设置（CAPTURE 缓冲从 3137536 翻到 6270976 字节）。
@@ -964,7 +1020,7 @@ QP10 / Q12A 格式设置（CAPTURE 缓冲从 3137536 翻到 6270976 字节）。
 真正重协商 CAPTURE（STREAMOFF + REQBUFS(0) + 重配）会立刻触发 `SYS_ERROR`，
 印证了 v0.4.1 记录的"STREAMOFF 把 state 打回 `MSM_VIDC_START_DONE` 以下"。
 
-判定为平台限制。探测代码保留在 `DMD_PROBE_10BIT` / `DMD_PROBE_10BIT_RECFG`
+当时判定为平台限制（后续证据已推翻将其作为 Main10 普遍限制的结论）。探测代码保留在 `DMD_PROBE_10BIT` / `DMD_PROBE_10BIT_RECFG`
 （运行时）与 `-DDMD_PROBE_10BIT_PROFILES`（编译期）开关后，发布版不声明 ——
 上层像素路径全是 8bit NV12 假设，声明了会输出错画面。
 

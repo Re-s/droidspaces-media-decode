@@ -1,9 +1,27 @@
 # DroidSpaces Media Decode
 
+Version 0.5.0-dev adds **in-process V4L2 hardware encoding** on `/dev/video33`,
+alongside the existing V4L2 decoder. It does not require an Android daemon,
+MediaCodec, Termux or a custom Mesa build. H.264 Constrained Baseline/Main/High,
+HEVC Main and VP9 Profile 0 encoding entrypoints are gated by the selected
+device's actual formats and profiles. Override the node with
+`DMD_VA_ENCODE_DEVICE`.
+
+Encoding accepts progressive 8-bit NV12, CBR/VBR, I/P pictures, one reference
+and one slice. Use `-bf 0` with FFmpeg; recreate the context to change stream
+parameters. HRD/VBV and peak bitrate are hardware rate-control hints.
+See [the encoding guide](doc/hardware-encoding.md) for setup and validation.
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
+  -i input.mp4 -vf format=nv12,hwupload -an \
+  -c:v h264_vaapi -bf 0 -g 30 -rc_mode CBR -b:v 6M output.mp4
+```
+
 > 🌐 **中文版本：[README.md](README.md)**
 
-Hardware video decoding for Linux containers: a VA-API driver that talks directly
-to Qualcomm's msm_vidc V4L2 interface.
+Hardware video decoding and encoding for Linux containers: a VA-API driver that
+talks directly to Qualcomm's msm_vidc V4L2 interfaces.
 
 ## Overview
 
@@ -20,6 +38,21 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 ```
 
 **Nothing from this project runs on the Android side.**
+
+This example uses `/dev/video32` for H.264 decode, the driver's NV12 scaling
+filter, and `/dev/video33` for H.264 encode:
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg \
+  -init_hw_device vaapi=va:/dev/dri/renderD128 \
+  -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi \
+  -i in.mp4 -vf 'scale_vaapi=format=nv12' \
+  -c:v h264_vaapi -b:v 2M -an out.mp4
+```
+
+The encoder also accepts FFmpeg's default no-bitrate `h264_vaapi` mode. VAAPI
+CQP is mapped to msm_vidc's VBR mode with the QP requested by VAAPI (26 if the
+client supplies none), since this device exposes only CBR/VBR in its V4L2 menu.
 
 > ⚠️ **0.4.0 is an architectural rewrite.** 0.3.x used
 > `container → unix socket → Android-side decode-daemon → MediaCodec`,
@@ -40,9 +73,10 @@ libva → dlopen → msm_drm_drv_video.so     ← this project
 | VP9 Profile 0 | ✅ Working | 50/50 frames, md5 byte-identical to software |
 | VP8 | ✅ Working | 90/90 frames, md5 byte-identical to software (new in 0.4.2) |
 | AV1 Profile 0 | ✅ Working (0.4.7) | Real stream (Bilibili 1080p60) 1800/1800 frames md5 byte-identical to software at 120~190 fps, plus 14 synthetic-structure regressions; in Chrome 480p/720p/1080p/**4K** all balance per session, 3-stream concurrency and MSE (seek / in-band resolution change) pass |
-| AV1 10-bit (P010) | 🚧 Decodes, **not usable in browsers** | Real 10-bit streams are byte-identical to software through the ffmpeg path; Chrome/Firefox request `SEPARATE_LAYERS`, and 10-bit two-layer export is not implemented yet, so browsers silently fall back to software (known limitation) |
+| AV1 10-bit (P010) | 🚧 Verified in an `AV1=1` build | Real 10-bit streams are byte-identical to software through FFmpeg; independent P010 EGL sampling passes, while browser integration still needs separate verification |
 | MPEG-2 | 🚧 Incomplete | Synthesis is byte-identical to the original stream, but firmware raises `SYS_ERROR`; not advertised by default |
-| HEVC Main10 / VP9 Profile2 | ❌ Firmware limit | Firmware recognises 10-bit but keeps reporting `INSUFFICIENT` and emits no frames |
+| HEVC Main10 (NV12/P010) | ✅ Enabled in tested tmp; source builds still require `HEVC10=1` | SM8750P, 2026-11-15: 300 Main10-profile P010/NV12 frames across five cases match software with zero errors; direct mpv VAAPI, Firefox 160 and a Chrome 154 ANGLE OpenGL comparison show correct images on a real ~10-second excerpt; Chrome’s default ANGLE Vulkan decodes successfully but fails P010 image import with a black picture; see the validation record |
+| VP9 Profile2 | 🚧 Not enabled | `HEVC10=1` does not enable it; the historical failed probe does not prove a hardware limitation |
 
 0.4.4 re-ran the four 1080p regressions with unchanged results (H.264 150 frames,
 HEVC 90, VP9 90, VP8 90); the non-1080p suite also passes in full — HEVC at
@@ -56,17 +90,15 @@ the warning under Build and install. **0.4.3 and earlier stall for seconds when
 you seek or the player switches quality** in a browser; fixed in 0.4.4, see
 Browser setup.
 
-AV1 is only advertised when built with `-DDMD_ENABLE_AV1`; see
-[`doc/av1-v4l2-status.md`](doc/av1-v4l2-status.md) for the outstanding defects.
-MPEG-2 requires `-DDMD_ENABLE_MPEG2`; for the 10-bit probe switches see
-v0.4.2 in `CHANGELOG.md`, for the root cause of the non-1080p green screen
-see v0.4.3, and for the seek / quality-switch stall see v0.4.4.
+AV1 uses `AV1=1`; HEVC Main10 has the independent `HEVC10=1` build option.
+Encoding remains limited to 8-bit NV12. MPEG-2 requires `-DDMD_ENABLE_MPEG2`.
+See [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md) for current boundaries
+and [`doc/hevc-main10-p010-validation.md`](doc/hevc-main10-p010-validation.md)
+for Main10/P010 setup and validation.
 
-> One class of HEVC stream cannot be supported: those whose SPS carries
-> `st_ref_pic_set` (`num_short_term_ref_pic_sets > 0`). VA-API exposes only the
-> count, not the contents, so it cannot be reconstructed. In that case
-> `vaEndPicture` returns `UNIMPLEMENTED` so the caller falls back to software.
-> x265 emits 0 by default, so common streams are unaffected.
+HEVC SPS short-term reference sets are supported through a restricted slice
+rewrite using VA DPB/POC information. Missing SPS long-term reference tables,
+custom scaling lists and unknown slice boundaries still fail explicitly.
 
 ## Build and install
 
@@ -76,6 +108,7 @@ Must be built on **aarch64** (x86_64 cross toolchains lack aarch64 glibc):
 # Dependencies: build-essential pkg-config libva-dev libdrm-dev
 cd vaapi-driver
 make            # produces build/msm_drm_drv_video.so
+# Opt-in Main10 without AV1: make HEVC10=1 AV1=0 BUILD=build-hevc10
 make check      # confirms the __vaDriverInit_* entry point is exported
 make tests      # unit tests
 ```
@@ -205,15 +238,23 @@ Full instructions, flags, profile configuration and verification steps are in
   linux-dmabuf; under X11 the decoder is created but sees zero traffic
 - **Chrome needs `--render-node-override=/dev/dri/renderD128`**: Chromium only
   enumerates DRM devices on the PCI bus, skipping ARM platform devices
-- **Firefox needs `MOZ_DISABLE_RDD_SANDBOX=1`** plus the four VA-API prefs in
-  user.js; find the real profile via the Default entry in `installs.ini`
+- **Native Firefox 160 / GNU/Linux AArch64 uses the dedicated
+  [RDD compatibility entrypoint](doc/firefox-sandbox.md)**, retaining Mozilla
+  sandboxes with explicit, limited KGSL rules. Install the matching library,
+  system policy and user launcher; do not set `MOZ_DISABLE_RDD_SANDBOX`.
 - **Never put `Vulkan` into `--enable-features`** (same for the `Vulkan` toggle in
   `chrome://flags`): measured on Snapdragon 8 Elite with Chrome 151, that one flag
   makes Chrome create **zero** VA-API decode contexts — the GPU process still
   probes and builds configs, then `vaTerminate`s without a single
   `CreateContext`, and video silently falls back to software. `--use-angle=vulkan`
-  is a different thing: it only selects ANGLE's Vulkan backend, is required on
-  8 Elite (otherwise text smears and ghosts) and does not affect hardware decode.
+  is a different thing: it only selects ANGLE's Vulkan backend. Early Chrome 151
+  NV12 tests on 8 Elite required it to avoid text smearing and ghosting; this is
+  not a requirement for every video format. Chrome 154 Main10/P010 testing found
+  that ANGLE Vulkan decodes successfully but fails image import with a black
+  image, while ANGLE OpenGL displays correctly. Fully exit Chrome, then append
+  `--use-gl=angle --use-angle=gl` to the existing launcher for Main10 playback.
+  The global launcher was not changed; see the
+  [Main10/P010 validation record](doc/hevc-main10-p010-validation.md).
   nabu / SD855 additionally drops `--use-angle=vulkan` (Vulkan conflicts with
   Wayland there). Vulkan cannot be turned off from the command line — this Chrome build
   has no `--disable-vulkan` switch — so if someone enabled it in

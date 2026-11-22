@@ -21,6 +21,7 @@
 #include <fcntl.h> /* O_CLOEXEC —— drm.h 的 DRM_CLOEXEC 是它的别名 */
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <drm/drm.h>
 #include <drm_fourcc.h>
@@ -67,6 +68,14 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         pthread_mutex_unlock(&drv->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface_id &&
+            (img->handle_acquired || img->mapped)) {
+            pthread_mutex_unlock(&drv->lock);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
+    }
 
     if (!s->exportable || !s->dumb_handle || s->dumb_drm_fd < 0) {
         /* 分配时回落成普通 heap 了（dumb buffer 不可用）。
@@ -85,31 +94,15 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     uint32_t handle = s->dumb_handle;
     int drm_fd = s->dumb_drm_fd;
     size_t total = s->dumb_size;
+    const unsigned char *allocation = s->data;
+    unsigned int format = s->format;
     pthread_mutex_unlock(&drv->lock);
 
-    /* 10bit 的 SEPARATE_LAYERS 暂不支持，宁可不给也别给错。
-     *
-     * 判据是 DRM 侧没有能准确表达 P010 的分离层格式：本机的
-     * libdrm/drm_fourcc.h 里有 R10（10bit 存进 16bit LE），但没有 GR10，
-     * 于是 UV 层只能借用 GR16/GR1616 这类"16bit 原生"格式 —— 那会让
-     * 消费方按 16bit 量程解释采样值，整幅暗 64 倍。
-     *
-     * ⚠️ 0.4.7 实测更正：这里原来写"Chrome 走的正是 COMPOSED"是**错的**。
-     * Chrome 151 在 8bit 与 10bit 上传的都是 flags=0x5
-     * （SEPARATE_LAYERS | READ_ONLY），日志：
-     *     ExportSurfaceHandle: surface 1 是 P010，SEPARATE_LAYERS 未实现（flags=0x5）
-     *     vaapi_wrapper.cc:2756] vaExportSurfaceHandle failed,
-     *         VA error: the requested RT Format is not supported
-     * 后果要说清：**10bit 硬件本身能解**（ffmpeg 路径真 10bit 流输出 p010le
-     * 与软解逐字节一致），只是浏览器拿不到可导入的 10bit 双层描述，
-     * 于是 Chrome 建了会话、`送入 0` 后静默回落软解。
-     * 想在浏览器里开 10bit，得先把 10bit 的分离层格式定下来再放开这里。 */
-    if (ten_bit && !(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
-        dmd_log("ExportSurfaceHandle: surface %u 是 P010，"
-                "SEPARATE_LAYERS 未实现（flags=0x%x）\n",
-                (unsigned)surface_id, flags);
-        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
-    }
+    /* 标准 P010 把有效 10bit 放在每个 16bit LE 字的高位（15:6），
+     * 因而分离层使用 R16 / GR1616；这也是 Mesa 的 P010 平面表示。
+     * 按 16bit UNORM 采样不会暗 64 倍：中性 UV 的存储值是 0x8000，
+     * 不是 0x0200。只有低位对齐的私有格式才需要另一套解释，不能冒充 P010。
+     * 描述符正确不代表消费者的 EGL/GL/Vulkan 路径一定支持这些平面格式。 */
 
     /* 导出 fd 时不持锁：ioctl 是内核调用，且调用方拿到 fd 后由它负责 close。 */
     struct drm_prime_handle prime;
@@ -118,9 +111,36 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     /* DRM_CLOEXEC 就是 O_CLOEXEC 的别名（drm.h），用它避免额外包含 fcntl.h。
      * fd 必须 CLOEXEC：驱动跑在浏览器进程里，泄漏到子进程是安全问题。 */
     prime.flags = DRM_CLOEXEC;
+    if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
+        prime.flags |= DRM_RDWR;
     if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0) {
         dmd_log("ExportSurfaceHandle: PRIME_HANDLE_TO_FD 失败\n");
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    /* The ioctl ran without the driver lock. A concurrent destroy/recreate or
+     * geometry change must not publish a descriptor or write permission for a
+     * different allocation. Keep the lock while reading pixels for diagnostics
+     * too: the previous cached surface pointer could otherwise be unmapped. */
+    pthread_mutex_lock(&drv->lock);
+    s = dmd_find_surface_locked(drv, surface_id);
+    if (!s || !s->exportable || s->dumb_handle != handle ||
+        s->dumb_drm_fd != drm_fd || s->dumb_size != total ||
+        s->data != allocation || s->format != format ||
+        s->stride != stride || s->slice_height != slice_h ||
+        s->width != disp_w || s->height != disp_h) {
+        pthread_mutex_unlock(&drv->lock);
+        close(prime.fd);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    for (int i = 0; i < DMD_MAX_IMAGES; i++) {
+        const struct dmd_image *img = &drv->images[i];
+        if (img->in_use && img->derived_from == surface_id &&
+            (img->handle_acquired || img->mapped)) {
+            pthread_mutex_unlock(&drv->lock);
+            close(prime.fd);
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
     }
 
     VADRMPRIMESurfaceDescriptor *desc =
@@ -139,7 +159,7 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
 
     /* Firefox 与 Chrome 都传 VA_EXPORT_SURFACE_SEPARATE_LAYERS（Chrome 实测
      * flags=0x5），要求 Y / UV 各成一层。
-     * 合并成一层（NV12 单 layer）只有在对方传 COMPOSED_LAYERS 时才合适。 */
+     * 合并成一层（NV12/P010 单 layer）仅在传 COMPOSED_LAYERS 时使用。 */
     if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
         desc->num_layers = 1;
         desc->layers[0].drm_format =
@@ -153,17 +173,16 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[0].pitch[1] = stride;
     } else {
         desc->num_layers = 2;
-        /* Y 平面：8bpp 单通道。走到这里必然是 8bit ——
-         * 上面已把 10bit 的 SEPARATE 请求挡掉。 */
-        desc->layers[0].drm_format = DRM_FORMAT_R8;
+        /* Y 平面：NV12 为 R8；MSB 对齐的 P010 为 R16。 */
+        desc->layers[0].drm_format = ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
         desc->layers[0].num_planes = 1;
         desc->layers[0].object_index[0] = 0;
         desc->layers[0].offset[0] = 0;
         desc->layers[0].pitch[0] = stride;
-        /* UV 平面：交织的两通道，宽度减半（每个采样 2 字节，
-         * 所以 pitch 与 Y 相同）。offset 用 **slice_height** 不是显示高 ——
-         * 与 VAImage.offsets[1] 同一个坑。 */
-        desc->layers[1].drm_format = DRM_FORMAT_GR88;
+        /* UV 平面：交织的 Cb/Cr，逻辑宽高各减半，每个采样占 2/4 字节，
+         * 字节 pitch 与 Y 相同。GR1616 的 LE 低字是 R（Cb），高字是 G（Cr）。
+         * offset 用存储 slice_height 而非显示高，保留 Y 平面对齐填充。 */
+        desc->layers[1].drm_format = ten_bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
         desc->layers[1].num_planes = 1;
         desc->layers[1].object_index[0] = 0;
         desc->layers[1].offset[0] = (uint32_t)stride * slice_h;
@@ -235,11 +254,11 @@ VAStatus dmd_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     /* 标记这个 surface 走的是"导出 dmabuf 自己采样"的契约。
      * EndPicture 据此决定是否必须在返回前把像素同步写进 surface ——
      * 只有这类消费者（Chrome）需要，ffmpeg/Firefox 有 map 兜底。
-     * 重新取指针：上面为了做 ioctl 放过锁。 */
-    pthread_mutex_lock(&drv->lock);
-    s = dmd_find_surface_locked(drv, surface_id);
-    if (s)
-        s->exported = 1;
+     * WRITE export is a separate producer contract (OBS texture input). It
+     * does not change IDLE/PENDING/READY or make undecoded pixels readable. */
+    s->exported = 1;
+    if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
+        s->external_write_exported = 1;
     pthread_mutex_unlock(&drv->lock);
 
     return VA_STATUS_SUCCESS;

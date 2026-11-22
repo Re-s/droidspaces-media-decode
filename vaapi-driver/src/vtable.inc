@@ -61,4 +61,6 @@
     vtable->vaSyncSurface2 = dmd_SyncSurface2;
     vtable->vaSyncBuffer = dmd_SyncBuffer;
     vtable->vaCopy = dmd_Copy;
+#if VA_CHECK_VERSION(1, 22, 0)
     vtable->vaMapBuffer2 = dmd_MapBuffer2;
+#endif

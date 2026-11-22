@@ -151,6 +151,10 @@ struct dmd_frame {
     uint32_t width;
     uint32_t height;
 
+    /* Internal V4L2 metadata for telemetry. Existing pixel/VA return behavior
+     * is unchanged, but a known bad CAPTURE is not a successful output. */
+    int hardware_error;
+
     /* 该帧对应的**输入单元序号**（1 起），0 = daemon 未提供。
      *
      * 由 daemon 在 queueInputBuffer 时写入 presentationTimeUs，
@@ -173,6 +177,10 @@ struct dmd_frame {
 
 /* ------------------------------------------------------------ 会话 */
 struct dmd_session;
+struct dmd_video_stats;
+/* Retains telemetry independently of the VA context's/deferred IO lifetime. */
+void dmd_session_set_video_stats(struct dmd_session *session,
+                                 struct dmd_video_stats *stats);
 
 /* 会话建立之后再告知位深：vaCreateContext 阶段还拿不到位深（AV1 的
  * bit_depth_idx 在首个 PPB 里），而 CAPTURE 协商要等首个单元送出后的

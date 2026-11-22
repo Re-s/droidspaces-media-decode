@@ -200,9 +200,13 @@ struct dmd_v4l2_buf {
     void    *map;             /* mmap 到用户空间的地址，NULL 表示未映射 */
     size_t   length;
     int      queued;          /* 1 = 已在驱动队列里 */
+    int      hardware_error;  /* Last nonempty CAPTURE had V4L2_BUF_FLAG_ERROR. */
 };
 
+struct dmd_video_stats;
 struct dmd_v4l2_dec {
+    /* Borrowed from the owning session, which retains it across deferred IO. */
+    struct dmd_video_stats *video_stats;
     int      fd;                              /* /dev/videoN */
     int      heap_fd;                         /* dma_heap 或 /dev/ion 的 fd */
     int      heap_kind;                       /* 见 v4l2_backend.c 的 HEAP_* */

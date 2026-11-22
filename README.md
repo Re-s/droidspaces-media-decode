@@ -2,11 +2,12 @@
 
 > 🌐 **English version: [README.en.md](README.en.md)**
 
-给 Linux 容器提供视频硬件解码：一个 VA-API 驱动，直连高通 msm_vidc 的 V4L2 接口。
+给 Linux 容器提供视频硬件解码与编码：一个 VA-API 驱动，直连高通 msm_vidc 的 V4L2 接口。
 
 ## 项目简介
 
-容器内的应用（ffmpeg、Firefox、Chrome）通过标准 VA-API 用上硬件解码，**无需任何改动**。
+容器内的应用（ffmpeg、Firefox、Chrome）通过标准 VA-API 调用驱动；浏览器还需
+对应的启动环境与沙箱设备兼容配置。
 驱动被 libva `dlopen` 进消费者进程，直接操作 `/dev/video32`。
 
 ```
@@ -37,19 +38,50 @@ libva → dlopen → msm_drm_drv_video.so     ← 本项目
 | VP9 Profile 0 | ✅ 可用 | 50/50 帧，md5 与软解逐字节一致 |
 | VP8 | ✅ 可用 | 90/90 帧，md5 与软解逐字节一致（0.4.2 新增）|
 | AV1 Profile 0 | ✅ 可用（0.4.7） | 真流（B 站 1080p60）1800/1800 帧 md5 与软解逐字节一致，120~190fps；另 14 组合成结构回归全过。浏览器侧 480p/720p/1080p/**4K** 均在 Chrome 里逐帧平衡，三路并发与 MSE（seek / 带内换分辨率）已通过 |
-| AV1 10bit（P010） | 🚧 解码可用，**浏览器不可用** | ffmpeg 路径真 10bit 流输出 p010le 与软解逐字节一致；Chrome/Firefox 传的是 `SEPARATE_LAYERS`，驱动尚未实现 10bit 的双层导出，浏览器会静默回落软解（已知限制） |
+| AV1 10bit（P010） | 🚧 `AV1=1` 独立构建已验证 | ffmpeg 路径真 10bit 流与软解逐字节一致；P010 独立 EGL 数值采样已通过，浏览器实际消费链路另需验证 |
 | MPEG-2 | 🚧 未完成 | 合成与原始流逐字节一致，但固件 `SYS_ERROR`，默认不声明 |
-| HEVC Main10 / VP9 Profile2 | ❌ 固件限制 | 固件识别 10bit 但持续报 `INSUFFICIENT`，不出帧 |
+| HEVC Main10（NV12/P010） | ✅ 本机 tmp 已启用；源码仍需 `HEVC10=1` | 2026-11-15，SM8750P 上 Main10 profile 的 P010/NV12 五组共 300 帧像素一致、错误 0；mpv 直接 VAAPI、Firefox 160 与 Chrome 154 的 ANGLE OpenGL 对照均有正常画面；Chrome 默认 ANGLE Vulkan 虽硬解成功，P010 图像导入仍黑屏，详见真实约 10 秒片段验证记录 |
+| VP9 Profile2 | 🚧 未开放 | 不受 `HEVC10=1` 开关影响；早期探测失败不能证明硬件必然不支持 |
 
 判据一律是与软解 **md5 逐字节一致**，而不是"能解出来"。除 1080p 外，
 HEVC 的 720p、854x480（宽非 128 倍数）、640x360、720x1280（竖屏）与一条
 1080p→720p→480p 切换流均已逐字节验证。
 
-AV1 需要 `-DDMD_ENABLE_AV1` 才会声明，MPEG-2 需要 `-DDMD_ENABLE_MPEG2`。
-这两者的现状、10bit 的固件限制、以及 HEVC 带 `st_ref_pic_set` 的码流为什么
-只能回落软解，见 [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md)。
+AV1 使用 `AV1=1`，HEVC Main10 使用独立的 `HEVC10=1` 构建开关；编码仍限 8 位 NV12。
+HEVC 的 SPS 短期参考集通过受限的切片重写支持，缺失的长期参考表、自定义缩放表等仍拒绝。
+能力边界见 [`doc/upgrade-and-pitfalls.md`](doc/upgrade-and-pitfalls.md)，Main10 的构建、
+P010 校验和实测范围见 [`doc/hevc-main10-p010-validation.md`](doc/hevc-main10-p010-validation.md)。
 
 ## 编译与安装
+
+Firefox 160 在 GNU/Linux AArch64 上可使用可选兼容库，保留 Mozilla 沙箱并为
+RDD 增加限定 KGSL ioctl 规则。它只在 RDD 预开所需设备，保护缓存 fd，明确拒绝
+exec 与 io_uring；不会启动 daemon。编译 `make -C vaapi-driver firefox-compat`，
+安装与 Gold 用户桌面入口见 [`doc/firefox-sandbox.md`](doc/firefox-sandbox.md)。
+仅 `about:support` 显示支持不能证明硬解，须同时核对实际硬件输出帧数。
+
+### 新增：V4L2 硬编码（0.5.0-dev）
+
+编码也在容器进程内直接调用 V4L2，默认节点 `/dev/video33`，**无需 daemon、
+Termux、MediaCodec 或定制 Mesa**。H.264 Constrained Baseline / Main / High、
+HEVC Main、VP9 Profile 0 的 `VAEntrypointEncSlice` 按设备实际格式和 profile
+探测结果声明；没有枚举到的编码器不会出现。编码节点可用
+`DMD_VA_ENCODE_DEVICE` 覆盖。
+
+当前支持 8bit NV12、CBR/VBR、I/P 帧、单参考与单 slice；使用 FFmpeg 时指定
+`-bf 0`。码率控制由硬件执行，HRD/VBV 是建议，不保证精确峰值或自定义 QP。
+参数变更需要重建编码 context。完整用法、设备权限与验证范围见
+[`doc/hardware-encoding.md`](doc/hardware-encoding.md)。
+
+```sh
+LIBVA_DRIVER_NAME=msm_drm ffmpeg -vaapi_device /dev/dri/renderD128 \
+  -i input.mp4 -vf format=nv12,hwupload -an \
+  -c:v h264_vaapi -bf 0 -g 30 -rc_mode CBR -b:v 6M output.mp4
+```
+
+安装方法与解码相同，仍只有一个 `.so`。
+
+### 构建
 
 必须在 **aarch64** 上编译（x86_64 交叉工具链缺 aarch64 glibc）：
 
@@ -57,6 +89,7 @@ AV1 需要 `-DDMD_ENABLE_AV1` 才会声明，MPEG-2 需要 `-DDMD_ENABLE_MPEG2`�
 # 依赖：build-essential pkg-config libva-dev libdrm-dev
 cd vaapi-driver
 make AV1=1      # 产物 build/msm_drm_drv_video.so（含 AV1；不带 AV1=1 则不声明）
+# Main10 独立构建（不额外开启 AV1）：make HEVC10=1 AV1=0 BUILD=build-hevc10
 make check      # 确认导出了 __vaDriverInit_* 入口
 make tests      # 单元测试
 ```
@@ -145,11 +178,17 @@ grep -c render-node-override "$D"   # 每个 Exec 行 1 次，不随执行次数
 看起来就像"配了没生效"。
 
 `--use-angle=vulkan` 是另一回事：它只把 ANGLE（WebGL / GL 呈现）切到 Vulkan 后端，
-骁龙 8 Elite 上少了它文字糊成一团并重影，而实测**不影响**硬解，所以保留。
+早期骁龙 8 Elite / Chrome 151 的 NV12 测试中少了它文字糊成一团并重影，因此当时保留。
 nabu（SD855）这一代连它也要去掉（wayland 与 Vulkan 冲突）。
 
+这不是所有格式通用的要求：2026-11-15 的 Chrome 154 / Main10 P010 实测中，
+ANGLE Vulkan 能完成硬解，但图像导入黑屏；ANGLE OpenGL 的画面正常。
+播放 Main10 时，正常退出全部 Chrome 后，通过现入口追加
+`--use-gl=angle --use-angle=gl`。本次未修改全局启动后端，详见
+[`Main10/P010 验证记录`](doc/hevc-main10-p010-validation.md)。
+
 同理，`chrome://flags` 里那个 "Vulkan" 开关（等价于 `--enable-features=Vulkan`）
-也要保持 `Disabled`；`--use-angle=vulkan` 才是显示正常需要的那一项。
+也要保持 `Disabled`；ANGLE 后端需按上述设备、浏览器版本和视频格式选择。
 逐条对照实测见 [`doc/browser-vaapi-guide.md`](doc/browser-vaapi-guide.md) 第 2.5 节。
 重启浏览器后生效。
 
@@ -158,7 +197,11 @@ profile。B 站等站点默认给 AV1 时 Chrome 会静默走软解（页面流�
 驱动 0 配对帧），看起来像"配了没生效"。播放器里选 AVC / HEVC。
 别的机型以编码表和 `vainfo` 为准，不要把这条当成驱动通用限制。
 
-**Firefox** —— 两步都要做，只写 `user.js` 不会生效。
+**Firefox** —— 当前原生 Firefox 160 / GNU/Linux AArch64 使用
+[`RDD 兼容入口`](doc/firefox-sandbox.md)，保留 Mozilla 沙箱并增加限定 KGSL
+访问规则。按该文档安装配套兼容库、系统策略和用户启动器，不设置
+`MOZ_DISABLE_RDD_SANDBOX`。下面两步保留为旧版手工配置的历史记录，
+不适用于当前兼容入口。
 
 第一步，给 `.desktop` 注入环境变量：
 
@@ -171,7 +214,7 @@ grep -q MOZ_DISABLE_RDD_SANDBOX "$D" || {
 grep -c MOZ_DISABLE_RDD_SANDBOX "$D"   # 每个 Exec 行 1 次
 ```
 
-`MOZ_DISABLE_RDD_SANDBOX=1` 是必需的：Firefox 把解码放在 RDD 进程里，
+旧版手工配置曾使用 `MOZ_DISABLE_RDD_SANDBOX=1`：Firefox 把解码放在 RDD 进程里，
 它的沙箱会挡掉 `/dev/video32`，日志里表现为
 `Sandbox: Couldn't open video device`。这一项和 `user.js` 里的
 pref 是两回事 —— pref 只开 Firefox 自己的硬解开关，不解决设备访问。

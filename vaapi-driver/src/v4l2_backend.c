@@ -22,6 +22,8 @@
 #endif
 
 #include "v4l2_backend.h"
+#include "sandbox_heap.h"
+#include "video_stats.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -210,6 +212,13 @@ static uint32_t ion_system_mask(int fd)
 static int heap_open(struct dmd_v4l2_dec *d)
 {
     if (d->heap_fd >= 0) return 0;
+
+    d->heap_fd = dmd_sandbox_system_heap_dup();
+    if (d->heap_fd >= 0) {
+        d->heap_kind = HEAP_DMA_HEAP;
+        V4L2_LOG("缓冲来源: preopened /dev/dma_heap/system");
+        return 0;
+    }
 
     d->heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
     if (d->heap_fd >= 0) {
@@ -412,6 +421,175 @@ uint32_t dmd_v4l2_pick_fourcc(int codec_id)
 static int setup_capture(struct dmd_v4l2_dec *d);
 static int cap_reconfig(struct dmd_v4l2_dec *d);
 
+/* New Qualcomm ABI reuses legacy numeric CIDs for unrelated metadata.
+ * A name/type match identifies the ABI even if that control is disabled:
+ * never send old EXTRADATA/SECONDARY values to known modern metadata CIDs. */
+static int query_named_control(int fd, uint32_t id, const char *name,
+                               uint32_t type, struct v4l2_queryctrl *query)
+{
+    memset(query, 0, sizeof(*query));
+    query->id = id;
+    return ioctl(fd, VIDIOC_QUERYCTRL, query) == 0 && query->id == id &&
+           query->type == type && memchr(query->name, 0, sizeof(query->name)) &&
+           !strcmp((const char *)query->name, name);
+}
+
+static int control_can_write_value(const struct v4l2_queryctrl *query, int value)
+{
+    const uint32_t blocked = V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY |
+                             V4L2_CTRL_FLAG_INACTIVE | V4L2_CTRL_FLAG_GRABBED;
+    return !(query->flags & blocked) && query->minimum <= value &&
+           query->maximum >= value && query->step > 0 &&
+           ((int64_t)value - query->minimum) % query->step == 0;
+}
+
+/* Return -1 only for the legacy required SECONDARY control failure. Optional
+ * delay requests retain their diagnostic, nonfatal failure behavior; 0 alone
+ * must not be used as evidence that the hardware outputs in decode order. */
+static int configure_decode_controls(int fd)
+{
+    struct v4l2_queryctrl latency;
+    const int modern = query_named_control(fd, 0x00992003, "LOWLATENCY_MODE",
+                                           V4L2_CTRL_TYPE_INTEGER, &latency);
+    if (modern) {
+        /* 0x992003 is LOWLATENCY, not legacy OUTPUT_ORDER. The other legacy
+         * IDs are BLUR_RESOLUTION / output-fence / OPB-MISR metadata here. */
+        V4L2_LOG("已识别现代 msm_vidc 控制 ABI，跳过旧 EXTRADATA/SECONDARY 控制");
+        if (control_can_write_value(&latency, 1)) {
+            struct v4l2_control ctl = { .id = 0x00992003, .value = 1 };
+            if (ioctl(fd, VIDIOC_S_CTRL, &ctl) < 0)
+                V4L2_LOG("S_CTRL LOWLATENCY_MODE(0x%x)=1 失败: %s",
+                         ctl.id, strerror(errno));
+        }
+    } else {
+        /* msm_vidc 私有控制项。CID 数值来自厂商 uapi 头
+         * include/uapi/linux/v4l2-controls.h:684
+         *   V4L2_CID_MPEG_MSM_VIDC_BASE = V4L2_CTRL_CLASS_MPEG|0x2000 = 0x00992000
+         * 与 OMX HAL 活体 strace（pid omx@1.0-service）逐项对照得出： */
+        struct v4l2_control ctl;
+        static const struct { uint32_t id; int32_t val; const char *nm; } inits[] = {
+            /* OUTPUT_ORDER: 0=显示序（重排后输出）1=解码序（不等重排）。
+             *
+             * ⚠️ 必须用解码序(1)，否则浏览器无法硬解。
+             *
+             * research/slowfeed.c 直接打 V4L2 实测首帧滞后（1080p H.264）：
+             *     OUTPUT_ORDER=0（显示序）→ 送满 7 个单元，第 8 个才出首帧
+             *     OUTPUT_ORDER=1（解码序）→ 送 4 个单元，第 5 个就出首帧
+             * 差的 3 帧就是显示序重排的代价。
+             *
+             * 为什么这决定浏览器能否工作：Firefox 稳态只保持 5 帧在飞
+             * （实测 pending 恒为 5，占 99.9%），而显示序滞后 7 > 5，
+             * 于是它送完第 5 帧就等，解码器却还欠 2 帧料 —— 双方互等。
+             * SyncSurface 只能超时放行、谎报就绪，Firefox 采到未填充的缓冲：
+             * 实测 847 解码 / 792 丢弃 = 93.5%，画面几乎不动。
+             * 这是结构性矛盾，调 DMD_PIPELINE_DEPTH 无解 —— 12/4/7 三个值都试过，
+             * 分别是每帧放行(93.5% 丢帧)、每帧阻塞 5s 超时(fps 0.4、会话反复重建)、
+             * 仍然每帧放行(91.8% 丢帧)。
+             *
+             * 出帧顺序变成解码序不影响帧内容的正确性：配对按 v4l2_buffer.timestamp
+             * 携带的 unit_seq 精确匹配（见 decode.c 的 dmd_pending_take_locked），
+             * 与出帧顺序完全解耦 —— ffmpeg 五码流逐字节回归 5/5 即为此提供证据，
+             * 专门造的 B 帧顺序检验流（research/perf/order.mp4，220 个 B 帧、
+             * 匀速横移方块）在 ffmpeg 路径下 300 帧位置零回跳、与软解逐帧一致。
+             *
+             * ⚠️ 但浏览器路径有代价，取舍如下（Firefox 140，order_long.mp4，20s）：
+             *     ORDER=0 显示序: mediaTime 回退 0 处，但丢帧 99.79%
+             *                     （950 解码/948 丢弃，20s 任务跑了 62s，不可用）
+             *     ORDER=1 解码序: mediaTime 回退 2/465 = 0.43%，丢帧 4.17%
+             * 回退量恰为一帧（33ms），是 Firefox 自己上屏调度偶尔换位，
+             * 不是配对错误 —— Sync 只在请求的那张 surface 就绪时才返回。
+             * 用可察觉但极少的顺序抖动换回可用的播放，这是当前硬件下的最优解：
+             * 显示序滞后 7 > Firefox 在飞 5，互等无法靠软件消除（LOWLATENCY
+             * 开关对显示序滞后无影响，slowfeed 实测两种设置都是 7）。 */
+            { 0x00992003, 1,  "OUTPUT_ORDER"    },  /* base+3，1=解码序 */
+            { 0x00992011, 2,  "EXTRADATA"       },  /* base+17，MENU，HAL 连设四种 */
+            { 0x00992011, 25, "EXTRADATA"       },
+            { 0x00992011, 31, "EXTRADATA"       },
+            { 0x00992011, 29, "EXTRADATA"       },
+            { 0x00992038, 1,  "LOWLATENCY_MODE" },  /* base+56 */
+        };
+        for (unsigned i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+            memset(&ctl, 0, sizeof(ctl));
+            ctl.id = inits[i].id;
+            ctl.value = inits[i].val;
+            if (ioctl(fd, VIDIOC_S_CTRL, &ctl) < 0)
+                V4L2_LOG("S_CTRL %s(0x%x)=%d 失败: %s", inits[i].nm,
+                         inits[i].id, inits[i].val, strerror(errno));
+        }
+
+        /* 决定性一项：必须启用 SECONDARY 分流模式。
+         *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base+22 = 0x00992016
+         *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_SECONDARY = 1
+         * PRIMARY（默认）下 CAPTURE 直接充当 DPB，start_streaming() 恒返回
+         * -EINVAL。SECONDARY 启用 HAL_BUFFER_OUTPUT2，DPB 与 OPB 分离
+         * （msm_vidc.c:1214-1222 会额外调 msm_comm_set_output_buffers()
+         * 让驱动自行分配 DPB），校验路径不同，两侧 STREAMON 才能通过。
+         * 单一变量对照实测：SECONDARY → OK；PRIMARY → EINVAL。
+         * 附带好处：CAPTURE 可用线性 NV12，不必走 UBWC 的 Q128。 */
+        memset(&ctl, 0, sizeof(ctl));
+        ctl.id = 0x00992016;
+        ctl.value = 1;
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctl) < 0) {
+            V4L2_LOG("致命: STREAM_OUTPUT_MODE=SECONDARY 失败: %s", strerror(errno));
+            return -1;
+        }
+    }
+
+    const char *delay_env = getenv("DMD_V4L2_DISPLAY_DELAY");
+    int request_delay = 0;
+    if (delay_env) {
+        if (!strcmp(delay_env, "0")) {
+            V4L2_LOG("DMD_V4L2_DISPLAY_DELAY=0：禁用 DISPLAY_DELAY 请求");
+        } else if (!strcmp(delay_env, "1")) {
+            request_delay = 1; /* Explicit diagnostic request on any ABI. */
+        } else {
+            V4L2_LOG("DMD_V4L2_DISPLAY_DELAY 只接受 0 或 1，本次不设置 DISPLAY_DELAY");
+        }
+    } else if (modern) {
+        struct v4l2_queryctrl enable, delay;
+        request_delay = control_can_write_value(&latency, 1) &&
+            query_named_control(fd,
+                V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE,
+                "Display Delay Enable", V4L2_CTRL_TYPE_BOOLEAN, &enable) &&
+            control_can_write_value(&enable, 1) &&
+            query_named_control(fd, V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,
+                "Display Delay", V4L2_CTRL_TYPE_INTEGER, &delay) &&
+            control_can_write_value(&delay, 0);
+        if (!request_delay)
+            V4L2_LOG("DISPLAY_DELAY 控件未确认可写，跳过自动设置");
+    }
+
+    /* AHMETBAYIR identified the standard display-delay controls for decode
+     * order on SM8750 and the legacy control-ID collision in upstream #6:
+     * https://github.com/Re-s/droidspaces-media-decode/issues/6
+     *
+     * Must run after S_FMT(OUTPUT), BEFORE the first REQBUFS(OUTPUT).
+     * Qualcomm queue_setup adjusts DISPLAY_DELAY_ENABLE=1 + DELAY=0 into
+     * internal OUTPUT_ORDER=1; STREAMON sends the derived value, not a fresh
+     * calculation. Setting these after REQBUFS silently leaves output order 0.
+     * Official source, commit a2883c1e49efae9c7cefe038eb1a7a9864a5e6eb:
+     * driver/vidc/src/msm_vidc_vb2.c msm_vb2_adjust_properties()/queue_setup(),
+     * driver/platform/common/src/msm_vidc_platform.c msm_vidc_adjust_output_order().
+     * nabu/4.14 rejects these controls; only positively identified modern
+     * controls are automatic. Explicit env=1 preserves legacy diagnostics. */
+    if (request_delay) {
+        struct v4l2_control ctl = {
+            .id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE, .value = 1
+        };
+        if (ioctl(fd, VIDIOC_S_CTRL, &ctl) == 0) {
+            ctl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
+            ctl.value = 0;
+            if (ioctl(fd, VIDIOC_S_CTRL, &ctl) == 0)
+                V4L2_LOG("已请求 DISPLAY_DELAY=0（解码序输出）");
+            else
+                V4L2_LOG("DISPLAY_DELAY 设置失败，沿用默认重排输出: %s", strerror(errno));
+        } else {
+            V4L2_LOG("DISPLAY_DELAY_ENABLE 设置失败，沿用默认重排输出: %s", strerror(errno));
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------- open */
 
 int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
@@ -493,77 +671,7 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     sp.parm.output.timeperframe.denominator = 30;
     ioctl(d->fd, VIDIOC_S_PARM, &sp);
 
-    /* msm_vidc 私有控制项。CID 数值来自厂商 uapi 头
-     * include/uapi/linux/v4l2-controls.h:684
-     *   V4L2_CID_MPEG_MSM_VIDC_BASE = V4L2_CTRL_CLASS_MPEG|0x2000 = 0x00992000
-     * 与 OMX HAL 活体 strace（pid omx@1.0-service）逐项对照得出： */
-    struct v4l2_control ctl;
-    static const struct { uint32_t id; int32_t val; const char *nm; } inits[] = {
-        /* OUTPUT_ORDER: 0=显示序（重排后输出）1=解码序（不等重排）。
-         *
-         * ⚠️ 必须用解码序(1)，否则浏览器无法硬解。
-         *
-         * research/slowfeed.c 直接打 V4L2 实测首帧滞后（1080p H.264）：
-         *     OUTPUT_ORDER=0（显示序）→ 送满 7 个单元，第 8 个才出首帧
-         *     OUTPUT_ORDER=1（解码序）→ 送 4 个单元，第 5 个就出首帧
-         * 差的 3 帧就是显示序重排的代价。
-         *
-         * 为什么这决定浏览器能否工作：Firefox 稳态只保持 5 帧在飞
-         * （实测 pending 恒为 5，占 99.9%），而显示序滞后 7 > 5，
-         * 于是它送完第 5 帧就等，解码器却还欠 2 帧料 —— 双方互等。
-         * SyncSurface 只能超时放行、谎报就绪，Firefox 采到未填充的缓冲：
-         * 实测 847 解码 / 792 丢弃 = 93.5%，画面几乎不动。
-         * 这是结构性矛盾，调 DMD_PIPELINE_DEPTH 无解 —— 12/4/7 三个值都试过，
-         * 分别是每帧放行(93.5% 丢帧)、每帧阻塞 5s 超时(fps 0.4、会话反复重建)、
-         * 仍然每帧放行(91.8% 丢帧)。
-         *
-         * 出帧顺序变成解码序不影响帧内容的正确性：配对按 v4l2_buffer.timestamp
-         * 携带的 unit_seq 精确匹配（见 decode.c 的 dmd_pending_take_locked），
-         * 与出帧顺序完全解耦 —— ffmpeg 五码流逐字节回归 5/5 即为此提供证据，
-         * 专门造的 B 帧顺序检验流（research/perf/order.mp4，220 个 B 帧、
-         * 匀速横移方块）在 ffmpeg 路径下 300 帧位置零回跳、与软解逐帧一致。
-         *
-         * ⚠️ 但浏览器路径有代价，取舍如下（Firefox 140，order_long.mp4，20s）：
-         *     ORDER=0 显示序: mediaTime 回退 0 处，但丢帧 99.79%
-         *                     （950 解码/948 丢弃，20s 任务跑了 62s，不可用）
-         *     ORDER=1 解码序: mediaTime 回退 2/465 = 0.43%，丢帧 4.17%
-         * 回退量恰为一帧（33ms），是 Firefox 自己上屏调度偶尔换位，
-         * 不是配对错误 —— Sync 只在请求的那张 surface 就绪时才返回。
-         * 用可察觉但极少的顺序抖动换回可用的播放，这是当前硬件下的最优解：
-         * 显示序滞后 7 > Firefox 在飞 5，互等无法靠软件消除（LOWLATENCY
-         * 开关对显示序滞后无影响，slowfeed 实测两种设置都是 7）。 */
-        { 0x00992003, 1,  "OUTPUT_ORDER"    },  /* base+3，1=解码序 */
-        { 0x00992011, 2,  "EXTRADATA"       },  /* base+17，MENU，HAL 连设四种 */
-        { 0x00992011, 25, "EXTRADATA"       },
-        { 0x00992011, 31, "EXTRADATA"       },
-        { 0x00992011, 29, "EXTRADATA"       },
-        { 0x00992038, 1,  "LOWLATENCY_MODE" },  /* base+56 */
-    };
-    for (unsigned i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
-        memset(&ctl, 0, sizeof(ctl));
-        ctl.id = inits[i].id;
-        ctl.value = inits[i].val;
-        if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) < 0)
-            V4L2_LOG("S_CTRL %s(0x%x)=%d 失败: %s", inits[i].nm,
-                     inits[i].id, inits[i].val, strerror(errno));
-    }
-
-    /* 决定性一项：必须启用 SECONDARY 分流模式。
-     *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_MODE = base+22 = 0x00992016
-     *   V4L2_CID_MPEG_VIDC_VIDEO_STREAM_OUTPUT_SECONDARY = 1
-     * PRIMARY（默认）下 CAPTURE 直接充当 DPB，start_streaming() 恒返回
-     * -EINVAL。SECONDARY 启用 HAL_BUFFER_OUTPUT2，DPB 与 OPB 分离
-     * （msm_vidc.c:1214-1222 会额外调 msm_comm_set_output_buffers()
-     * 让驱动自行分配 DPB），校验路径不同，两侧 STREAMON 才能通过。
-     * 单一变量对照实测：SECONDARY → OK；PRIMARY → EINVAL。
-     * 附带好处：CAPTURE 可用线性 NV12，不必走 UBWC 的 Q128。 */
-    memset(&ctl, 0, sizeof(ctl));
-    ctl.id = 0x00992016;
-    ctl.value = 1;
-    if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) < 0) {
-        V4L2_LOG("致命: STREAM_OUTPUT_MODE=SECONDARY 失败: %s", strerror(errno));
-        goto fail;
-    }
+    if (configure_decode_controls(d->fd) < 0) goto fail;
 
     /* 订阅事件。关键：msm_vidc 用的是**厂商私有事件**，
      * 从不发标准 V4L2_EVENT_SOURCE_CHANGE。
@@ -603,41 +711,6 @@ int dmd_v4l2_open(struct dmd_v4l2_dec *d, int codec_id, int w, int h)
     if (bufs_alloc(d, d->out, d->n_out, d->in_size, 1) < 0) goto fail;
 
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    /* AV1 金字塔 B 结构下，解码器默认只对 show_frame=1 的帧吐 CAPTURE
-     * 缓冲（正确行为），但 ffmpeg 的 VA-API 后端会对部分 show_frame=0 的
-     * surface 也读像素。V4L2 标准控制 DISPLAY_DELAY(_ENABLE) 可要求解码器
-     * 不做重排、逐帧立即输出，从而让每个 surface 都拿到内容。
-     *
-     * ⚠️ 更正（第 81 轮本机实测）：此前这里写"实测这两项 S_CTRL 均返回 OK"。
-     * 在 nabu 的 msm_vidc 上实测 **S_CTRL 返回 EINVAL**，两项都设不进去。
-     *
-     * 当时那个"返回 OK"的结论很可能来自 G_CTRL —— 而这个驱动的 G_CTRL
-     * **完全不校验 id**：拿 0xDEADBEEF 去读也返回成功、值为 0。
-     * 所以 G_CTRL 成功不能作为"控制项存在"的证据，只有 S_CTRL 能。
-     * 配套证据：VIDIOC_QUERYCTRL 遍历这个节点得到 0 项
-     * （见 tools/probe_v4l2_ctrls.c）。
-     *
-     * 结论：DISPLAY_DELAY 这条路在 msm_vidc 上不存在。保留代码是因为它
-     * 在别的 V4L2 stateful 解码器上是标准做法，且失败不致命；
-     * 但**不要**再把它当成 AV1 缺陷的可行解法。
-     * 用 DMD_V4L2_DISPLAY_DELAY=1 开启（在 msm_vidc 上只会打印设置失败）。 */
-    if (getenv("DMD_V4L2_DISPLAY_DELAY")) {
-        struct v4l2_control ctl;
-        memset(&ctl, 0, sizeof(ctl));
-        ctl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
-        ctl.value = 1;
-        if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) == 0) {
-            memset(&ctl, 0, sizeof(ctl));
-            ctl.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
-            ctl.value = 0;
-            if (ioctl(d->fd, VIDIOC_S_CTRL, &ctl) == 0)
-                V4L2_LOG("已启用 DISPLAY_DELAY=0（逐帧输出，不重排）");
-            else
-                V4L2_LOG("DISPLAY_DELAY 设置失败，沿用默认重排输出");
-        } else {
-            V4L2_LOG("DISPLAY_DELAY_ENABLE 设置失败，沿用默认重排输出");
-        }
-    }
 
 /* 配 CAPTURE 的时机由缓冲内存模式决定（顺序仍照厂商 OMX 组件，见
      * msm_vidc.c:1294-1302，第一个 STREAMON 因对侧未 streaming 而跳过
@@ -671,8 +744,8 @@ fail:
 
 /*
  * 收到 SOURCE_CHANGE 后配置 CAPTURE 侧。
- * 关键：CAPTURE 默认是 QCOM 压缩格式 Q08C，必须显式改成 NV12，
- * 否则拿到的不是线性帧，上层无法直接当 NV12 用。
+ * 关键：CAPTURE 默认可能是 QCOM 压缩格式，必须显式选择线性的 NV12/P010，
+ * 否则上层不能直接按半平面布局读取。
  */
 static int setup_capture(struct dmd_v4l2_dec *d)
 {
@@ -710,14 +783,14 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     /* DMD_PROBE_10BIT=1：把 CAPTURE 设成 QP10（P10 Venus，10bit 半平面）
      * 而不是 NV12，用来判定"10bit 解不出来"是硬件/固件的限制还是驱动没实现。
      *
-     * ⚠️ 这是**探测开关，不是功能开关**。上层（surface 分配、VAImage、
-     * export）全都假设 8bit NV12：每像素字节数、UV 平面偏移、
-     * DRM_FORMAT_NV12 都是按 8bit 写死的，所以开了它像素必然错乱。
+     * ⚠️ 这是**探测开关，不是功能开关**。QP10/Q12A 的厂商布局没有转换为
+     * 线性 P010；标准 P010 的 surface/VAImage/export 路径不能解释它们。
      * 它只回答一个问题：固件在 Main10 码流下会不会吐 CAPTURE 缓冲。 */
     uint32_t want = d->ten_bit ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
     const char *probe10 = getenv("DMD_PROBE_10BIT");
     /* DMD_PROBE_10BIT=9：逐个试候选 CAPTURE 格式，只记录固件接受哪个，
-     * 最终仍按 NV12 走正常路径。用于回答"10bit 流固件愿意吐哪种格式"。 */
+     * 最终仍按上面的 NV12/P010 正常请求恢复。用于回答固件接受哪些格式，
+     * 不以某次 S_FMT 成功替代最终线性格式及像素验证。 */
     if (probe10 && probe10[0] == '9') {
         static const uint32_t cand[] = {
             V4L2_PIX_FMT_NV12,
@@ -762,12 +835,24 @@ static int setup_capture(struct dmd_v4l2_dec *d)
     }
     f.fmt.pix_mp.pixelformat = want;
     if (xioctl(d->fd, VIDIOC_S_FMT, &f, "S_FMT(CAPTURE)") < 0) return -1;
-    if (f.fmt.pix_mp.pixelformat != want)
+    if (f.fmt.pix_mp.pixelformat != want) {
         V4L2_LOG("CAPTURE 格式被驱动改写为 %c%c%c%c",
                  (char)(f.fmt.pix_mp.pixelformat & 0xFF),
                  (char)((f.fmt.pix_mp.pixelformat >> 8) & 0xFF),
                  (char)((f.fmt.pix_mp.pixelformat >> 16) & 0xFF),
                  (char)((f.fmt.pix_mp.pixelformat >> 24) & 0xFF));
+        /* A successful S_FMT can still substitute NV12 or a vendor format.
+         * Neither can be read using P010's 16-bit samples/UV offset. Fail
+         * before allocating/queuing CAPTURE buffers, rather than reporting a
+         * successful 10-bit decode with a different pixel representation.
+         * QP10/Q12A overrides deliberately retain their diagnostic behavior;
+         * they never select the normal P010 request above. */
+        if (want == V4L2_PIX_FMT_P010) {
+            V4L2_LOG("线性 P010 未被接受，拒绝把替代格式作为 P010 输出");
+            errno = ENOTSUP;
+            return -1;
+        }
+    }
 
     d->w = (int)f.fmt.pix_mp.width;
     d->h = (int)f.fmt.pix_mp.height;
@@ -1121,6 +1206,9 @@ static int try_dq_capture(struct dmd_v4l2_dec *d, uint8_t **out_data,
                (uint64_t)v.timestamp.tv_usec;
     *out_index = (int)v.index;
     if (v.flags & V4L2_BUF_FLAG_LAST) d->saw_eos = 1;
+    d->cap[v.index].hardware_error = (v.flags & V4L2_BUF_FLAG_ERROR) != 0;
+    if (d->cap[v.index].hardware_error) dmd_video_stats_error(d->video_stats);
+    else dmd_video_stats_hw(d->video_stats);
     return 1;
 }
 

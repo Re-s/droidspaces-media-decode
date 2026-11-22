@@ -1,0 +1,8 @@
+#!/bin/sh
+# VLC 3: the X11 EGL converter supplies the VA display and surface pool.
+# The vaapi decoder consumes that pool; vaapi_drm expects to create its own.
+if [ -n "${DISPLAY:-}" ]; then
+    exec env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb MESA_LOADER_DRIVER_OVERRIDE=msm \
+        /usr/bin/vlc --avcodec-hw=vaapi --vout=gl --gl=egl_x11 "$@"
+fi
+exec env MESA_LOADER_DRIVER_OVERRIDE=msm /usr/bin/vlc "$@"

@@ -50,12 +50,14 @@ IMPLEMENTED = {
     "vaEndPicture",
     "vaSyncSurface",
     "vaSyncSurface2",
+    "vaSyncBuffer",
     "vaQuerySurfaceStatus",
     # ---- VAImage 出口（image.c） ----
     "vaCreateImage",
     "vaDeriveImage",
     "vaDestroyImage",
     "vaGetImage",
+    "vaPutImage",
     # ---- dmabuf 出口（export.c） ----
     # Firefox 取帧只走这条路：CreateImageVAAPI 要 DRM_PRIME_2 描述符，
     # 失败即整条流回落软解，且没有拷贝回退路径。
